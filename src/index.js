@@ -153,8 +153,10 @@ const PROACTIVE_DROP = new Set(
 );
 
 // Concurrent verification config
-const VERIFY_CONCURRENCY = parseInt(process.env.VERIFY_CONCURRENCY || '8', 10);
-const VERIFY_INTERVAL = parseInt(process.env.VERIFY_INTERVAL || '600', 10) * 1000;
+// (BUGFIX audit-2026-06-30 R-verify: reduced default concurrency 16→8→4 and interval 600→1200
+// to prevent verify sweep from monopolizing the key pool and causing 503 cascade.)
+const VERIFY_CONCURRENCY = parseInt(process.env.VERIFY_CONCURRENCY || '4', 10);
+const VERIFY_INTERVAL = parseInt(process.env.VERIFY_INTERVAL || '1200', 10) * 1000;
 const VERIFY_ON_BOOT = process.env.VERIFY_ON_BOOT !== 'false';
 
 // Upstream routing config
@@ -558,7 +560,10 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
 
   const strippedParams = new Set();
   let attempt = 0;
-  const maxAttempts = Math.max(MAX_RETRIES + 1, pool.totalKeys);
+  // (BUGFIX audit-2026-06-30 R-maxretry: cap maxAttempts to MAX_RETRIES+1 only.
+  // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
+  // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
+  const maxAttempts = MAX_RETRIES + 1;
   while (attempt < maxAttempts) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
@@ -662,7 +667,17 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         return { status: 400, data: errBody || { error: { message: respText || 'Bad Request', type: 'invalid_request_error' } } };
       }
 
-      const isRetryableError = (resp.status >= 500) || [401, 403, 404].includes(resp.status);
+      // (BUGFIX audit-2026-06-30 R-404: 404 = model not found on upstream, NOT transient.
+      // Retrying 404 across all keys wastes capacity and causes P95=41s latency spikes.)
+      const isRetryableError = (resp.status >= 500) || [401, 403].includes(resp.status);
+      // (BUGFIX audit-2026-06-30 R-404-mark: auto-mark 404 models unavailable so
+      // subsequent requests skip immediately instead of retrying every key.)
+      if (resp.status === 404) {
+        let respText404 = '';
+        try { respText404 = await resp.text(); } catch {}
+        markModel(modelId, false, 404, '/v1/chat/completions', 'not_found: ' + (respText404 || '').slice(0, 200));
+        console.warn(`[UPSTREAM 404] Model ${modelId} not found on upstream — marked unavailable, returning 404 fast`);
+      }
       if (isRetryableError && attempt < maxAttempts - 1) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
@@ -731,7 +746,10 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
 async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl }) {
   const strippedParams = new Set();
   let attempt = 0;
-  const maxAttempts = Math.max(MAX_RETRIES + 1, pool.totalKeys);
+  // (BUGFIX audit-2026-06-30 R-maxretry: cap maxAttempts to MAX_RETRIES+1 only.
+  // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
+  // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
+  const maxAttempts = MAX_RETRIES + 1;
   while (attempt < maxAttempts) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
@@ -823,7 +841,9 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         return jsonResp(res, 400, errBody || { error: { message: respText || 'Bad Request', type: 'invalid_request_error' } });
       }
 
-      const isRetryableError = (resp.status >= 500) || [401, 403, 404].includes(resp.status);
+      // (BUGFIX audit-2026-06-30 R-404: 404 = model not found on upstream, NOT transient.
+      // Retrying 404 across all keys wastes capacity and causes P95=41s latency spikes.)
+      const isRetryableError = (resp.status >= 500) || [401, 403].includes(resp.status);
       if (isRetryableError && attempt < maxAttempts - 1) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
@@ -1235,7 +1255,10 @@ async function handleCatchAll(req, res, path, url) {
 
   let attempt = 0;
   const strippedParams = new Set();
-  const maxAttempts = Math.max(MAX_RETRIES + 1, pool.totalKeys);
+  // (BUGFIX audit-2026-06-30 R-maxretry: cap maxAttempts to MAX_RETRIES+1 only.
+  // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
+  // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
+  const maxAttempts = MAX_RETRIES + 1;
   while (attempt < maxAttempts) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
@@ -1328,7 +1351,9 @@ async function handleCatchAll(req, res, path, url) {
         return jsonResp(res, 400, errBody || { error: { message: respText || 'Bad Request', type: 'invalid_request_error' } });
       }
 
-      const isRetryableError = (resp.status >= 500) || [401, 403, 404].includes(resp.status);
+      // (BUGFIX audit-2026-06-30 R-404: 404 = model not found on upstream, NOT transient.
+      // Retrying 404 across all keys wastes capacity and causes P95=41s latency spikes.)
+      const isRetryableError = (resp.status >= 500) || [401, 403].includes(resp.status);
       if (isRetryableError && attempt < maxAttempts - 1) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
