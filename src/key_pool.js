@@ -451,6 +451,11 @@ class KeyPool {
       return [null, 0.0];
     }
 
+    // (PATCH-004) provider circuit breaker — short-circuit if upstream is OPEN
+    if (typeof acquireProviderCircuitCheck === 'function' && acquireProviderCircuitCheck()) {
+      return [null, 0.0];
+    }
+
     if (signal) {
       if (signal.aborted) {
         return [null, 0.0];

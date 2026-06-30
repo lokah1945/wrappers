@@ -103,6 +103,11 @@ const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require(
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
 const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_MODELS } = require('./capabilities');
 const { Metrics } = require('./metrics');
+// (PATCH-004) provider circuit breaker classifier
+const { ErrorTaxonomy } = require('./error_taxonomy');
+const errorTaxonomy = new ErrorTaxonomy();
+const PROVIDER_CIRCUIT_ENABLED = (process.env.PROVIDER_CIRCUIT_ENABLED || 'true').toLowerCase() !== 'false';
+const PROVIDER_NAME = (process.env.PROVIDER_CIRCUIT_NAME || 'integrate.api.nvidia.com');
 
 // ── Fault Tolerance (Enterprise & Military Grade Resilience) ─────────────
 function safeInterval(fn, ms) {
@@ -698,6 +703,9 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
+        // (PATCH-004) classify — provider-level failures feed circuit breaker
+        const _class = errorTaxonomy.classify({ status: resp.status, body: '', model: modelId, key: key.label, provider: PROVIDER_NAME });
+        globalThis.__handleFailClassification?.(_class, { status: resp.status, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff, capped
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -729,6 +737,11 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
 
       const data = await resp.json();
       const { pt, ct, tt, cacht } = extractUsageFields(data.usage);
+      // (PATCH-004) success — clear provider circuit (half-open recovery)
+      if (errorTaxonomy.isProviderOpen(PROVIDER_NAME)) {
+        errorTaxonomy.providerProbeSucceeded(PROVIDER_NAME);
+        console.info(`[CIRCUIT-CLOSE] ${PROVIDER_NAME} recovered (half-open probe succeeded)`);
+      }
       metrics.recordRequest({
         method: 'POST', path: '/v1/chat/completions',
         model: modelId, keyLabel: key.label,
@@ -742,6 +755,9 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
+        // (PATCH-004) classify network errors — they DON'T trigger provider circuit (only provider class does)
+        const _class = errorTaxonomy.classify({ status: 0, body: e.message, model: modelId, key: key.label, provider: PROVIDER_NAME });
+        if (_class !== 'network') globalThis.__handleFailClassification?.(_class, { status: 0, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -869,6 +885,9 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
+        // (PATCH-004) classify — provider-level failures feed circuit breaker
+        const _class = errorTaxonomy.classify({ status: resp.status, body: '', model: modelId, key: key.label, provider: PROVIDER_NAME });
+        globalThis.__handleFailClassification?.(_class, { status: resp.status, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff, capped
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -927,6 +946,9 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
+        // (PATCH-004) classify network errors — they DON'T trigger provider circuit (only provider class does)
+        const _class = errorTaxonomy.classify({ status: 0, body: e.message, model: modelId, key: key.label, provider: PROVIDER_NAME });
+        if (_class !== 'network') globalThis.__handleFailClassification?.(_class, { status: 0, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -1381,6 +1403,9 @@ async function handleCatchAll(req, res, path, url) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
+        // (PATCH-004) classify — provider-level failures feed circuit breaker
+        const _class = errorTaxonomy.classify({ status: resp.status, body: '', model: modelId, key: key.label, provider: PROVIDER_NAME });
+        globalThis.__handleFailClassification?.(_class, { status: resp.status, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff, capped
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -1538,6 +1563,9 @@ async function handleCatchAll(req, res, path, url) {
       if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
+        // (PATCH-004) classify network errors — they DON'T trigger provider circuit (only provider class does)
+        const _class = errorTaxonomy.classify({ status: 0, body: e.message, model: modelId, key: key.label, provider: PROVIDER_NAME });
+        if (_class !== 'network') globalThis.__handleFailClassification?.(_class, { status: 0, model: modelId });
         attempt++;
         // (PATCH-006) jittered exponential backoff
         await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
@@ -2026,6 +2054,24 @@ function startKeyReload() {
     }
   }, keysReloadSec * 1000);
 }
+
+// (PATCH-004) provider circuit breaker helper — referenced by key_pool.acquireSlot
+// Returns true if circuit is currently open (refuse traffic). Reads from errorTaxonomy.
+globalThis.acquireProviderCircuitCheck = () => {
+  if (!PROVIDER_CIRCUIT_ENABLED) return false;
+  return errorTaxonomy.isProviderOpen(PROVIDER_NAME);
+};
+
+// (PATCH-004) — called from retry loops on each classifier result
+function handleFailClassification(kind, ev) {
+  if (!PROVIDER_CIRCUIT_ENABLED) return;
+  if (kind !== 'provider') return;
+  const opened = errorTaxonomy.recordProviderFail(PROVIDER_NAME);
+  if (opened) {
+    console.error(`[CIRCUIT-OPEN] ${PROVIDER_NAME} circuit OPEN for ${parseInt(process.env.PROVIDER_OPEN_MS || '120000', 10)}ms after ${errorTaxonomy._recentFails.get(PROVIDER_NAME)?.length} fails`);
+  }
+}
+globalThis.__handleFailClassification = handleFailClassification;
 
 // ── Start ───────────────────────────────────────────────────────────────
 async function main() {
