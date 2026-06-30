@@ -11,6 +11,30 @@ const SOFT_LIMIT_RPM = parseInt(process.env.SOFT_LIMIT_RPM || '30', 10);
 const HARD_LIMIT_RPM = parseInt(process.env.HARD_LIMIT_RPM || '40', 10);
 const QUEUE_LIMIT_PER_KEY_PER_SEC = parseFloat(process.env.QUEUE_LIMIT_PER_KEY_PER_SEC || process.env.QUEUE_LIMIT || '1.0');
 const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || '100', 10);
+
+// Workload class (PATCH-FIX-001)
+const PRIORITY_CLASS = Object.freeze({
+  INTERACTIVE: 'interactive',
+  STREAM: 'stream',
+  BATCH: 'batch',
+  BACKGROUND: 'background',
+});
+const DEFAULT_PRIORITY = PRIORITY_CLASS.INTERACTIVE;
+
+// Workload classification rule (PATCH-FIX-001 REVISI #1):
+//   stream=true    -> 'stream'
+//   max_tokens>4000 -> 'batch'
+//   else          -> 'interactive'
+//   fallback      -> 'background'
+function classifyPriority(req) {
+  if (!req || typeof req !== 'object') return DEFAULT_PRIORITY;
+  const body = req.body || {};
+  if (body.stream === true) return PRIORITY_CLASS.STREAM;
+  const mt = Number(body.max_tokens || 0);
+  if (mt > 4000) return PRIORITY_CLASS.BATCH;
+  // We don't have explicit background marker yet; default interactive
+  return DEFAULT_PRIORITY;
+}
 const COOLDOWN_SEC = 65;
 const KEY_RETRY_INTERVAL_MS = parseInt(process.env.KEY_RETRY_INTERVAL_MS || '5000', 10);
 const MODEL_REFRESH_SEC = parseInt(process.env.MODEL_REFRESH_SEC || '600', 10);
@@ -273,6 +297,29 @@ class KeyPool {
     this._modelsCacheTs = 0;
     this._initErrors = [];
     this._agent = new Agent({ connections: 50, pipelining: 10 });
+
+    // (PATCH-FIX-004) queue observability state
+    this._priorityClasses = { interactive: 0, stream: 0, batch: 0, background: 0 };
+    this._waitingByPri = { interactive: new Map(), stream: new Map(), batch: new Map(), background: new Map() };
+    this._arrivalsAt = new Map(); // ticket -> epoch ms (when queued)
+    this._buckets = {
+      interactive: { admitted: 0, denied: 0, totalLatency: 0, count: 0, lastResetMs: 0 },
+      stream:      { admitted: 0, denied: 0, totalLatency: 0, count: 0, lastResetMs: 0 },
+      batch:       { admitted: 0, denied: 0, totalLatency: 0, count: 0, lastResetMs: 0 },
+      background:  { admitted: 0, denied: 0, totalLatency: 0, count: 0, lastResetMs: 0 },
+    };
+    this._recentAdmitLatency = { interactive: [], stream: [], batch: [], background: [] };
+    this._eventLog = []; // ring buffer of last 100 admission/denial events for /admin/state
+
+    // (PATCH-FIX-001 REVISI #3) dynamic capacity
+    // capacity = healthy_keys × effective_rps × target_latency
+    // reject_threshold = capacity × 1.5
+    // soft_threshold   = capacity × 1.1
+    this._targetLatencyMs = parseFloat(process.env.TARGET_LATENCY_MS || '5000');  // 5s target
+    this._capacityFloor = parseInt(process.env.CAPACITY_FLOOR || '10', 10);
+    this._capacityCeiling = parseInt(process.env.CAPACITY_CEILING || '500', 10);
+    this._maxHardInflight = 0; // observed rolling-window via metrics 5m
+    this._backpressureEnabled = (process.env.BACKPRESSURE_503 !== 'false');
   }
 
   /** Load keys from environment. */
@@ -428,7 +475,26 @@ class KeyPool {
 
   // ── Selection & Pacing Queue ─────────────────────────────────────────
 
-  async acquire(model = null, signal = null) {
+  /**
+   * Public acquire API. Backpressure-aware.
+   * Priority derived from reqBody (REVISI #1).
+   * @returns { key, waitedMs, priority, denied }
+   */
+  async acquire(model, signal, reqBody) {
+    const priority = classifyPriority({ body: reqBody });
+    // Capacity-based fast reject — return immediately, do not queue
+    const deny = this.shouldDenyByCapacity(priority);
+    if (deny) {
+      this.logDeny(deny.reason, priority);
+      return { key: null, waitedMs: 0, priority, denied: true, reason: deny.reason, capacity: deny.capacity, inflight: deny.inflight, threshold: deny.threshold };
+    }
+    const [chosen, waitedS] = await this.acquireSlot(model, signal, priority);
+    const waitedMs = Math.round(waitedS * 1000);
+    if (chosen) this.logAdmit(null, priority, waitedMs); // _ticketSeq tracked inside
+    return { key: chosen, waitedMs, priority, denied: chosen === null };
+  }
+
+  async acquireSlot(model = null, signal = null, priority = DEFAULT_PRIORITY) {
     const start = Date.now();
     const [chosen, waitedS] = await this.acquireSlot(model, signal);
     return {
@@ -437,7 +503,7 @@ class KeyPool {
     };
   }
 
-  async acquireSlot(model = null, signal = null) {
+  async acquireSlot(model = null, signal = null, priority = DEFAULT_PRIORITY) {
     const start = Date.now() / 1000;
     const soft = this.softLimit;
     const hard = this.hardLimit;
@@ -738,6 +804,100 @@ class KeyPool {
     return keyObj.effectiveLoad
       + mPenalty * MODEL_PENALTY_WEIGHT * 100
       + pPenalty * PROVIDER_PENALTY_WEIGHT * 100;
+  }
+
+  // ── PATCH-FIX-001 + PATCH-FIX-004 helpers ──────────────────────────────
+  /** Compute dynamic capacity. REVISI #3. */
+  computeDynamicCapacity() {
+    const healthy = this.keys.filter(k => !k.isHardBlocked() && !k.isHardBlocked() && k.currentRpm() < k.effectiveHardLimit(this.hardLimit)).length;
+    const total = this.keys.length || 1;
+    const healthyRatio = healthy / total;
+    // effective_rps from queueLimit: per-key × key count
+    const rps = (this.queueLimit > 0 ? this.queueLimit : 0) * this.keys.length;
+    // target_latency_sec → multiplicative factor on rps
+    const targetSec = this._targetLatencyMs / 1000;
+    const baseCap = Math.max(this._capacityFloor, Math.floor(healthyRatio * rps * targetSec));
+    return {
+      capacity: Math.min(this._capacityCeiling, Math.max(this._capacityFloor, baseCap)),
+      soft: Math.min(this._capacityCeiling, Math.max(this._capacityFloor, baseCap * 1.1)),
+      reject: Math.min(this._capacityCeiling, Math.max(this._capacityFloor, baseCap * 1.5)),
+      healthy, total,
+    };
+  }
+  /** Get current global inflight across all keys. */
+  getInflightTotal() {
+    return this.keys.reduce((s, k) => s + (k.inFlight || 0), 0);
+  }
+  /** Insert arrival entry; called when packet enters queue waiting. */
+  recordArrival(ticket, priority) {
+    this._arrivalsAt.set(ticket, Date.now());
+    const m = this._waitingByPri[priority];
+    if (m && !m.has(ticket)) m.set(ticket, Date.now());
+  }
+  /** Clear arrival entry — called on admit OR deny. */
+  clearArrival(ticket, priority) {
+    this._arrivalsAt.delete(ticket);
+    const m = this._waitingByPri[priority];
+    if (m) m.delete(ticket);
+  }
+  /** Record a denial event with reason. */
+  logDeny(reason, priority) {
+    const b = this._buckets[priority];
+    if (b) b.denied++;
+    const ev = { ts: Date.now(), kind: 'deny', reason, pri: priority, depth: this._waiting.size };
+    this._eventLog.push(ev);
+    if (this._eventLog.length > 100) this._eventLog.shift();
+  }
+  /** Record an admit event with wait-ms. */
+  logAdmit(ticket, priority, waitMs) {
+    const b = this._buckets[priority];
+    if (b) { b.admitted++; b.totalLatency += waitMs; b.count++; }
+    const arr = this._recentAdmitLatency[priority];
+    arr.push(waitMs);
+    if (arr.length > 100) arr.shift();
+    this.clearArrival(ticket, priority);
+    const ev = { ts: Date.now(), kind: 'admit', pri: priority, waitMs, depth: this._waiting.size };
+    this._eventLog.push(ev);
+    if (this._eventLog.length > 100) this._eventLog.shift();
+  }
+  /** Snapshot for /admin/queue observability (PATCH-FIX-004). */
+  queueSnapshot() {
+    const cap = this.computeDynamicCapacity();
+    const inflight = this.getInflightTotal();
+    const byPri = {};
+    for (const k of Object.keys(this._waitingByPri)) {
+      const m = this._waitingByPri[k];
+      const arrivalAges = [...m.values()].map(t => Date.now() - t).sort((a, b) => b - a);
+      const p50 = arrivalAges.length ? arrivalAges[Math.floor(arrivalAges.length * 0.5)] : 0;
+      const p95 = arrivalAges.length ? arrivalAges[Math.floor(arrivalAges.length * 0.95)] : 0;
+      byPri[k] = { waiting: m.size, oldestWaitMs: arrivalAges[0] || 0, p50, p95 };
+    }
+    const buckets = {};
+    for (const k of Object.keys(this._buckets)) {
+      buckets[k] = { ...this._buckets[k] };
+    }
+    return {
+      capacity: cap,
+      inflight,
+      waiting: this._waiting.size,
+      byPri,
+      buckets,
+      eventLogLast: this._eventLog.slice(-20),
+    };
+  }
+  /** Save rejection reason: returns 503 or progress. */
+  shouldDenyByCapacity(priority) {
+    if (!this._backpressureEnabled) return null;
+    const cap = this.computeDynamicCapacity();
+    const inflight = this.getInflightTotal();
+    if (inflight >= cap.reject) {
+      return { reason: 'capacity-reject', inflight, threshold: cap.reject, capacity: cap };
+    }
+    // Soft threshold: at 110%, allow only INTERACTIVE priority and stream
+    if (inflight >= cap.soft && priority !== PRIORITY_CLASS.INTERACTIVE && priority !== PRIORITY_CLASS.STREAM) {
+      return { reason: 'capacity-soft-interactive-only', inflight, threshold: cap.soft };
+    }
+    return null;
   }
 
   async syncKeys(keysList) {

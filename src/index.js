@@ -458,7 +458,8 @@ async function probeModel(modelId) {
     return;
   }
 
-  const keyResult = await pool.acquire(modelId);
+  const keyResult = await pool.acquire(modelId, null, dryRunPayload());
+  if (keyResult && keyResult.denied) return null;
   const key = keyResult ? keyResult.key : null;
   if (!key) return;  // acquireSlot already cleans up myTicket on null return
 
@@ -601,7 +602,15 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
     if (Date.now() - retryStartedAt > RETRY_BUDGET_MS) {
       return { status: 504, data: { error: { message: 'retry budget exhausted', type: 'timeout_error', budget_ms: RETRY_BUDGET_MS, attempts: attempt } } };
     }
-    const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
+    const keyResult = await pool.acquire(modelId, req?.clientAbortSignal, body);
+    // (PATCH-FIX-001) backpressure fast-path: rejected by capacity
+    if (keyResult && keyResult.denied) {
+      return {
+        status: 503,
+        data: { error: { message: 'overloaded', type: 'overloaded', reason: keyResult.reason, retry_after_ms: 1000 } },
+        headers: { 'Retry-After': '1' }
+      };
+    }
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
 
@@ -1230,6 +1239,16 @@ function handleHealth(res) {
   jsonResp(res, 200, pool.healthJson());
 }
 
+/** GET /admin/queue — PATCH-FIX-004 observability */
+function handleQueueState(res) {
+  try {
+    const snap = pool.queueSnapshot();
+    jsonResp(res, 200, snap);
+  } catch (e) {
+    jsonResp(res, 500, { error: 'queue_snapshot_failed', message: e?.message || String(e) });
+  }
+}
+
 /** GET /stats */
 function handleStats(res) {
   const summ = metrics.summary();
@@ -1326,7 +1345,14 @@ async function handleCatchAll(req, res, path, url) {
   const retryStartedAt = Date.now();
   function _budgetLeft() { return RETRY_BUDGET_MS - (Date.now() - retryStartedAt); }
   while (attempt < maxAttempts && (Date.now() - retryStartedAt) < RETRY_BUDGET_MS) {
-    const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
+    const keyResult = await pool.acquire(modelId, req?.clientAbortSignal, body);
+    if (keyResult && keyResult.denied) {
+      return {
+        status: 503,
+        data: { error: { message: 'overloaded', type: 'overloaded', reason: keyResult.reason, retry_after_ms: 1000 } },
+        headers: { 'Retry-After': '1' }
+      };
+    }
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
 
@@ -1644,6 +1670,7 @@ async function handleRequest(req, res) {
     if (method === 'GET' && path === '/health')        return handleHealth(res);
     if (method === 'GET' && path === '/stats')         return handleStats(res);
     if (method === 'GET' && path === '/metrics/prom')   return handlePromMetrics(res);
+    if (method === 'GET' && path === '/admin/queue')    return handleQueueState(res);
     if (method === 'GET' && path === '/v1/models')      return await handleModels(res, url);
     if (method === 'GET' && path.startsWith('/v1/models/')) {
       const modelId = decodeURIComponent(path.slice('/v1/models/'.length));
