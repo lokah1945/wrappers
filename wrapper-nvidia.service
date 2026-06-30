@@ -1,0 +1,32 @@
+[Unit]
+Description=wrapper-nvidia Node.js proxy (NVIDIA NIM)
+After=network.target
+Documentation=https://github.com/lokah1945/wrapper-nvidia
+# Limit rapid restart attempts (was in [Service] before — wrong section).
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper/nvidia
+ExecStart=/usr/bin/node /root/wrapper/nvidia/src/index.js
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/root/wrapper/nvidia/.env
+Environment=LISTEN_PORT=9100
+Environment=METRICS_DB=/root/wrapper/nvidia/metrics.db
+# (BUGFIX audit-2026-06-30 R-handle: tighten server timeouts so a stuck
+# handler / socket doesn't snowball into a 5-minute silent hang from
+# the wrapper's perspective.)
+Environment=SERVER_REQUEST_TIMEOUT_MS=60000
+Environment=SERVER_KEEPALIVE_TIMEOUT_MS=10000
+Environment=SERVER_HEADERS_TIMEOUT_MS=15000
+Environment=ANTI_SILENCE_TIMEOUT_MS=45000
+TimeoutStopSec=15
+# Resource limits — cap memory so a runaway upstream response can't OOM
+# the host. Conservative; tune up if needed.
+MemoryMax=512M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,38 @@
+# Secrets — NEVER commit
+.env
+.env.bkp
+.env.*
+!.env.example
+
+# Logs
+*.log
+metrics_data/
+server.log
+
+# Runtime data
+metrics.db
+metrics.db-*
+metrics.db.*
+*.tmp
+
+# Backups (managed by backup.sh)
+backups/*
+
+# Cache
+node_modules/
+.npm/
+*.tgz
+
+# Editor
+*.swp
+*~
+.DS_Store
+.idea/
+.vscode/
+
+# Audit artifacts
+*.bak
+.audit-*/
+
+# Restore script temp
+restore/
