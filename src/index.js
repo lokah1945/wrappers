@@ -142,6 +142,20 @@ const QUIET_RETRIED_429 = parseInt(process.env.QUIET_RETRIED_429 || '3', 10);
 const MAX_RETRIES = QUIET_RETRIED_429;
 const VERSION     = '4.6.0-node';
 
+// (PATCH-006) retry budget — cap total retry walltime instead of bare attempt count.
+// Default 15s. Combined with jittered exponential backoff.
+const RETRY_BUDGET_MS = parseInt(process.env.RETRY_BUDGET_MS || '15000', 10);
+const RETRY_BACKOFF_BASE_MS = parseInt(process.env.RETRY_BACKOFF_BASE_MS || '100', 10);
+const RETRY_BACKOFF_CAP_MS = parseInt(process.env.RETRY_BACKOFF_CAP_MS || '1500', 10);
+
+// Jittered exponential backoff helper (PATCH-006).
+// attempt is 1-based: 1 -> ~100ms+jitter, 2 -> ~200ms+jitter, 3 -> ~400ms+jitter
+function retryBackoffMs(attempt) {
+  const exp = Math.min(RETRY_BACKOFF_BASE_MS * Math.pow(1.8, attempt - 1), RETRY_BACKOFF_CAP_MS);
+  const jitter = Math.floor(Math.random() * Math.min(exp * 0.4, 200));
+  return Math.round(exp + jitter);
+}
+
 // Metrics dashboard cache (avoid blocking DB reads on every poll)
 const _metricsCache = { _ts: 0, _ttl: 3000, _data: null }; // 3s TTL
 
@@ -564,7 +578,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
   // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
   // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
   const maxAttempts = MAX_RETRIES + 1;
-  while (attempt < maxAttempts) {
+  while (attempt < maxAttempts && (Date.now() - retryStartedAt) < RETRY_BUDGET_MS) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
@@ -613,10 +627,12 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         try { bodyText = await resp.text(); } catch {}
         const [scope, reason] = await pool.registerRateLimit(key, modelId, ra, null, bodyText);
         metrics.recordRateLimitEvent({ keyLabel: key.label, model: modelId, retryAfterS: ra });
-        if (attempt < maxAttempts - 1) {
+        // (PATCH-002) record model-level penalty so future selects avoid this model on this key
+        if (scope === 'model') pool.recordModelPenalty(key.label, modelId);
+        if (attempt < maxAttempts - 1 && _budgetLeft() > 200) {
           attempt++;
-          // Fast rotation on rate limits: retry immediately with 50ms delay
-          await new Promise(resolve => setTimeout(resolve, 50));
+          // (PATCH-006) jittered exponential backoff
+          await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
           continue;
         }
         return { status: 429, data: { error: { message: `Rate limited (retry-after ${ra}s). Scope: ${scope}, Reason: ${reason}`, type: 'rate_limit_error' } } };
@@ -678,12 +694,13 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         markModel(modelId, false, 404, '/v1/chat/completions', 'not_found: ' + (respText404 || '').slice(0, 200));
         console.warn(`[UPSTREAM 404] Model ${modelId} not found on upstream — marked unavailable, returning 404 fast`);
       }
-      if (isRetryableError && attempt < maxAttempts - 1) {
+      if (isRetryableError && attempt < maxAttempts - 1 && _budgetLeft() > 300) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff, capped
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
 
@@ -722,11 +739,12 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       pool.releaseSuccess(key);
       return { status: 200, data, key };
     } catch (e) {
-      if (attempt < maxAttempts - 1) {
-        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key`);
+      if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
+        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
       const latencyMs = Date.now() - startMs;
@@ -745,12 +763,15 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
 // ── Generic POST Helper (embeddings, images, ranking) ─────────────────
 async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl }) {
   const strippedParams = new Set();
-  let attempt = 0;
   // (BUGFIX audit-2026-06-30 R-maxretry: cap maxAttempts to MAX_RETRIES+1 only.
   // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
   // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
+  let attempt = 0;
   const maxAttempts = MAX_RETRIES + 1;
-  while (attempt < maxAttempts) {
+  // (PATCH-006) per-call retry budget — caps total walltime across attempts
+  const retryStartedAt = Date.now();
+  function _budgetLeft() { return RETRY_BUDGET_MS - (Date.now() - retryStartedAt); }
+  while (attempt < maxAttempts && (Date.now() - retryStartedAt) < RETRY_BUDGET_MS) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
@@ -844,12 +865,13 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       // (BUGFIX audit-2026-06-30 R-404: 404 = model not found on upstream, NOT transient.
       // Retrying 404 across all keys wastes capacity and causes P95=41s latency spikes.)
       const isRetryableError = (resp.status >= 500) || [401, 403].includes(resp.status);
-      if (isRetryableError && attempt < maxAttempts - 1) {
+      if (isRetryableError && attempt < maxAttempts - 1 && _budgetLeft() > 300) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff, capped
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
 
@@ -902,11 +924,12 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         return;
       }
     } catch (e) {
-      if (attempt < maxAttempts - 1) {
-        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key`);
+      if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
+        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
       metrics.recordRequest({
@@ -1255,11 +1278,11 @@ async function handleCatchAll(req, res, path, url) {
 
   let attempt = 0;
   const strippedParams = new Set();
-  // (BUGFIX audit-2026-06-30 R-maxretry: cap maxAttempts to MAX_RETRIES+1 only.
-  // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
-  // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
   const maxAttempts = MAX_RETRIES + 1;
-  while (attempt < maxAttempts) {
+  // (PATCH-006) per-call retry budget — caps total walltime across attempts
+  const retryStartedAt = Date.now();
+  function _budgetLeft() { return RETRY_BUDGET_MS - (Date.now() - retryStartedAt); }
+  while (attempt < maxAttempts && (Date.now() - retryStartedAt) < RETRY_BUDGET_MS) {
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
@@ -1354,12 +1377,13 @@ async function handleCatchAll(req, res, path, url) {
       // (BUGFIX audit-2026-06-30 R-404: 404 = model not found on upstream, NOT transient.
       // Retrying 404 across all keys wastes capacity and causes P95=41s latency spikes.)
       const isRetryableError = (resp.status >= 500) || [401, 403].includes(resp.status);
-      if (isRetryableError && attempt < maxAttempts - 1) {
+      if (isRetryableError && attempt < maxAttempts - 1 && _budgetLeft() > 300) {
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} on key: ${key.label} — retrying next key`);
         const cooldown = [401, 403].includes(resp.status) ? 3600 : 15;
         pool.releaseRateLimited(key, cooldown);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff, capped
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
 
@@ -1511,11 +1535,12 @@ async function handleCatchAll(req, res, path, url) {
         return;
       }
     } catch (e) {
-      if (attempt < maxAttempts - 1) {
-        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key`);
+      if (attempt < maxAttempts - 1 && _budgetLeft() > 250) {
+        console.warn(`[NETWORK ERROR] ${e.message} — retrying next key (budget-rem=${_budgetLeft()}ms)`);
         pool.releaseRateLimited(key, 10);
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // (PATCH-006) jittered exponential backoff
+        await new Promise(resolve => setTimeout(resolve, retryBackoffMs(attempt)));
         continue;
       }
       metrics.recordRequest({
