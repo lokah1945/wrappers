@@ -24,6 +24,11 @@ const MODEL_BLOCK_CAP = parseInt(process.env.MODEL_BLOCK_CAP || '10', 10);
 const KEY_BLOCK_CAP = parseInt(process.env.KEY_BLOCK_CAP || '30', 10);
 const MODEL_BLOCK_DEFAULT_SECS = parseInt(process.env.MODEL_BLOCK_DEFAULT_SECS || '8', 10);
 
+// (PATCH-002) selector scoring weights
+const USE_SCORE_SELECTOR = (process.env.USE_SCORE_SELECTOR || 'true').toLowerCase() !== 'false';
+const MODEL_PENALTY_WEIGHT = parseFloat(process.env.MODEL_PENALTY_WEIGHT || '0.20');
+const PROVIDER_PENALTY_WEIGHT = parseFloat(process.env.PROVIDER_PENALTY_WEIGHT || '0.25');
+
 const MODEL_429_HINTS = (process.env.MODEL_429_HINTS ||
   'for this model,per-model,per model,requests for model,model is rate,model rate limit,this model,model_rate_limit')
   .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
@@ -228,6 +233,16 @@ class KeyEntry {
 
 class KeyPool {
   constructor() {
+    // (PATCH-002) score-adjustment penalty maps (label|model) -> penalty score 0..1
+    this._modelPenalty = new Map();    // "label/model" -> sum of recent model 429 penalties (decays)
+    this._providerPenalty = new Map(); // "integrate.api.nvidia.com" -> provider-level penalty 0..1
+    // raw counts (last 60s window) that drive the penalties
+    this._modelPenaltyRaw = new Map();
+    this._providerPenaltyRaw = new Map();
+    this._lastPenaltyDecay = Date.now();
+    this.ramping = {
+      model: new Map(),
+    };
     this.keys = [];
     this.softLimit = SOFT_LIMIT_RPM;
     this.hardLimit = HARD_LIMIT_RPM;
@@ -617,12 +632,19 @@ class KeyPool {
     };
 
     // Sort ready keys by:
-    // 1. effectiveLoad (ascending) - active in-flight requests + RPM load
-    // 2. totalRequests (ascending) - historical usage count to guarantee equal usage
-    // 3. rrDistance (ascending) - round-robin distance as the final tie-breaker
+    // (PATCH-002) composite score when USE_SCORE_SELECTOR=true, else legacy effectiveLoad.
+    // Score = availability_signal - (model_penalty * MODEL_PENALTY_WEIGHT) - (provider_penalty * PROVIDER_PENALTY_WEIGHT).
+    // Lower score = worse candidate; we pick the LOWEST score (= most available).
+    this._decayPenalties();
     const candidates = [...ready].sort((a, b) => {
-      if (a.effectiveLoad !== b.effectiveLoad) {
-        return a.effectiveLoad - b.effectiveLoad;
+      if (USE_SCORE_SELECTOR) {
+        const sa = this._scoreFor(a);
+        const sb = this._scoreFor(b);
+        if (sa !== sb) return sa - sb;
+      } else {
+        if (a.effectiveLoad !== b.effectiveLoad) {
+          return a.effectiveLoad - b.effectiveLoad;
+        }
       }
       if (a.totalRequests !== b.totalRequests) {
         return a.totalRequests - b.totalRequests;
@@ -656,6 +678,61 @@ class KeyPool {
       if (!s.isHardBlocked()) return s;
     }
     return this.keys[0] || null;
+  }
+
+  // ── PATCH-002 scoring helpers ──────────────────────────────────────────
+  /** Increment penalty for a single (keyLabel, model) failure record. */
+  recordModelPenalty(keyLabel, model) {
+    if (!keyLabel || !model) return;
+    const k = `${keyLabel}/${model}`;
+    this._modelPenaltyRaw.set(k, (this._modelPenaltyRaw.get(k) || 0) + 1);
+  }
+  /** Increment provider-level penalty for provider-wide failures (CLASS C). */
+  recordProviderPenalty(provider) {
+    if (!provider) return;
+    this._providerPenaltyRaw.set(provider, (this._providerPenaltyRaw.get(provider) || 0) + 1);
+  }
+  /** Decay raw counters every 5s; recompute normalized penalties [0,1]. */
+  _decayPenalties() {
+    const now = Date.now();
+    if (now - this._lastPenaltyDecay < 5000) return;
+    this._lastPenaltyDecay = now;
+    const halfLife = 60_000; // raw halves every 60s
+    const factor = Math.pow(0.5, (now - (this._lastPenaltyDecay)) / halfLife);
+    // model penalties: max raw across map -> 1.0 normalizer
+    let maxM = 0;
+    const normM = new Map();
+    for (const [k, v] of this._modelPenaltyRaw.entries()) {
+      const decayed = v * factor;
+      this._modelPenaltyRaw.set(k, decayed);
+      normM.set(k, decayed);
+      if (decayed > maxM) maxM = decayed;
+    }
+    this._modelPenalty = new Map();
+    if (maxM > 0) {
+      for (const [k, v] of normM.entries()) this._modelPenalty.set(k, Math.min(1, v / maxM));
+    }
+    let maxP = 0;
+    const normP = new Map();
+    for (const [k, v] of this._providerPenaltyRaw.entries()) {
+      const decayed = v * factor;
+      this._providerPenaltyRaw.set(k, decayed);
+      normP.set(k, decayed);
+      if (decayed > maxP) maxP = decayed;
+    }
+    this._providerPenalty = new Map();
+    if (maxP > 0) {
+      for (const [k, v] of normP.entries()) this._providerPenalty.set(k, Math.min(1, v / maxP));
+    }
+  }
+  /** Lower = better. effectiveLoad baseline + penalty weight. */
+  _scoreFor(keyObj) {
+    if (!USE_SCORE_SELECTOR) return keyObj.effectiveLoad;
+    const mPenalty = this._modelPenalty.get(keyObj.label) || 0;
+    const pPenalty = this._providerPenalty.get('integrate.api.nvidia.com') || 0;
+    return keyObj.effectiveLoad
+      + mPenalty * MODEL_PENALTY_WEIGHT * 100
+      + pPenalty * PROVIDER_PENALTY_WEIGHT * 100;
   }
 
   async syncKeys(keysList) {
