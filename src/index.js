@@ -586,7 +586,13 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
   // Using pool.totalKeys allowed 5× retries on 5xx/401, causing 20+ second
   // hangs when upstream is degraded. MAX_RETRIES=3 → maxAttempts=4 is enough.)
   const maxAttempts = MAX_RETRIES + 1;
+  // (PATCH-006) per-call retry budget — caps total walltime across attempts
+  const retryStartedAt = Date.now();
+  function _budgetLeft() { return RETRY_BUDGET_MS - (Date.now() - retryStartedAt); }
   while (attempt < maxAttempts && (Date.now() - retryStartedAt) < RETRY_BUDGET_MS) {
+    if (Date.now() - retryStartedAt > RETRY_BUDGET_MS) {
+      return { status: 504, data: { error: { message: 'retry budget exhausted', type: 'timeout_error', budget_ms: RETRY_BUDGET_MS, attempts: attempt } } };
+    }
     const keyResult = await pool.acquire(modelId, req?.clientAbortSignal);
     const key = keyResult ? keyResult.key : null;
     const pacingMs = keyResult ? keyResult.waitedMs : 0;
