@@ -99,6 +99,7 @@ const { fetch: undiciFetch, Agent } = require('undici');
 // Canonical wrapper dir
 const WRAPPER_DIR = path.resolve(__dirname, '..');
 
+// (PATCH-001/PATCH-004/PATCH-005) module imports — keep grouped for clarity
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('./key_pool');
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
 const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_MODELS } = require('./capabilities');
@@ -108,6 +109,8 @@ const { ErrorTaxonomy } = require('./error_taxonomy');
 const errorTaxonomy = new ErrorTaxonomy();
 const PROVIDER_CIRCUIT_ENABLED = (process.env.PROVIDER_CIRCUIT_ENABLED || 'true').toLowerCase() !== 'false';
 const PROVIDER_NAME = (process.env.PROVIDER_CIRCUIT_NAME || 'integrate.api.nvidia.com');
+// (PATCH-005) stream heartbeat writer
+const { installHeartbeatInterval } = require('./stream_heartbeat');
 
 // ── Fault Tolerance (Enterprise & Military Grade Resilience) ─────────────
 function safeInterval(fn, ms) {
@@ -987,6 +990,8 @@ async function handleChatCompletions(body, req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
+      // (PATCH-005) install heartbeat writer on stream — OFF by default, env-gated
+      installHeartbeatInterval(res);
       const reader = result.stream.getReader();
       const decoder = new TextDecoder();
       let lastUsage = null;
@@ -1137,6 +1142,8 @@ async function handleAnthropicMessages(rawBody, req, res) {
         'Connection': 'keep-alive',
         'X-Accel-Buffering': 'no',
       });
+      // (PATCH-005) install heartbeat writer on stream — OFF by default, env-gated
+      installHeartbeatInterval(res);
       const capture = {};
       try {
         for await (const chunk of streamOpenaiToAnthropic(result.stream, aBody.model, capture)) {
@@ -1420,6 +1427,8 @@ async function handleCatchAll(req, res, path, url) {
           'Connection': 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
+        // (PATCH-005) install heartbeat writer on catchAll stream — OFF by default, env-gated
+        installHeartbeatInterval(res);
 
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
