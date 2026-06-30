@@ -198,12 +198,20 @@ function sseEvent(event, data) {
 }
 
 function jsonResp(res, code, obj) {
+  // (BUGFIX patch-006-fix2: race with ANTI-SILENCE watchdog — if handler already
+  // wrote headers (504 watchdog fired) and we get here, writeHead throws
+  // ERR_HTTP_HEADERS_SENT unhandled rejection. Guard against it.)
+  if (res.headersSent || res.writableEnded || res.destroyed) return;
   const body = JSON.stringify(obj);
-  res.writeHead(code, {
-    'Content-Type': 'application/json',
-    'Content-Length': Buffer.byteLength(body),
-  });
-  res.end(body);
+  try {
+    res.writeHead(code, {
+      'Content-Type': 'application/json',
+      'Content-Length': Buffer.byteLength(body),
+    });
+    res.end(body);
+  } catch (e) {
+    /* swallow — connection already closed */
+  }
 }
 
 function readBody(req) {
