@@ -71,8 +71,6 @@ function anthropicToOpenai(a) {
       const t = blk.type;
       if (t === 'text') {
         parts.push({ type: 'text', text: blk.text || '' });
-      } else if (t === 'thinking') {
-        parts.push({ type: 'text', text: `<thinking>\n${blk.thinking || ''}\n</thinking>\n` });
       } else if (t === 'image') {
         const src = blk.source || {};
         let url;
@@ -205,27 +203,12 @@ function estimateInputTokens(a) {
 // ── Response: OpenAI → Anthropic (non-streaming) ─────────────────────────
 
 function openaiToAnthropic(o, model) {
-  const choice = (o.choices?.length > 0 ? o.choices[0] : {});
-  const msg = choice?.message || {};
+  const choice = ((o.choices) || [{}])[0];
+  const msg = choice.message || {};
   const content = [];
 
-  let rawContent = msg.content || "";
-  let reasoning = msg.reasoning_content || msg.reasoning || "";
-
-  // Parse unstructured <think>...</think> if present in the content
-  if (!reasoning && rawContent.startsWith("<think>")) {
-    const endIdx = rawContent.indexOf("</think>");
-    if (endIdx !== -1) {
-      reasoning = rawContent.substring(7, endIdx).trim();
-      rawContent = rawContent.substring(endIdx + 8).trim();
-    }
-  }
-
-  if (reasoning) {
-    content.push({ type: 'thinking', thinking: reasoning });
-  }
-  if (rawContent) {
-    content.push({ type: 'text', text: rawContent });
+  if (msg.content) {
+    content.push({ type: 'text', text: msg.content });
   }
   for (const tc of (msg.tool_calls || [])) {
     const fn = tc.function || {};
@@ -239,9 +222,8 @@ function openaiToAnthropic(o, model) {
   const usage = {
     input_tokens: u.prompt_tokens || 0,
     output_tokens: u.completion_tokens || 0,
-    cache_creation_input_tokens: 0,
-    cache_read_input_tokens: cached,
   };
+  if (cached) usage.cache_read_input_tokens = cached;
 
   return {
     id: o.id || 'msg_wrapper',
@@ -264,60 +246,18 @@ function openaiToAnthropic(o, model) {
 async function* streamOpenaiToAnthropic(stream, model, capture) {
   const msgId = 'msg_wrapper';
   let textIndex = null;
-  let thinkingIndex = null;
   const toolMap = {};       // openai tool index -> anthropic block index
   let nextIndex = 0;
   let openIdx = null;
   let finalStop = 'end_turn';
   let usage = {};
-  let inThinkTag = false;
-
-  const emitText = async function* (text) {
-    if (textIndex === null) {
-      if (openIdx !== null) {
-        yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-      }
-      textIndex = nextIndex++;
-      openIdx = textIndex;
-      yield _sse('content_block_start', {
-        type: 'content_block_start', index: textIndex,
-        content_block: { type: 'text', text: '' },
-      });
-    }
-    yield _sse('content_block_delta', {
-      type: 'content_block_delta', index: textIndex,
-      delta: { type: 'text_delta', text: text },
-    });
-  };
-
-  const emitThinkingStart = async function* () {
-    if (thinkingIndex === null) {
-      if (openIdx !== null) {
-        yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-      }
-      thinkingIndex = nextIndex++;
-      openIdx = thinkingIndex;
-      yield _sse('content_block_start', {
-        type: 'content_block_start', index: thinkingIndex,
-        content_block: { type: 'thinking', thinking: '' },
-      });
-    }
-  };
-
-  const emitThinkingDelta = async function* (text) {
-    yield* emitThinkingStart();
-    yield _sse('content_block_delta', {
-      type: 'content_block_delta', index: thinkingIndex,
-      delta: { type: 'thinking_delta', thinking: text },
-    });
-  };
 
   yield _sse('message_start', {
     type: 'message_start',
     message: {
       id: msgId, type: 'message', role: 'assistant', model,
       content: [], stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      usage: { input_tokens: 0, output_tokens: 0 },
     },
   });
   yield _sse('ping', { type: 'ping' });
@@ -325,16 +265,11 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let isFirstRead = true;
 
   try {
     while (true) {
       const { done, value } = await reader.read();
       if (done) break;
-      if (isFirstRead) {
-        capture.ttftMs = capture._startMs ? (Date.now() - capture._startMs) : 0;
-        isFirstRead = false;
-      }
 
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
@@ -355,68 +290,41 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
         const ch = choices[0];
         const delta = ch.delta || {};
 
-        let contentText = delta.content || "";
-        const reasoning = delta.reasoning_content || delta.reasoning;
-
-        if (reasoning) {
-          yield* emitThinkingDelta(reasoning);
-        } else if (contentText) {
-          if (!inThinkTag && contentText.includes("<think>")) {
-            inThinkTag = true;
-            const parts = contentText.split("<think>");
-            const before = parts[0];
-            const after = parts.slice(1).join("<think>");
-            if (before) {
-              yield* emitText(before);
+        // text delta
+        if (delta.content) {
+          if (textIndex === null) {
+            if (openIdx !== null) {
+              yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
             }
-            yield* emitThinkingStart();
-            contentText = after;
+            textIndex = nextIndex++;
+            openIdx = textIndex;
+            yield _sse('content_block_start', {
+              type: 'content_block_start', index: textIndex,
+              content_block: { type: 'text', text: '' },
+            });
           }
-
-          if (inThinkTag) {
-            if (contentText.includes("</think>")) {
-              inThinkTag = false;
-              const parts = contentText.split("</think>");
-              const inside = parts[0];
-              const after = parts.slice(1).join("</think>");
-              if (inside) {
-                yield* emitThinkingDelta(inside);
-              }
-              if (openIdx !== null) {
-                yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-                openIdx = null;
-              }
-              if (after) {
-                yield* emitText(after);
-              }
-            } else {
-              yield* emitThinkingDelta(contentText);
-            }
-          } else {
-            yield* emitText(contentText);
-          }
+          yield _sse('content_block_delta', {
+            type: 'content_block_delta', index: textIndex,
+            delta: { type: 'text_delta', text: delta.content },
+          });
         }
 
         // tool-call deltas
         for (const tc of (delta.tool_calls || [])) {
-          const oi = tc.index ?? 0;
+          const oi = tc.index || 0;
           const fn = tc.function || {};
           if (!(oi in toolMap)) {
             if (openIdx !== null) {
               yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
             }
-            textIndex = null;
             const ai = nextIndex++;
             toolMap[oi] = ai;
             openIdx = ai;
-            // Generate unique tool call ID using message ID + index to prevent collisions
-            // Use the tool call ID from OpenAI if available, otherwise generate a deterministic one
-            const toolCallId = tc.id || `toolu_${msgId.replace('msg_', '')}_${ai}`;
             yield _sse('content_block_start', {
               type: 'content_block_start', index: ai,
               content_block: {
                 type: 'tool_use',
-                id: toolCallId,
+                id: tc.id || `toolu_${ai}`,
                 name: fn.name || '',
                 input: {},
               },
@@ -450,8 +358,6 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
     usage: {
       input_tokens: usage.prompt_tokens || 0,
       output_tokens: usage.completion_tokens || 0,
-      cache_creation_input_tokens: 0,
-      cache_read_input_tokens: ((usage.prompt_tokens_details) || {}).cached_tokens || 0,
     },
   });
   yield _sse('message_stop', { type: 'message_stop' });

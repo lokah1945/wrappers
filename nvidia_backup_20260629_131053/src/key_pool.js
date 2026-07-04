@@ -1,5 +1,5 @@
 /**
- * key_pool.js v4.4.0 — Two-tier rate-limited API key pool for NVIDIA NIM.
+ * key_pool.js v4.6.0 — Two-tier rate-limited API key pool for NVIDIA NIM.
  * Ported from Python key_pool.py — functionally identical with full pacing,
  * corroboration-based 429 classification, and FIFO admission queue.
  */
@@ -23,17 +23,16 @@ const CORROBORATION_WINDOW_S = parseInt(process.env.CORROBORATION_WINDOW_S || '6
 const MODEL_BLOCK_CAP = parseInt(process.env.MODEL_BLOCK_CAP || '10', 10);
 const KEY_BLOCK_CAP = parseInt(process.env.KEY_BLOCK_CAP || '30', 10);
 const MODEL_BLOCK_DEFAULT_SECS = parseInt(process.env.MODEL_BLOCK_DEFAULT_SECS || '8', 10);
-const INFLIGHT_SOFT_CAP = parseInt(process.env.INFLIGHT_SOFT_CAP || '50', 10);
 
 const MODEL_429_HINTS = (process.env.MODEL_429_HINTS ||
-  'rate limit exceeded for model,model rate limit exceeded,per-model rate limit,requests for this model exceeded,model quota exceeded,model capacity exceeded')
+  'for this model,per-model,per model,requests for model,model is rate,model rate limit,this model,model_rate_limit')
   .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
 
 const KEY_429_HINTS = (process.env.KEY_429_HINTS ||
-  'account rate limit,api key rate limit,organization rate limit,your key rate limit,credential rate limit,key quota exceeded,account quota exceeded')
+  'account,api key,api-key,apikey,organization,your key,credential')
   .split(',').map(h => h.trim().toLowerCase()).filter(Boolean);
 
-// Simple Promise-based Mutex — prevents double-release from waking multiple waiters.
+// Simple Promise-based Mutex
 class Mutex {
   constructor() {
     this._queue = [];
@@ -108,17 +107,15 @@ class KeyEntry {
   }
 
   effectiveHardLimit(configuredHard) {
-    const hard = configuredHard || HARD_LIMIT_RPM;
-    if (this.detectedLimit && this.detectedLimit < hard) {
+    if (this.detectedLimit && this.detectedLimit < configuredHard) {
       return this.detectedLimit;
     }
-    return hard;
+    return configuredHard;
   }
 
   effectiveSoftLimit(configuredSoft, configuredHard) {
     const hard = this.effectiveHardLimit(configuredHard);
-    const soft = configuredSoft || SOFT_LIMIT_RPM;
-    return Math.max(1, Math.min(soft, hard - 1));
+    return Math.max(1, Math.min(configuredSoft, hard - 1));
   }
 
   secondsUntilBelow(limit, window = 60) {
@@ -235,7 +232,7 @@ class KeyPool {
     this.softLimit = SOFT_LIMIT_RPM;
     this.hardLimit = HARD_LIMIT_RPM;
     this.pacing = true;
-    this.pacingMaxWait = parseFloat(process.env.PACING_MAX_WAIT || '60');
+    this.pacingMaxWait = 60.0;
     this.queueLimit = QUEUE_LIMIT_PER_KEY_PER_SEC;
     this.maxQueueSize = MAX_QUEUE_SIZE;
     this._admitInterval = this.queueLimit > 0 ? 1.0 / this.queueLimit : 0.0;
@@ -253,16 +250,7 @@ class KeyPool {
     this._modelsCache = [];
     this._modelsCacheTs = 0;
     this._initErrors = [];
-    this._agent = null;
-    this._ownsAgent = true;
-  }
-
-  setExternalAgent(extAgent) {
-    if (this._agent && this._ownsAgent) {
-      try { this._agent.close(); } catch {}
-    }
-    this._agent = extAgent;
-    this._ownsAgent = false;
+    this._agent = new Agent({ connections: 50, pipelining: 10 });
   }
 
   /** Load keys from environment. */
@@ -280,7 +268,7 @@ class KeyPool {
       }
       if (keysSeen.has(v)) continue;
       keysSeen.add(v);
-      envKeys.push(v.trim());
+      envKeys.push(v);
     }
 
     if (envKeys.length === 0) {
@@ -296,7 +284,7 @@ class KeyPool {
   get totalKeys()       { return this.keys.length; }
   get availableKeys()   { return this.keys.filter(k => !k.isHardBlocked() && k.currentRpm() < k.effectiveHardLimit(this.hardLimit)).length; }
   get blockedKeys()     { return this.keys.filter(k => k.isHardBlocked()).length; }
-  get exhaustedCount()  { return this.keys.filter(k => k.currentRpm() >= k.effectiveHardLimit(this.hardLimit)).length; }
+  get exhaustedCount()  { return this.keys.filter(k => k.effectiveLoad >= k.effectiveHardLimit(this.hardLimit)).length; }
 
   get totalSoftCapacity() {
     return this.keys.reduce((sum, k) => {
@@ -308,15 +296,12 @@ class KeyPool {
   recordModel(model, keyLabel = null) {
     if (!model) return;
     const now = Date.now() / 1000;
-    const window = 60;
     if (keyLabel) {
       const k = `${keyLabel}/${model}`;
       if (!this._modelTsByKey[k]) this._modelTsByKey[k] = [];
-      this._modelTsByKey[k] = this._modelTsByKey[k].filter(t => now - t < window);
       this._modelTsByKey[k].push(now);
     }
     if (!this._modelTs[model]) this._modelTs[model] = [];
-    this._modelTs[model] = this._modelTs[model].filter(t => now - t < window);
     this._modelTs[model].push(now);
   }
 
@@ -442,15 +427,6 @@ class KeyPool {
     if (this._waiting.size >= this.maxQueueSize) {
       console.warn(`[wrapper-nvidia] Queue backpressure load shed: waiting queue size ${this._waiting.size} exceeds max ${this.maxQueueSize}. Rejecting request.`);
       return [null, 0.0];
-    }
-
-    // Check in-flight soft cap (load shedding)
-    if (process.env.LOAD_SHEDDING_ENABLED !== 'false') {
-      const totalInFlight = this.keys.reduce((sum, k) => sum + k.inFlight, 0);
-      if (totalInFlight >= INFLIGHT_SOFT_CAP) {
-        console.warn(`[wrapper-nvidia] Load shedding: total in-flight ${totalInFlight} >= INFLIGHT_SOFT_CAP ${INFLIGHT_SOFT_CAP}. Rejecting with 503.`);
-        return [null, 0.0];
-      }
     }
 
     if (signal) {
@@ -614,6 +590,10 @@ class KeyPool {
     if (key) key.decrementInFlight();
   }
 
+  releaseFailure(key) {
+    if (key) key.decrementInFlight();
+  }
+
   releaseRateLimited(key, retryAfterSec = 65) {
     if (key) {
       key.decrementInFlight();
@@ -622,36 +602,49 @@ class KeyPool {
   }
 
   _pickKey(ready) {
-    const load = {};
-    for (const s of ready) {
-      load[s.label] = s.effectiveLoad;
-    }
-    const minLoad = Math.min(...Object.values(load));
-    const candidates = ready.filter(s => load[s.label] === minLoad);
-    if (candidates.length === 1) {
-      return candidates[0];
-    }
     const labels = this.keys.map(s => s.label);
     const rrDistance = (s) => {
       const idx = labels.indexOf(s.label);
       if (idx === -1) return labels.length;
       return (idx - this._rrIndex + labels.length) % labels.length;
     };
-    candidates.sort((a, b) => rrDistance(a) - rrDistance(b));
+
+    // Sort ready keys by:
+    // 1. effectiveLoad (ascending) - active in-flight requests + RPM load
+    // 2. totalRequests (ascending) - historical usage count to guarantee equal usage
+    // 3. rrDistance (ascending) - round-robin distance as the final tie-breaker
+    const candidates = [...ready].sort((a, b) => {
+      if (a.effectiveLoad !== b.effectiveLoad) {
+        return a.effectiveLoad - b.effectiveLoad;
+      }
+      if (a.totalRequests !== b.totalRequests) {
+        return a.totalRequests - b.totalRequests;
+      }
+      return rrDistance(a) - rrDistance(b);
+    });
+
     const chosen = candidates[0];
-    const chosenIdx = labels.indexOf(chosen.label);
-    if (chosenIdx !== -1) {
-      this._rrIndex = (chosenIdx + 1) % labels.length;
-    } else {
-      this._rrIndex = 0;
+    if (chosen) {
+      const chosenIdx = labels.indexOf(chosen.label);
+      if (chosenIdx !== -1) {
+        this._rrIndex = (chosenIdx + 1) % labels.length;
+      }
     }
     return chosen;
   }
 
-  peekKey() {
+  /** Initialize the totalRequests count from the SQLite database at boot/reload. */
+  initializeKeyRequests(counts) {
+    if (!counts) return;
     for (const s of this.keys) {
-      if (!s.isHardBlocked() && s.inFlight < 5) return s;
+      if (counts[s.label] !== undefined) {
+        s.totalRequests = counts[s.label];
+      }
     }
+  }
+
+
+  peekKey() {
     for (const s of this.keys) {
       if (!s.isHardBlocked()) return s;
     }
@@ -662,23 +655,36 @@ class KeyPool {
     if (!keysList || keysList.length === 0) return false;
     await this._lock.acquire();
     try {
-      const oldSet = new Set(this.keys.map(k => k.apiKey));
+      const existing = {};
+      for (const s of this.keys) {
+        existing[s.apiKey] = s;
+      }
+      const newKeys = [];
+      for (let i = 0; i < keysList.length; i++) {
+        const k = keysList[i];
+        let st = existing[k];
+        if (!st) {
+          st = new KeyEntry(`key${i + 1}`, k);
+        } else {
+          st.label = `key${i + 1}`;
+        }
+        newKeys.push(st);
+      }
+
+      const oldSet = new Set(Object.keys(existing));
       const newSet = new Set(keysList);
 
-      // Check if keys are identical (same keys, same order)
       let same = oldSet.size === newSet.size;
       if (same) {
-        for (let i = 0; i < keysList.length; i++) {
-          if (this.keys[i]?.apiKey !== keysList[i]) { same = false; break; }
+        for (const k of newSet) {
+          if (!oldSet.has(k)) { same = false; break; }
         }
       }
 
-      if (same) {
-        return false; // No change needed
+      if (same && newKeys.length === this.keys.length) {
+        this.keys = newKeys;
+        return false;
       }
-
-      // Always create NEW KeyEntry objects to avoid state corruption on reorder
-      const newKeys = keysList.map((k, i) => new KeyEntry(`key${i + 1}`, k));
 
       const added = keysList.filter(k => !oldSet.has(k));
       const removed = Array.from(oldSet).filter(k => !newSet.has(k));
@@ -757,23 +763,14 @@ class KeyPool {
     let totalFixed = 0;
     await this._lock.acquire();
     try {
-      const now = Date.now() / 1000;
       for (const s of this.keys) {
-        // Only heal if key has positive inFlight AND hasn't been used recently (stuck > 60s)
-        if (s.inFlight > 0 && s.lastUsed > 0 && (now - s.lastUsed) > 60) {
-          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} stuck since lastUsed ${Math.round(now - s.lastUsed)}s ago -> 0`);
-          s.inFlight = 0;
-          totalFixed++;
-        } else if (s.inFlight > 0 && s.lastUsed === 0) {
-          // Never used but has inFlight? Stuck.
-          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} with no lastUsed -> 0`);
+        if (s.inFlight > 0) {
+          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} -> 0`);
           s.inFlight = 0;
           totalFixed++;
         }
       }
-      if (totalFixed > 0) {
-        console.info(`[wrapper-nvidia] heal_in_flight: ${totalFixed} key(s) corrected`);
-      }
+      console.info(`[wrapper-nvidia] heal_in_flight: ${totalFixed} key(s) corrected`);
     } finally {
       this._lock.release();
     }
@@ -782,8 +779,6 @@ class KeyPool {
   allStats() {
     return this.keys.map(s => s.stats(this.softLimit, this.hardLimit));
   }
-
-  // keyDetails() is defined below with a richer schema for /stats
 
   summary() {
     const stats = this.allStats();
@@ -802,47 +797,29 @@ class KeyPool {
 
   // ── Model Cache ─────────────────────────────────────────────────────
 
-  get modelsMetadata() {
-    return this._modelsMetadata || {};
-  }
-
   async _fetchModels() {
     const key = this.peekKey();
     if (!key) return [];
-    const agent = this._agent || undefined;
 
     try {
       const resp = await undiciFetch(`${NVIDIA_BASE_URL}/v1/models`, {
         headers: { 'Authorization': `Bearer ${key.apiKey}`, 'Accept': 'application/json' },
-        dispatcher: agent,
+        dispatcher: this._agent,
       });
+
+      let respText = '';
+      try { respText = await resp.text(); } catch {}
+
       if (!resp.ok) {
+        this.releaseRateLimited(key, resp.status === 429 ? 65 : 10);
         return [];
       }
-      const body = await resp.json();
-      let modelsRaw = [];
-      if (Array.isArray(body.data)) {
-        modelsRaw = body.data;
-      } else if (Array.isArray(body.models)) {
-        modelsRaw = body.models;
-      }
-      
-      const parsedModels = [];
-      this._modelsMetadata = this._modelsMetadata || {};
-      
-      for (const m of modelsRaw) {
-        const id = typeof m === 'string' ? m : m.id;
-        if (!id) continue;
-        const cleanId = id.replace(/^(stg|dev|test)\//i, '');
-        parsedModels.push(cleanId);
-        
-        if (typeof m === 'object') {
-          this._modelsMetadata[cleanId] = m;
-        }
-      }
-      
-      parsedModels.sort();
-      return parsedModels;
+      this.releaseSuccess(key);
+
+      let body;
+      try { body = JSON.parse(respText); } catch {}
+      const models = (body && body.data || []).map(m => m.id).filter(Boolean).sort();
+      return models;
     } catch (e) {
       return [];
     }
@@ -863,41 +840,10 @@ class KeyPool {
 
   get modelsCached() { return this._modelsCache; }
 
-  /** Prune stale entries from rate-tracking maps to prevent memory leaks. */
-  pruneStaleEntries() {
-    const now = Date.now() / 1000;
-    const window = 60;
-    // Prune _modelTs — remove entries with no recent timestamps
-    for (const model of Object.keys(this._modelTs)) {
-      this._modelTs[model] = this._modelTs[model].filter(t => now - t < window);
-      if (this._modelTs[model].length === 0) delete this._modelTs[model];
-    }
-    // Prune _modelTsByKey — same
-    for (const k of Object.keys(this._modelTsByKey)) {
-      this._modelTsByKey[k] = this._modelTsByKey[k].filter(t => now - t < window);
-      if (this._modelTsByKey[k].length === 0) delete this._modelTsByKey[k];
-    }
-    // Prune _recent429 — keep only within corroboration window
-    this._recent429 = this._recent429.filter(item => now - item.ts < CORROBORATION_WINDOW_S);
-    // Prune _modelLimit — remove models with no recent activity in _modelTs
-    for (const model of Object.keys(this._modelLimit)) {
-      const ts = (this._modelTs[model] || []).filter(t => now - t < window * 10);
-      if (ts.length === 0) delete this._modelLimit[model];
-    }
-    // Prune _keyModelLimit — remove entries with no recent activity
-    for (const km of Object.keys(this._keyModelLimit)) {
-      const [keyLabel, model] = km.split('/');
-      const k = `${keyLabel}/${model}`;
-      const ts = (this._modelTsByKey[k] || []).filter(t => now - t < window * 10);
-      if (ts.length === 0) delete this._keyModelLimit[km];
-    }
-  }
-
   /** Start background model refresh. */
   startModelRefresh() {
     const refresh = async () => {
       try { await this.refreshModels(); } catch {}
-      this.pruneStaleEntries();
     };
     refresh();
     setInterval(refresh, MODEL_REFRESH_SEC * 1000);
@@ -951,11 +897,11 @@ class KeyPool {
       total_keys: this.totalKeys,
       available_keys: this.availableKeys,
       blocked_keys: this.blockedKeys,
-      soft_limit_rpm: this.softLimit,
-      hard_limit_rpm: this.hardLimit,
-      queue_limit_per_key_per_sec: this.queueLimit,
+      soft_limit_rpm: SOFT_LIMIT_RPM,
+      hard_limit_rpm: HARD_LIMIT_RPM,
+      queue_limit_per_key_per_sec: QUEUE_LIMIT_PER_KEY_PER_SEC,
       models_cached: this._modelsCache.length,
-      version: '4.4.0-node',
+      version: '4.6.0-node',
     };
   }
 

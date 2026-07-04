@@ -62,9 +62,18 @@ function buildRuntimeConfig() {
     if (dv) dp[p] = dv;
   }
   DEFAULT_PARAMS = dp;
-  PROACTIVE_DROP = new Set(
-    (process.env.DROP_PARAMS || 'think').split(',').map(s => s.trim()).filter(Boolean)
-  );
+  // NVIDIA NIM forbids context_length/context_window (and variants) in the
+  // request payload. Strip them proactively even if a client/agent sends them.
+  // `think` retained for backward compatibility with the prior default.
+  const FORBIDDEN_CONTEXT_PARAMS = [
+    'context_length', 'context_window', 'context_len',
+    'max_position_embeddings', 'max_context_length',
+    'max_input_tokens', 'max_output_tokens', 'token_limit',
+  ];
+  PROACTIVE_DROP = new Set([
+    ...((process.env.DROP_PARAMS || 'think').split(',').map(s => s.trim()).filter(Boolean)),
+    ...FORBIDDEN_CONTEXT_PARAMS,
+  ]);
 }
 buildRuntimeConfig();
 
@@ -391,7 +400,7 @@ function forwardHeaders(req) {
   if (req.headers['content-type']) h['Content-Type'] = req.headers['content-type'];
   for (const [k, v] of Object.entries(req.headers)) {
     const lk = k.toLowerCase();
-    if (!SKIP_HEADERS.has(lk) && lk !== 'content-type' && lk !== 'accept' && !lk.startsWith('x-hermes')) {
+    if (!SKIP_HEADERS.has(lk) && lk !== 'content-type' && lk !== 'accept' && !lk.startsWith('x-hermes') && !lk.startsWith('anthropic-')) {
       h[k] = v;
     }
   }
@@ -1406,19 +1415,12 @@ function handleStats(res) {
 function enrichModelMetadata(id, desc) {
   const isChat = desc.type === 'chat' || desc.type === 'vision_chat' || desc.type === 'parse';
   const isVision = desc.type === 'vision_chat' || desc.type === 'parse';
-  const contextWindow = desc.context_window || 131072;
-  const maxTokens = isChat ? Math.min(16384, Math.max(4096, Math.floor(contextWindow / 4))) : 4096;
   return {
     id,
     object: 'model',
     owned_by: id.split('/')[0] || 'nvidia',
     created: 0,
     ...desc,
-    max_context_length: contextWindow,
-    max_input_tokens: contextWindow,
-    max_output_tokens: maxTokens,
-    max_tokens: maxTokens,
-    token_limit: contextWindow,
     supports_vision: isVision,
     supports_function_calling: isChat,
     supports_parallel_tool_calls: isChat,
@@ -1945,7 +1947,6 @@ async function handleRequest(req, res) {
     }
     if (method === 'GET' && path === '/api/tags') {
       const models = pool.modelsCached.map(mid => {
-        const desc = describe(mid, BASE_LLM, BASE_GENAI);
         return {
           name: mid,
           model: mid,
@@ -1959,8 +1960,6 @@ async function handleRequest(req, res) {
             families: [mid.includes('/') ? mid.split('/')[0] : mid],
             parameter_size: '',
             quantization_level: '',
-            context_window: desc.context_window || 131072,
-            max_tokens: Math.min(16384, Math.max(4096, Math.floor((desc.context_window || 131072) / 4))),
           }
         };
       });
@@ -2579,8 +2578,10 @@ function loadConfigFromEnvFile() {
       if (!key || !val) continue;
 
       if (key.startsWith('NVIDIA_API_KEY')) {
-        if (val.length >= 10) {
+        if (val.length >= 10 && val.startsWith('nvapi-')) {
           config.keys.push(val);
+        } else if (val.length > 0) {
+          console.warn(`[wrapper-nvidia] Ignoring invalid or placeholder key in .env: ${key}`);
         }
       } else if (key === 'SOFT_LIMIT_RPM') {
         config.softLimit = parseInt(val, 10);
@@ -2656,10 +2657,11 @@ async function main() {
   metrics.prune(30);
 
   serverInstance = http.createServer(handleRequest);
-  serverInstance.timeout = 600000;
-  serverInstance.keepAliveTimeout = 75000;
+  const antiSilence = parseInt(process.env.ANTI_SILENCE_TIMEOUT_MS || process.env.SERVER_REQUEST_TIMEOUT_MS || '60000', 10);
+  serverInstance.timeout = antiSilence;
+  serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_MS || '10000', 10);
   serverInstance.maxHeadersCount = 100;
-  serverInstance.headersTimeout = 610000;
+  serverInstance.headersTimeout = parseInt(process.env.SERVER_HEADERS_TIMEOUT_MS || '15000', 10);
 
   serverInstance.listen(BETA_PORT, BIND_HOST, () => {
     console.log(`[wrapper-nvidia] v${VERSION} listening on ${BIND_HOST}:${BETA_PORT}`);

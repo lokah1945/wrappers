@@ -15,12 +15,7 @@ class Metrics {
     this._db = null;
     this._writeCounter = 0;
     this._ready = this._init();
-    this._onRequest = null;
-    this._onRateLimit = null;
   }
-
-  onRequest(cb) { this._onRequest = cb; }
-  onRateLimit(cb) { this._onRateLimit = cb; }
 
   async _init() {
     const SQL = await initSqlJs();
@@ -33,35 +28,60 @@ class Metrics {
       this._db = new SQL.Database();
     }
 
-    // Check if the database has the old Node.js schema (missing total_tokens or ttft_ms)
-    // Migrate instead of reset to preserve historical data
+    // Check if the database has the old Node.js schema (missing total_tokens)
+    let needsReset = false;
+    let tableExists = false;
     try {
-      const tableExists = this._withStmt("SELECT name FROM sqlite_master WHERE type='table' AND name='requests'", (s) => {
-        return s.step();
-      });
-
-      if (tableExists) {
-        let hasTotalTokens = false;
-        let hasTtftMs = false;
-        this._withStmt("PRAGMA table_info(requests)", (stmt) => {
-          while (stmt.step()) {
-            const col = stmt.getAsObject().name;
-            if (col === 'total_tokens') hasTotalTokens = true;
-            if (col === 'ttft_ms') hasTtftMs = true;
-          }
-        });
-
-        if (!hasTotalTokens) {
-          console.log("[metrics] Migrating schema: adding total_tokens column...");
-          this._db.run("ALTER TABLE requests ADD COLUMN total_tokens INTEGER DEFAULT 0");
-        }
-        if (!hasTtftMs) {
-          console.log("[metrics] Migrating schema: adding ttft_ms column...");
-          this._db.run("ALTER TABLE requests ADD COLUMN ttft_ms REAL DEFAULT 0");
+      const stmt = this._db.prepare("PRAGMA table_info(requests)");
+      let hasTotalTokens = false;
+      while (stmt.step()) {
+        tableExists = true;
+        if (stmt.getAsObject().name === 'total_tokens') {
+          hasTotalTokens = true;
         }
       }
-    } catch (e) {
-      console.warn("[metrics] Schema check failed:", e.message);
+      stmt.free();
+      if (tableExists && !hasTotalTokens) needsReset = true;
+    } catch {
+      needsReset = false;
+    }
+
+    if (needsReset) {
+      // FIX M1: Backup old DB and ALTER TABLE instead of nuking all data.
+      // Previous code: this._db = new SQL.Database() — silent total data loss.
+      const backupPath = this._dbPath + '.bak-' + Date.now();
+      try {
+        const oldBuf = fs.readFileSync(this._dbPath);
+        fs.writeFileSync(backupPath, oldBuf);
+        console.log(`[metrics] Old schema detected. Backed up to ${backupPath}`);
+      } catch (e) {
+        console.warn(`[metrics] Could not backup old DB: ${e.message}`);
+      }
+
+      // Add missing columns via ALTER TABLE instead of dropping everything
+      try {
+        const alterCols = [
+          { table: 'requests', col: 'total_tokens', type: 'INTEGER DEFAULT 0' },
+          { table: 'requests', col: 'cached_tokens', type: 'INTEGER DEFAULT 0' },
+          { table: 'requests', col: 'retries', type: 'INTEGER DEFAULT 0' },
+          { table: 'requests', col: 'request_bytes', type: 'INTEGER DEFAULT 0' },
+          { table: 'requests', col: 'pacing_ms', type: 'REAL DEFAULT 0' },
+        ];
+        for (const { table, col, type } of alterCols) {
+          try {
+            this._db.run(`ALTER TABLE ${table} ADD COLUMN ${col} ${type}`);
+          } catch (alterErr) {
+            // Column already exists — that's fine
+            if (!String(alterErr?.message || '').includes('duplicate column')) {
+              console.warn(`[metrics] ALTER TABLE ${table} ADD ${col}: ${alterErr?.message}`);
+            }
+          }
+        }
+        console.log('[metrics] Schema migrated via ALTER TABLE (data preserved)');
+      } catch (migrateErr) {
+        console.error(`[metrics] Migration failed, falling back to fresh DB: ${migrateErr.message}`);
+        this._db = new SQL.Database();
+      }
     }
 
     this._db.run(`
@@ -82,15 +102,11 @@ class Metrics {
         was_rate_limited  INTEGER DEFAULT 0,
         retries           INTEGER DEFAULT 0,
         request_bytes     INTEGER DEFAULT 0,
-        pacing_ms         REAL    DEFAULT 0,
-        ttft_ms           REAL    DEFAULT 0
+        pacing_ms         REAL    DEFAULT 0
       );
       CREATE INDEX IF NOT EXISTS idx_req_ts    ON requests(ts);
       CREATE INDEX IF NOT EXISTS idx_req_model ON requests(model);
       CREATE INDEX IF NOT EXISTS idx_req_key   ON requests(key_label);
-      CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status_code);
-      CREATE INDEX IF NOT EXISTS idx_req_ts_model ON requests(ts, model);
-      CREATE INDEX IF NOT EXISTS idx_req_ts_key ON requests(ts, key_label);
 
       CREATE TABLE IF NOT EXISTS model_status (
         model       TEXT PRIMARY KEY,
@@ -113,8 +129,6 @@ class Metrics {
         observed_rpm   INTEGER
       );
       CREATE INDEX IF NOT EXISTS idx_rl_ts     ON rate_limit_events(ts);
-      CREATE INDEX IF NOT EXISTS idx_rl_key    ON rate_limit_events(key_label);
-      CREATE INDEX IF NOT EXISTS idx_rl_model  ON rate_limit_events(model);
     `);
 
     this._save();
@@ -124,48 +138,37 @@ class Metrics {
 
   async ready() { await this._ready; }
 
-  /**
-   * Helper: prepare a statement, run callback, guarantee free() via try/finally.
-   * Prevents statement leaks when bind/step/getAsObject throw.
-   */
-  _withStmt(sql, fn) {
-    const stmt = this._db.prepare(sql);
-    try {
-      return fn(stmt);
-    } finally {
-      stmt.free();
-    }
-  }
-
   _save(sync = false) {
-    if (sync) {
-      try {
-        if (!this._db) return;
-        const data = this._db.export();
-        const buffer = Buffer.from(data);
-        fs.writeFileSync(this._dbPath + '.tmp', buffer);
-        fs.renameSync(this._dbPath + '.tmp', this._dbPath);
-      } catch (e) {
-        console.error("[metrics] Synchronous save error:", e ? e.message || e : "unknown");
+    // FIX M2: Log write errors instead of silently swallowing them.
+    // FIX M3: Atomic write via temp file + rename to prevent partial/corrupt DB.
+    // OPTIMIZATION: Async write by default to prevent blocking Node's single-threaded event loop.
+    try {
+      if (!this._db) return;
+      const data = this._db.export();
+      const buffer = Buffer.from(data.buffer, data.byteOffset, data.byteLength);
+      const tmpPath = this._dbPath + '.tmp';
+      
+      if (sync) {
+        fs.writeFileSync(tmpPath, buffer);
+        fs.renameSync(tmpPath, this._dbPath);
+      } else {
+        fs.writeFile(tmpPath, buffer, (err) => {
+          if (!this._db) return;
+          if (err) {
+            console.error('[metrics] _save() write failed:', err.message);
+            return;
+          }
+          fs.rename(tmpPath, this._dbPath, (renameErr) => {
+            if (!this._db) return;
+            if (renameErr) {
+              console.error('[metrics] _save() rename failed:', renameErr.message);
+            }
+          });
+        });
       }
-      return;
+    } catch (e) {
+      console.error('[metrics] _save() failed — DB not persisted:', e.message);
     }
-
-    if (this._savePending) return;
-    this._savePending = true;
-    setImmediate(async () => {
-      try {
-        if (!this._db) return;
-        const data = this._db.export();
-        const buffer = Buffer.from(data);
-        await fs.promises.writeFile(this._dbPath + '.tmp', buffer);
-        await fs.promises.rename(this._dbPath + '.tmp', this._dbPath);
-      } catch (e) {
-        console.error("[metrics] Save error:", e ? e.message || e : "unknown");
-      } finally {
-        this._savePending = false;
-      }
-    });
   }
 
   _maybeSave() {
@@ -179,51 +182,26 @@ class Metrics {
   async recordRequest({
     method, path, model, keyLabel, streaming, statusCode, latencyMs,
     promptTokens, completionTokens, cachedTokens, totalTokens,
-    wasRateLimited, retries, requestBytes, pacingMs, ttftMs
+    wasRateLimited, retries, requestBytes, pacingMs
   }) {
     await this._ready;
     try {
-      // Compute total_tokens if not provided
-      const computedTotalTokens = totalTokens ?? ((promptTokens ?? 0) + (completionTokens ?? 0));
-      const ttf = ttftMs || 0;
-
       this._db.run(
         `INSERT INTO requests
            (ts, method, path, model, key_label, streaming, status_code,
             latency_ms, prompt_tokens, completion_tokens, cached_tokens,
-            total_tokens, was_rate_limited, retries, request_bytes, pacing_ms, ttft_ms)
-         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+            total_tokens, was_rate_limited, retries, request_bytes, pacing_ms)
+         VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
         [
           Date.now() / 1000, method || 'POST', path || '', model || '', keyLabel || '',
           streaming ? 1 : 0, statusCode || 200, latencyMs || 0,
-          promptTokens || 0, completionTokens || 0, cachedTokens || 0, computedTotalTokens,
-          wasRateLimited ? 1 : 0, retries || 0, requestBytes || 0, pacingMs || 0, ttf
+          promptTokens || 0, completionTokens || 0, cachedTokens || 0, totalTokens || 0,
+          wasRateLimited ? 1 : 0, retries || 0, requestBytes || 0, pacingMs || 0
         ]
       );
       this._maybeSave();
-      if (this._onRequest) {
-        this._onRequest({
-          ts: Date.now() / 1000,
-          method: method || 'POST',
-          path: path || '',
-          model: model || '',
-          key_label: keyLabel || '',
-          streaming: streaming ? 1 : 0,
-          status_code: statusCode || 200,
-          latency_ms: latencyMs || 0,
-          ttft_ms: ttf,
-          prompt_tokens: promptTokens || 0,
-          completion_tokens: completionTokens || 0,
-          cached_tokens: cachedTokens || 0,
-          total_tokens: computedTotalTokens,
-          was_rate_limited: wasRateLimited ? 1 : 0,
-          retries: retries || 0,
-          request_bytes: requestBytes || 0,
-          pacing_ms: pacingMs || 0,
-        });
-      }
     } catch (e) {
-      console.error("[metrics] recordRequest error:", e.message);
+      console.error("[metrics] recordRequest error:", e);
     }
   }
 
@@ -243,20 +221,8 @@ class Metrics {
         ]
       );
       this._maybeSave();
-      if (this._onRateLimit) {
-        this._onRateLimit({
-          ts: Date.now() / 1000,
-          key_label: keyLabel || '',
-          model: model || '',
-          retry_after_s: retryAfterS || 0,
-          detected_limit: detectedLimit || null,
-          rotated_to: rotatedTo || null,
-          scope: scope || 'key',
-          observed_rpm: observedRpm || null,
-        });
-      }
     } catch (e) {
-      console.error("[metrics] recordRateLimitEvent error:", e.message);
+      console.error("[metrics] recordRateLimitEvent error:", e);
     }
   }
 
@@ -274,32 +240,32 @@ class Metrics {
       );
       this._maybeSave();
     } catch (e) {
-      console.error("[metrics] setModelStatus error:", e.message);
+      console.error("[metrics] setModelStatus error:", e);
     }
   }
 
   getModelStatus() {
     try {
-      return this._withStmt("SELECT * FROM model_status", (stmt) => {
-        const out = {};
-        while (stmt.step()) {
-          const r = stmt.getAsObject();
-          out[r.model] = r;
-        }
-        return out;
-      });
+      const stmt = this._db.prepare("SELECT * FROM model_status");
+      const out = {};
+      while (stmt.step()) {
+        const r = stmt.getAsObject();
+        out[r.model] = r;
+      }
+      stmt.free();
+      return out;
     } catch { return {}; }
   }
 
   getUnavailableModels() {
     try {
-      return this._withStmt("SELECT model FROM model_status WHERE ok=0", (stmt) => {
-        const out = new Set();
-        while (stmt.step()) {
-          out.add(stmt.getAsObject().model);
-        }
-        return out;
-      });
+      const stmt = this._db.prepare("SELECT model FROM model_status WHERE ok=0");
+      const out = new Set();
+      while (stmt.step()) {
+        out.add(stmt.getAsObject().model);
+      }
+      stmt.free();
+      return out;
     } catch { return new Set(); }
   }
 
@@ -307,11 +273,12 @@ class Metrics {
   avgLatency24h() {
     try {
       const since = (Date.now() / 1000) - 86400;
-      return this._withStmt(`SELECT CAST(AVG(latency_ms) AS INTEGER) AS avg FROM requests WHERE ts >= ?`, (stmt) => {
-        stmt.bind([since]);
-        stmt.step();
-        return stmt.getAsObject().avg || 0;
-      });
+      const stmt = this._db.prepare(`SELECT CAST(AVG(latency_ms) AS INTEGER) AS avg FROM requests WHERE ts >= ?`);
+      stmt.bind([since]);
+      stmt.step();
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row.avg || 0;
     } catch { return 0; }
   }
 
@@ -319,39 +286,40 @@ class Metrics {
   exhaustionCount24h() {
     try {
       const since = (Date.now() / 1000) - 86400;
-      return this._withStmt(`SELECT COUNT(*) AS cnt FROM rate_limit_events WHERE ts >= ?`, (stmt) => {
-        stmt.bind([since]);
-        stmt.step();
-        return stmt.getAsObject().cnt || 0;
-      });
+      const stmt = this._db.prepare(`SELECT COUNT(*) AS cnt FROM rate_limit_events WHERE ts >= ?`);
+      stmt.bind([since]);
+      stmt.step();
+      const row = stmt.getAsObject();
+      stmt.free();
+      return row.cnt || 0;
     } catch { return 0; }
   }
 
   /** Recent requests for dashboard activity. */
   recentRequests(limit = 100, offset = 0) {
     try {
-      return this._withStmt(`SELECT * FROM requests ORDER BY ts DESC LIMIT ? OFFSET ?`, (stmt) => {
-        stmt.bind([limit, offset]);
-        const out = [];
-        while (stmt.step()) {
-          out.push(stmt.getAsObject());
-        }
-        return out;
-      });
+      const stmt = this._db.prepare(`SELECT * FROM requests ORDER BY ts DESC LIMIT ? OFFSET ?`);
+      stmt.bind([limit, offset]);
+      const out = [];
+      while (stmt.step()) {
+        out.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return out;
     } catch { return []; }
   }
 
   /** Rate limit events log. */
   rateLimitEvents(limit = 100) {
     try {
-      return this._withStmt(`SELECT * FROM rate_limit_events ORDER BY ts DESC LIMIT ?`, (stmt) => {
-        stmt.bind([limit]);
-        const out = [];
-        while (stmt.step()) {
-          out.push(stmt.getAsObject());
-        }
-        return out;
-      });
+      const stmt = this._db.prepare(`SELECT * FROM rate_limit_events ORDER BY ts DESC LIMIT ?`);
+      stmt.bind([limit]);
+      const out = [];
+      while (stmt.step()) {
+        out.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return out;
     } catch { return []; }
   }
 
@@ -360,18 +328,17 @@ class Metrics {
     try {
       const windowSecs = { "1m": 60, "5m": 300, "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[windowStr] || 86400;
       const since = (Date.now() / 1000) - windowSecs;
-      const by = this._withStmt(`
+      const stmt = this._db.prepare(`
         SELECT COALESCE(scope,'key') AS scope, COUNT(*) AS n
         FROM rate_limit_events WHERE ts >= ? GROUP BY scope
-      `, (stmt) => {
-        stmt.bind([since]);
-        const result = {};
-        while (stmt.step()) {
-          const r = stmt.getAsObject();
-          result[r.scope] = r.n;
-        }
-        return result;
-      });
+      `);
+      stmt.bind([since]);
+      const by = {};
+      while (stmt.step()) {
+        const r = stmt.getAsObject();
+        by[r.scope] = r.n;
+      }
+      stmt.free();
       const key_events = by.key || 0;
       const model_events = by.model || 0;
       const total = key_events + model_events;
@@ -385,9 +352,8 @@ class Metrics {
       const cutoff = (Date.now() / 1000) - days * 86400;
       this._db?.run(`DELETE FROM requests WHERE ts < ?`, [cutoff]);
       this._db?.run(`DELETE FROM rate_limit_events WHERE ts < ?`, [cutoff]);
-      this._db?.run(`DELETE FROM model_status WHERE checked_at < ?`, [cutoff]);
       this._save();
-    } catch {}
+    } catch { console.warn('[METRICS WARN] Failed to prune old events'); }
   }
 
   /** Summary stats. */
@@ -397,7 +363,7 @@ class Metrics {
       const now = Date.now() / 1000;
       const since = now - windowSecs;
 
-      const r = this._withStmt(`
+      const s1 = this._db.prepare(`
         SELECT COUNT(*)               AS total_requests,
                SUM(prompt_tokens)     AS prompt_tokens,
                SUM(completion_tokens) AS completion_tokens,
@@ -407,50 +373,50 @@ class Metrics {
                SUM(was_rate_limited)  AS rate_limited_count,
                SUM(retries)           AS total_retries,
                SUM(pacing_ms)         AS total_pacing_ms,
-               SUM(CASE WHEN pacing_ms > 0 THEN 1 ELSE 0 END) AS paced_requests,
-               SUM(streaming)         AS streaming_count,
-               AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END) AS avg_ttft_ms
+               SUM(CASE WHEN pacing_ms > 0 THEN 1 ELSE 0 END) AS paced_requests
          FROM requests WHERE ts >= ?
-       `, (s1) => {
-        s1.bind([since]);
-        s1.step();
-        return s1.getAsObject();
-      });
+       `);
+      s1.bind([since]);
+      s1.step();
+      const r = s1.getAsObject();
+      s1.free();
 
       const total_requests = r.total_requests || 0;
       const total_tokens = r.total_tokens || 0;
       const cached_tokens = r.cached_tokens || 0;
       const cache_pct = total_tokens ? parseFloat((cached_tokens / total_tokens * 100).toFixed(1)) : 0;
 
-      // Percentiles - using a more efficient approach
-      const cnt = this._withStmt(`SELECT COUNT(*) AS c FROM requests WHERE ts >= ? AND latency_ms > 0`, (s2) => {
-        s2.bind([since]);
-        s2.step();
-        return s2.getAsObject().c || 0;
-      });
+      // Percentiles
+      const s2 = this._db.prepare(`SELECT COUNT(*) AS c FROM requests WHERE ts >= ? AND latency_ms > 0`);
+      s2.bind([since]);
+      s2.step();
+      const cnt = s2.getAsObject().c || 0;
+      s2.free();
 
       const getPctl = (p) => {
         if (!cnt) return 0;
         const off = Math.min(cnt - 1, Math.floor(cnt * p));
-        return this._withStmt(`
+        const sP = this._db.prepare(`
           SELECT latency_ms FROM requests WHERE ts >= ? AND latency_ms > 0
           ORDER BY latency_ms LIMIT 1 OFFSET ?
-        `, (sP) => {
-          sP.bind([since, off]);
-          sP.step();
-          return sP.getAsObject().latency_ms || 0;
-        });
+        `);
+        sP.bind([since, off]);
+        sP.step();
+        const resObj = sP.getAsObject();
+        sP.free();
+        return resObj.latency_ms || 0;
       };
 
       const p95 = getPctl(0.95);
       const p99 = getPctl(0.99);
 
       const getReqCountSince = (secs) => {
-        return this._withStmt(`SELECT COUNT(*) AS c FROM requests WHERE ts >= ?`, (sReq) => {
-          sReq.bind([now - secs]);
-          sReq.step();
-          return sReq.getAsObject().c || 0;
-        });
+        const sReq = this._db.prepare(`SELECT COUNT(*) AS c FROM requests WHERE ts >= ?`);
+        sReq.bind([now - secs]);
+        sReq.step();
+        const resObj = sReq.getAsObject();
+        sReq.free();
+        return resObj.c || 0;
       };
 
       const req_1m = getReqCountSince(60);
@@ -473,15 +439,13 @@ class Metrics {
         total_retries: r.total_retries || 0,
         total_pacing_ms: r.total_pacing_ms ? Math.round(r.total_pacing_ms) : 0,
         paced_requests: r.paced_requests || 0,
-        streaming_count: r.streaming_count || 0,
-        avg_ttft_ms: r.avg_ttft_ms ? parseFloat(r.avg_ttft_ms.toFixed(1)) : 0.0,
         req_per_min: req_1m,
         req_per_5min: req_5m,
         req_per_hour: req_1h,
         req_per_day: req_24h,
       };
     } catch (e) {
-      console.error("metrics.summary error:", e.message);
+      console.error("metrics.summary error:", e);
       return {};
     }
   }
@@ -491,7 +455,7 @@ class Metrics {
     try {
       const windowSecs = { "1m": 60, "5m": 300, "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[windowStr] || 86400;
       const since = (Date.now() / 1000) - windowSecs;
-      return this._withStmt(`
+      const stmt = this._db.prepare(`
         SELECT model,
                COUNT(*)                AS requests,
                SUM(total_tokens)       AS total_tokens,
@@ -505,29 +469,27 @@ class Metrics {
                SUM(CASE WHEN status_code <  400 THEN 1 ELSE 0 END) AS success_count,
                SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS error_count,
                SUM(streaming)          AS streaming_count,
-                COUNT(DISTINCT key_label) AS keys_used,
-                MAX(ts)                 AS last_ts,
-                MIN(ts)                 AS first_ts,
-                ROUND(AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END), 1) AS avg_ttft_ms
-         FROM requests WHERE ts >= ?
+               COUNT(DISTINCT key_label) AS keys_used,
+               MAX(ts)                 AS last_ts,
+               MIN(ts)                 AS first_ts
+        FROM requests WHERE ts >= ?
         GROUP BY model ORDER BY requests DESC
-      `, (stmt) => {
-        stmt.bind([since]);
-        const out = [];
-        while (stmt.step()) {
-          const d = stmt.getAsObject();
-          const req = d.requests || 0;
-          d.non_streaming_count = req - (d.streaming_count || 0);
-          d.success_rate = req ? parseFloat(((d.success_count || 0) / req * 100).toFixed(1)) : 0.0;
-          d.avg_total_tokens = req ? Math.round((d.total_tokens || 0) / req) : 0;
-          d.avg_output_tokens = req ? Math.round((d.completion_tokens || 0) / req) : 0;
-          const tt = d.total_tokens || 0;
-          d.cache_hit_pct = tt ? parseFloat(((d.cached_tokens || 0) / tt * 100).toFixed(1)) : 0.0;
-          d.avg_ttft_ms = d.avg_ttft_ms || 0.0;
-          out.push(d);
-        }
-        return out;
-      });
+      `);
+      stmt.bind([since]);
+      const out = [];
+      while (stmt.step()) {
+        const d = stmt.getAsObject();
+        const req = d.requests || 0;
+        d.non_streaming_count = req - (d.streaming_count || 0);
+        d.success_rate = req ? parseFloat(((d.success_count || 0) / req * 100).toFixed(1)) : 0.0;
+        d.avg_total_tokens = req ? Math.round((d.total_tokens || 0) / req) : 0;
+        d.avg_output_tokens = req ? Math.round((d.completion_tokens || 0) / req) : 0;
+        const tt = d.total_tokens || 0;
+        d.cache_hit_pct = tt ? parseFloat(((d.cached_tokens || 0) / tt * 100).toFixed(1)) : 0.0;
+        out.push(d);
+      }
+      stmt.free();
+      return out;
     } catch { return []; }
   }
 
@@ -539,16 +501,16 @@ class Metrics {
       for (let i = hours; i > 0; i--) {
         const start = now - i * 3600;
         const end = now - (i - 1) * 3600;
-        const row = this._withStmt(`
+        const stmt = this._db.prepare(`
           SELECT COUNT(*) AS req,
                  COALESCE(SUM(total_tokens), 0) AS tok,
                  COALESCE(SUM(was_rate_limited), 0) AS rl
           FROM requests WHERE model = ? AND ts >= ? AND ts < ?
-        `, (stmt) => {
-          stmt.bind([model, start, end]);
-          stmt.step();
-          return stmt.getAsObject();
-        });
+        `);
+        stmt.bind([model, start, end]);
+        stmt.step();
+        const row = stmt.getAsObject();
+        stmt.free();
         out.push({
           hour_ago: i,
           requests: row.req || 0,
@@ -565,7 +527,7 @@ class Metrics {
     try {
       const windowSecs = { "1m": 60, "5m": 300, "1h": 3600, "24h": 86400, "7d": 604800, "30d": 2592000 }[windowStr] || 86400;
       const since = (Date.now() / 1000) - windowSecs;
-      return this._withStmt(`
+      const stmt = this._db.prepare(`
         SELECT key_label,
                COUNT(*)                 AS requests,
                SUM(total_tokens)        AS total_tokens,
@@ -578,36 +540,66 @@ class Metrics {
         FROM requests
         WHERE ts >= ? AND key_label NOT IN ('none', 'exhausted')
         GROUP BY key_label ORDER BY requests DESC
-      `, (stmt) => {
-        stmt.bind([since]);
-        const out = [];
-        while (stmt.step()) {
-          out.push(stmt.getAsObject());
-        }
-        return out;
-      });
+      `);
+      stmt.bind([since]);
+      const out = [];
+      while (stmt.step()) {
+        out.push(stmt.getAsObject());
+      }
+      stmt.free();
+      return out;
     } catch { return []; }
   }
+
+  /** Retrieve total historical request count per API key from metrics.db. */
+  getAllTimeKeyRequests() {
+    try {
+      const stmt = this._db.prepare(`
+        SELECT key_label, COUNT(*) AS count
+        FROM requests
+        WHERE key_label NOT IN ('none', 'exhausted')
+        GROUP BY key_label
+      `);
+      const out = {};
+      while (stmt.step()) {
+        const obj = stmt.getAsObject();
+        out[obj.key_label] = obj.count;
+      }
+      stmt.free();
+      return out;
+    } catch {
+      return {};
+    }
+  }
+
 
   _bucketChart(bucketSecs, n) {
     try {
       const now = Date.now() / 1000;
+      const startAll = now - n * bucketSecs;
+      // Single query: bucket via integer division on (ts - startAll)
+      const stmt = this._db.prepare(`
+        SELECT
+          CAST((ts - ?) / ? AS INTEGER) AS bucket_idx,
+          COUNT(*) AS req,
+          COALESCE(SUM(total_tokens), 0) AS tok,
+          COALESCE(SUM(was_rate_limited), 0) AS rl
+        FROM requests
+        WHERE ts >= ? AND ts < ?
+        GROUP BY bucket_idx
+      `);
+      stmt.bind([startAll, bucketSecs, startAll, now]);
+      const bucketMap = {};
+      while (stmt.step()) {
+        const row = stmt.getAsObject();
+        bucketMap[row.bucket_idx] = row;
+      }
+      stmt.free();
       const out = [];
-      for (let i = n; i > 0; i--) {
-        const start = now - i * bucketSecs;
-        const end = now - (i - 1) * bucketSecs;
-        const row = this._withStmt(`
-          SELECT COUNT(*) AS req,
-                 COALESCE(SUM(total_tokens), 0) AS tok,
-                 COALESCE(SUM(was_rate_limited), 0) AS rl
-          FROM requests WHERE ts >= ? AND ts < ?
-        `, (stmt) => {
-          stmt.bind([start, end]);
-          stmt.step();
-          return stmt.getAsObject();
-        });
+      for (let i = 0; i < n; i++) {
+        const row = bucketMap[i] || { req: 0, tok: 0, rl: 0 };
         out.push({
-          index: n - i,
+          index: i,
           requests: row.req || 0,
           total_tokens: row.tok || 0,
           rate_limited: row.rl || 0
@@ -637,20 +629,20 @@ class Metrics {
 
   getTotalCounts() {
     try {
-      const r = this._withStmt(`
+      const stmt = this._db.prepare(`
         SELECT COUNT(*) AS total_requests,
                COALESCE(SUM(total_tokens), 0) AS total_tokens,
                COALESCE(SUM(was_rate_limited), 0) AS total_rl_events
         FROM requests
-      `, (stmt) => {
-        stmt.step();
-        return stmt.getAsObject();
-      });
+      `);
+      stmt.step();
+      const r = stmt.getAsObject();
+      stmt.free();
 
-      const rl = this._withStmt(`SELECT COUNT(*) AS c FROM rate_limit_events`, (stmt2) => {
-        stmt2.step();
-        return stmt2.getAsObject().c || 0;
-      });
+      const stmt2 = this._db.prepare(`SELECT COUNT(*) AS c FROM rate_limit_events`);
+      stmt2.step();
+      const rl = stmt2.getAsObject().c || 0;
+      stmt2.free();
 
       return {
         all_time_requests: r.total_requests || 0,
@@ -665,23 +657,27 @@ class Metrics {
 
   resetAll() {
     try {
-      const n_req = this._withStmt("SELECT COUNT(*) AS c FROM requests", (s1) => {
-        s1.step();
-        return s1.getAsObject().c || 0;
-      });
+      const s1 = this._db.prepare("SELECT COUNT(*) AS c FROM requests");
+      s1.step(); const n_req = s1.getAsObject().c || 0; s1.free();
 
-      const n_rl = this._withStmt("SELECT COUNT(*) AS c FROM rate_limit_events", (s2) => {
-        s2.step();
-        return s2.getAsObject().c || 0;
-      });
+      const s2 = this._db.prepare("SELECT COUNT(*) AS c FROM rate_limit_events");
+      s2.step(); const n_rl = s2.getAsObject().c || 0; s2.free();
 
-      this._db.run("DELETE FROM requests");
-      this._db.run("DELETE FROM rate_limit_events");
+      // Transaction: both deletes atomic — rollback if either fails
+      this._db.run('BEGIN TRANSACTION');
+      try {
+        this._db.run("DELETE FROM requests");
+        this._db.run("DELETE FROM rate_limit_events");
+        this._db.run('COMMIT');
+      } catch (txErr) {
+        this._db.run('ROLLBACK');
+        throw txErr;
+      }
       this._save();
       console.log(`[metrics] Reset: removed ${n_req} requests, ${n_rl} rate-limit events`);
       return { requests_removed: n_req, rate_limit_events_removed: n_rl };
     } catch (e) {
-      console.error("metrics.resetAll error:", e.message);
+      console.error("metrics.resetAll error:", e);
       return { requests_removed: 0, rate_limit_events_removed: 0 };
     }
   }
@@ -689,11 +685,10 @@ class Metrics {
   close() {
     try {
       if (this._saveInterval) clearInterval(this._saveInterval);
-      this._save(true); // synchronous save before closing
-      const db = this._db;
-      this._db = null; // Set to null so any pending saves exit early
-      db?.close();
-    } catch {}
+      this._save(true); // Force synchronous save on exit to ensure persistence
+      this._db?.close();
+      this._db = null;
+    } catch (e) { console.error('[METRICS ERROR] Failed to close DB:', e.message); }
   }
 }
 

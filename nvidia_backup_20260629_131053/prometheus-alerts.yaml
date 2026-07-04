@@ -1,0 +1,53 @@
+groups:
+  - name: wrapper-nvidia
+    interval: 30s
+    rules:
+      # 1. All keys exhausted — wrapper cannot fan out, requests will start 5xx
+      - alert: WrapperNvidiaAllKeysExhausted
+        expr: wrapper_nvidia_keys_available == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "wrapper-nvidia: all 5 keys unavailable"
+          description: "wrapper_nvidia_keys_available=0 for >1m. Client requests will be 5xx-downstream. Action: rotate API keys or wait for upstream cooldown."
+
+      # 2. Single-key elevated exhaustion (≥80% blocked) — 1-min warning
+      - alert: WrapperNvidiaHighKeyBlocking
+        expr: (wrapper_nvidia_keys_blocked / wrapper_nvidia_keys_total) >= 0.8
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "wrapper-nvidia: ≥80% keys blocked"
+          description: "Only 1 of 5 keys still available. Likely imminent full exhaustion. Check upstream NM error rate or 429 storms."
+
+      # 3. Latency — 24h avg latency > 8s
+      - alert: WrapperNvidiaHighLatency
+        expr: wrapper_nvidia_avg_latency_ms_24h > 8000
+        for: 10m
+        labels:
+          severity: medium
+        annotations:
+          summary: "wrapper-nvidia: avg latency > 8s"
+          description: "Average request latency is {{ $value }}ms. Investigate upstream network or key health."
+
+      # 4. Exhaustion count rising sharply — >50 exhaustions over last 24h
+      - alert: WrapperNvidiaAbnormalExhaustion
+        expr: increase(wrapper_nvidia_exhaustions_total_24h[1h]) > 10
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          summary: "wrapper-nvidia: exhaustion rate spike"
+          description: "More than 10 pool exhausted events in last 1h (window may differ per scrape). Indicates upstream API rate-limit storm."
+
+      # 5. Service dead — endpoint scrape failing
+      - alert: WrapperNvidiaDown
+        expr: up{job="wrapper-nvidia"} == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "wrapper-nvidia: scrape failed"
+          description: "Prometheus cannot reach /metrics/prom. Service is down or unreachable."

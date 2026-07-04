@@ -224,116 +224,15 @@ const CAPABILITY_PARAMS = {
   },
 };
 
-// Known context windows for specific model families
-const CONTEXT_WINDOWS = {
-  // 1M context (2048k)
-  'minimax-m3': 1048576,
-  'minimaxai/minimax-m3': 1048576,
-  'minimaxai/minimax-m2': 1048576,
-  'minimaxai/m2': 1048576,
-  'minimax': 1048576,
-
-  // 256k context
-  'mistral-small-4': 262144,
-  'mistral-small-3': 262144,
-  'yi-lightning': 262144,
-  'glm': 202752,
-  'glm-4': 202752,
-  'glm4': 202752,
-
-  // 128k context
-  'llama-3.1': 131072,
-  'llama-3.3': 131072,
-  'llama-3.2': 131072,
-  'llama-4': 131072,
-  'llama-3-nemotron': 131072,
-  'llama-3.1-nemotron': 131072,
-  'llama-3.3-nemotron': 131072,
-  'mistral-large': 131072,
-  'mistral-nemo': 131072,
-  'mistral-saba': 131072,
-  'qwen2.5': 131072,
-  'qwen-2.5': 131072,
-  'qwen3': 131072,
-  'qwen-3': 131072,
-  'qwen-3b': 131072,
-  'qwen-32b': 131072,
-  'qwen-110b': 131072,
-  'deepseek-v3': 131072,
-  'deepseek-r1': 131072,
-  'deepseek-v4': 131072,
-  'deepseek-v4-flash': 131072,
-  'gemma-3-12b': 131072,
-  'gemma-3-4b': 131072,
-  'gemma-3-27b': 131072,
-  'gemma-3n-e2b': 131072,
-  'gemma-3n-e4b': 131072,
-  'gemma-4': 131072,
-  'gemma4': 131072,
-  'palmyra-creative-122b': 131072,
-  'phi-3': 131072,
-  'phi-3.5': 131072,
-  'phi-4-mini': 131072,
-  'phi-4-moe': 131072,
-  'claude-3': 131072,
-  'claude-3.5': 131072,
-  'claude-3.7': 131072,
-  'claude-4': 131072,
-  'gpt-4': 131072,
-  'gpt-4o': 131072,
-  'gpt-4.1': 131072,
-  'o1': 131072,
-  'o3': 131072,
-  'o4': 131072,
-  'command-a': 131072,
-  'command-a-': 131072,
-  'nemotron': 131072,
-  'minitron': 131072,
-
-  // 32k context
-  'phi-4': 32768,
-  'mixtral-8x22b': 32768,
-  'yi-large': 32768,
-  'nv-embed-v1': 32768,
-  'nv-embed': 32768,
-  'palmyra': 32768,
-  'gemma-3-1b': 32768,
-  'gemma-27b': 32768,
-
-  // 16k context
-  'mistral-7b': 16384,
-  'mixtral-8x7b': 16384,
-  'deepseek-coder-6.7b': 16384,
-
-  // 8k context
-  'llama3-': 8192,
-  'llama-3-': 8192,
-  'gemma-2': 8192,
-  'gemma2': 8192,
-  'gemma-2b': 8192,
-  'gemma-7b': 8192,
-  'kosmos-2': 8192,
-  'solar-10.7b': 8192,
-  'palmyra-med-70b': 8192,
-  'bge-m3': 8192,
-};
+// NOTE: context length / context window fields are intentionally NOT provided.
+// NVIDIA NIM upstream does not return context_length/context_window and the
+// NVIDIA NIM API reference forbids sending context_length/context_window in
+// request payloads. The wrapper therefore passes request bodies through
+// untouched (the upstream handles context limits) and exposes no context
+// length metadata to clients/agents either.
 
 function getCapabilityParams(capType) {
   return CAPABILITY_PARAMS[capType] || CAPABILITY_PARAMS.chat;
-}
-
-function getContextWindow(modelId) {
-  const mid = (modelId || '').toLowerCase();
-
-  // Check specific model matches first
-  for (const [pattern, window] of Object.entries(CONTEXT_WINDOWS)) {
-    if (mid.includes(pattern.toLowerCase())) {
-      return window;
-    }
-  }
-
-  // Default context window — 128K for modern LLMs
-  return 131072;
 }
 
 const _classifyCache = new Map();
@@ -356,8 +255,6 @@ function classify(modelId) {
   const cached = _classifyCache.get(mid);
   if (cached) return _cloneResult(cached);
 
-  const contextWindow = getContextWindow(modelId);
-
   // Find matching classification rule
   // The last rule has patterns:[] which acts as a catch-all fallback.
   for (const rule of CLASSIFICATION_RULES) {
@@ -373,9 +270,6 @@ function classify(modelId) {
         capabilities: [...(baseDef.capabilities || [])],
         endpoints: (baseDef.endpoints || []).map(ep => ({ ...ep })),
         supported_params: { ...getCapabilityParams(rule.type) },
-        context_window: contextWindow,
-        context_len: contextWindow,
-        max_position_embeddings: contextWindow,
       };
 
       // Add extra capabilities if specified
@@ -410,9 +304,6 @@ function classify(modelId) {
     capabilities: [...(baseDef.capabilities || [])],
     endpoints: (baseDef.endpoints || []).map(ep => ({ ...ep })),
     supported_params: { ...getCapabilityParams('chat') },
-    context_window: contextWindow,
-    context_len: contextWindow,
-    max_position_embeddings: contextWindow,
   };
 
   if (mid.includes('code') || mid.includes('coder')) {
@@ -486,5 +377,4 @@ function summarize(catalog) {
 module.exports = {
   LLM, GENAI, classify, describe, buildCatalog, summarize,
   getCapabilityParams, CAPABILITY_PARAMS, RETIRED_MODELS, CURATED_GENAI,
-  CONTEXT_WINDOWS,
 };

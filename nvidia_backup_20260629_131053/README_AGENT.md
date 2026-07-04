@@ -1,15 +1,7 @@
 # wrapper-nvidia — Agent Integration Guide
 
 > **Audience:** ILMA agents, subagents, Ferrers/SuperCoding workers, integrators.
-> **Snapshot:** 2026-06-30 05:36 WIB (post-audit hardening, systemd-managed, anti-silence watchdog)
->
-> ⚠️ **Status: PRODUCTION-READY after audit 2026-06-30** — see
-> `AUDIT_REPORT_2026-06-30.md` for full evidence. Three structural bugs were
-> fixed: (1) orphan process + dead systemd unit, (2) `server.timeout=300s`
-> + `keepAliveTimeout=75s` causing silent stalls, (3) `_save()` race with
-> ENOENT on shutdown. Service is now `systemd-managed (PPID=1, single
-> canonical unit)`, runs `install.sh` for idempotent deploy, and has a
-> guaranteed `ANTI_SILENCE_TIMEOUT_MS=45000` watchdog.
+> **Snapshot:** 2026-06-29 01:55 WIB (handler modular, NVIDIA NIM proxy)
 
 ## 1. Cara pakai dalam 30 detik
 
@@ -186,48 +178,16 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 
 ```
 BASE:        http://127.0.0.1:9100/v1
-SERVICE:     wrapper-nvidia.service (systemd, enabled, PPID=1)
+SERVICE:     nvidia-wrapper.service (systemd --user)
+PID:         136341 (live, uptime ~38m at snapshot)
 LISTEN:      0.0.0.0:9100
-KEYS:        5 (auto-rotate, transparent, hot-reload 60s)
+KEYS:        5 (auto-rotate, transparent)
 MODELS:      121 cached
 REFRESH:     keys 60s, models 600s
 PROCESS:     /usr/bin/node /root/wrapper/nvidia/src/index.js
 PROJECT:     /root/wrapper/nvidia
-INSTALL:     ./install.sh [--status | --no-restart]
-GIT:         git@github.com:lokah1945/wrappers.git (mono-repo)
+GIT:         git@github.com:lokah1945/wrapper-nvidia.git (via /root/wrapper/.git)
 ```
 
-**Hardening knobs (env vars, all optional)**:
-
-| Var | Default | Description |
-|-----|---------|-------------|
-| `REQUEST_TIMEOUT_SEC` | 60 | Per-upstream call hard timeout |
-| `SERVER_REQUEST_TIMEOUT_MS` | 60000 | Node `server.timeout` |
-| `SERVER_KEEPALIVE_TIMEOUT_MS` | 10000 | Node keep-alive socket timeout |
-| `SERVER_HEADERS_TIMEOUT_MS` | 15000 | Node headers parse timeout |
-| `ANTI_SILENCE_TIMEOUT_MS` | 45000 | Watchdog: 504 if no response body started |
-| `PACING_MAX_WAIT` | 30 | Max seconds `acquireSlot` waits for a key ticket |
-
----
-
-## 11. Anti-stall invariants (guaranteed post-audit-2026-06-30)
-
-1. **No silent hang > 45 s** — `ANTI_SILENCE_TIMEOUT_MS` watchdog fires 504
-   if `res.writeHead()` hasn't been called.
-2. **No zombie sockets after client abort** — `req.clientAbortSignal` propagates
-   to upstream undici fetch via `AbortSignal.any([...])`.
-3. **No double-release of keys** — every `release*()` path uses a one-shot
-   guard (`streamReleased`, `ctStreamReleased`).
-4. **No DB corruption on shutdown** — `metrics._save()` is coalesced with
-   `_saveInFlight` flag; ENOENT on rename is logged but treated benign.
-5. **systemd owns the lifecycle** — wrapper is always restarted by systemd
-   within 5 s of any unexpected exit; orphan processes (PPID ≠ 1) on port
-   9100 are killed automatically by `install.sh` before restart.
-6. **Single canonical service unit** — duplicate `nvidia-wrapper.service` was
-   removed; only `wrapper-nvidia.service` references the binary.
-
----
-
-**Maintainer**: ILMA v3.29 (SOT + ClaudeCode-style parallel coding + SuperCoding)
-**Last audited**: 2026-07-04 (full audit: end-to-end source + runtime)
-**Last verified**: 2026-07-04 (post-audit fix verification)
+**Maintainer**: ILMA v3.0 (SOT + ClaudeCode-style parallel coding + SuperCoding)
+**Last verified**: 2026-06-29 01:55 WIB

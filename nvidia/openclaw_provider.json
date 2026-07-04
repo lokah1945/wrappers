@@ -1,0 +1,335 @@
+{
+  "provider": "wrapper-nvidia",
+  "base_url": "http://localhost:9100/v1",
+  "api_key": "optional",
+  "api": "openai-completions",
+  "models": {
+    "01-ai/yi-large": {
+      "compaction_reserve": 1024
+    },
+    "abacusai/dracarys-llama-3.1-70b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "adept/fuyu-8b": {
+      "compaction_reserve": 1024
+    },
+    "ai21labs/jamba-1.5-large-instruct": {
+      "compaction_reserve": 1024
+    },
+    "aisingapore/sea-lion-7b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "bigcode/starcoder2-15b": {
+      "compaction_reserve": 1024
+    },
+    "bytedance/seed-oss-36b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "databricks/dbrx-instruct": {
+      "compaction_reserve": 1024
+    },
+    "deepseek-ai/deepseek-coder-6.7b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "deepseek-ai/deepseek-v4-flash": {
+      "compaction_reserve": 1024
+    },
+    "deepseek-ai/deepseek-v4-pro": {
+      "compaction_reserve": 1024
+    },
+    "google/codegemma-1.1-7b": {
+      "compaction_reserve": 1024
+    },
+    "google/codegemma-7b": {
+      "compaction_reserve": 1024
+    },
+    "google/deplot": {
+      "compaction_reserve": 1024
+    },
+    "google/diffusiongemma-26b-a4b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-2-2b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-2b": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-3-12b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-3-4b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-3n-e2b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-3n-e4b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/gemma-4-31b-it": {
+      "compaction_reserve": 1024
+    },
+    "google/recurrentgemma-2b": {
+      "compaction_reserve": 1024
+    },
+    "ibm/granite-3.0-3b-a800m-instruct": {
+      "compaction_reserve": 1024
+    },
+    "ibm/granite-3.0-8b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "ibm/granite-34b-code-instruct": {
+      "compaction_reserve": 1024
+    },
+    "ibm/granite-8b-code-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/codellama-70b": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.1-70b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.1-8b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.2-11b-vision-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.2-1b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.2-3b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.2-90b-vision-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-3.3-70b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-4-maverick-17b-128e-instruct": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama-guard-4-12b": {
+      "compaction_reserve": 1024
+    },
+    "meta/llama2-70b": {
+      "compaction_reserve": 1024
+    },
+    "microsoft/kosmos-2": {
+      "compaction_reserve": 1024
+    },
+    "microsoft/phi-3-vision-128k-instruct": {
+      "compaction_reserve": 1024
+    },
+    "microsoft/phi-3.5-moe-instruct": {
+      "compaction_reserve": 1024
+    },
+    "microsoft/phi-4-mini-instruct": {
+      "compaction_reserve": 1024
+    },
+    "microsoft/phi-4-multimodal-instruct": {
+      "compaction_reserve": 1024
+    },
+    "minimaxai/minimax-m2.7": {
+      "compaction_reserve": 1024
+    },
+    "minimaxai/minimax-m3": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/codestral-22b-instruct-v0.1": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/ministral-14b-instruct-2512": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-7b-instruct-v0.3": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-large": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-large-2-instruct": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-large-3-675b-instruct-2512": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-medium-3.5-128b": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-nemotron": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mistral-small-4-119b-2603": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mixtral-8x22b-v0.1": {
+      "compaction_reserve": 1024
+    },
+    "mistralai/mixtral-8x7b-instruct-v0.1": {
+      "compaction_reserve": 1024
+    },
+    "moonshotai/kimi-k2.6": {
+      "compaction_reserve": 1024
+    },
+    "nv-mistralai/mistral-nemo-12b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/gliner-pii": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/ising-calibration-1-35b-a3b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemoguard-8b-content-safety": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemoguard-8b-topic-control": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-51b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-70b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-nano-8b-v1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-nano-vl-8b-v1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-safety-guard-8b-v3": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.1-nemotron-ultra-253b-v1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.3-nemotron-super-49b-v1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama-3.3-nemotron-super-49b-v1.5": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/llama3-chatqa-1.5-70b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/mistral-nemo-minitron-8b-8k-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemoretriever-parse": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3-content-safety": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3-nano-30b-a3b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3-super-120b-a12b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-3.5-content-safety": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-4-340b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-4-340b-reward": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-content-safety-reasoning-4b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-mini-4b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-nano-12b-v2-vl": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-nano-3-30b-a3b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nemotron-parse": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/neva-22b": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nv-embedcode-7b-v1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nvclip": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/nvidia-nemotron-nano-9b-v2": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/riva-translate-4b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/riva-translate-4b-instruct-v1.1": {
+      "compaction_reserve": 1024
+    },
+    "nvidia/vila": {
+      "compaction_reserve": 1024
+    },
+    "openai/gpt-oss-120b": {
+      "compaction_reserve": 1024
+    },
+    "openai/gpt-oss-20b": {
+      "compaction_reserve": 1024
+    },
+    "qwen/qwen3-next-80b-a3b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "qwen/qwen3.5-122b-a10b": {
+      "compaction_reserve": 1024
+    },
+    "qwen/qwen3.5-397b-a17b": {
+      "compaction_reserve": 1024
+    },
+    "sarvamai/sarvam-m": {
+      "compaction_reserve": 1024
+    },
+    "stepfun-ai/step-3.5-flash": {
+      "compaction_reserve": 1024
+    },
+    "stepfun-ai/step-3.7-flash": {
+      "compaction_reserve": 1024
+    },
+    "stockmark/stockmark-2-100b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "upstage/solar-10.7b-instruct": {
+      "compaction_reserve": 1024
+    },
+    "writer/palmyra-creative-122b": {
+      "compaction_reserve": 1024
+    },
+    "writer/palmyra-fin-70b-32k": {
+      "compaction_reserve": 1024
+    },
+    "writer/palmyra-med-70b": {
+      "compaction_reserve": 1024
+    },
+    "writer/palmyra-med-70b-32k": {
+      "compaction_reserve": 1024
+    },
+    "z-ai/glm-5.2": {
+      "compaction_reserve": 1024
+    },
+    "zyphra/zamba2-7b-instruct": {
+      "compaction_reserve": 1024
+    }
+  }
+}

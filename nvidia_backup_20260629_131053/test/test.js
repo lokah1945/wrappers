@@ -8,9 +8,8 @@ process.env.HARD_LIMIT_RPM = '25';
 process.env.MAX_QUEUE_SIZE = '10';
 
 const srcDir = path.join(__dirname, '..', 'src');
-const rootDir = path.join(__dirname, '..');
-const { KeyPool } = require(path.join(rootDir, 'key_pool'));
-const { estimateInputTokens, anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic } = require(path.join(srcDir, 'anthropic_compat'));
+const { KeyPool } = require(path.join(srcDir, 'key_pool'));
+const { estimateInputTokens, anthropicToOpenai, openaiToAnthropic } = require(path.join(srcDir, 'anthropic_compat'));
 const { classify, describe } = require(path.join(srcDir, 'capabilities'));
 const { Metrics } = require(path.join(srcDir, 'metrics'));
 
@@ -71,88 +70,6 @@ function testAnthropicCompat() {
   assert.strictEqual(anthropicResponse.content[0].text, '2');
   assert.strictEqual(anthropicResponse.usage.input_tokens, 10);
 
-  // Test Anthropic -> OpenAI with thinking block
-  const requestWithThinking = {
-    model: 'claude-3-5-sonnet',
-    messages: [{
-      role: 'user',
-      content: [
-        { type: 'thinking', thinking: 'Let me think' },
-        { type: 'text', text: 'Hello' }
-      ]
-    }]
-  };
-  const openaiReqThinking = anthropicToOpenai(requestWithThinking);
-  assert.ok(openaiReqThinking.messages[0].content.includes('<thinking>'), 'Should convert thinking block');
-  assert.ok(openaiReqThinking.messages[0].content.includes('Let me think'), 'Should preserve thinking content');
-
-  // Test OpenAI -> Anthropic with reasoning_content
-  const oaiResponseReasoning = {
-    choices: [{
-      message: {
-        role: 'assistant',
-        content: '42',
-        reasoning_content: 'Calculating the ultimate answer'
-      }
-    }]
-  };
-  const anthropicRespReasoning = openaiToAnthropic(oaiResponseReasoning, 'model');
-  assert.strictEqual(anthropicRespReasoning.content[0].type, 'thinking');
-  assert.strictEqual(anthropicRespReasoning.content[0].thinking, 'Calculating the ultimate answer');
-  assert.strictEqual(anthropicRespReasoning.content[1].type, 'text');
-  assert.strictEqual(anthropicRespReasoning.content[1].text, '42');
-
-  // Test OpenAI -> Anthropic with XML <think> tags in content
-  const oaiResponseXML = {
-    choices: [{
-      message: {
-        role: 'assistant',
-        content: '<think>\nThinking about life\n</think>\nBe happy!'
-      }
-    }]
-  };
-  const anthropicRespXML = openaiToAnthropic(oaiResponseXML, 'model');
-  assert.strictEqual(anthropicRespXML.content[0].type, 'thinking');
-  assert.strictEqual(anthropicRespXML.content[0].thinking, 'Thinking about life');
-  assert.strictEqual(anthropicRespXML.content[1].type, 'text');
-  assert.strictEqual(anthropicRespXML.content[1].text, 'Be happy!');
-
-  // Test streamOpenaiToAnthropic
-  const makeMockStream = (chunks) => {
-    let index = 0;
-    return {
-      getReader() {
-        return {
-          read() {
-            if (index < chunks.length) {
-              const val = chunks[index++];
-              return Promise.resolve({ done: false, value: new TextEncoder().encode(val) });
-            }
-            return Promise.resolve({ done: true, value: undefined });
-          },
-          releaseLock() {}
-        };
-      }
-    };
-  };
-
-  const runStreamTest = async () => {
-    const mockChunks = [
-      'data: {"choices": [{"delta": {"reasoning_content": "Think" }}]}\n',
-      'data: {"choices": [{"delta": {"content": "Hello" }}]}\n'
-    ];
-    const capture = { _startMs: Date.now() };
-    const sseGen = streamOpenaiToAnthropic(makeMockStream(mockChunks), 'model', capture);
-    const events = [];
-    for await (const chunk of sseGen) {
-      events.push(chunk);
-    }
-    assert.ok(events.some(e => e.includes('content_block_start') && e.includes('thinking')), 'Should start thinking block in stream');
-    assert.ok(events.some(e => e.includes('content_block_delta') && e.includes('Think')), 'Should yield thinking delta in stream');
-    assert.ok(events.some(e => e.includes('content_block_start') && e.includes('text')), 'Should start text block in stream');
-    assert.ok(events.some(e => e.includes('content_block_delta') && e.includes('Hello')), 'Should yield text delta in stream');
-  };
-
   // Test malformed payload resilience
   const badRequest1 = anthropicToOpenai(null);
   assert.deepStrictEqual(badRequest1, { model: '', messages: [] });
@@ -163,9 +80,6 @@ function testAnthropicCompat() {
   const badTokens = estimateInputTokens(null);
   assert.strictEqual(badTokens, 1);
 
-  // Run async stream tests synchronously in a promise wait (or since this function is synchronous, we run it and handle completion in runAll)
-  testAnthropicCompat.asyncTests = runStreamTest();
-
   console.log('✔ Anthropic compatibility tests passed successfully.');
 }
 
@@ -174,27 +88,27 @@ function testCapabilities() {
   
   const c1 = classify('meta/llama-3.1-8b-instruct');
   assert.strictEqual(c1.type, 'chat');
-  assert.strictEqual(c1.context_window, undefined, 'context_window must not be exposed');
-   
+  assert.strictEqual(c1.context_window, 131072, 'Llama 3.1 should have 128k context');
+  
   const c2 = classify('nvidia/nv-embed-v1');
   assert.strictEqual(c2.type, 'embedding');
-  assert.strictEqual(c2.context_window, undefined, 'embedding must not expose context_window');
+  assert.strictEqual(c2.context_window, 32768, 'NV-Embed-v1 should have 32k context');
 
   const c3 = classify('meta/llama-3.2-11b-vision-instruct');
   assert.strictEqual(c3.type, 'vision_chat');
-  assert.strictEqual(c3.context_window, undefined, 'vision_chat must not expose context_window');
+  assert.strictEqual(c3.context_window, 131072, 'Llama 3.2 should have 128k context');
 
   const c4 = classify('google/gemma-3-12b-it');
-  assert.strictEqual(c4.context_window, undefined, 'no context_window field');
+  assert.strictEqual(c4.context_window, 131072, 'Gemma 3 12B should have 128k context');
 
   const c5 = classify('google/gemma-3-1b-it');
-  assert.strictEqual(c5.context_window, undefined, 'no context_window field');
+  assert.strictEqual(c5.context_window, 32768, 'Gemma 3 1B should have 32k context');
 
   const c6 = classify('mistralai/mistral-small-4-119b-2603');
-  assert.strictEqual(c6.context_window, undefined, 'no context_window field');
+  assert.strictEqual(c6.context_window, 262144, 'Mistral Small v4 should have 256k context');
 
   const c7 = classify('baai/bge-m3');
-  assert.strictEqual(c7.context_window, undefined, 'no context_window field');
+  assert.strictEqual(c7.context_window, 8192, 'BGE-M3 should have 8k context');
 
   console.log('✔ Capabilities tests passed successfully.');
 }
@@ -254,9 +168,6 @@ async function runAll() {
   try {
     await testKeyPool();
     testAnthropicCompat();
-    if (testAnthropicCompat.asyncTests) {
-      await testAnthropicCompat.asyncTests;
-    }
     testCapabilities();
     await testMetrics();
     console.log('\n=== All unit tests passed successfully! ===');
