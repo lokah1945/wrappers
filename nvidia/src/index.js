@@ -17,6 +17,16 @@ const http = require('http');
 const { URL } = require('url');
 const { fetch: undiciFetch, Agent } = require('undici');
 
+// Combine multiple AbortSignals into one (fires if ANY signal aborts)
+function anySignal(signals) {
+  const controller = new AbortController();
+  for (const signal of signals) {
+    if (signal.aborted) { controller.abort(); break; }
+    signal.addEventListener('abort', () => controller.abort(), { once: true });
+  }
+  return controller.signal;
+}
+
 // Canonical wrapper dir
 const WRAPPER_DIR = path.resolve(__dirname, '..');
 
@@ -630,9 +640,11 @@ async function verifyModels() {
   console.log(`[verify] Model verification done: ${unavailableModels.size} unavailable models.`);
 }
 
+let serverInstance = null;
+
 async function verifyLoop() {
   await new Promise(resolve => setTimeout(resolve, 30000));
-  while (true) {
+  while (serverInstance && serverInstance.listening) {
     try {
       await verifyModels();
     } catch (e) {
@@ -699,6 +711,14 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       pacingMs = keyResult ? keyResult.waitedMs : 0;
       if (key) break;
 
+      // Client disconnected — no point retrying
+      if (req?.clientAbortSignal?.aborted) {
+        if (cycles === 0) {
+          return { status: 499, data: { error: { message: 'Client disconnected', type: 'client_error' } } };
+        }
+        break;
+      }
+
       cycles++;
       if (cycles >= 3) break;
       console.warn(`[RETRY-CYCLE] All keys exhausted for model: ${modelId}. Cycle ${cycles}/3: Waiting for adaptive revalidation...`);
@@ -740,12 +760,25 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       }
       const timeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
       const timeoutMs = (body.stream ? Math.max(timeoutSec, 600) : timeoutSec) * 1000;
+      const abortController = new AbortController();
+      const clientAbortSignal = req?.clientAbortSignal;
+      if (clientAbortSignal) {
+        if (clientAbortSignal.aborted) {
+          abortController.abort();
+        } else {
+          const onAbort = () => abortController.abort();
+          clientAbortSignal.addEventListener('abort', onAbort, { once: true });
+          // Clean up the listener after timeout to prevent memory leaks
+          setTimeout(() => clientAbortSignal.removeEventListener('abort', onAbort), timeoutMs + 1000).unref();
+        }
+      }
+      const timeoutSignal = AbortSignal.timeout(timeoutMs);
       const resp = await undiciFetch(url, {
         method: 'POST',
         headers,
         body: JSON.stringify(body),
         dispatcher: agent,
-        signal: AbortSignal.timeout(timeoutMs),
+        signal: anySignal([abortController.signal, timeoutSignal]),
       });
 
       let _400respText = '';
@@ -930,6 +963,13 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       pacingMs = keyResult ? keyResult.waitedMs : 0;
       if (key) break;
 
+      if (req?.clientAbortSignal?.aborted) {
+        if (cycles === 0) {
+          return jsonResp(res, 499, { error: { message: 'Client disconnected', type: 'client_error' } });
+        }
+        break;
+      }
+
       cycles++;
       if (cycles >= 3) break;
       console.warn(`[RETRY-CYCLE] All keys exhausted for model: ${modelId} in proxyPost. Cycle ${cycles}/3: Waiting for adaptive revalidation...`);
@@ -958,6 +998,18 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
     try {
       incInFlight();
       const targetUrl = getTargetUrl(key);
+      const ppTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
+      const ppTimeoutMs = (body.stream ? Math.max(ppTimeoutSec, 600) : ppTimeoutSec) * 1000;
+      const ppAbortController = new AbortController();
+      const ppClientSignal = req?.clientAbortSignal;
+      if (ppClientSignal) {
+        if (ppClientSignal.aborted) { ppAbortController.abort(); }
+        else {
+          const onAbort = () => ppAbortController.abort();
+          ppClientSignal.addEventListener('abort', onAbort, { once: true });
+          setTimeout(() => ppClientSignal.removeEventListener('abort', onAbort), ppTimeoutMs + 1000).unref();
+        }
+      }
       const resp = await undiciFetch(targetUrl, {
         method: 'POST',
         headers: {
@@ -967,7 +1019,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         },
         body: JSON.stringify(body),
         dispatcher: agent,
-        signal: AbortSignal.timeout((body.stream ? 600 : parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10)) * 1000),
+        signal: anySignal([ppAbortController.signal, AbortSignal.timeout(ppTimeoutMs)]),
       });
 
       let _pp400text = '';
@@ -1351,19 +1403,49 @@ function handleStats(res) {
   });
 }
 
+function enrichModelMetadata(id, desc) {
+  const isChat = desc.type === 'chat' || desc.type === 'vision_chat' || desc.type === 'parse';
+  const isVision = desc.type === 'vision_chat' || desc.type === 'parse';
+  const contextWindow = desc.context_window || 131072;
+  const maxTokens = isChat ? Math.min(16384, Math.max(4096, Math.floor(contextWindow / 4))) : 4096;
+  return {
+    id,
+    object: 'model',
+    owned_by: id.split('/')[0] || 'nvidia',
+    created: 0,
+    ...desc,
+    max_context_length: contextWindow,
+    max_input_tokens: contextWindow,
+    max_output_tokens: maxTokens,
+    max_tokens: maxTokens,
+    token_limit: contextWindow,
+    supports_vision: isVision,
+    supports_function_calling: isChat,
+    supports_parallel_tool_calls: isChat,
+    supports_streaming: desc.streaming !== false,
+    supports_structured_output: isChat,
+    supports_tool_choice: isChat,
+    supports_stop_sequences: isChat,
+    supports_system_prompt: isChat,
+    supports_temperature: isChat,
+    supports_top_p: isChat,
+    supports_top_k: isChat,
+    supports_seed: isChat,
+    supports_logprobs: isChat && !desc.type?.includes('embedding'),
+    supports_embedding: desc.type === 'embedding',
+    supports_batch: false,
+    provider: 'nvidia',
+    model_family: id.includes('/') ? id.split('/')[1]?.split('-')[0] || id : id.split('-')[0] || id,
+  };
+}
+
 /** GET /v1/models */
 async function handleModels(res, url = null) {
   const force = url?.searchParams?.get('refresh') === 'true';
   const ids = await pool.refreshModels(force);
   const data = ids.map(id => {
     const desc = describe(id, BASE_LLM, BASE_GENAI);
-    return {
-      id,
-      object: 'model',
-      owned_by: id.split('/')[0] || 'nvidia',
-      created: 0,
-      ...desc
-    };
+    return enrichModelMetadata(id, desc);
   });
   jsonResp(res, 200, { object: 'list', data });
 }
@@ -1372,7 +1454,7 @@ async function handleModels(res, url = null) {
 async function handleModelInfo(modelId, res) {
   const desc = describe(modelId, BASE_LLM, BASE_GENAI);
   if (modelId in RETIRED_MODELS) desc.availability = RETIRED_MODELS[modelId];
-  jsonResp(res, 200, { id: modelId, object: 'model', ...desc });
+  jsonResp(res, 200, enrichModelMetadata(modelId, desc));
 }
 
 /** GET /metrics/prom */
@@ -1442,6 +1524,13 @@ async function handleCatchAll(req, res, path, url) {
       pacingMs = keyResult ? keyResult.waitedMs : 0;
       if (key) break;
 
+      if (req?.clientAbortSignal?.aborted) {
+        if (cycles === 0) {
+          return jsonResp(res, 499, { error: { message: 'Client disconnected', type: 'client_error' } });
+        }
+        break;
+      }
+
       cycles++;
       if (cycles >= 3) break;
       console.warn(`[RETRY-CYCLE] All keys exhausted for model: ${modelId} in handleCatchAll. Cycle ${cycles}/3: Waiting for adaptive revalidation...`);
@@ -1476,12 +1565,24 @@ async function handleCatchAll(req, res, path, url) {
       if (isPost) {
         headers['Content-Type'] = 'application/json';
       }
+      const caTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
+      const caTimeoutMs = (isStreaming ? Math.max(caTimeoutSec, 600) : caTimeoutSec) * 1000;
+      const caAbortController = new AbortController();
+      const caClientSignal = req?.clientAbortSignal;
+      if (caClientSignal) {
+        if (caClientSignal.aborted) { caAbortController.abort(); }
+        else {
+          const onAbort = () => caAbortController.abort();
+          caClientSignal.addEventListener('abort', onAbort, { once: true });
+          setTimeout(() => caClientSignal.removeEventListener('abort', onAbort), caTimeoutMs + 1000).unref();
+        }
+      }
       const resp = await undiciFetch(targetUrl, {
         method,
         headers,
         body: isPost ? JSON.stringify(body) : undefined,
         dispatcher: agent,
-        signal: AbortSignal.timeout((isStreaming ? 600 : parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10)) * 1000),
+        signal: anySignal([caAbortController.signal, AbortSignal.timeout(caTimeoutMs)]),
       });
 
       let _gen400text = '';
@@ -1843,18 +1944,26 @@ async function handleRequest(req, res) {
       return jsonResp(res, 200, { version: `wrapper-nvidia-${VERSION}` });
     }
     if (method === 'GET' && path === '/api/tags') {
-      const models = pool.modelsCached.map(mid => ({
-        name: mid,
-        model: mid,
-        modified_at: '1970-01-01T00:00:00Z',
-        size: 0,
-        digest: '',
-        details: {
-          family: mid.includes('/') ? mid.split('/')[0] : mid,
-          parameter_size: '',
-          quantization_level: ''
-        }
-      }));
+      const models = pool.modelsCached.map(mid => {
+        const desc = describe(mid, BASE_LLM, BASE_GENAI);
+        return {
+          name: mid,
+          model: mid,
+          modified_at: '1970-01-01T00:00:00Z',
+          size: 0,
+          digest: '',
+          details: {
+            parent_model: '',
+            format: 'gguf',
+            family: mid.includes('/') ? mid.split('/')[0] : mid,
+            families: [mid.includes('/') ? mid.split('/')[0] : mid],
+            parameter_size: '',
+            quantization_level: '',
+            context_window: desc.context_window || 131072,
+            max_tokens: Math.min(16384, Math.max(4096, Math.floor((desc.context_window || 131072) / 4))),
+          }
+        };
+      });
       return jsonResp(res, 200, { models });
     }
     if (method === 'GET' && (path === '/api/v1/models' || path === '/models')) {
@@ -2052,7 +2161,7 @@ async function handleRequest(req, res) {
         return jsonResp(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
       }
       
-      if (!body.input_type) {
+      if (!body.input_type && body.input && typeof body.input === 'string') {
         body.input_type = 'query';
       }
 
@@ -2546,12 +2655,13 @@ async function main() {
 
   metrics.prune(30);
 
-  const server = http.createServer(handleRequest);
-  server.timeout = 300000;
-  server.keepAliveTimeout = 75000;
-  server.maxHeadersCount = 100;
+  serverInstance = http.createServer(handleRequest);
+  serverInstance.timeout = 600000;
+  serverInstance.keepAliveTimeout = 75000;
+  serverInstance.maxHeadersCount = 100;
+  serverInstance.headersTimeout = 610000;
 
-  server.listen(BETA_PORT, BIND_HOST, () => {
+  serverInstance.listen(BETA_PORT, BIND_HOST, () => {
     console.log(`[wrapper-nvidia] v${VERSION} listening on ${BIND_HOST}:${BETA_PORT}`);
     console.log(`[wrapper-nvidia] Keys: ${pool.totalKeys} total, ${pool.availableKeys} available`);
     console.log(`[wrapper-nvidia] Models cached: ${pool.modelsCached.length}`);
@@ -2569,9 +2679,28 @@ async function main() {
 
   const shutdown = () => {
     console.log('[wrapper-nvidia] Shutting down...');
-    metrics.close();
-    server.close(() => process.exit(0));
-    setTimeout(() => process.exit(0), 5000);
+    // Stop accepting new connections
+    serverInstance.close(() => {
+      console.log('[wrapper-nvidia] Server closed, draining remaining requests...');
+      // Give in-flight requests a chance to complete
+      let drainAttempts = 0;
+      const drainInterval = setInterval(() => {
+        const remaining = inFlight;
+        if (remaining <= 0 || drainAttempts >= 10) {
+          clearInterval(drainInterval);
+          metrics.close();
+          process.exit(0);
+        }
+        console.log(`[wrapper-nvidia] Draining: ${remaining} in-flight requests...`);
+        drainAttempts++;
+      }, 1000);
+    });
+    // Force shutdown after timeout
+    setTimeout(() => {
+      console.log('[wrapper-nvidia] Force shutdown after timeout');
+      metrics.close();
+      process.exit(0);
+    }, 15000);
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT',  shutdown);

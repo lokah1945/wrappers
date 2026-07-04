@@ -226,41 +226,79 @@ const CAPABILITY_PARAMS = {
 
 // Known context windows for specific model families
 const CONTEXT_WINDOWS = {
+  // 1M context (2048k)
+  'minimax-m3': 1048576,
+  'minimaxai/minimax-m3': 1048576,
+  'minimaxai/minimax-m2': 1048576,
+  'minimaxai/m2': 1048576,
+  'minimax': 1048576,
+
   // 256k context
   'mistral-small-4': 262144,
+  'mistral-small-3': 262144,
+  'yi-lightning': 262144,
   'glm': 202752,
+  'glm-4': 202752,
+  'glm4': 202752,
 
   // 128k context
   'llama-3.1': 131072,
   'llama-3.3': 131072,
   'llama-3.2': 131072,
+  'llama-4': 131072,
   'llama-3-nemotron': 131072,
+  'llama-3.1-nemotron': 131072,
   'llama-3.3-nemotron': 131072,
   'mistral-large': 131072,
   'mistral-nemo': 131072,
+  'mistral-saba': 131072,
   'qwen2.5': 131072,
   'qwen-2.5': 131072,
   'qwen3': 131072,
   'qwen-3': 131072,
+  'qwen-3b': 131072,
+  'qwen-32b': 131072,
+  'qwen-110b': 131072,
   'deepseek-v3': 131072,
   'deepseek-r1': 131072,
   'deepseek-v4': 131072,
+  'deepseek-v4-flash': 131072,
   'gemma-3-12b': 131072,
   'gemma-3-4b': 131072,
   'gemma-3-27b': 131072,
   'gemma-3n-e2b': 131072,
   'gemma-3n-e4b': 131072,
   'gemma-4': 131072,
+  'gemma4': 131072,
   'palmyra-creative-122b': 131072,
-  'phi-3': 131072, // phi-3 with 128k
+  'phi-3': 131072,
+  'phi-3.5': 131072,
+  'phi-4-mini': 131072,
+  'phi-4-moe': 131072,
+  'claude-3': 131072,
+  'claude-3.5': 131072,
+  'claude-3.7': 131072,
+  'claude-4': 131072,
+  'gpt-4': 131072,
+  'gpt-4o': 131072,
+  'gpt-4.1': 131072,
+  'o1': 131072,
+  'o3': 131072,
+  'o4': 131072,
+  'command-a': 131072,
+  'command-a-': 131072,
+  'nemotron': 131072,
+  'minitron': 131072,
 
   // 32k context
   'phi-4': 32768,
   'mixtral-8x22b': 32768,
   'yi-large': 32768,
   'nv-embed-v1': 32768,
+  'nv-embed': 32768,
   'palmyra': 32768,
   'gemma-3-1b': 32768,
+  'gemma-27b': 32768,
 
   // 16k context
   'mistral-7b': 16384,
@@ -294,11 +332,12 @@ function getContextWindow(modelId) {
     }
   }
 
-  // Default context window
-  return 4096;
+  // Default context window — 128K for modern LLMs
+  return 131072;
 }
 
 const _classifyCache = new Map();
+const _CLASSIFY_CACHE_MAX = 500;
 
 /** Deep-clone a cached classify result so callers cannot corrupt the cache. */
 function _cloneResult(obj) {
@@ -349,6 +388,11 @@ function classify(modelId) {
         result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
       }
 
+      // Evict oldest entry if cache exceeds limit
+      if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
+        const firstKey = _classifyCache.keys().next().value;
+        if (firstKey !== undefined) _classifyCache.delete(firstKey);
+      }
       _classifyCache.set(mid, result);
       return _cloneResult(result);
     }
@@ -375,6 +419,10 @@ function classify(modelId) {
     result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
   }
 
+  if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
+    const firstKey = _classifyCache.keys().next().value;
+    if (firstKey !== undefined) _classifyCache.delete(firstKey);
+  }
   _classifyCache.set(mid, result);
   return _cloneResult(result);
 }

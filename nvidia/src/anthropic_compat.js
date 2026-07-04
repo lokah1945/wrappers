@@ -331,7 +331,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
       const { done, value } = await reader.read();
       if (done) break;
       if (isFirstRead) {
-        capture.ttftMs = Date.now() - capture._startMs;
+        capture.ttftMs = capture._startMs ? (Date.now() - capture._startMs) : 0;
         isFirstRead = false;
       }
 

@@ -650,6 +650,9 @@ class KeyPool {
 
   peekKey() {
     for (const s of this.keys) {
+      if (!s.isHardBlocked() && s.inFlight < 5) return s;
+    }
+    for (const s of this.keys) {
       if (!s.isHardBlocked()) return s;
     }
     return this.keys[0] || null;
@@ -754,14 +757,23 @@ class KeyPool {
     let totalFixed = 0;
     await this._lock.acquire();
     try {
+      const now = Date.now() / 1000;
       for (const s of this.keys) {
-        if (s.inFlight > 0) {
-          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} -> 0`);
+        // Only heal if key has positive inFlight AND hasn't been used recently (stuck > 60s)
+        if (s.inFlight > 0 && s.lastUsed > 0 && (now - s.lastUsed) > 60) {
+          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} stuck since lastUsed ${Math.round(now - s.lastUsed)}s ago -> 0`);
+          s.inFlight = 0;
+          totalFixed++;
+        } else if (s.inFlight > 0 && s.lastUsed === 0) {
+          // Never used but has inFlight? Stuck.
+          console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} with no lastUsed -> 0`);
           s.inFlight = 0;
           totalFixed++;
         }
       }
-      console.info(`[wrapper-nvidia] heal_in_flight: ${totalFixed} key(s) corrected`);
+      if (totalFixed > 0) {
+        console.info(`[wrapper-nvidia] heal_in_flight: ${totalFixed} key(s) corrected`);
+      }
     } finally {
       this._lock.release();
     }
@@ -804,7 +816,14 @@ class KeyPool {
         return [];
       }
       const body = await resp.json();
-      const models = (body.data || []).map(m => m.id).filter(Boolean).sort();
+      let models = [];
+      if (Array.isArray(body.data)) {
+        models = body.data.map(m => (typeof m === 'string' ? m : m.id)).filter(Boolean);
+      } else if (Array.isArray(body.models)) {
+        models = body.models.map(m => (typeof m === 'string' ? m : m.id)).filter(Boolean);
+      }
+      // Strip staging prefixes like "stg/" or "dev/"
+      models = models.map(m => m.replace(/^(stg|dev|test)\//i, '')).filter(Boolean).sort();
       return models;
     } catch (e) {
       return [];
