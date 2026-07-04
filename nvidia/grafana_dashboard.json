@@ -1,0 +1,226 @@
+{
+  "annotations": {
+    "list": [
+      {
+        "builtIn": 1,
+        "datasource": {"type": "grafana", "uid": "-- Grafana --"},
+        "enable": true,
+        "hide": true,
+        "iconColor": "rgba(0, 211, 255, 1)",
+        "name": "Annotations & Alerts",
+        "type": "dashboard"
+      }
+    ]
+  },
+  "description": "wrapper-nvidia runtime telemetry — request latency, 429 rate-limit hits, key exhaustion events, pacing state, and model availability. Sourced from JSON-sink events pushed to Loki.",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": "shared",
+  "id": null,
+  "uid": "wrapper-nvidia",
+  "title": "wrapper-nvidia / Production Telemetry",
+  "tags": ["wrapper-nvidia", "llm", "nvidia", "rate-limit"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "templating": {
+    "list": [
+      {
+        "type": "query",
+        "name": "model",
+        "label": "Model",
+        "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+        "query": "label_values({job=\"wrapper-nvidia\"} | json | model != \"\", model)",
+        "includeAll": true,
+        "multi": true,
+        "current": {"text": "All", "value": "$__all"}
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Status (last 1h)",
+      "gridPos": {"h": 4, "w": 6, "x": 0, "y": 0},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "STATUS",
+        "expr": "sum_over_time({job=\"wrapper-nvidia\"}[1h])",
+        "instant": true
+      }],
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "thresholds"},
+          "thresholds": {"mode": "absolute", "steps": [
+            {"color":"green","value":null},
+            {"color":"yellow","value":1000},
+            {"color":"red","value":10000}
+          ]}
+        }
+      },
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": true},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto"
+      }
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Rate-limit 429 (1m)",
+      "gridPos": {"h": 4, "w": 6, "x": 6, "y": 0},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "RL1M",
+        "expr": "sum(rate({job=\"wrapper-nvidia\"} |= \"429\" [1m]))"
+      }],
+      "fieldConfig": {"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[
+        {"color":"green","value":null},{"color":"yellow","value":1},{"color":"red","value":5}
+      ]}}},
+      "options": {"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none"}
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Exhaustion (1h, critical)",
+      "gridPos": {"h": 4, "w": 6, "x": 12, "y": 0},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "EXH",
+        "expr": "sum(rate({job=\"wrapper-nvidia\"} |= \"exhaust\" [1h]) * 3600)"
+      }],
+      "fieldConfig": {"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[
+        {"color":"green","value":null},{"color":"red","value":1}
+      ]}}},
+      "options": {"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none"}
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Active models",
+      "gridPos": {"h": 4, "w": 6, "x": 18, "y": 0},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "MODELS",
+        "expr": "count(count by (model) ({job=\"wrapper-nvidia\"}))"
+      }],
+      "fieldConfig": {"defaults":{"color":{"mode":"thresholds"},"thresholds":{"mode":"absolute","steps":[
+        {"color":"red","value":null},{"color":"yellow","value":1},{"color":"green","value":5}
+      ]}}},
+      "options": {"reduceOptions":{"calcs":["lastNotNull"]},"colorMode":"background","graphMode":"none"}
+    },
+    {
+      "id": 10,
+      "type": "timeseries",
+      "title": "Request volume by model",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 4},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "A",
+        "expr": "sum by (model) (rate({job=\"wrapper-nvidia\"} |~ \"POST /v1/chat\" [1m]))",
+        "legendFormat": "{{model}}"
+      }],
+      "fieldConfig": {"defaults":{"unit":"reqps","custom":{"drawStyle":"line","lineWidth":2,"fillOpacity":15}}},
+      "options": {"legend":{"displayMode":"table","placement":"right","calcs":["mean","max"]}}
+    },
+    {
+      "id": 11,
+      "type": "timeseries",
+      "title": "Latency p95 by key (ms)",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 4},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "B",
+        "expr": "quantile_over_time(0.95, {job=\"wrapper-nvidia\"} |~ \"latency_ms\" | json | unwrap latency_ms [1m]) by (key_label)",
+        "legendFormat": "p95 · {{key_label}}"
+      }],
+      "fieldConfig": {"defaults":{"unit":"ms","custom":{"drawStyle":"line","lineWidth":2}}},
+      "options": {"legend":{"displayMode":"table","placement":"right","calcs":["mean","max"]}}
+    },
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "429 rate-limit events",
+      "gridPos": {"h": 8, "w": 12, "x": 0, "y": 12},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "C",
+        "expr": "sum(rate({job=\"wrapper-nvidia\"} |= \"429\" [1m]))",
+        "legendFormat": "429/min"
+      },{
+        "refId": "D",
+        "expr": "sum(rate({job=\"wrapper-nvidia\"} |= \"exhaust\" [1m]))",
+        "legendFormat": "exhaust/min"
+      }],
+      "fieldConfig": {"defaults":{"unit":"short","custom":{"drawStyle":"bars","fillOpacity":50}}},
+      "options": {"legend":{"displayMode":"list","placement":"bottom"}}
+    },
+    {
+      "id": 21,
+      "type": "timeseries",
+      "title": "In-flight requests",
+      "gridPos": {"h": 8, "w": 12, "x": 12, "y": 12},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "E",
+        "expr": "max_over_time({job=\"wrapper-nvidia\"} |~ \"TOTAL in_flight\" | regexp \"in_flight=(?<v>\\\\d+)\" | unwrap v [1m]) by (model)",
+        "legendFormat": "in-flight · {{model}}"
+      }],
+      "fieldConfig": {"defaults":{"unit":"short","custom":{"drawStyle":"line","lineWidth":2}}}
+    },
+    {
+      "id": 30,
+      "type": "logs",
+      "title": "Exhaustion + 429 events",
+      "gridPos": {"h": 9, "w": 24, "x": 0, "y": 20},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "F",
+        "expr": "{job=\"wrapper-nvidia\"} |= \"exhaust\" or \"429\" or \"rate-limit\""
+      }],
+      "options": {"showLabels":false,"showTime":true,"wrap":true,"dedupStrategy":"none","prettifyLogMessage":true}
+    },
+    {
+      "id": 40,
+      "type": "table",
+      "title": "Most-rate-limited keys (24h)",
+      "gridPos": {"h": 7, "w": 12, "x": 0, "y": 29},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "G",
+        "expr": "topk(10, sum by (key, model) (count_over_time({job=\"wrapper-nvidia\"} |= \"429\" [24h])))",
+        "format": "table",
+        "instant": true
+      }],
+      "transformations": [{"id":"organize","options":{"excludeByName":{}}}]
+    },
+    {
+      "id": 41,
+      "type": "table",
+      "title": "Keys not seen (>1h inactive)",
+      "gridPos": {"h": 7, "w": 12, "x": 12, "y": 29},
+      "datasource": {"type": "loki", "uid": "${DS_LOKI}"},
+      "targets": [{
+        "refId": "H",
+        "expr": "sum by (key) (count_over_time({job=\"wrapper-nvidia\"} |= \"key=\" [1h])) < 1",
+        "format": "table",
+        "instant": true
+      }]
+    }
+  ],
+  "__inputs": [
+    {
+      "name": "DS_LOKI",
+      "label": "Loki",
+      "description": "Loki data source for wrapper-nvidia logs",
+      "type": "datasource",
+      "pluginId": "loki",
+      "pluginName": "Loki"
+    }
+  ],
+  "__elements": []
+}

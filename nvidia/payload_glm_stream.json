@@ -1,0 +1,10 @@
+{
+  "model": "z-ai/glm-5.1",
+  "messages": [
+    {
+      "role": "user",
+      "content": "Hello!"
+    }
+  ],
+  "stream": true
+}

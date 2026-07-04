@@ -36,3 +36,24 @@ node_modules/
 
 # Restore script temp
 restore/
+
+# nvidia wrapper — runtime artifacts
+nvidia/node_modules/
+nvidia/metrics.db
+nvidia/metrics.db-*
+nvidia/metrics_data/
+nvidia/backups/
+nvidia/archive/
+nvidia/.pre-phase3-backups/
+nvidia/__pycache__/
+nvidia/.pytest_cache/
+nvidia/*.log
+nvidia/*.bak
+nvidia/.env.backup-*.bak
+nvidia/.env.bkp
+nvidia/.env.bos-audit-*.bak
+nvidia/.env.pre-stable-*.bak
+
+# DB files
+netrics.db
+netrics.db-*
