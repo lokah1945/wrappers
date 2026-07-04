@@ -12,7 +12,9 @@ const _FINISH_TO_STOP = {
   stop: 'end_turn',
   length: 'max_tokens',
   tool_calls: 'tool_use',
-  content_filter: 'end_turn',
+  // content_filter → refusal (Anthropic spec value for filtered responses) so
+  // clients can distinguish a filtered response from a normal completion.
+  content_filter: 'refusal',
   [null]: 'end_turn',
   [undefined]: 'end_turn',
 };
@@ -30,6 +32,11 @@ function _sse(event, data) {
 function _flattenText(content) {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
+    // Concatenate all text blocks verbatim. Do NOT dedupe or insert newlines:
+    // system prompts and tool_results legitimately contain multiple text blocks
+    // (and repeated fragments) that must be preserved bit-for-bit for upstream
+    // to see the same prompt the client sent. The previous dedup+newline logic
+    // silently corrupted multi-block system prompts and tool_result content.
     return content
       .filter(b => typeof b === 'object' && b !== null && b.type === 'text')
       .map(b => b.text || '')
@@ -126,7 +133,11 @@ function anthropicToOpenai(a) {
 
   oai.messages = msgs;
 
-  if (a.max_tokens != null) oai.max_tokens = a.max_tokens;
+  // Anthropic SDK requires max_tokens, but non-SDK clients may omit it. NIM
+  // rejects or silently truncates (often to a tiny default) when max_tokens is
+  // missing — truncation mid-tool-call corrupts the JSON in tool_calls.arguments.
+  // Default to a sane value when omitted so the request is always well-formed.
+  oai.max_tokens = a.max_tokens != null ? a.max_tokens : 4096;
 
   const paramMap = [
     ['temperature', 'temperature'],
@@ -272,11 +283,22 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
   let usage = {};
   let inThinkTag = false;
 
+  // Stop the currently-open block (if any) and reset its index so a future
+  // delta for the SAME content type opens a FRESH block. Without these resets,
+  // interleaved text→thinking→text or reasoning_content-after-</thinking>
+  // patterns reuse an already-stopped block index → Claude Code SDK desync.
+  const stopOpen = async function* () {
+    if (openIdx !== null) {
+      yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
+      if (openIdx === textIndex) textIndex = null;
+      if (openIdx === thinkingIndex) thinkingIndex = null;
+      openIdx = null;
+    }
+  };
+
   const emitText = async function* (text) {
     if (textIndex === null) {
-      if (openIdx !== null) {
-        yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-      }
+      yield* stopOpen();
       textIndex = nextIndex++;
       openIdx = textIndex;
       yield _sse('content_block_start', {
@@ -292,9 +314,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
 
   const emitThinkingStart = async function* () {
     if (thinkingIndex === null) {
-      if (openIdx !== null) {
-        yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-      }
+      yield* stopOpen();
       thinkingIndex = nextIndex++;
       openIdx = thinkingIndex;
       yield _sse('content_block_start', {
@@ -411,7 +431,13 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
             openIdx = ai;
             // Generate unique tool call ID using message ID + index to prevent collisions
             // Use the tool call ID from OpenAI if available, otherwise generate a deterministic one
-            const toolCallId = tc.id || `toolu_${msgId.replace('msg_', '')}_${ai}`;
+            // Generate a unique tool-call ID. The OpenAI id is preferred when
+            // present; otherwise synthesize one with a random suffix so it is
+            // globally unique across turns (the Anthropic SDK requires tool_use
+            // ids to be unique so the client can reference them in the next
+            // turn's tool_result). The previous `toolu_wrapper_${ai}` fallback
+            // collided across turns because msgId is the constant 'msg_wrapper'.
+            const toolCallId = tc.id || `toolu_${Math.random().toString(36).slice(2, 10)}${ai}`;
             yield _sse('content_block_start', {
               type: 'content_block_start', index: ai,
               content_block: {

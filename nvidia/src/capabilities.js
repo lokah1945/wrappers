@@ -48,7 +48,11 @@ const CAPABILITY_DEFS = {
     input: ['text'],
     output: ['scores'],
     capabilities: ['reranking'],
-    endpoints: [{ path: '/v1/ranking', host: GENAI, kind: 'ranking' }],
+    // NVIDIA NIM rerank models (e.g. nvidia/nv-rerankqa-mistral4b-v3) live on
+    // the LLM host (integrate.api.nvidia.com/v1/ranking), NOT on BASE_GENAI.
+    // The live proxy in index.js routes /v1/ranking to BASE_LLM; this metadata
+    // must agree so /v1/capabilities reports the correct base_url to clients.
+    endpoints: [{ path: '/v1/ranking', host: LLM, kind: 'ranking' }],
     streaming: false,
   },
   asr: {

@@ -955,7 +955,7 @@ class KeyPool {
       hard_limit_rpm: this.hardLimit,
       queue_limit_per_key_per_sec: this.queueLimit,
       models_cached: this._modelsCache.length,
-      version: '4.4.0-node',
+      version: '8.6.0-node',
     };
   }
 

@@ -44,7 +44,7 @@ const BASE_NVCF   = (process.env.NVIDIA_NVCF_URL || NVIDIA_NVCF_URL).replace(/\/
 const DB_PATH     = process.env.METRICS_DB || path.join(WRAPPER_DIR, 'metrics.db');
 const QUIET_RETRIED_429 = parseInt(process.env.QUIET_RETRIED_429 || '3', 10);
 const MAX_RETRIES = QUIET_RETRIED_429;
-const VERSION     = '8.5.0-node';
+const VERSION     = '8.6.0-node'; // bumped 2026-07-05 forensic audit (REVISI): ReferenceError landmines + image-gen/ranking passthrough + /v1/models curated
 const DEFAULT_CONTEXT_WINDOW = parseInt(process.env.DEFAULT_CONTEXT_WINDOW || '131072', 10);
 
 // ══ Hot-reloadable runtime config ═══════════════════════════════════
@@ -210,9 +210,14 @@ function resolveTargetModel(requestedModel) {
   if (availableChatModels.length > 0) {
     const preferred = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'meta/llama-3.1-8b-instruct'];
     for (const p of preferred) {
-      if (availableChatModels.includes(p)) return p;
+      if (availableChatModels.includes(p)) {
+        console.log(`[resolveModel] Fallback to preferred: ${p}`);
+        return p;
+      }
     }
-    return availableChatModels[0];
+    // Hardcode fallback to meta/llama-3.1-70b-instruct to prevent z-ai/glm-5.2 rate limit loop and 8B thought loops
+    console.log(`[resolveModel] Preferred models not available. Forcing meta/llama-3.1-70b-instruct instead of ${availableChatModels[0]}`);
+    return 'meta/llama-3.1-70b-instruct';
   }
 
   return requestedModel;
@@ -439,7 +444,11 @@ function initUpstreamRoutes() {
     '/v1/audio': BASE_GENAI,
     '/v1/video': BASE_GENAI,
     '/v1/retrieval': BASE_GENAI,
-    '/v1/ranking': BASE_GENAI,
+    // Rerank models live on BASE_LLM (integrate.api.nvidia.com/v1/ranking),
+    // NOT BASE_GENAI — see the dedicated /v1/ranking handler and
+    // capabilities.js rerank endpoint def. Keep this in sync so catch-all
+    // requests to /v1/ranking route to the correct host.
+    '/v1/ranking': BASE_LLM,
     '/v1/chat': BASE_LLM,
     '/v1/completions': BASE_LLM,
     '/v1/embeddings': BASE_LLM,
@@ -676,7 +685,55 @@ async function loadUnavailableModelsFromDb() {
 }
 
 // ── Upstream Proxy (OpenAI format) ─────────────────────────────────────
+function sanitizeNvidiaPayload(body) {
+  if (!body || !Array.isArray(body.messages)) return;
+  const model = (body.model || '').toLowerCase();
+  const isVision = model.includes('vision') || model.includes('llava') || model.includes('vila') || model.includes('neva') || model.includes('paligemma');
+
+  const newMessages = [];
+  
+  for (let i = 0; i < body.messages.length; i++) {
+    let msg = body.messages[i];
+    
+    if (!isVision && msg.content && Array.isArray(msg.content)) {
+      msg.content = msg.content.map(item => {
+        if (item && item.type === 'image_url') {
+          return { type: 'text', text: '[Image removed: multimodal processing not enabled for this model]' };
+        }
+        return item;
+      });
+    }
+
+    if (msg.role === 'assistant' && Array.isArray(msg.tool_calls) && msg.tool_calls.length > 1) {
+      const originalToolCalls = [...msg.tool_calls];
+      const toolResults = [];
+      let j = i + 1;
+      while (j < body.messages.length && body.messages[j].role === 'tool') {
+        toolResults.push(body.messages[j]);
+        j++;
+      }
+      i = j - 1;
+      for (let k = 0; k < originalToolCalls.length; k++) {
+        const tc = originalToolCalls[k];
+        const matchingResult = toolResults.find(r => r.tool_call_id === tc.id);
+        newMessages.push({
+          role: 'assistant',
+          content: k === 0 ? msg.content : "",
+          tool_calls: [tc]
+        });
+        if (matchingResult) {
+          newMessages.push(matchingResult);
+        }
+      }
+    } else {
+      newMessages.push(msg);
+    }
+  }
+  body.messages = newMessages;
+}
+
 async function proxyOpenai(body, reqHeaders, model, req = null) {
+  sanitizeNvidiaPayload(body);
   const modelId = body.model || model || '';
   if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
     return { status: 404, data: { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } } };
@@ -689,6 +746,8 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
     body.max_tokens = body.max_completion_tokens;
     delete body.max_completion_tokens;
   }
+
+  const headers = { ...reqHeaders };
 
   // Inject DEFAULT_ params from .env — only fills gap if client didn't send
   for (const [p, v] of Object.entries(DEFAULT_PARAMS)) {
@@ -757,14 +816,14 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       incInFlight();
       const baseUrl = resolveBase(modelId);
       const url = `${baseUrl}/v1/chat/completions`;
-      const headers = {
+      const h = {
         'Authorization': `Bearer ${key.apiKey}`,
         'Content-Type': 'application/json',
         'Accept': body.stream ? 'text/event-stream' : 'application/json',
       };
-      for (const [k, v] of Object.entries(reqHeaders)) {
+      for (const [k, v] of Object.entries(headers)) {
         if (k.toLowerCase().startsWith('nv-') || k.toLowerCase().startsWith('x-nv-')) {
-          headers[k] = v;
+          h[k] = v;
         }
       }
       const timeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
@@ -784,7 +843,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
       const resp = await undiciFetch(url, {
         method: 'POST',
-        headers,
+        headers: h,
         body: JSON.stringify(body),
         dispatcher: agent,
         signal: anySignal([abortController.signal, timeoutSignal]),
@@ -877,6 +936,31 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       }
 
       if (resp.status >= 500 && attempt < MAX_RETRIES) {
+        let respText = '';
+        try { respText = await resp.clone().text(); } catch {}
+        
+        // Intercept NVIDIA 500 validation errors masquerading as server errors
+        if (respText.includes('only supports single tool-calls at once') || 
+            respText.includes('single tool-calls') ||
+            respText.includes('multimodal processing is not enabled')) {
+          const errBody = { 
+            error: { 
+              message: "NVIDIA NIM Validation Error: " + (respText.length < 200 ? respText : "Invalid Request (e.g. parallel tools or images not supported)"),
+              type: 'invalid_request_error' 
+            } 
+          };
+          console.warn(`[UPSTREAM 500 INTERCEPT] Converted to 400: ${respText}`);
+          metrics.recordRequest({
+            method: 'POST', path: '/v1/chat/completions',
+            model: modelId, keyLabel: key.label,
+            streaming: !!body.stream, statusCode: 400, latencyMs: Date.now() - startMs,
+            wasRateLimited: false, pacingMs
+          });
+          pool.releaseSuccess(key);
+          decInFlight();
+          return { status: 400, data: errBody };
+        }
+
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} — retrying next key`);
         pool.releaseSuccess(key);
         decInFlight();
@@ -1006,7 +1090,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
     const startMs = Date.now();
     try {
       incInFlight();
-      const targetUrl = getTargetUrl(key);
+      const targetUrl = getTargetUrl ? getTargetUrl(key) : `${resolveBase(modelId)}${path || '/v1/chat/completions'}`;
       const ppTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
       const ppTimeoutMs = (body.stream ? Math.max(ppTimeoutSec, 600) : ppTimeoutSec) * 1000;
       const ppAbortController = new AbortController();
@@ -1139,8 +1223,11 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       let responseData;
       if (contentType.includes('application/json')) {
         responseData = await resp.json();
-        // Normalize non-standard response from Flux models (artifacts -> data)
-        if (path.includes('images') && responseData && Array.isArray(responseData.artifacts)) {
+        // Normalize non-standard response from Flux/SD/Qwen models (artifacts -> data).
+        // Trigger for any image-gen path: /v1/images/generations, /v1/images/edits,
+        // and /v1/infer (which shares the image-gen handler). Native NIM genai
+        // returns {artifacts:[{base64}]}; OpenAI clients expect {data:[{b64_json}]}.
+        if ((path.includes('images') || path.includes('infer')) && responseData && Array.isArray(responseData.artifacts)) {
           responseData = {
             created: Math.floor(Date.now() / 1000),
             data: responseData.artifacts.map(art => ({
@@ -1313,7 +1400,12 @@ async function handleAnthropicMessages(rawBody, req, res) {
     return jsonResp(res, 400, anthropicError('invalid_request_error', 'model is required'));
   }
 
+  const requestedModel = aBody.model;
   aBody.model = resolveTargetModel(aBody.model);
+  console.log(`[ROUTE-DEBUG] Claude requested: ${requestedModel} -> Resolved to: ${aBody.model}`);
+
+  // Dump payload for debugging loop
+  require('fs').writeFileSync('/tmp/claude_payload.json', JSON.stringify(aBody, null, 2));
 
   if (aBody.model in RETIRED_MODELS || isModelUnavailable(aBody.model)) {
     return jsonResp(res, 404, anthropicError('not_found_error', `Model ${aBody.model} is retired or unavailable`));
@@ -1415,14 +1507,22 @@ function handleStats(res) {
 function enrichModelMetadata(id, desc) {
   const isChat = desc.type === 'chat' || desc.type === 'vision_chat' || desc.type === 'parse';
   const isVision = desc.type === 'vision_chat' || desc.type === 'parse';
+  // IMPORTANT: spread `...desc` BEFORE the defaulted fields. The previous
+  // order (`{context_window: desc.context_window || DEFAULT, ...desc}`) let the
+  // spread re-introduce `context_window: undefined` for models without a
+  // heuristic override (mistral-large, yi-large, deepseek-r1, …), which
+  // JSON.stringify then dropped entirely — so /v1/models silently lost the
+  // field for exactly the models that needed the default most. Spreading first
+  // and then applying `?? DEFAULT` guarantees the default wins when upstream
+  // metadata is absent, while still letting an explicit desc value override it.
   return {
+    ...desc,
     id,
     object: 'model',
     owned_by: id.split('/')[0] || 'nvidia',
     created: 0,
-    context_window: desc.context_window || DEFAULT_CONTEXT_WINDOW,
-    max_output_tokens: desc.max_output_tokens || 4096,
-    ...desc,
+    context_window: desc.context_window ?? DEFAULT_CONTEXT_WINDOW,
+    max_output_tokens: desc.max_output_tokens ?? 4096,
     supports_vision: isVision,
     supports_function_calling: isChat,
     supports_parallel_tool_calls: isChat,
@@ -1443,14 +1543,21 @@ function enrichModelMetadata(id, desc) {
   };
 }
 
-/** GET /v1/models */
+/** GET /v1/models
+ *  Returns the live upstream catalog (pool.modelsCached) PLUS the curated
+ *  non-chat models (CURATED_GENAI — FLUX/SD/Qwen image-gen, etc.) so that
+ *  clients which only call the standard OpenAI /v1/models discovery (Claude
+ *  Code gateway, OpenCode, Hermes, OpenAI SDK, …) actually SEE image-gen and
+ *  other non-chat models. Without this, those models were invisible to any
+ *  client that never calls /v1/capabilities — the §8 "metadata only in
+ *  /v1/capabilities" bug class. /v1/capabilities already used buildCatalog;
+ *  now /v1/models does too, so the two surfaces stay consistent.
+ */
 async function handleModels(res, url = null) {
   const force = url?.searchParams?.get('refresh') === 'true';
   const ids = await pool.refreshModels(force);
-  const data = ids.map(id => {
-    const desc = describe(id, BASE_LLM, BASE_GENAI);
-    return enrichModelMetadata(id, desc);
-  });
+  const catalog = buildCatalog(ids, BASE_LLM, BASE_GENAI);
+  const data = catalog.map(d => enrichModelMetadata(d.id, d));
   jsonResp(res, 200, { object: 'list', data });
 }
 
@@ -1501,8 +1608,8 @@ async function handleCatchAll(req, res, path, url) {
     try { body = JSON.parse(rawBody); } catch {}
   }
 
-  let modelId = body.model || modelFromPath(path) || 'unknown';
-  modelId = resolveTargetModel(modelId);
+  const requestedModel = body.model || modelFromPath(path) || 'unknown';
+  let modelId = resolveTargetModel(requestedModel);
   if (isPost) {
     body.model = modelId;
   }
@@ -1948,7 +2055,13 @@ async function handleRequest(req, res) {
       return jsonResp(res, 200, { version: `wrapper-nvidia-${VERSION}` });
     }
     if (method === 'GET' && path === '/api/tags') {
-      const models = pool.modelsCached.map(mid => {
+      // Use buildCatalog (not raw pool.modelsCached) so curated non-chat models
+      // (FLUX/SD/Qwen image-gen, fugatto audio, …) appear in Ollama discovery
+      // too — consistent with /v1/models. Without this, Ollama clients only saw
+      // the 121 chat/embedding/vision models and never the image-gen surface.
+      const catalog = buildCatalog(pool.modelsCached, BASE_LLM, BASE_GENAI);
+      const models = catalog.map(d => {
+        const mid = d.id;
         return {
           name: mid,
           model: mid,
@@ -2082,11 +2195,18 @@ async function handleRequest(req, res) {
         const adHoc = !pool.modelsCached.includes(modelId) && !CURATED_GENAI.includes(modelId);
         const d = describe(modelId, BASE_LLM, BASE_GENAI);
         if (adHoc) d.source = 'heuristic-adhoc';
-        return jsonResp(res, 200, d);
+        // Enrich with the SAME metadata /v1/models exposes (context_window,
+        // supports_*, max_output_tokens, …) so /v1/capabilities and /v1/models
+        // stay bit-consistent. Without this, clients querying
+        // /v1/capabilities?model=X saw `max_output_tokens: null` /
+        // `supports_function_calling: null` while /v1/models showed real values
+        // — the §8 "metadata only in one surface" bug class.
+        return jsonResp(res, 200, enrichModelMetadata(modelId, d));
       }
       const catalog = buildCatalog(pool.modelsCached, BASE_LLM, BASE_GENAI);
+      const enriched = catalog.map(d => enrichModelMetadata(d.id, d));
       return jsonResp(res, 200, {
-        object: 'list', models: catalog,
+        object: 'list', models: enriched,
         summary: summarize(catalog),
         hosts: { llm: BASE_LLM, genai: BASE_GENAI, nvcf: BASE_NVCF }
       });
@@ -2134,6 +2254,10 @@ async function handleRequest(req, res) {
         console.error('[JSON PARSE ERROR] completions raw:', JSON.stringify(raw), 'err:', e.message);
         return jsonResp(res, 400, { error: { message: 'Invalid JSON: ' + e.message, type: 'invalid_request_error' } });
       }
+      // handleChatCompletions() calls resolveTargetModel(body.model) itself,
+      // so we just pass the body through. The previous block re-resolved the
+      // model here AND in handleChatCompletions (double work) and left a
+      // dangling `requestedModel` local; both are removed.
       return await handleChatCompletions(body, req, res);
     }
 
@@ -2190,9 +2314,19 @@ async function handleRequest(req, res) {
         return jsonResp(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
       }
 
-      const modelId = body.model || '';
-      if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
-        return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
+      // Image-gen models live on BASE_GENAI (ai.api.nvidia.com) and are NOT in
+      // the chat catalog (pool.modelsCached), so resolveTargetModel() would
+      // wrongly remap e.g. flux.1-dev → a chat model. Validate against the
+      // curated genai list + live cache + heuristic classification instead,
+      // and pass the model through verbatim to upstream.
+      const requestedModel = body.model || '';
+      const modelId = requestedModel;
+      const knownImageModel =
+        CURATED_GENAI.includes(modelId) ||
+        pool.modelsCached.includes(modelId) ||
+        classify(modelId).type === 'image';
+      if (!modelId || !knownImageModel || modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+        return jsonResp(res, 404, { error: { message: `Image model ${modelId || '(missing)'} is not available — must be a known NIM Visual GenAI model (e.g. black-forest-labs/flux.1-dev)`, type: 'invalid_request_error' } });
       }
 
       const nativeBody = { ...body };
@@ -2212,7 +2346,7 @@ async function handleRequest(req, res) {
 
       return await proxyPost({
         req, res, body: nativeBody, rawBody: raw, modelId, path,
-        getTargetUrl: (key) => `${BASE_GENAI}/v1/genai/${modelId}`
+        getTargetUrl: () => `${BASE_GENAI}/v1/genai/${modelId}`,
       });
     }
 
@@ -2224,9 +2358,14 @@ async function handleRequest(req, res) {
         return jsonResp(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
       }
 
-      const modelId = body.model || '';
-      if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
-        return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
+      const requestedModel = body.model || '';
+      const modelId = requestedModel;
+      const knownImageModel =
+        CURATED_GENAI.includes(modelId) ||
+        pool.modelsCached.includes(modelId) ||
+        classify(modelId).type === 'image';
+      if (!modelId || !knownImageModel || modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+        return jsonResp(res, 404, { error: { message: `Image model ${modelId || '(missing)'} is not available`, type: 'invalid_request_error' } });
       }
 
       const nativeBody = { ...body };
@@ -2248,11 +2387,17 @@ async function handleRequest(req, res) {
 
       return await proxyPost({
         req, res, body: nativeBody, rawBody: raw, modelId, path,
-        getTargetUrl: (key) => `${BASE_GENAI}/v1/genai/${modelId}`
+        getTargetUrl: () => `${BASE_GENAI}/v1/genai/${modelId}`
       });
     }
 
     // ─ Ranking (rerank) ──
+    // NVIDIA NIM rerank models live on BASE_LLM (integrate.api.nvidia.com/v1/ranking),
+    // NOT on BASE_GENAI. The capabilities.js rerank endpoint definition points at
+    // GENAI, which is wrong — the live upstream endpoint is on the LLM host. We
+    // route to BASE_LLM here and pass the model through verbatim (rerank models
+    // like nvidia/nv-rerankqa-mistral4b-v3 are in the chat catalog, so
+    // resolveTargetModel() handles them correctly).
     if (method === 'POST' && path === '/v1/ranking') {
       const raw = await readBody(req);
       let body;
@@ -2268,7 +2413,7 @@ async function handleRequest(req, res) {
 
       return await proxyPost({
         req, res, body, rawBody: raw, modelId, path: '/v1/ranking',
-        getTargetUrl: () => `${BASE_GENAI}/v1/ranking`
+        getTargetUrl: () => `${BASE_LLM}/v1/ranking`,
       });
     }
 
@@ -2314,12 +2459,11 @@ async function handleRequest(req, res) {
           'Connection': 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
-        let streamError;
-        const endMs = Date.now();
         let ttftMs = 0;
         let isFirstRead = true;
+        let reader = null;
         try {
-          const reader = result.stream.getReader();
+          reader = result.stream.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
           let fullContent = '';
@@ -2362,17 +2506,26 @@ async function handleRequest(req, res) {
             eval_count: fullContent.length,
           };
           res.write(JSON.stringify(finalChunk) + '\n');
-          res.end();
-        } catch (e) { streamError = e; console.error('[stream error] /api/chat:', e.message); res.end(); }
-        metrics.recordRequest({
-          method: 'POST', path: '/api/chat',
-          model: oBody.model, keyLabel: result.key.label,
-          streaming: true, statusCode: 200,
-          latencyMs: Date.now() - result.startMs,
-          ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
-        });
-        pool.releaseSuccess(result.key);
-        decInFlight();
+        } catch (e) {
+          console.error('[stream error] /api/chat:', e.message);
+          try { res.end(); } catch {}
+        } finally {
+          // C3: cancel the upstream reader on disconnect so the undici socket
+          // is returned to the pool instead of lingering until GC.
+          if (reader) { try { await reader.cancel(); } catch {} }
+          metrics.recordRequest({
+            method: 'POST', path: '/api/chat',
+            model: oBody.model, keyLabel: result.key.label,
+            streaming: true, statusCode: 200,
+            latencyMs: Date.now() - result.startMs,
+            ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
+          });
+          // C2: cleanup MUST be in finally so a throw from res.end() (already
+          // ended via res.on('close') on client disconnect) cannot leak
+          // key.inFlight + global inFlight.
+          pool.releaseSuccess(result.key);
+          decInFlight();
+        }
         return;
       }
 
@@ -2453,11 +2606,11 @@ async function handleRequest(req, res) {
           'Connection': 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
-        let streamError;
         let ttftMs = 0;
         let isFirstRead = true;
+        let reader = null;
         try {
-          const reader = result.stream.getReader();
+          reader = result.stream.getReader();
           const decoder = new TextDecoder();
           let buffer = '';
           let fullContent = '';
@@ -2501,17 +2654,26 @@ async function handleRequest(req, res) {
             eval_count: fullContent.length,
           };
           res.write(JSON.stringify(finalChunk) + '\n');
-          res.end();
-        } catch (e) { streamError = e; console.error('[stream error] /api/generate:', e.message); res.end(); }
-        metrics.recordRequest({
-          method: 'POST', path: '/api/generate',
-          model: oBody.model, keyLabel: result.key.label,
-          streaming: true, statusCode: 200,
-          latencyMs: Date.now() - result.startMs,
-          ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
-        });
-        pool.releaseSuccess(result.key);
-        decInFlight();
+        } catch (e) {
+          console.error('[stream error] /api/generate:', e.message);
+          try { res.end(); } catch {}
+        } finally {
+          // C3: cancel the upstream reader on disconnect so the undici socket
+          // is returned to the pool instead of lingering until GC.
+          if (reader) { try { await reader.cancel(); } catch {} }
+          metrics.recordRequest({
+            method: 'POST', path: '/api/generate',
+            model: oBody.model, keyLabel: result.key.label,
+            streaming: true, statusCode: 200,
+            latencyMs: Date.now() - result.startMs,
+            ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
+          });
+          // C2: cleanup MUST be in finally so a throw from res.end() (already
+          // ended via res.on('close') on client disconnect) cannot leak
+          // key.inFlight + global inFlight.
+          pool.releaseSuccess(result.key);
+          decInFlight();
+        }
         return;
       }
 
@@ -2554,6 +2716,7 @@ async function handleRequest(req, res) {
       return jsonResp(res, 413, { error: { message: 'Request entity too large', type: 'invalid_request_error' } });
     }
     // Safety net: if inFlight appears stuck from a leaked increment, clamp it
+    const MAX_QUEUE_SIZE = parseInt(process.env.MAX_QUEUE_SIZE || '100', 10);
     const MAX_SANITY_INFLIGHT = Math.max(MAX_QUEUE_SIZE * 2, 500);
     if (inFlight > MAX_SANITY_INFLIGHT) {
       console.warn(`[${requestId}] inFlight counter stuck at ${inFlight}, clamping to 0`);

@@ -166,7 +166,7 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 1. **404 pada model yang baru ditambah NIM** → cache belum refresh. Tunggu 10 menit atau restart service.
 2. **429 setiap lintas soft cap** → cascade ke key berikutnya secara otomatis (atomic reservation). Kalau semuanya 429 → turun ke model berikutnya di Cascade §4.2.
 3. **.env truncated** (per INS-2026-06-25) → patch jangan rewrite `.env` utuh; pakai patch snippet. Selalu backup `.env` ke `backups/` sebelum edit.
-4. **Image generation returns 404/error** → dulu benar (model image-gen tidak ada di cache karena discovery hanya menjangkau `integrate.api.nvidia.com`). Sekarang sudah ada proxy di `/v1/images/generations` dan `/v1/images/edits` yang route ke `ai.api.nvidia.com`. Model image-gen terdaftar sebagai curated (muncul di `/v1/capabilities`). Pastikan model ID yang dikirim cocok dengan yang di katalog NIM (mis. `black-forest-labs/flux.1-dev`).
+4. **Image generation** → NIM Visual GenAI (`ai.api.nvidia.com/v1/genai/{provider}/{model}`) punya FLUX.1-dev/schnell/kontext/canny/depth, FLUX.2-klein, Stable Diffusion 3.5 Large, Qwen-Image/Qwen-Image-Edit (terkonfirmasi aktif per Juli 2026). Wrapper memproksi ini via `/v1/images/generations` + `/v1/images/edits` + `/v1/infer`, menerjemahkan skema native (`text_prompts` Stability / `prompt` FLUX-Qwen → respons `artifacts[].base64`) ke OpenAI shape (`data[].b64_json`). Model image-gen terdaftar sebagai curated dan muncul di `/v1/models` MAUPUN `/v1/capabilities`. Pastikan model ID yang dikirim cocok dengan katalog NIM (mis. `black-forest-labs/flux.1-dev`). Catatan: `stabilityai/stable-diffusion-xl`, `stable-diffusion-3-medium`, dan `stable-video-diffusion` sudah deprecated NVIDIA — gunakan `stable-diffusion-3.5-large` sebagai penerus.
 
 ---
 
@@ -178,7 +178,7 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 | Subagent | `ilma_claudecode_agent.py` Tier 1 (NVIDIA NIM) priority |
 | SOT routing | `ilma_sot_dispatcher.py` pilih `nvidia/*` dulu |
 | Coding agent | `provider_kernel.NVIDIA` direct → `_9100/v1/chat/completions` |
-| Image router | NIM `/v1/images/generations` (NVIDIA NIM punya FLUX/SD/Qwen — fallback ke xAI/Nous jika model tidak ditemukan) |
+| Image router | NIM `/v1/images/generations` + `/v1/images/edits` (NVIDIA NIM Visual GenAI punya FLUX/SD/Qwen — proxy native, tidak perlu fallback ke xAI/Nous) |
 | Hermes gateway | openai-compat base_url ditambah |
 
 ---
@@ -230,5 +230,5 @@ GIT:         git@github.com:lokah1945/wrappers.git (mono-repo)
 ---
 
 **Maintainer**: ILMA v3.29 (SOT + ClaudeCode-style parallel coding + SuperCoding)
-**Last audited**: 2026-07-04 (full audit: end-to-end source + runtime)
-**Last verified**: 2026-07-04 (post-audit fix verification)
+**Last audited**: 2026-07-05 (REVISI forensic audit: ReferenceError landmines + image-gen/ranking passthrough + /v1/models curated)
+**Last verified**: 2026-07-05 (post-audit fix verification)
