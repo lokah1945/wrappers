@@ -36,7 +36,7 @@ const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_
 const { Metrics } = require('./metrics');
 
 // ── Config ──────────────────────────────────────────────────────────────
-const BETA_PORT   = parseInt(process.env.LISTEN_PORT || '9101', 10);
+const LISTEN_PORT = parseInt(process.env.LISTEN_PORT || '9100', 10);
 const BIND_HOST   = process.env.LISTEN_HOST || '0.0.0.0';
 const BASE_LLM    = (process.env.NVIDIA_BASE_URL || NVIDIA_BASE_URL).replace(/\/+$/, '');
 const BASE_GENAI  = (process.env.NVIDIA_GENAI_URL || NVIDIA_GENAI_URL).replace(/\/+$/, '');
@@ -44,7 +44,7 @@ const BASE_NVCF   = (process.env.NVIDIA_NVCF_URL || NVIDIA_NVCF_URL).replace(/\/
 const DB_PATH     = process.env.METRICS_DB || path.join(WRAPPER_DIR, 'metrics.db');
 const QUIET_RETRIED_429 = parseInt(process.env.QUIET_RETRIED_429 || '3', 10);
 const MAX_RETRIES = QUIET_RETRIED_429;
-const VERSION     = '4.6.0-node';
+const VERSION     = '8.5.0-node';
 const DEFAULT_CONTEXT_WINDOW = parseInt(process.env.DEFAULT_CONTEXT_WINDOW || '131072', 10);
 
 // ══ Hot-reloadable runtime config ═══════════════════════════════════
@@ -1145,7 +1145,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
             created: Math.floor(Date.now() / 1000),
             data: responseData.artifacts.map(art => ({
               b64_json: art.base64 || art.b64_json || '',
-              revised_prompt: body.prompt || ''
+              revised_prompt: body.prompt || (body.text_prompts && body.text_prompts[0] && body.text_prompts[0].text) || ''
             }))
           };
         }
@@ -1420,6 +1420,8 @@ function enrichModelMetadata(id, desc) {
     object: 'model',
     owned_by: id.split('/')[0] || 'nvidia',
     created: 0,
+    context_window: desc.context_window || DEFAULT_CONTEXT_WINDOW,
+    max_output_tokens: desc.max_output_tokens || 4096,
     ...desc,
     supports_vision: isVision,
     supports_function_calling: isChat,
@@ -2188,42 +2190,65 @@ async function handleRequest(req, res) {
         return jsonResp(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
       }
 
-      const modelId = resolveTargetModel(body.model || '');
-      body.model = modelId;
+      const modelId = body.model || '';
       if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
         return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
       }
 
-      const minDim = modelId.toLowerCase().includes('flux') ? 768 : 256;
-      let w = body.width;
-      let h = body.height;
-      if (body.size && typeof body.size === 'string') {
-        const parts = body.size.split('x');
-        if (parts.length === 2) {
-          w = parseInt(parts[0], 10) || w;
-          h = parseInt(parts[1], 10) || h;
-        }
-      }
-      w = parseInt(w, 10) || 1024;
-      h = parseInt(h, 10) || 1024;
+      const nativeBody = { ...body };
+      delete nativeBody.model;
+      delete nativeBody.n;
+      delete nativeBody.size;
+      delete nativeBody.response_format;
+      delete nativeBody.user;
+      delete nativeBody.width;
+      delete nativeBody.height;
 
-      if (w < minDim || h < minDim) {
-        body.width = Math.max(w, minDim);
-        body.height = Math.max(h, minDim);
-        if (body.size) {
-          body.size = `${body.width}x${body.height}`;
+      const isStability = modelId.toLowerCase().includes('stable-diffusion') || modelId.toLowerCase().includes('sdxl') || modelId.toLowerCase().includes('playground') || modelId.toLowerCase().includes('kandinsky');
+      if (isStability) {
+        nativeBody.text_prompts = [{ text: body.prompt || '', weight: 1 }];
+        delete nativeBody.prompt;
+      }
+
+      return await proxyPost({
+        req, res, body: nativeBody, rawBody: raw, modelId, path,
+        getTargetUrl: (key) => `${BASE_GENAI}/v1/genai/${modelId}`
+      });
+    }
+
+    // ─ Images Edits ──
+    if (method === 'POST' && path === '/v1/images/edits') {
+      const raw = await readBody(req);
+      let body;
+      try { body = JSON.parse(raw); } catch {
+        return jsonResp(res, 400, { error: { message: 'Invalid JSON', type: 'invalid_request_error' } });
+      }
+
+      const modelId = body.model || '';
+      if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+        return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
+      }
+
+      const nativeBody = { ...body };
+      delete nativeBody.model;
+      delete nativeBody.n;
+      delete nativeBody.size;
+      delete nativeBody.response_format;
+      delete nativeBody.user;
+
+      const isStability = modelId.toLowerCase().includes('stable-diffusion') || modelId.toLowerCase().includes('sdxl');
+      if (isStability) {
+        nativeBody.text_prompts = [{ text: body.prompt || '', weight: 1 }];
+        delete nativeBody.prompt;
+        if (body.image) {
+          nativeBody.init_image = body.image;
+          delete nativeBody.image;
         }
       }
 
       return await proxyPost({
-        req, res, body, rawBody: raw, modelId, path,
-        getTargetUrl: (key) => {
-          const desc = describe(modelId, BASE_LLM, BASE_GENAI);
-          const ep = (desc.endpoints || [{}])[0];
-          const targetBase = ep.base_url || BASE_GENAI;
-          const targetPath = ep.path || '/v1/images/generations';
-          return `${targetBase}${targetPath}`;
-        }
+        req, res, body: nativeBody, rawBody: raw, modelId, path,
+        getTargetUrl: (key) => `${BASE_GENAI}/v1/genai/${modelId}`
       });
     }
 
@@ -2663,8 +2688,8 @@ async function main() {
   serverInstance.maxHeadersCount = 100;
   serverInstance.headersTimeout = parseInt(process.env.SERVER_HEADERS_TIMEOUT_MS || '15000', 10);
 
-  serverInstance.listen(BETA_PORT, BIND_HOST, () => {
-    console.log(`[wrapper-nvidia] v${VERSION} listening on ${BIND_HOST}:${BETA_PORT}`);
+  serverInstance.listen(LISTEN_PORT, BIND_HOST, () => {
+    console.log(`[wrapper-nvidia] v${VERSION} listening on ${BIND_HOST}:${LISTEN_PORT}`);
     console.log(`[wrapper-nvidia] Keys: ${pool.totalKeys} total, ${pool.availableKeys} available`);
     console.log(`[wrapper-nvidia] Models cached: ${pool.modelsCached.length}`);
     console.log(`[wrapper-nvidia] Upstream: LLM=${BASE_LLM}`);

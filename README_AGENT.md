@@ -75,8 +75,9 @@ curl -s http://127.0.0.1:9100/v1/models | jq '.data | length'
 | `embedding` | 10 | nv-embed-v1, nemoretriever, arctic-embed-l, bge-m3 |
 | `video` | 2 | cosmos-reason2-8b, ai-synthetic-video-detector |
 | `parse` | 2 | nemoretriever-parse, nemotron-parse |
+| `image` | curated | flux.1-dev/schnell, stable-diffusion-3.5-large, qwen-image (via ai.api.nvidia.com) |
 
-**TIDAK ada model image-gen** (flux/sdxl) di upstream NIM ini → image harus dari xAI Grok (Nous).
+**Image-gen models tersedia di upstream NVIDIA NIM (`ai.api.nvidia.com/v1/genai/...`)** — wrapper sudah punya proxy di `/v1/images/generations` dan `/v1/images/edits`. Lihat §8 untuk catatan discovery.
 
 ---
 
@@ -142,7 +143,7 @@ Wrapper supports **OpenAI + Anthropic wire format**:
 
 ### 7.1 Verify health
 ```bash
-systemctl show nvidia-wrapper.service --property=ActiveEnterTimestamp,MainPID,SubState
+systemctl show wrapper-nvidia.service --property=ActiveEnterTimestamp,MainPID,SubState
 curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rpm}'
 ```
 
@@ -156,7 +157,7 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 ### 7.4 Incident recovery
 - `POST /admin/heal-in-flight` clears stuck requests.
 - `POST /metrics/reset` zero outs counters.
-- Cek `journalctl -u nvidia-wrapper.service --since '10 min ago' | jq .` untuk structured logs.
+- Cek `journalctl -u wrapper-nvidia.service --since '10 min ago' | jq .` untuk structured logs.
 
 ---
 
@@ -165,7 +166,7 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 1. **404 pada model yang baru ditambah NIM** → cache belum refresh. Tunggu 10 menit atau restart service.
 2. **429 setiap lintas soft cap** → cascade ke key berikutnya secara otomatis (atomic reservation). Kalau semuanya 429 → turun ke model berikutnya di Cascade §4.2.
 3. **.env truncated** (per INS-2026-06-25) → patch jangan rewrite `.env` utuh; pakai patch snippet. Selalu backup `.env` ke `backups/` sebelum edit.
-4. **Image generation returns 404** → benar, NVIDIA NIM ini tidak expose image gen. Pakai Nous Grok via xAI.
+4. **Image generation returns 404/error** → dulu benar (model image-gen tidak ada di cache karena discovery hanya menjangkau `integrate.api.nvidia.com`). Sekarang sudah ada proxy di `/v1/images/generations` dan `/v1/images/edits` yang route ke `ai.api.nvidia.com`. Model image-gen terdaftar sebagai curated (muncul di `/v1/capabilities`). Pastikan model ID yang dikirim cocok dengan yang di katalog NIM (mis. `black-forest-labs/flux.1-dev`).
 
 ---
 
@@ -177,7 +178,7 @@ curl -s http://127.0.0.1:9100/health | jq '{status, keys: .keys|length, rpm: .rp
 | Subagent | `ilma_claudecode_agent.py` Tier 1 (NVIDIA NIM) priority |
 | SOT routing | `ilma_sot_dispatcher.py` pilih `nvidia/*` dulu |
 | Coding agent | `provider_kernel.NVIDIA` direct → `_9100/v1/chat/completions` |
-| Image router | falls through ke xAI/Nous (NIM bukan image provider) |
+| Image router | NIM `/v1/images/generations` (NVIDIA NIM punya FLUX/SD/Qwen — fallback ke xAI/Nous jika model tidak ditemukan) |
 | Hermes gateway | openai-compat base_url ditambah |
 
 ---

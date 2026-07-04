@@ -1,7 +1,7 @@
 [Unit]
 Description=wrapper-nvidia Node.js proxy (NVIDIA NIM)
 After=network.target
-Documentation=https://github.com/lokah1945/wrapper-nvidia
+Documentation=https://github.com/lokah1945/wrappers
 # Limit rapid restart attempts (was in [Service] before — wrong section).
 StartLimitIntervalSec=60
 StartLimitBurst=10

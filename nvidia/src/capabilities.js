@@ -224,13 +224,8 @@ const CAPABILITY_PARAMS = {
   },
 };
 
-// NOTE: context length / context window fields are intentionally NOT provided.
-// NVIDIA NIM upstream does not return context_length/context_window and the
-// NVIDIA NIM API reference forbids sending context_length/context_window in
-// request payloads. The wrapper therefore passes request bodies through
-// untouched (the upstream handles context limits) and exposes no context
-// length metadata to clients/agents either.
-
+// Context lengths are manually maintained as NIM upstream does not expose them.
+// Default context window is applied in enrichModelMetadata if not specified here.
 function getCapabilityParams(capType) {
   return CAPABILITY_PARAMS[capType] || CAPABILITY_PARAMS.chat;
 }
@@ -281,6 +276,17 @@ function classify(modelId) {
       if (mid.includes('code') || mid.includes('coder') || mid.includes('codestral') || mid.includes('starcoder')) {
         result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
       }
+      
+      // Context window overrides
+      if (mid.includes('minimax-m3') || mid.includes('minimax-m2.7')) {
+        result.context_window = 1000000;
+      } else if (mid.includes('phi-3-vision-128k') || mid.includes('128k') || mid.includes('128b')) {
+        result.context_window = 128000;
+      } else if (mid.includes('32k') || mid.includes('nemotron-4-340b')) {
+        result.context_window = 32768;
+      } else if (mid.includes('llama-3.1') || mid.includes('llama-3.2') || mid.includes('llama-3.3')) {
+        result.context_window = 131072;
+      }
 
       // Evict oldest entry if cache exceeds limit
       if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
@@ -309,6 +315,17 @@ function classify(modelId) {
   if (mid.includes('code') || mid.includes('coder')) {
     result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
   }
+  
+  // Context window overrides for fallback
+  if (mid.includes('minimax-m3') || mid.includes('minimax-m2.7')) {
+    result.context_window = 1000000;
+  } else if (mid.includes('phi-3-vision-128k') || mid.includes('128k') || mid.includes('128b')) {
+    result.context_window = 128000;
+  } else if (mid.includes('32k') || mid.includes('nemotron-4-340b')) {
+    result.context_window = 32768;
+  } else if (mid.includes('llama-3.1') || mid.includes('llama-3.2') || mid.includes('llama-3.3')) {
+    result.context_window = 131072;
+  }
 
   if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
     const firstKey = _classifyCache.keys().next().value;
@@ -321,6 +338,24 @@ function classify(modelId) {
 // Curated models that might not be in the NVIDIA catalog but should be available
 const CURATED_GENAI = [
   'nvidia/ai-synthetic-video-detector',
+  // Image generation — FLUX family
+  'black-forest-labs/flux.1-dev',
+  'black-forest-labs/flux.1-schnell',
+  'black-forest-labs/flux.1-kontext-dev',
+  'black-forest-labs/flux.1-canny-dev',
+  'black-forest-labs/flux.1-depth-dev',
+  'black-forest-labs/flux.2-klein',
+  // Image generation — Stability AI
+  'stabilityai/stable-diffusion-3.5-large',
+  // Image generation — Qwen
+  'qwen/qwen-image',
+  'qwen/qwen-image-edit',
+  // Image generation — other
+  'playgroundai/playground-v2.5-1024px-aesthetic',
+  'consistory/consistory',
+  'kandinsky-community/kandinsky-3',
+  // Audio generation
+  'nvidia/fugatto',
 ];
 
 // Retired/unavailable models (kept minimal - most should be dynamically determined)
