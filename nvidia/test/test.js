@@ -142,7 +142,7 @@ function testAnthropicCompat() {
       'data: {"choices": [{"delta": {"content": "Hello" }}]}\n'
     ];
     const capture = { _startMs: Date.now() };
-    const sseGen = streamOpenaiToAnthropic(makeMockStream(mockChunks), 'model', capture);
+    const sseGen = streamOpenaiToAnthropic(makeMockStream(mockChunks), 'model', capture, 15, 'test_req_001');
     const events = [];
     for await (const chunk of sseGen) {
       events.push(chunk);

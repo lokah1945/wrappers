@@ -1534,7 +1534,7 @@ async function handleAnthropicMessages(rawBody, req, res) {
       const capture = { _startMs: result.startMs };
       let hasContent = false;
       try {
-        for await (const chunk of streamOpenaiToAnthropic(result.stream, aBody.model, capture)) {
+        for await (const chunk of streamOpenaiToAnthropic(result.stream, aBody.model, capture, inputTokens, req.requestId)) {
           if (res.writableEnded) break;
           res.write(chunk);
           if (chunk.includes('content_block_delta') || chunk.includes('text_delta') || chunk.includes('input_json_delta')) {
@@ -1576,18 +1576,23 @@ async function handleAnthropicMessages(rawBody, req, res) {
   }
 
   if (result.status === 200 && result.data) {
-    const anthroResp = openaiToAnthropic(result.data, aBody.model);
+    const anthroResp = openaiToAnthropic(result.data, aBody.model, req.requestId);
     jsonResp(res, 200, anthroResp, result.key?.label);
     return;
   }
 
   const errData = result.data || {};
   const errMsg = errData?.error?.message || `Upstream error ${result.status}`;
-  const errType = result.status === 429 ? 'rate_limit_error' :
-                  result.status === 401 ? 'authentication_error' :
-                  result.status === 403 ? 'permission_error' :
-                  result.status === 404 ? 'not_found_error' :
-                  'api_error';
+  // Preserve original upstream error type; fall back to status-derived type
+  const originalType = errData?.error?.type;
+  const errType = originalType || (
+    result.status === 429 ? 'rate_limit_error' :
+    result.status === 401 ? 'authentication_error' :
+    result.status === 403 ? 'permission_error' :
+    result.status === 404 ? 'not_found_error' :
+    result.status >= 400 && result.status < 500 ? 'invalid_request_error' :
+    'api_error'
+  );
   jsonResp(res, result.status, anthropicError(errType, errMsg));
 }
 

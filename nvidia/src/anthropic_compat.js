@@ -216,7 +216,7 @@ function estimateInputTokens(a) {
 
 // ── Response: OpenAI → Anthropic (non-streaming) ─────────────────────────
 
-function openaiToAnthropic(o, model) {
+function openaiToAnthropic(o, model, requestId = null) {
   const choice = (o.choices?.length > 0 ? o.choices[0] : {});
   const msg = choice?.message || {};
   const content = [];
@@ -256,7 +256,7 @@ function openaiToAnthropic(o, model) {
   };
 
   return {
-    id: o.id || 'msg_wrapper',
+    id: requestId ? `msg_${requestId}` : (o.id || `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`),
     type: 'message',
     role: 'assistant',
     model,
@@ -273,8 +273,8 @@ function openaiToAnthropic(o, model) {
  * Async generator: consume NVIDIA OpenAI SSE ReadableStream, emit Anthropic event stream.
  * Captures final usage/stop into `capture` for the caller's metrics.
  */
-async function* streamOpenaiToAnthropic(stream, model, capture) {
-  const msgId = 'msg_wrapper';
+async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0, requestId = null) {
+  const msgId = requestId ? `msg_${requestId}` : `msg_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   let textIndex = null;
   let thinkingIndex = null;
   const toolMap = {};       // openai tool index -> anthropic block index
@@ -338,20 +338,38 @@ async function* streamOpenaiToAnthropic(stream, model, capture) {
     message: {
       id: msgId, type: 'message', role: 'assistant', model,
       content: [], stop_reason: null, stop_sequence: null,
-      usage: { input_tokens: 0, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
+      usage: { input_tokens: inputTokens, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 },
     },
   });
-  yield _sse('ping', { type: 'ping' });
-
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
   let isFirstRead = true;
 
+  // Periodic heartbeat (ping) during long idle periods
+  const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '5000', 10);
+  let heartbeatTimer = null;
+  let lastDataTime = Date.now();
+
+  const heartbeatPromise = () => new Promise(resolve => {
+    const elapsed = Date.now() - lastDataTime;
+    const wait = Math.max(0, HEARTBEAT_MS - elapsed);
+    heartbeatTimer = setTimeout(() => resolve({ _heartbeat: true }), wait);
+  });
+
+  const clearHeartbeat = () => { if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; } };
+
   try {
     while (true) {
-      const { done, value } = await reader.read();
+      const result = await Promise.race([reader.read(), heartbeatPromise()]);
+      clearHeartbeat();
+      if (result._heartbeat) {
+        yield _sse('ping', { type: 'ping' });
+        continue;
+      }
+      const { done, value } = result;
       if (done) break;
+      lastDataTime = Date.now();
       if (isFirstRead) {
         capture.ttftMs = capture._startMs ? (Date.now() - capture._startMs) : 0;
         isFirstRead = false;
