@@ -47,6 +47,7 @@ function _flattenText(content) {
 
 function anthropicToOpenai(a) {
   if (!a || typeof a !== 'object') return { model: '', messages: [] };
+  if (!Array.isArray(a.messages)) return { model: '', messages: [] };
   const oai = { model: a.model || '' };
   const msgs = [];
 

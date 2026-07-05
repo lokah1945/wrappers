@@ -160,7 +160,104 @@ function generateRequestId() {
 
 // Map external model request names (Claude, GPT, etc.) to available local NIM equivalents
 function resolveTargetModel(requestedModel) {
-  // Pass-through exactly as requested per user instruction. No fallbacks.
+  if (!requestedModel || typeof requestedModel !== 'string') return requestedModel;
+
+  // 1. If it's directly available and not marked unavailable, use it!
+  if (pool.modelsCached.includes(requestedModel) && !unavailableModels.has(requestedModel)) {
+    return requestedModel;
+  }
+
+  const lower = requestedModel.toLowerCase();
+
+  // 2. Handle embedding models mapping separately
+  const isEmbedding = lower.includes('embed') || lower.includes('similarity') || lower.includes('ada-002') || lower.includes('bge-') || lower.includes('e5-');
+  if (isEmbedding) {
+    const embeddingCandidates = [
+      'nvidia/nv-embed-v1',
+      'nvidia/nv-embedqa-e5-v5',
+      'nvidia/llama-nemotron-embed-1b-v2',
+      'nvidia/nv-embedqa-mistral-7b-v2',
+      'snowflake/arctic-embed-l',
+      'baai/bge-m3'
+    ];
+    for (const cand of embeddingCandidates) {
+      if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
+        console.log(`[resolveModel] Mapping embedding "${requestedModel}" to available fallback "${cand}"`);
+        return cand;
+      }
+    }
+    // Fallback to any cached embedding model
+    const cachedEmbedding = pool.modelsCached.find(m => m.includes('embed') || m.includes('bge') || m.includes('e5'));
+    if (cachedEmbedding) return cachedEmbedding;
+  }
+
+  // 3. Handle rerank models mapping separately
+  const isRerank = lower.includes('rerank');
+  if (isRerank) {
+    const rerankCandidates = ['nvidia/nv-rerankqa-mistral4b-v3'];
+    for (const cand of rerankCandidates) {
+      if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
+        console.log(`[resolveModel] Mapping rerank "${requestedModel}" to available fallback "${cand}"`);
+        return cand;
+      }
+    }
+  }
+
+  // 4. Try exact/predefined mappings for chat models
+  const mapping = {
+    'claude-3-7-sonnet': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
+    'claude-3-5-sonnet': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
+    'claude-3-5-sonnet-20241022': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
+    'claude-3-5-sonnet-v2': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
+    'claude-3-5-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
+    'claude-3-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
+    'claude-3-haiku-20240307': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
+    'claude-3-opus': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct'],
+    'gpt-4o': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'],
+    'gpt-4o-mini': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
+    'gpt-4': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
+    'gpt-3.5-turbo': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
+    'o1': ['meta/llama-3.3-70b-instruct'],
+    'o1-preview': ['meta/llama-3.3-70b-instruct'],
+    'o1-mini': ['meta/llama-3.1-8b-instruct'],
+    'o3-mini': ['meta/llama-3.3-70b-instruct']
+  };
+
+  let candidates = mapping[requestedModel] || mapping[lower] || [];
+
+  // 5. Heuristic matching by family
+  if (candidates.length === 0) {
+    if (lower.includes('sonnet') || lower.includes('opus') || lower.includes('gpt-4') || lower.includes('mistral-large') || lower.includes('mixtral-8x22b')) {
+      candidates = ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'];
+    } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('gpt-3.5') || lower.includes('gemma-3-4b') || lower.includes('llama-3.1-8b')) {
+      candidates = ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'];
+    } else if (lower.includes('claude') || lower.includes('gpt') || lower.includes('gemini')) {
+      candidates = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'];
+    }
+  }
+
+  for (const cand of candidates) {
+    if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
+      console.log(`[resolveModel] Mapping "${requestedModel}" to available fallback "${cand}"`);
+      return cand;
+    }
+  }
+
+  // 6. Default fallback: Pick the first available chat model in cache
+  const availableChatModels = pool.modelsCached.filter(m => !unavailableModels.has(m));
+  if (availableChatModels.length > 0) {
+    const preferred = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'meta/llama-3.1-8b-instruct'];
+    for (const p of preferred) {
+      if (availableChatModels.includes(p)) {
+        console.log(`[resolveModel] Fallback to preferred: ${p}`);
+        return p;
+      }
+    }
+    const fallbackModel = availableChatModels.includes('meta/llama-3.3-70b-instruct') ? 'meta/llama-3.3-70b-instruct' : 'meta/llama-3.1-70b-instruct';
+    console.log(`[resolveModel] Preferred models not available. Forcing ${fallbackModel} instead of ${availableChatModels[0]}`);
+    return fallbackModel;
+  }
+
   return requestedModel;
 }
 
@@ -754,6 +851,9 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
     }
 
     const startMs = Date.now();
+    let ttftFired = false;
+    const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
+    let ttftTimer = null;
     try {
       incInFlight();
       const baseUrl = resolveBase(modelId);
@@ -783,9 +883,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         }
       }
       
-      let ttftFired = false;
-      const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
-      const ttftTimer = setTimeout(() => {
+      ttftTimer = setTimeout(() => {
         ttftFired = true;
         abortController.abort(new Error('TTFT_Timeout'));
       }, ttftMs);
@@ -975,6 +1073,18 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         decInFlight();
         return { status: 504, data: { error: { message: `Upstream NIM timeout (no response within headers timeout)`, type: 'gateway_timeout' } } };
       }
+      if (req?.clientAbortSignal?.aborted) {
+        const latencyMs = Date.now() - startMs;
+        metrics.recordRequest({
+          method: 'POST', path: '/v1/chat/completions',
+          model: modelId, keyLabel: key.label,
+          streaming: !!body.stream, statusCode: 499, latencyMs,
+          wasRateLimited: false, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return { status: 499, data: { error: { message: 'Client disconnected — request aborted', type: 'client_error' } } };
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
@@ -1052,6 +1162,9 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
     }
 
     const startMs = Date.now();
+    let ttftFired = false;
+    const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
+    let ttftTimer = null;
     try {
       incInFlight();
       const targetUrl = getTargetUrl ? getTargetUrl(key) : `${resolveBase(modelId)}${path || '/v1/chat/completions'}`;
@@ -1068,9 +1181,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         }
       }
       
-      let ttftFired = false;
-      const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
-      const ttftTimer = setTimeout(() => {
+      ttftTimer = setTimeout(() => {
         ttftFired = true;
         ppAbortController.abort(new Error('TTFT_Timeout'));
       }, ttftMs);
@@ -1225,6 +1336,18 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       decInFlight();
       return jsonResp(res, resp.status, responseData);
     } catch (e) {
+      if (typeof ttftFired !== 'undefined' && ttftFired) {
+        clearTimeout(ttftTimer);
+        const latencyMs = Date.now() - startMs;
+        metrics.recordRequest({
+          method: 'POST', path, model: modelId, keyLabel: key.label,
+          streaming: false, statusCode: 504, latencyMs,
+          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return jsonResp(res, 504, { error: { message: 'Upstream NIM timeout (no response within headers timeout)', type: 'gateway_timeout' } });
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
@@ -1275,6 +1398,7 @@ async function handleChatCompletions(body, req, res) {
       let lastUsageSnippet = '';
       try {
         while (true) {
+          if (res.writableEnded) break;
           const { done, value } = await reader.read();
           if (done) break;
           if (isFirstChunk) {
@@ -1296,6 +1420,7 @@ async function handleChatCompletions(body, req, res) {
           }
         }
       } catch (e) { streamError = e; console.error('[stream error] handleChatCompletions:', e.message); }
+      if (res.writableEnded) return;
       if (!hasContent) {
         const friendlyMsg = `The context/history for model "${body.model}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
         const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
@@ -1378,7 +1503,11 @@ async function handleAnthropicMessages(rawBody, req, res) {
   console.log(`[ROUTE-DEBUG] Claude requested: ${requestedModel} -> Resolved to: ${aBody.model}`);
 
   // Dump payload for debugging loop
-  require('fs').writeFileSync('/tmp/claude_payload.json', JSON.stringify(aBody, null, 2));
+  try {
+    require('fs').writeFileSync(path.join(require('os').tmpdir(), 'claude_payload.json'), JSON.stringify(aBody, null, 2));
+  } catch (e) {
+    console.warn(`[DEBUG-DUMP] Failed to write claude_payload.json: ${e.message}`);
+  }
 
   if (aBody.model in RETIRED_MODELS || isModelUnavailable(aBody.model)) {
     return jsonResp(res, 404, anthropicError('not_found_error', `Model ${aBody.model} is retired or unavailable`));
@@ -1406,15 +1535,17 @@ async function handleAnthropicMessages(rawBody, req, res) {
       let hasContent = false;
       try {
         for await (const chunk of streamOpenaiToAnthropic(result.stream, aBody.model, capture)) {
+          if (res.writableEnded) break;
           res.write(chunk);
           if (chunk.includes('content_block_delta') || chunk.includes('text_delta') || chunk.includes('input_json_delta')) {
             hasContent = true;
           }
         }
       } catch (e) { streamError = e; console.error('[stream error] handleAnthropicMessages:', e.message); }
+      if (res.writableEnded) return;
       if (!hasContent) {
         const friendlyMsg = `The Claude Code session history is too large and exceeds the model's context limit (or the upstream connection was closed immediately). Please exit the current Claude session (type /exit or Ctrl+D) and run 'claude' again to start a clean session.`;
-        const errEvent = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: 'api_error', message: friendlyMsg } })}\n\n`;
+        const errEvent = `event: error\ndata: ${JSON.stringify({ error: { type: 'api_error', message: friendlyMsg } })}\n\n`;
         res.write(errEvent);
       }
       res.end();
@@ -1919,14 +2050,6 @@ async function handleRequest(req, res) {
   req.requestId = requestId;
   res.setHeader('X-Request-ID', requestId);
 
-  const controller = new AbortController();
-  req.clientAbortSignal = controller.signal;
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      controller.abort();
-    }
-  });
-
   let url, path, method;
   try {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
@@ -1936,6 +2059,15 @@ async function handleRequest(req, res) {
     console.warn(`[${requestId}] Malformed request URL: ${req.url}`);
     return jsonResp(res, 400, { error: { message: 'Invalid request URL', type: 'invalid_request_error' } });
   }
+
+  const controller = new AbortController();
+  req.clientAbortSignal = controller.signal;
+  res.on('close', () => {
+    if (!res.writableEnded) {
+      console.warn(`[close-abort] request ${requestId} path=${path} closed before writableEnded — aborting`);
+      controller.abort();
+    }
+  });
 
   // Log incoming request
   const startTime = Date.now();

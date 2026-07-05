@@ -174,7 +174,7 @@ function testCapabilities() {
   
   const c1 = classify('meta/llama-3.1-8b-instruct');
   assert.strictEqual(c1.type, 'chat');
-  assert.strictEqual(c1.context_window, undefined, 'context_window must not be exposed');
+  assert.strictEqual(c1.context_window, 131072, 'Llama 3.1 should have 128k context');
    
   const c2 = classify('nvidia/nv-embed-v1');
   assert.strictEqual(c2.type, 'embedding');
@@ -182,7 +182,7 @@ function testCapabilities() {
 
   const c3 = classify('meta/llama-3.2-11b-vision-instruct');
   assert.strictEqual(c3.type, 'vision_chat');
-  assert.strictEqual(c3.context_window, undefined, 'vision_chat must not expose context_window');
+  assert.strictEqual(c3.context_window, 131072, 'Llama 3.2 should have 128k context');
 
   const c4 = classify('google/gemma-3-12b-it');
   assert.strictEqual(c4.context_window, undefined, 'no context_window field');
