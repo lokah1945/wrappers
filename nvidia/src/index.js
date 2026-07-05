@@ -162,8 +162,8 @@ function generateRequestId() {
 function resolveTargetModel(requestedModel) {
   if (!requestedModel || typeof requestedModel !== 'string') return requestedModel;
 
-  // 1. If it's directly available and not marked unavailable, use it!
-  if (pool.modelsCached.includes(requestedModel) && !unavailableModels.has(requestedModel)) {
+  // 1. If it's directly available, use it!
+  if (pool.modelsCached.includes(requestedModel)) {
     return requestedModel;
   }
 
