@@ -160,104 +160,10 @@ function generateRequestId() {
 
 // Map external model request names (Claude, GPT, etc.) to available local NIM equivalents
 function resolveTargetModel(requestedModel) {
-  if (!requestedModel || typeof requestedModel !== 'string') return requestedModel;
-
-  // 1. If it's directly available, use it!
-  if (pool.modelsCached.includes(requestedModel)) {
-    return requestedModel;
-  }
-
-  const lower = requestedModel.toLowerCase();
-
-  // 2. Handle embedding models mapping separately
-  const isEmbedding = lower.includes('embed') || lower.includes('similarity') || lower.includes('ada-002') || lower.includes('bge-') || lower.includes('e5-');
-  if (isEmbedding) {
-    const embeddingCandidates = [
-      'nvidia/nv-embed-v1',
-      'nvidia/nv-embedqa-e5-v5',
-      'nvidia/llama-nemotron-embed-1b-v2',
-      'nvidia/nv-embedqa-mistral-7b-v2',
-      'snowflake/arctic-embed-l',
-      'baai/bge-m3'
-    ];
-    for (const cand of embeddingCandidates) {
-      if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
-        console.log(`[resolveModel] Mapping embedding "${requestedModel}" to available fallback "${cand}"`);
-        return cand;
-      }
-    }
-    // Fallback to any cached embedding model
-    const cachedEmbedding = pool.modelsCached.find(m => m.includes('embed') || m.includes('bge') || m.includes('e5'));
-    if (cachedEmbedding) return cachedEmbedding;
-  }
-
-  // 3. Handle rerank models mapping separately
-  const isRerank = lower.includes('rerank');
-  if (isRerank) {
-    const rerankCandidates = ['nvidia/nv-rerankqa-mistral4b-v3'];
-    for (const cand of rerankCandidates) {
-      if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
-        console.log(`[resolveModel] Mapping rerank "${requestedModel}" to available fallback "${cand}"`);
-        return cand;
-      }
-    }
-  }
-
-  // 4. Try exact/predefined mappings for chat models
-  const mapping = {
-    'claude-3-7-sonnet': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-sonnet': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-sonnet-20241022': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-sonnet-v2': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-haiku-20240307': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-opus': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct'],
-    'gpt-4o': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'],
-    'gpt-4o-mini': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'gpt-4': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'gpt-3.5-turbo': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'o1': ['meta/llama-3.3-70b-instruct'],
-    'o1-preview': ['meta/llama-3.3-70b-instruct'],
-    'o1-mini': ['meta/llama-3.1-8b-instruct'],
-    'o3-mini': ['meta/llama-3.3-70b-instruct']
-  };
-
-  let candidates = mapping[requestedModel] || mapping[lower] || [];
-
-  // 5. Heuristic matching by family
-  if (candidates.length === 0) {
-    if (lower.includes('sonnet') || lower.includes('opus') || lower.includes('gpt-4') || lower.includes('mistral-large') || lower.includes('mixtral-8x22b')) {
-      candidates = ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'];
-    } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('gpt-3.5') || lower.includes('gemma-3-4b') || lower.includes('llama-3.1-8b')) {
-      candidates = ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'];
-    } else if (lower.includes('claude') || lower.includes('gpt') || lower.includes('gemini')) {
-      candidates = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'];
-    }
-  }
-
-  for (const cand of candidates) {
-    if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
-      console.log(`[resolveModel] Mapping "${requestedModel}" to available fallback "${cand}"`);
-      return cand;
-    }
-  }
-
-  // 6. Default fallback: Pick the first available chat model in cache
-  const availableChatModels = pool.modelsCached.filter(m => !unavailableModels.has(m));
-  if (availableChatModels.length > 0) {
-    const preferred = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'meta/llama-3.1-8b-instruct'];
-    for (const p of preferred) {
-      if (availableChatModels.includes(p)) {
-        console.log(`[resolveModel] Fallback to preferred: ${p}`);
-        return p;
-      }
-    }
-    const fallbackModel = availableChatModels.includes('meta/llama-3.3-70b-instruct') ? 'meta/llama-3.3-70b-instruct' : 'meta/llama-3.1-70b-instruct';
-    console.log(`[resolveModel] Preferred models not available. Forcing ${fallbackModel} instead of ${availableChatModels[0]}`);
-    return fallbackModel;
-  }
-
+  // Transparent proxy: pass through model name exactly as the client sent it.
+  // No hardcoded mapping, no heuristic matching, no fallback.
+  // The wrapper only handles API key load balancing — model validation is
+  // delegated to the upstream NVIDIA NIM endpoint.
   return requestedModel;
 }
 
