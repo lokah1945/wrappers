@@ -32,7 +32,8 @@ const WRAPPER_DIR = path.resolve(__dirname, '..');
 
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('../key_pool');
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
-const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_MODELS, CURATED_GENAI, getCapabilityParams } = require('./capabilities');
+const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_MODELS: _RETIRED_MODELS, CURATED_GENAI, getCapabilityParams } = require('./capabilities');
+const RETIRED_MODELS = {}; // Transparent proxy mode: never block retired models
 const { Metrics } = require('./metrics');
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -159,67 +160,7 @@ function generateRequestId() {
 
 // Map external model request names (Claude, GPT, etc.) to available local NIM equivalents
 function resolveTargetModel(requestedModel) {
-  if (!requestedModel || typeof requestedModel !== 'string') return requestedModel;
-
-  // 1. If it's directly available and not marked unavailable, use it!
-  if (pool.modelsCached.includes(requestedModel) && !unavailableModels.has(requestedModel)) {
-    return requestedModel;
-  }
-
-  // 2. Try exact/predefined mappings
-  const mapping = {
-    'claude-3-5-sonnet': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-sonnet-20241022': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'claude-3-5-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-haiku': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-haiku-20240307': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'claude-3-opus': ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct'],
-    'gpt-4o': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'],
-    'gpt-4o-mini': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'gpt-4': ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'],
-    'gpt-3.5-turbo': ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'],
-    'o1': ['meta/llama-3.3-70b-instruct'],
-    'o1-preview': ['meta/llama-3.3-70b-instruct'],
-    'o1-mini': ['meta/llama-3.1-8b-instruct'],
-    'o3-mini': ['meta/llama-3.3-70b-instruct']
-  };
-
-  const lower = requestedModel.toLowerCase();
-  let candidates = mapping[requestedModel] || mapping[lower] || [];
-
-  // 3. Heuristic matching by family
-  if (candidates.length === 0) {
-    if (lower.includes('sonnet') || lower.includes('opus') || lower.includes('gpt-4') || lower.includes('mistral-large') || lower.includes('mixtral-8x22b')) {
-      candidates = ['mistralai/mistral-large', 'meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct'];
-    } else if (lower.includes('haiku') || lower.includes('mini') || lower.includes('gpt-3.5') || lower.includes('gemma-3-4b') || lower.includes('llama-3.1-8b')) {
-      candidates = ['meta/llama-3.1-8b-instruct', 'google/gemma-3-4b-it'];
-    } else if (lower.includes('claude') || lower.includes('gpt') || lower.includes('gemini')) {
-      candidates = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'mistralai/mistral-large'];
-    }
-  }
-
-  for (const cand of candidates) {
-    if (pool.modelsCached.includes(cand) && !unavailableModels.has(cand)) {
-      console.log(`[resolveModel] Mapping "${requestedModel}" to available fallback "${cand}"`);
-      return cand;
-    }
-  }
-
-  // 4. Default fallback: Pick the first available chat model in cache
-  const availableChatModels = pool.modelsCached.filter(m => !unavailableModels.has(m));
-  if (availableChatModels.length > 0) {
-    const preferred = ['meta/llama-3.3-70b-instruct', 'nvidia/llama-3.1-nemotron-70b-instruct', 'meta/llama-3.1-8b-instruct'];
-    for (const p of preferred) {
-      if (availableChatModels.includes(p)) {
-        console.log(`[resolveModel] Fallback to preferred: ${p}`);
-        return p;
-      }
-    }
-    // Hardcode fallback to meta/llama-3.1-70b-instruct to prevent z-ai/glm-5.2 rate limit loop and 8B thought loops
-    console.log(`[resolveModel] Preferred models not available. Forcing meta/llama-3.1-70b-instruct instead of ${availableChatModels[0]}`);
-    return 'meta/llama-3.1-70b-instruct';
-  }
-
+  // Pass-through exactly as requested per user instruction. No fallbacks.
   return requestedModel;
 }
 
@@ -502,7 +443,8 @@ const MODEL_GRACE_FAILS = 2;
 const modelFailCount = {};
 
 function isModelUnavailable(modelId) {
-  return unavailableModels.has(modelId);
+  // Transparent proxy mode: never block requests proactively.
+  return false;
 }
 
 function markModel(modelId, ok, status, path, reason) {
@@ -840,6 +782,14 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
           setTimeout(() => clientAbortSignal.removeEventListener('abort', onAbort), timeoutMs + 1000).unref();
         }
       }
+      
+      let ttftFired = false;
+      const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
+      const ttftTimer = setTimeout(() => {
+        ttftFired = true;
+        abortController.abort(new Error('TTFT_Timeout'));
+      }, ttftMs);
+      
       const timeoutSignal = AbortSignal.timeout(timeoutMs);
       const resp = await undiciFetch(url, {
         method: 'POST',
@@ -848,6 +798,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         dispatcher: agent,
         signal: anySignal([abortController.signal, timeoutSignal]),
       });
+      clearTimeout(ttftTimer);
 
       let _400respText = '';
       if (resp.status === 400) {
@@ -1011,6 +962,19 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       decInFlight();
       return { status: 200, data, key };
     } catch (e) {
+      if (typeof ttftTimer !== 'undefined') clearTimeout(ttftTimer);
+      if (typeof ttftFired !== 'undefined' && ttftFired) {
+        const latencyMs = Date.now() - startMs;
+        metrics.recordRequest({
+          method: 'POST', path: '/v1/chat/completions',
+          model: modelId, keyLabel: key.label,
+          streaming: !!body.stream, statusCode: 504, latencyMs,
+          wasRateLimited: false, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return { status: 504, data: { error: { message: `Upstream NIM timeout (no response within headers timeout)`, type: 'gateway_timeout' } } };
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
@@ -1103,6 +1067,14 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
           setTimeout(() => ppClientSignal.removeEventListener('abort', onAbort), ppTimeoutMs + 1000).unref();
         }
       }
+      
+      let ttftFired = false;
+      const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
+      const ttftTimer = setTimeout(() => {
+        ttftFired = true;
+        ppAbortController.abort(new Error('TTFT_Timeout'));
+      }, ttftMs);
+      
       const resp = await undiciFetch(targetUrl, {
         method: 'POST',
         headers: {
@@ -1114,6 +1086,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         dispatcher: agent,
         signal: anySignal([ppAbortController.signal, AbortSignal.timeout(ppTimeoutMs)]),
       });
+      clearTimeout(ttftTimer);
 
       let _pp400text = '';
       if (resp.status === 400) {
