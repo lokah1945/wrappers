@@ -269,7 +269,7 @@ All config via `.env` file (auto-reloaded every `KEYS_RELOAD_SECONDS`):
 | Variable | Default | Description |
 |---|---|---|
 | `NVIDIA_API_KEY_N` | — | NVIDIA API key(s). Supports `_1` through `_N` |
-| `LISTEN_PORT` | 9101 | HTTP listen port |
+| `LISTEN_PORT` | 9100 | HTTP listen port |
 | `LISTEN_HOST` | 0.0.0.0 | Bind address |
 | `SOFT_LIMIT_RPM` | 30 | Soft RPM limit per key (pacing target) |
 | `HARD_LIMIT_RPM` | 40 | Hard RPM limit per key |
