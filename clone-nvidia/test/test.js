@@ -130,11 +130,7 @@ function testAnthropicCompat() {
             }
             return Promise.resolve({ done: true, value: undefined });
           },
-          releaseLock() {},
-          // Stream-protocol cancel is optional; the generator's finally
-          // gate now checks `typeof reader.cancel === 'function'`. Provide it
-          // anyway so any other consumer that calls it on a mock doesn't crash.
-          cancel() {}
+          releaseLock() {}
         };
       }
     };

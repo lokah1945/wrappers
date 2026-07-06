@@ -344,7 +344,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
-  let lastUsageChunk = '';
+  let fullStreamText = '';
   let isFirstRead = true;
 
   // Periodic heartbeat (ping) during long idle periods
@@ -361,9 +361,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   const clearHeartbeat = () => { if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; } };
 
   try {
-    let pendingRead = reader.read();
     while (true) {
-      const result = await Promise.race([pendingRead, heartbeatPromise()]);
+      const result = await Promise.race([reader.read(), heartbeatPromise()]);
       clearHeartbeat();
       if (result._heartbeat) {
         yield _sse('ping', { type: 'ping' });
@@ -372,7 +371,6 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       const { done, value } = result;
       if (done) break;
       lastDataTime = Date.now();
-      pendingRead = reader.read();
       if (isFirstRead) {
         capture.ttftMs = capture._startMs ? (Date.now() - capture._startMs) : 0;
         isFirstRead = false;
@@ -380,7 +378,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
 
       const chunkText = decoder.decode(value, { stream: true });
       buffer += chunkText;
-      if (chunkText.includes('"usage"')) lastUsageChunk = chunkText;
+      fullStreamText += chunkText;
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -430,7 +428,10 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
               if (inside) {
                 yield* emitThinkingDelta(inside);
               }
-              yield* stopOpen();
+              if (openIdx !== null) {
+                yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
+                openIdx = null;
+              }
               if (after) {
                 yield* emitText(after);
               }
@@ -447,7 +448,10 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
           const oi = tc.index ?? 0;
           const fn = tc.function || {};
           if (!(oi in toolMap)) {
-            yield* stopOpen();
+            if (openIdx !== null) {
+              yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
+            }
+            textIndex = null;
             const ai = nextIndex++;
             toolMap[oi] = ai;
             openIdx = ai;
@@ -485,15 +489,6 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       }
     }
   } finally {
-    clearHeartbeat();
-    // Defensive: some stream readers (e.g. test mocks, custom ReadableStream
-    // transforms) may not implement cancel(). Swallow the TypeError so the
-    // generator isn't killed prematurely — releaseLock below is sufficient.
-    try {
-      if (typeof reader.cancel === 'function') {
-        reader.cancel().catch(() => {});
-      }
-    } catch {}
     try { reader.releaseLock(); } catch {}
   }
 
@@ -514,17 +509,16 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   yield _sse('message_stop', { type: 'message_stop' });
 
   if (!capture.usage || Object.keys(capture.usage).length === 0) {
-    if (lastUsageChunk) {
-      const usageMatch = lastUsageChunk.match(/"usage"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
-      if (usageMatch) {
-        try { capture.usage = JSON.parse(usageMatch[1]); } catch {}
-      }
+    const usageMatch = fullStreamText.match(/"usage"\s*:\s*({[^}]+})/);
+    if (usageMatch) {
+      try { capture.usage = JSON.parse(usageMatch[1]); } catch {}
     }
   }
   if (!capture.usage || Object.keys(capture.usage).length === 0) {
     capture.usage = usage;
   }
   capture.stop = finalStop;
+  fullStreamText = '';
 }
 
 module.exports = {
