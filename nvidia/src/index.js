@@ -2134,7 +2134,7 @@ async function handleRequest(req, res) {
       return jsonResp(res, 200, {
         window: windowStr,
         models: metrics.getPerModel(windowStr),
-        blocked_models: pool.blockedModels ? pool.blockedModels() : []
+        blocked_models: pool.blockedModels ? pool.blockedModels() : {}
       });
     }
     if (method === 'GET' && path === '/metrics/models/timeseries') {
@@ -2191,7 +2191,7 @@ async function handleRequest(req, res) {
       return jsonResp(res, 200, {
         events,
         summary,
-        blocked_models: pool.blockedModels ? pool.blockedModels() : [],
+        blocked_models: pool.blockedModels ? pool.blockedModels() : {},
         learned_model_limits: pool.summary ? (pool.summary().learned_model_limits || {}) : {},
         pacing: {
           paced_requests: full.paced_requests || 0,
