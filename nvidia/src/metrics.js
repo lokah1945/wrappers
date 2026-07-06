@@ -119,7 +119,7 @@ class Metrics {
 
     this._save();
     // Periodic save every 30s
-    this._saveInterval = setInterval(() => this._save(), 30000);
+    this._saveInterval = setInterval(() => this._save(), 30000).unref();
   }
 
   async ready() { await this._ready; }

@@ -32,8 +32,7 @@ const WRAPPER_DIR = path.resolve(__dirname, '..');
 
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('../key_pool');
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
-const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, RETIRED_MODELS: _RETIRED_MODELS, CURATED_GENAI, getCapabilityParams } = require('./capabilities');
-const RETIRED_MODELS = {}; // Transparent proxy mode: never block retired models
+const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, CURATED_GENAI, getCapabilityParams } = require('./capabilities');
 const { Metrics } = require('./metrics');
 
 // ── Config ──────────────────────────────────────────────────────────────
@@ -274,43 +273,6 @@ async function convertVisionImages(body) {
     }
   }
 }
-function validateRequestBody(body, path) {
-  if (!body || typeof body !== 'object') {
-    return { valid: false, error: 'Request body must be a JSON object' };
-  }
-
-  if (path === '/v1/chat/completions' || path === '/v1/complete') {
-    if (!body.model) return { valid: false, error: 'Model is required' };
-    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
-      return { valid: false, error: 'Messages array is required and must not be empty' };
-    }
-    for (const msg of body.messages) {
-      if (!msg.role || !['system', 'user', 'assistant', 'tool'].includes(msg.role)) {
-        return { valid: false, error: `Invalid message role: ${msg.role}` };
-      }
-      if (msg.content !== undefined && msg.content !== null && typeof msg.content !== 'string' && !Array.isArray(msg.content)) {
-        return { valid: false, error: 'Message content must be string or array' };
-      }
-    }
-  }
-
-  if (path === '/v1/embeddings') {
-    if (!body.model) return { valid: false, error: 'Model is required' };
-    if (!body.input || (typeof body.input !== 'string' && !Array.isArray(body.input))) {
-      return { valid: false, error: 'Input must be string or array of strings' };
-    }
-  }
-
-  if (path === '/v1/messages') {
-    if (!body.model) return { valid: false, error: 'Model is required' };
-    if (!body.messages || !Array.isArray(body.messages) || body.messages.length === 0) {
-      return { valid: false, error: 'Messages array is required and must not be empty' };
-    }
-  }
-
-  return { valid: true };
-}
-
 // Add standard rate limit headers to response
 function addRateLimitHeaders(headers, keyLabel, pool) {
   const key = pool.keys.find(k => k.label === keyLabel);
@@ -325,10 +287,17 @@ function addRateLimitHeaders(headers, keyLabel, pool) {
 
 function extractUsageFields(usage) {
   const u = usage || {};
-  const pt = u.prompt_tokens || 0;
-  const ct = u.completion_tokens || 0;
-  const tt = u.total_tokens || 0;
-  const cacht = u.prompt_tokens_details?.cached_tokens || 0;
+  // Support both OpenAI format (prompt_tokens/completion_tokens) and
+  // Anthropic format (input_tokens/output_tokens)
+  const pt = u.prompt_tokens || u.input_tokens || 0;
+  const ct = u.completion_tokens || u.output_tokens || 0;
+  const tt = u.total_tokens || (pt + ct) || 0;
+  const cacht =
+    // OpenAI: prompt_tokens_details.cached_tokens
+    u.prompt_tokens_details?.cached_tokens ||
+    // Anthropic: cache_read_input_tokens
+    u.cache_read_input_tokens ||
+    0;
   return { pt, ct, tt, cacht };
 }
 
@@ -677,10 +646,10 @@ function sanitizeNvidiaPayload(body) {
   body.messages = newMessages;
 }
 
-async function proxyOpenai(body, reqHeaders, model, req = null) {
+async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v1/chat/completions') {
   sanitizeNvidiaPayload(body);
   const modelId = body.model || model || '';
-  if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+  if (isModelUnavailable(modelId)) {
     return { status: 404, data: { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } } };
   }
 
@@ -784,8 +753,6 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         } else {
           const onAbort = () => abortController.abort();
           clientAbortSignal.addEventListener('abort', onAbort, { once: true });
-          // Clean up the listener after timeout to prevent memory leaks
-          setTimeout(() => clientAbortSignal.removeEventListener('abort', onAbort), timeoutMs + 1000).unref();
         }
       }
       
@@ -834,7 +801,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
           let errBody = null;
           try { errBody = JSON.parse(respText); } catch {}
           metrics.recordRequest({
-            method: 'POST', path: '/v1/chat/completions',
+            method: 'POST', path: metricPath,
             model: modelId, keyLabel: key.label,
             streaming: !!body.stream, statusCode: resp.status, latencyMs: Date.now() - startMs,
             wasRateLimited: false, pacingMs
@@ -852,7 +819,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
           const friendlyMsg = getFriendlyContextLimitError(modelId, rawMsg);
           errBody = { error: { message: friendlyMsg, type: 'invalid_request_error' } };
           metrics.recordRequest({
-            method: 'POST', path: '/v1/chat/completions',
+            method: 'POST', path: metricPath,
             model: modelId, keyLabel: key.label,
             streaming: !!body.stream, statusCode: resp.status, latencyMs: Date.now() - startMs,
             wasRateLimited: false, pacingMs
@@ -878,9 +845,9 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         }
         let errBody = null;
         try { errBody = JSON.parse(respText); } catch {}
-        console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} | error: ${JSON.stringify(errBody)}`);
+        console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} | error: ${JSON.stringify(errBody).slice(0, 500)}`);
         metrics.recordRequest({
-          method: 'POST', path: '/v1/chat/completions',
+          method: 'POST', path: metricPath,
           model: modelId, keyLabel: key.label,
           streaming: !!body.stream, statusCode: resp.status, latencyMs: Date.now() - startMs,
           wasRateLimited: false, pacingMs
@@ -906,7 +873,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
           };
           console.warn(`[UPSTREAM 500 INTERCEPT] Converted to 400: ${respText}`);
           metrics.recordRequest({
-            method: 'POST', path: '/v1/chat/completions',
+            method: 'POST', path: metricPath,
             model: modelId, keyLabel: key.label,
             streaming: !!body.stream, statusCode: 400, latencyMs: Date.now() - startMs,
             wasRateLimited: false, pacingMs
@@ -931,10 +898,10 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
         const showMsg = resp.status >= 500
           ? 'Upstream server error — all retries exhausted'
           : `Upstream ${resp.status}`;
-        console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} | error: ${JSON.stringify(errBody)}`);
+        console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} | error: ${JSON.stringify(errBody).slice(0, 500)}`);
         const latencyMs = Date.now() - startMs;
         metrics.recordRequest({
-          method: 'POST', path: '/v1/chat/completions',
+          method: 'POST', path: metricPath,
           model: modelId, keyLabel: key.label,
           streaming: !!body.stream, statusCode: showStatus, latencyMs,
           wasRateLimited: false, pacingMs
@@ -956,7 +923,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       }
       const { pt, ct, tt, cacht } = extractUsageFields(data.usage);
       metrics.recordRequest({
-        method: 'POST', path: '/v1/chat/completions',
+        method: 'POST', path: metricPath,
         model: modelId, keyLabel: key.label,
         streaming: false, statusCode: 200, latencyMs: Date.now() - startMs,
         promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
@@ -970,7 +937,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       if (typeof ttftFired !== 'undefined' && ttftFired) {
         const latencyMs = Date.now() - startMs;
         metrics.recordRequest({
-          method: 'POST', path: '/v1/chat/completions',
+          method: 'POST', path: metricPath,
           model: modelId, keyLabel: key.label,
           streaming: !!body.stream, statusCode: 504, latencyMs,
           wasRateLimited: false, pacingMs
@@ -982,7 +949,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       if (req?.clientAbortSignal?.aborted) {
         const latencyMs = Date.now() - startMs;
         metrics.recordRequest({
-          method: 'POST', path: '/v1/chat/completions',
+          method: 'POST', path: metricPath,
           model: modelId, keyLabel: key.label,
           streaming: !!body.stream, statusCode: 499, latencyMs,
           wasRateLimited: false, pacingMs
@@ -1001,7 +968,7 @@ async function proxyOpenai(body, reqHeaders, model, req = null) {
       }
       const latencyMs = Date.now() - startMs;
       metrics.recordRequest({
-        method: 'POST', path: '/v1/chat/completions',
+        method: 'POST', path: metricPath,
         model: modelId, keyLabel: key.label,
         streaming: !!body.stream, statusCode: e.name === 'TimeoutError' ? 408 : 502, latencyMs,
         wasRateLimited: false, pacingMs
@@ -1083,7 +1050,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         else {
           const onAbort = () => ppAbortController.abort();
           ppClientSignal.addEventListener('abort', onAbort, { once: true });
-          setTimeout(() => ppClientSignal.removeEventListener('abort', onAbort), ppTimeoutMs + 1000).unref();
+          res.on('close', () => ppClientSignal.removeEventListener('abort', onAbort));
         }
       }
       
@@ -1283,7 +1250,6 @@ async function handleChatCompletions(body, req, res) {
   const result = await proxyOpenai(body, forwardHeaders(req), body.model, req);
 
   if (result.stream) {
-    let streamError;
     try {
       const respHeaders = {
         'Content-Type': 'text/event-stream',
@@ -1325,17 +1291,19 @@ async function handleChatCompletions(body, req, res) {
             streamBuffer = streamBuffer.slice(-MAX_STREAM_BUFFER);
           }
         }
-      } catch (e) { streamError = e; console.error('[stream error] handleChatCompletions:', e.message); }
+      } catch (e) { console.error('[stream error] handleChatCompletions:', e.message); }
       if (res.writableEnded) return;
-      if (!hasContent) {
-        const friendlyMsg = `The context/history for model "${body.model}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
-        const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
-        res.write(errChunk);
-      }
-      if (!streamBuffer.includes('data: [DONE]')) {
-        res.write('data: [DONE]\n\n');
-      }
-      res.end();
+      try {
+        if (!hasContent) {
+          const friendlyMsg = `The context/history for model "${body.model}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
+          const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
+          res.write(errChunk);
+        }
+        if (!streamBuffer.includes('data: [DONE]')) {
+          res.write('data: [DONE]\n\n');
+        }
+        res.end();
+      } catch {}
 
       try {
         // First try the preserved usage snippet
@@ -1362,7 +1330,7 @@ async function handleChatCompletions(body, req, res) {
             }
           }
         }
-      } catch {}
+      } catch (usageErr) { console.warn(`[USAGE] Parse failed for ${body.model}: ${usageErr.message}`); }
 
       const { pt, ct, tt, cacht } = extractUsageFields(lastUsage);
       metrics.recordRequest({
@@ -1371,7 +1339,7 @@ async function handleChatCompletions(body, req, res) {
         model: result.model,
         keyLabel: result.key.label,
         streaming: true,
-        statusCode: 200,
+        statusCode: (req?.clientAbortSignal?.aborted) ? 499 : 200,
         latencyMs: Date.now() - result.startMs,
         ttftMs,
         promptTokens: pt,
@@ -1383,6 +1351,7 @@ async function handleChatCompletions(body, req, res) {
         pacingMs: result.pacingMs || 0
       });
     } finally {
+      try { reader.cancel(); } catch {}
       pool.releaseSuccess(result.key);
       decInFlight();
     }
@@ -1396,7 +1365,7 @@ async function handleChatCompletions(body, req, res) {
 async function handleAnthropicMessages(rawBody, req, res) {
   let aBody;
   try { aBody = JSON.parse(rawBody); } catch (e) {
-    console.error('[JSON PARSE ERROR] messages raw:', JSON.stringify(rawBody), 'err:', e.message);
+    console.error('[JSON PARSE ERROR] messages raw:', JSON.stringify(rawBody).slice(0, 1000), 'err:', e.message);
     return jsonResp(res, 400, anthropicError('invalid_request_error', 'Invalid JSON body: ' + e.message));
   }
 
@@ -1406,16 +1375,8 @@ async function handleAnthropicMessages(rawBody, req, res) {
 
   const requestedModel = aBody.model;
   aBody.model = resolveTargetModel(aBody.model);
-  console.log(`[ROUTE-DEBUG] Claude requested: ${requestedModel} -> Resolved to: ${aBody.model}`);
 
-  // Dump payload for debugging loop
-  try {
-    require('fs').writeFileSync(path.join(require('os').tmpdir(), 'claude_payload.json'), JSON.stringify(aBody, null, 2));
-  } catch (e) {
-    console.warn(`[DEBUG-DUMP] Failed to write claude_payload.json: ${e.message}`);
-  }
-
-  if (aBody.model in RETIRED_MODELS || isModelUnavailable(aBody.model)) {
+  if (isModelUnavailable(aBody.model)) {
     return jsonResp(res, 404, anthropicError('not_found_error', `Model ${aBody.model} is retired or unavailable`));
   }
 
@@ -1424,10 +1385,9 @@ async function handleAnthropicMessages(rawBody, req, res) {
   for (const p of PROACTIVE_DROP) { delete oaiBody[p]; }
   const inputTokens = estimateInputTokens(aBody);
 
-  const result = await proxyOpenai(oaiBody, forwardHeaders(req), aBody.model, req);
+  const result = await proxyOpenai(oaiBody, forwardHeaders(req), aBody.model, req, '/v1/messages');
 
   if (result.stream) {
-    let streamError;
     try {
       const respHeaders = {
         'Content-Type': 'text/event-stream',
@@ -1447,29 +1407,38 @@ async function handleAnthropicMessages(rawBody, req, res) {
             hasContent = true;
           }
         }
-      } catch (e) { streamError = e; console.error('[stream error] handleAnthropicMessages:', e.message); }
+      } catch (e) { console.error('[stream error] handleAnthropicMessages:', e.message); }
       if (res.writableEnded) return;
-      if (!hasContent) {
-        const friendlyMsg = `The Claude Code session history is too large and exceeds the model's context limit (or the upstream connection was closed immediately). Please exit the current Claude session (type /exit or Ctrl+D) and run 'claude' again to start a clean session.`;
-        const errEvent = `event: error\ndata: ${JSON.stringify({ error: { type: 'api_error', message: friendlyMsg } })}\n\n`;
-        res.write(errEvent);
-      }
-      res.end();
+      try {
+        if (!hasContent) {
+          const friendlyMsg = `The Claude Code session history is too large and exceeds the model's context limit (or the upstream connection was closed immediately). Please exit the current Claude session (type /exit or Ctrl+D) and run 'claude' again to start a clean session.`;
+          const errEvent = `event: error\ndata: ${JSON.stringify({ error: { type: 'api_error', message: friendlyMsg } })}\n\n`;
+          res.write(errEvent);
+        }
+        if (!res.writableEnded) {
+          res.write('event: message_stop\ndata: {"type":"message_stop"}\n\n');
+          res.end();
+        }
+      } catch {}
 
-      const { pt, ct, tt, cacht } = extractUsageFields(capture.usage);
+      let { pt, ct, tt, cacht } = extractUsageFields(capture.usage);
+      if (!tt && inputTokens > 0) {
+        pt = inputTokens;
+        cacht = 0;
+      }
       metrics.recordRequest({
         method: 'POST',
         path: '/v1/messages',
         model: aBody.model,
         keyLabel: result.key.label,
         streaming: true,
-        statusCode: 200,
+        statusCode: (req?.clientAbortSignal?.aborted) ? 499 : 200,
         latencyMs: Date.now() - result.startMs,
         ttftMs: capture.ttftMs || 0,
         promptTokens: pt,
         completionTokens: ct,
         cachedTokens: cacht,
-        totalTokens: tt,
+        totalTokens: tt || (pt + ct),
         wasRateLimited: false,
         retries: 0,
         pacingMs: result.pacingMs || 0
@@ -1481,9 +1450,11 @@ async function handleAnthropicMessages(rawBody, req, res) {
     return;
   }
 
+  // Non-streaming Anthropic response — proxyOpenai already recorded under
+  // /v1/chat/completions with result.data.usage.  Just transform and return.
   if (result.status === 200 && result.data) {
     const anthroResp = openaiToAnthropic(result.data, aBody.model, req.requestId);
-    jsonResp(res, 200, anthroResp, result.key?.label);
+    try { jsonResp(res, 200, anthroResp, result.key?.label); } catch {}
     return;
   }
 
@@ -1499,7 +1470,7 @@ async function handleAnthropicMessages(rawBody, req, res) {
     result.status >= 400 && result.status < 500 ? 'invalid_request_error' :
     'api_error'
   );
-  jsonResp(res, result.status, anthropicError(errType, errMsg));
+  try { jsonResp(res, result.status, anthropicError(errType, errMsg)); } catch {}
 }
 
 /** GET /health */
@@ -1579,7 +1550,7 @@ async function handleModels(res, url = null) {
 /** GET /v1/models/:model */
 async function handleModelInfo(modelId, res) {
   const desc = describe(modelId, BASE_LLM, BASE_GENAI);
-  if (modelId in RETIRED_MODELS) desc.availability = RETIRED_MODELS[modelId];
+  // RETIRED_MODELS check removed — always empty in transparent proxy mode
   jsonResp(res, 200, enrichModelMetadata(modelId, desc));
 }
 
@@ -1628,7 +1599,7 @@ async function handleCatchAll(req, res, path, url) {
   if (isPost) {
     body.model = modelId;
   }
-  if (modelId in RETIRED_MODELS || isModelUnavailable(modelId) || modelId === 'unknown') {
+  if (isModelUnavailable(modelId) || modelId === 'unknown') {
     return jsonResp(res, 404, { error: { message: modelId === 'unknown' ? 'Unknown model — cannot route request' : `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
   }
   
@@ -1700,7 +1671,7 @@ async function handleCatchAll(req, res, path, url) {
         else {
           const onAbort = () => caAbortController.abort();
           caClientSignal.addEventListener('abort', onAbort, { once: true });
-          setTimeout(() => caClientSignal.removeEventListener('abort', onAbort), caTimeoutMs + 1000).unref();
+          res.on('close', () => caClientSignal.removeEventListener('abort', onAbort));
         }
       }
       const resp = await undiciFetch(targetUrl, {
@@ -1853,13 +1824,16 @@ async function handleCatchAll(req, res, path, url) {
               streamBuffer = streamBuffer.slice(-MAX_STREAM_BUFFER);
             }
           }
+        } catch (e) { console.error('[stream error] handleCatchAll:', e.message); }
+        try { reader.cancel(); } catch {}
+        try {
+          if (!hasContent) {
+            const friendlyMsg = `The context/history for model "${modelId}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
+            const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
+            res.write(errChunk);
+          }
+          res.end();
         } catch {}
-        if (!hasContent) {
-          const friendlyMsg = `The context/history for model "${modelId}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
-          const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
-          res.write(errChunk);
-        }
-        res.end();
 
         let lastUsage = null;
         try {
@@ -1888,16 +1862,19 @@ async function handleCatchAll(req, res, path, url) {
           }
         } catch {}
 
-        const { pt, ct, tt, cacht } = extractUsageFields(lastUsage);
-        metrics.recordRequest({
-          method, path, model: modelId, keyLabel: key.label,
-          streaming: true, statusCode: resp.status, latencyMs: Date.now() - startMs,
-          ttftMs,
-          promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
-          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
-        });
-        pool.releaseSuccess(key);
-        decInFlight();
+        try {
+          const { pt, ct, tt, cacht } = extractUsageFields(lastUsage);
+          metrics.recordRequest({
+            method, path, model: modelId, keyLabel: key.label,
+            streaming: true, statusCode: resp.status, latencyMs: Date.now() - startMs,
+            ttftMs,
+            promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
+            wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+          });
+        } catch {} finally {
+          pool.releaseSuccess(key);
+          decInFlight();
+        }
         return;
       }
 
@@ -1912,24 +1889,30 @@ async function handleCatchAll(req, res, path, url) {
       }
 
       if (isJson) {
-        const { pt, ct, tt, cacht } = extractUsageFields(responseData.usage);
-        metrics.recordRequest({
-          method, path, model: modelId, keyLabel: key.label,
-          streaming: false, statusCode: resp.status, latencyMs: Date.now() - startMs,
-          promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
-          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
-        });
-        pool.releaseSuccess(key);
-        decInFlight();
+        try {
+          const { pt, ct, tt, cacht } = extractUsageFields(responseData.usage);
+          metrics.recordRequest({
+            method, path, model: modelId, keyLabel: key.label,
+            streaming: false, statusCode: resp.status, latencyMs: Date.now() - startMs,
+            promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
+            wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+          });
+        } catch {} finally {
+          pool.releaseSuccess(key);
+          decInFlight();
+        }
         return jsonResp(res, resp.status, responseData);
       } else {
-        metrics.recordRequest({
-          method, path, model: modelId, keyLabel: key.label,
-          streaming: false, statusCode: resp.status, latencyMs: Date.now() - startMs,
-          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
-        });
-        pool.releaseSuccess(key);
-        decInFlight();
+        try {
+          metrics.recordRequest({
+            method, path, model: modelId, keyLabel: key.label,
+            streaming: false, statusCode: resp.status, latencyMs: Date.now() - startMs,
+            wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+          });
+        } catch {} finally {
+          pool.releaseSuccess(key);
+          decInFlight();
+        }
         res.writeHead(resp.status, { 'Content-Type': contentType });
         return res.end(responseData);
       }
@@ -2025,6 +2008,7 @@ async function handleRequest(req, res) {
       res.write(`event: connected\ndata: {"status":"ok"}\n\n`);
       sseClients.add(res);
       const keepalive = setInterval(() => {
+        if (res.destroyed) { clearInterval(keepalive); return; }
         try { res.write(': keepalive\n\n'); } catch { clearInterval(keepalive); }
       }, 3000);
       req.on('close', () => {
@@ -2267,7 +2251,7 @@ async function handleRequest(req, res) {
       const raw = await readBody(req);
       let body;
       try { body = JSON.parse(raw); } catch (e) {
-        console.error('[JSON PARSE ERROR] completions raw:', JSON.stringify(raw), 'err:', e.message);
+        console.error('[JSON PARSE ERROR] completions raw:', JSON.stringify(raw).slice(0, 1000), 'err:', e.message);
         return jsonResp(res, 400, { error: { message: 'Invalid JSON: ' + e.message, type: 'invalid_request_error' } });
       }
       // handleChatCompletions() calls resolveTargetModel(body.model) itself,
@@ -2308,7 +2292,7 @@ async function handleRequest(req, res) {
 
       const modelId = resolveTargetModel(body.model || '');
       body.model = modelId;
-      if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+      if (isModelUnavailable(modelId)) {
         return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
       }
 
@@ -2341,7 +2325,7 @@ async function handleRequest(req, res) {
         CURATED_GENAI.includes(modelId) ||
         pool.modelsCached.includes(modelId) ||
         classify(modelId).type === 'image';
-      if (!modelId || !knownImageModel || modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+      if (!modelId || !knownImageModel || isModelUnavailable(modelId)) {
         return jsonResp(res, 404, { error: { message: `Image model ${modelId || '(missing)'} is not available — must be a known NIM Visual GenAI model (e.g. black-forest-labs/flux.1-dev)`, type: 'invalid_request_error' } });
       }
 
@@ -2380,7 +2364,7 @@ async function handleRequest(req, res) {
         CURATED_GENAI.includes(modelId) ||
         pool.modelsCached.includes(modelId) ||
         classify(modelId).type === 'image';
-      if (!modelId || !knownImageModel || modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+      if (!modelId || !knownImageModel || isModelUnavailable(modelId)) {
         return jsonResp(res, 404, { error: { message: `Image model ${modelId || '(missing)'} is not available`, type: 'invalid_request_error' } });
       }
 
@@ -2423,7 +2407,7 @@ async function handleRequest(req, res) {
 
       const modelId = resolveTargetModel(body.model || '');
       body.model = modelId;
-      if (modelId in RETIRED_MODELS || isModelUnavailable(modelId)) {
+      if (isModelUnavailable(modelId)) {
         return jsonResp(res, 404, { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } });
       }
 
@@ -2443,7 +2427,7 @@ async function handleRequest(req, res) {
 
       if (!oBody.model) return jsonResp(res, 400, { error: 'model is required' });
       oBody.model = resolveTargetModel(oBody.model);
-      if (oBody.model in RETIRED_MODELS || isModelUnavailable(oBody.model)) {
+      if (isModelUnavailable(oBody.model)) {
         return jsonResp(res, 404, { error: { message: `Model ${oBody.model} is retired or unavailable`, type: 'invalid_request_error' } });
       }
 
@@ -2466,7 +2450,7 @@ async function handleRequest(req, res) {
         if (chatBody[k] === undefined) delete chatBody[k];
       }
 
-      const result = await proxyOpenai(chatBody, forwardHeaders(req), oBody.model, req);
+      const result = await proxyOpenai(chatBody, forwardHeaders(req), oBody.model, req, '/api/chat');
 
       if (result.stream) {
         res.writeHead(200, {
@@ -2532,7 +2516,7 @@ async function handleRequest(req, res) {
           metrics.recordRequest({
             method: 'POST', path: '/api/chat',
             model: oBody.model, keyLabel: result.key.label,
-            streaming: true, statusCode: 200,
+            streaming: true, statusCode: (req?.clientAbortSignal?.aborted) ? 499 : 200,
             latencyMs: Date.now() - result.startMs,
             ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
           });
@@ -2585,7 +2569,7 @@ async function handleRequest(req, res) {
 
       if (!oBody.model) return jsonResp(res, 400, { error: 'model is required' });
       oBody.model = resolveTargetModel(oBody.model);
-      if (oBody.model in RETIRED_MODELS || isModelUnavailable(oBody.model)) {
+      if (isModelUnavailable(oBody.model)) {
         return jsonResp(res, 404, { error: { message: `Model ${oBody.model} is retired or unavailable`, type: 'invalid_request_error' } });
       }
 
@@ -2613,7 +2597,7 @@ async function handleRequest(req, res) {
         chatBody.messages.unshift({ role: 'system', content: 'Previous context tokens: ' + JSON.stringify(oBody.context) });
       }
 
-      const result = await proxyOpenai(chatBody, forwardHeaders(req), oBody.model, req);
+      const result = await proxyOpenai(chatBody, forwardHeaders(req), oBody.model, req, '/api/generate');
 
       if (result.stream) {
         res.writeHead(200, {
@@ -2680,7 +2664,7 @@ async function handleRequest(req, res) {
           metrics.recordRequest({
             method: 'POST', path: '/api/generate',
             model: oBody.model, keyLabel: result.key.label,
-            streaming: true, statusCode: 200,
+            streaming: true, statusCode: (req?.clientAbortSignal?.aborted) ? 499 : 200,
             latencyMs: Date.now() - result.startMs,
             ttftMs, wasRateLimited: false, pacingMs: result.pacingMs || 0,
           });
@@ -2832,7 +2816,7 @@ function startKeyReload() {
     } catch (e) {
       console.error(`[wrapper-nvidia] Background config reload error:`, e.message);
     }
-  }, keysReloadSec * 1000);
+  }, keysReloadSec * 1000).unref();
 }
 
 // ── Start ───────────────────────────────────────────────────────────────
@@ -2881,7 +2865,7 @@ async function main() {
     verifyLoop();
   }
 
-  setInterval(() => metrics.prune(30), 6 * 3600 * 1000);
+  setInterval(() => metrics.prune(30), 6 * 3600 * 1000).unref();
 
   const shutdown = () => {
     console.log('[wrapper-nvidia] Shutting down...');
@@ -2910,6 +2894,12 @@ async function main() {
   };
   process.on('SIGTERM', shutdown);
   process.on('SIGINT',  shutdown);
+  process.on('uncaughtException', (err) => {
+    console.error('[FATAL] uncaughtException:', err.message, err.stack);
+  });
+  process.on('unhandledRejection', (reason) => {
+    console.error('[FATAL] unhandledRejection:', reason);
+  });
 }
 
 main().catch(e => {

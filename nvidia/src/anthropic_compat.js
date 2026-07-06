@@ -344,6 +344,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let lastUsageChunk = '';
   let isFirstRead = true;
 
   // Periodic heartbeat (ping) during long idle periods
@@ -360,8 +361,9 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   const clearHeartbeat = () => { if (heartbeatTimer) { clearTimeout(heartbeatTimer); heartbeatTimer = null; } };
 
   try {
+    let pendingRead = reader.read();
     while (true) {
-      const result = await Promise.race([reader.read(), heartbeatPromise()]);
+      const result = await Promise.race([pendingRead, heartbeatPromise()]);
       clearHeartbeat();
       if (result._heartbeat) {
         yield _sse('ping', { type: 'ping' });
@@ -370,12 +372,15 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       const { done, value } = result;
       if (done) break;
       lastDataTime = Date.now();
+      pendingRead = reader.read();
       if (isFirstRead) {
         capture.ttftMs = capture._startMs ? (Date.now() - capture._startMs) : 0;
         isFirstRead = false;
       }
 
-      buffer += decoder.decode(value, { stream: true });
+      const chunkText = decoder.decode(value, { stream: true });
+      buffer += chunkText;
+      if (chunkText.includes('"usage"')) lastUsageChunk = chunkText;
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
 
@@ -387,7 +392,11 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
 
         let chunk;
         try { chunk = JSON.parse(data); } catch { continue; }
-        if (chunk.usage) usage = chunk.usage;
+        if (chunk.usage && typeof chunk.usage === 'object' && Object.keys(chunk.usage).length > 0) {
+          usage = chunk.usage;
+          capture.usage = chunk.usage;
+        }
+        if (!chunk.choices || chunk.choices.length === 0) continue;
 
         const choices = chunk.choices || [];
         if (choices.length === 0) continue;
@@ -421,10 +430,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
               if (inside) {
                 yield* emitThinkingDelta(inside);
               }
-              if (openIdx !== null) {
-                yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-                openIdx = null;
-              }
+              yield* stopOpen();
               if (after) {
                 yield* emitText(after);
               }
@@ -441,10 +447,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
           const oi = tc.index ?? 0;
           const fn = tc.function || {};
           if (!(oi in toolMap)) {
-            if (openIdx !== null) {
-              yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx });
-            }
-            textIndex = null;
+            yield* stopOpen();
             const ai = nextIndex++;
             toolMap[oi] = ai;
             openIdx = ai;
@@ -482,6 +485,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       }
     }
   } finally {
+    clearHeartbeat();
+    reader.cancel().catch(() => {});
     try { reader.releaseLock(); } catch {}
   }
 
@@ -501,7 +506,17 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   });
   yield _sse('message_stop', { type: 'message_stop' });
 
-  capture.usage = usage;
+  if (!capture.usage || Object.keys(capture.usage).length === 0) {
+    if (lastUsageChunk) {
+      const usageMatch = lastUsageChunk.match(/"usage"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\})/);
+      if (usageMatch) {
+        try { capture.usage = JSON.parse(usageMatch[1]); } catch {}
+      }
+    }
+  }
+  if (!capture.usage || Object.keys(capture.usage).length === 0) {
+    capture.usage = usage;
+  }
   capture.stop = finalStop;
 }
 
