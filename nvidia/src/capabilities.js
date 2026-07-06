@@ -281,17 +281,6 @@ function classify(modelId) {
         result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
       }
       
-      // Context window overrides
-      if (mid.includes('minimax-m3') || mid.includes('minimax-m2.7')) {
-        result.context_window = 1000000;
-      } else if (mid.includes('phi-3-vision-128k') || mid.includes('128k') || mid.includes('128b')) {
-        result.context_window = 128000;
-      } else if (mid.includes('32k') || mid.includes('nemotron-4-340b')) {
-        result.context_window = 32768;
-      } else if (mid.includes('llama-3.1') || mid.includes('llama-3.2') || mid.includes('llama-3.3')) {
-        result.context_window = 131072;
-      }
-
       // Evict oldest entry if cache exceeds limit
       if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
         const firstKey = _classifyCache.keys().next().value;
@@ -320,17 +309,6 @@ function classify(modelId) {
     result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
   }
   
-  // Context window overrides for fallback
-  if (mid.includes('minimax-m3') || mid.includes('minimax-m2.7')) {
-    result.context_window = 1000000;
-  } else if (mid.includes('phi-3-vision-128k') || mid.includes('128k') || mid.includes('128b')) {
-    result.context_window = 128000;
-  } else if (mid.includes('32k') || mid.includes('nemotron-4-340b')) {
-    result.context_window = 32768;
-  } else if (mid.includes('llama-3.1') || mid.includes('llama-3.2') || mid.includes('llama-3.3')) {
-    result.context_window = 131072;
-  }
-
   if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
     const firstKey = _classifyCache.keys().next().value;
     if (firstKey !== undefined) _classifyCache.delete(firstKey);
