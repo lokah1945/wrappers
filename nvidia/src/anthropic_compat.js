@@ -138,7 +138,10 @@ function anthropicToOpenai(a) {
   // rejects or silently truncates (often to a tiny default) when max_tokens is
   // missing — truncation mid-tool-call corrupts the JSON in tool_calls.arguments.
   // Default to a sane value when omitted so the request is always well-formed.
-  oai.max_tokens = a.max_tokens != null ? a.max_tokens : 4096;
+  // 8192 (was 4096) gives large tool_calls.arguments JSON room to complete
+  // without mid-stream truncation. Claude Code's SDK always sends max_tokens,
+  // so this only affects non-SDK clients.
+  oai.max_tokens = a.max_tokens != null ? a.max_tokens : 8192;
 
   const paramMap = [
     ['temperature', 'temperature'],
@@ -194,6 +197,7 @@ function estimateInputTokens(a) {
         if (!blk || typeof blk !== 'object') continue;
         const t = blk.type;
         if (t === 'text') chars += (blk.text || '').length;
+        else if (t === 'thinking') chars += (blk.thinking || '').length;
         else if (t === 'tool_use') chars += (blk.name || '').length + JSON.stringify(blk.input || {}).length;
         else if (t === 'tool_result') {
           const rc = blk.content || '';
@@ -406,9 +410,14 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
         let contentText = delta.content || "";
         const reasoning = delta.reasoning_content || delta.reasoning;
 
+        // Some NIM models emit BOTH reasoning_content and content in a single
+        // delta. The previous `if (reasoning) ... else if (contentText)` form
+        // dropped the content text whenever reasoning was present, silently
+        // losing output. Emit each independently so neither is lost.
         if (reasoning) {
           yield* emitThinkingDelta(reasoning);
-        } else if (contentText) {
+        }
+        if (contentText) {
           if (!inThinkTag && contentText.includes("<think>")) {
             inThinkTag = true;
             const parts = contentText.split("<think>");
@@ -495,6 +504,16 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       }
     } catch {}
     try { reader.releaseLock(); } catch {}
+    // If the read loop threw (upstream error / abort) BEFORE the normal
+    // terminal-event path below could run, the stream would be left with an
+    // open content_block (content_block_start with no matching
+    // content_block_stop). Close any still-open block here so the SSE stream
+    // stays well-formed even on the error path. The handler emits the
+    // terminal `error` event; we only ensure block-level integrity.
+    if (openIdx !== null) {
+      try { yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx }); } catch {}
+      openIdx = null;
+    }
   }
 
   if (openIdx !== null) {

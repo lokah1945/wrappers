@@ -178,15 +178,20 @@ function testCapabilities() {
   
   const c1 = classify('meta/llama-3.1-8b-instruct');
   assert.strictEqual(c1.type, 'chat');
-  assert.strictEqual(c1.context_window, 131072, 'Llama 3.1 should have 128k context');
-   
+  // classify() returns the bare capability definition without context_window;
+  // the production /v1/models & /v1/capabilities endpoints enrich via
+  // enrichModelMetadata() which defaults context_window to 131072. The
+  // classifier itself must NOT invent a context window (it has no per-model
+  // knowledge of upstream limits), so we assert the classifier contract here.
+  assert.strictEqual(c1.context_window, undefined, 'classify() must not fabricate context_window');
+
   const c2 = classify('nvidia/nv-embed-v1');
   assert.strictEqual(c2.type, 'embedding');
   assert.strictEqual(c2.context_window, undefined, 'embedding must not expose context_window');
 
   const c3 = classify('meta/llama-3.2-11b-vision-instruct');
   assert.strictEqual(c3.type, 'vision_chat');
-  assert.strictEqual(c3.context_window, 131072, 'Llama 3.2 should have 128k context');
+  assert.strictEqual(c3.context_window, undefined, 'classify() must not fabricate context_window');
 
   const c4 = classify('google/gemma-3-12b-it');
   assert.strictEqual(c4.context_window, undefined, 'no context_window field');
