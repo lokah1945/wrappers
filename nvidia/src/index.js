@@ -1954,11 +1954,6 @@ async function handleRequest(req, res) {
     path = url.pathname;
     method = req.method;
 
-    // Normalize double /v1/v1/... → /v1/... (some clients misconfigure base URL
-    // with a trailing /v1, causing the SDK to send /v1/v1/messages etc.)
-    if (path.startsWith('/v1/v1/')) {
-      path = path.replace(/^\/v1\/v1\//, '/v1/');
-    }
   } catch (e) {
     console.warn(`[${requestId}] Malformed request URL: ${req.url}`);
     return jsonResp(res, 400, { error: { message: 'Invalid request URL', type: 'invalid_request_error' } });
