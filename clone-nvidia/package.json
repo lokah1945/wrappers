@@ -1,0 +1,17 @@
+{
+  "name": "wrapper-nvidia",
+  "version": "8.6.0",
+  "description": "NVIDIA NIM API proxy with key rotation, rate limiting, and metrics",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node test/test.js"
+  },
+  "engines": { "node": ">=18.0.0" },
+  "dependencies": {
+    "sql.js": "^1.11.0",
+    "dotenv": "^16.4.7",
+    "undici": "^7.6.0"
+  }
+}
