@@ -18,15 +18,6 @@ const { URL } = require('url');
 const { fetch: undiciFetch, Agent } = require('undici');
 
 // Combine multiple AbortSignals into one (fires if ANY signal aborts)
-function anySignal(signals) {
-  const controller = new AbortController();
-  for (const signal of signals) {
-    if (signal.aborted) { controller.abort(); break; }
-    signal.addEventListener('abort', () => controller.abort(), { once: true });
-  }
-  return controller.signal;
-}
-
 // Canonical wrapper dir
 const WRAPPER_DIR = path.resolve(__dirname, '..');
 
@@ -758,21 +749,24 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
           h[k] = v;
         }
       }
-      const timeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
-      const timeoutMs = (body.stream ? Math.max(timeoutSec, 600) : timeoutSec) * 1000;
+      const timeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '120', 10);
+      const timeoutMs = (body.stream ? Math.max(timeoutSec, 120) : timeoutSec) * 1000;
       
       ttftTimer = setTimeout(() => {
         ttftFired = true;
         console.warn(`[TTFT] Upstream model=${modelId} slow (>${ttftMs}ms), still waiting for REQUEST_TIMEOUT=${timeoutSec}s`);
       }, ttftMs);
       
-      const timeoutSignal = AbortSignal.timeout(timeoutMs);
+      const clientSignal = req?.clientAbortSignal;
+      const fetchSignal = clientSignal
+        ? AbortSignal.any([clientSignal, AbortSignal.timeout(timeoutMs)])
+        : AbortSignal.timeout(timeoutMs);
       const resp = await undiciFetch(url, {
         method: 'POST',
         headers: h,
         body: JSON.stringify(body),
         dispatcher: agent,
-        signal: timeoutSignal,
+        signal: fetchSignal,
       });
       clearTimeout(ttftTimer);
 
@@ -955,6 +949,19 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
       return { status: 200, data, key };
     } catch (e) {
       if (typeof ttftTimer !== 'undefined') clearTimeout(ttftTimer);
+      // Client disconnected — abort upstream immediately, free the key
+      if (req?.clientAbortSignal?.aborted) {
+        const latencyMs = Date.now() - startMs;
+        metrics.recordRequest({
+          method: 'POST', path: metricPath,
+          model: modelId, keyLabel: key.label,
+          streaming: !!body.stream, statusCode: 499, latencyMs,
+          wasRateLimited: false, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return { status: 499, data: { error: { message: 'Client disconnected', type: 'client_error' } } };
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
@@ -1038,14 +1045,18 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
     try {
       incInFlight();
       const targetUrl = getTargetUrl ? getTargetUrl(key) : `${resolveBase(modelId)}${path || '/v1/chat/completions'}`;
-      const ppTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
-      const ppTimeoutMs = (body.stream ? Math.max(ppTimeoutSec, 600) : ppTimeoutSec) * 1000;
+      const ppTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '120', 10);
+      const ppTimeoutMs = (body.stream ? Math.max(ppTimeoutSec, 120) : ppTimeoutSec) * 1000;
       
       ttftTimer = setTimeout(() => {
         ttftFired = true;
         console.warn(`[TTFT] Upstream model=${modelId} slow (>${ttftMs}ms), still waiting for REQUEST_TIMEOUT=${ppTimeoutSec}s`);
       }, ttftMs);
       
+      const ppClientSignal = req?.clientAbortSignal;
+      const ppFetchSignal = ppClientSignal
+        ? AbortSignal.any([ppClientSignal, AbortSignal.timeout(ppTimeoutMs)])
+        : AbortSignal.timeout(ppTimeoutMs);
       const resp = await undiciFetch(targetUrl, {
         method: 'POST',
         headers: {
@@ -1055,7 +1066,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         },
         body: JSON.stringify(body),
         dispatcher: agent,
-        signal: AbortSignal.timeout(ppTimeoutMs),
+        signal: ppFetchSignal,
       });
       clearTimeout(ttftTimer);
 
@@ -1197,6 +1208,16 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       return jsonResp(res, resp.status, responseData);
     } catch (e) {
       if (typeof ttftTimer !== 'undefined') clearTimeout(ttftTimer);
+      if (req?.clientAbortSignal?.aborted) {
+        metrics.recordRequest({
+          method: 'POST', path, model: modelId, keyLabel: key.label,
+          streaming: false, statusCode: 499, latencyMs: Date.now() - startMs,
+          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return jsonResp(res, 499, { error: { message: 'Client disconnected', type: 'client_error' } });
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
@@ -1675,15 +1696,18 @@ async function handleCatchAll(req, res, path, url) {
       if (isPost) {
         headers['Content-Type'] = 'application/json';
       }
-      const caTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '600', 10);
-      const caTimeoutMs = (isStreaming ? Math.max(caTimeoutSec, 600) : caTimeoutSec) * 1000;
-      const caAbortController = new AbortController();
+      const caTimeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_TIMEOUT_SEC || '120', 10);
+      const caTimeoutMs = (isStreaming ? Math.max(caTimeoutSec, 120) : caTimeoutSec) * 1000;
+      const caClientSignal = req?.clientAbortSignal;
+      const caFetchSignal = caClientSignal
+        ? AbortSignal.any([caClientSignal, AbortSignal.timeout(caTimeoutMs)])
+        : AbortSignal.timeout(caTimeoutMs);
       const resp = await undiciFetch(targetUrl, {
         method,
         headers,
         body: isPost ? JSON.stringify(body) : undefined,
         dispatcher: agent,
-        signal: anySignal([caAbortController.signal, AbortSignal.timeout(caTimeoutMs)]),
+        signal: caFetchSignal,
       });
 
       let _gen400text = '';
@@ -1921,6 +1945,16 @@ async function handleCatchAll(req, res, path, url) {
         return res.end(responseData);
       }
     } catch (e) {
+      if (req?.clientAbortSignal?.aborted) {
+        metrics.recordRequest({
+          method, path, model: modelId, keyLabel: key.label,
+          streaming: isStreaming, statusCode: 499, latencyMs: Date.now() - startMs,
+          wasRateLimited: false, requestBytes: rawBody.length, pacingMs
+        });
+        pool.releaseSuccess(key);
+        decInFlight();
+        return;
+      }
       if (attempt < MAX_RETRIES) {
         console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
         pool.releaseSuccess(key);
