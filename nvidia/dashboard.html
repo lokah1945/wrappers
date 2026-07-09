@@ -731,9 +731,7 @@ if (_resetBtn) _resetBtn.addEventListener('click', async () => {
   const orig = btn.textContent;
   btn.disabled = true; btn.textContent = '⏳ Resetting…';
   try {
-    const r = await fetch('/metrics/reset', { method: 'POST' });
-    if (!r.ok) throw new Error(r.status);
-    const d = await r.json();
+    const d = await apiFetch('/metrics/reset', { method: 'POST' });
     _modelsCount = 0;
     btn.textContent = '✓ Cleared';
     await refresh();
@@ -805,8 +803,35 @@ const fmtFull = ts => {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const pct = (v, total) => total ? Math.round(v / total * 100) : 0;
 
-async function apiFetch(url) {
-  const r = await fetch(url);
+// Auth token for API calls. Sources (in priority order):
+//   1. <meta name="wrapper-bearer-token"> — injected server-side by the wrapper
+//   2. ?token=... URL query param — for manual override / bookmark
+//   3. sessionStorage('wn-bearer') — persisted from previous source
+// Falls back to no-auth (bare fetch) when no token is set anywhere.
+function getAuthHeaders() {
+  // 1. Meta tag (injected server-side — most reliable)
+  const meta = document.querySelector('meta[name="wrapper-bearer-token"]');
+  if (meta && meta.content) {
+    return { 'Authorization': 'Bearer ' + meta.content };
+  }
+  // 2. URL query param
+  const params = new URLSearchParams(window.location.search);
+  const urlToken = params.get('token');
+  if (urlToken) {
+    try { sessionStorage.setItem('wn-bearer', urlToken); } catch {}
+    return { 'Authorization': 'Bearer ' + urlToken };
+  }
+  // 3. sessionStorage
+  try {
+    const stored = sessionStorage.getItem('wn-bearer');
+    if (stored) return { 'Authorization': 'Bearer ' + stored };
+  } catch {}
+  return {};
+}
+
+async function apiFetch(url, options = {}) {
+  const headers = { ...getAuthHeaders(), ...(options.headers || {}) };
+  const r = await fetch(url, { ...options, headers });
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }

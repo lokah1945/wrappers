@@ -108,7 +108,7 @@ const CAPABILITY_DEFS = {
 // Model classification rules - ordered by specificity (most specific first)
 const CLASSIFICATION_RULES = [
   // Vision/Chat models with vision capabilities
-  { patterns: ['vila', 'neva', '-vision', 'vision-', 'paligemma', 'kosmos', 'llava', 'florence', 'phi-3-vision', 'phi-3.5-vision', 'nvclip', 'fuyu', 'deplot', 'pix2struct', 'git-base', 'git-large', 'mm-reasoner', 'qwen2-vl', 'qwen-vl', 'internvl', 'cogvlm', 'internlm-xcomposer'], type: 'vision_chat' },
+  { patterns: ['vila', 'neva', '-vision', 'vision-', 'paligemma', 'kosmos', 'llava', 'florence', 'phi-3-vision', 'phi-3.5-vision', 'phi-4-multimodal', 'nvclip', 'fuyu', 'deplot', 'pix2struct', 'git-base', 'git-large', 'mm-reasoner', 'qwen2-vl', 'qwen-vl', 'internvl', 'cogvlm', 'internlm-xcomposer', 'gemma-3', 'llama-3.2-vision', 'pixtral', 'molmo', 'aria', 'nemotron-3-vision', 'nemotron-vision'], type: 'vision_chat' },
 
   // Code-specific models
   { patterns: ['code', 'codestral', 'starcoder', 'codegemma', 'deepseek-coder', 'qwen-coder'], type: 'chat', extraCaps: ['code_generation', 'code_completion'] },

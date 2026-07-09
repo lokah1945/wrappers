@@ -527,6 +527,13 @@ class KeyPool {
 
             const rank = Array.from(this._waiting).filter(t => t < myTicket).length;
 
+            // P1-4 FIX: Per-model block should not trigger load shedding for other models
+            // Only shed if ALL models on ALL keys are saturated
+            const modelSpecificShed = model && avail.every(s => {
+              const kml = this._keyModelLimit[`${s.label}/${model}`];
+              return kml !== undefined && this.keyModelRpm(s.label, model) >= Math.max(1, Math.floor(kml * 0.9));
+            });
+
             if (ready.length > 0 && (interval <= 0 || rank < ready.length)) {
               chosen = this._pickKey(ready);
               chosen.record();
@@ -546,6 +553,18 @@ class KeyPool {
               waits.push(Math.max(rpmW, admW));
             }
             wait = waits.length > 0 ? Math.min(...waits) : 1.0;
+
+            // Only apply model-specific wait if ALL keys have this model saturated
+            // Otherwise, other models can still proceed
+            if (modelSpecificShed) {
+              wait = 1.0;
+            } else if (avail.length === 0) {
+              // No keys at all - shed
+              wait = 1.0;
+            } else {
+              // Has available keys for other models - proceed normally
+              // wait already set above
+            }
           } else if (modelSaturated) {
             wait = 1.0;
           } else {
@@ -759,8 +778,14 @@ class KeyPool {
     try {
       const now = Date.now() / 1000;
       for (const s of this.keys) {
-        // Only heal if key has positive inFlight AND hasn't been used recently (stuck > 60s)
-        if (s.inFlight > 0 && s.lastUsed > 0 && (now - s.lastUsed) > 60) {
+        // Only heal if key has positive inFlight AND hasn't been used recently.
+        // Default 600s (10min) — reasoning models (deepseek-v4-pro) can think
+        // for 5+ minutes without sending data. The old 60s threshold caused
+        // healInFlight to falsely reset inFlight=0 for actively-streaming keys
+        // during long thinking pauses, enabling concurrent-request rate limit
+        // violations on the same key.
+        const HEAL_THRESHOLD_SEC = parseInt(process.env.HEAL_INFLIGHT_THRESHOLD_SEC || '600', 10);
+        if (s.inFlight > 0 && s.lastUsed > 0 && (now - s.lastUsed) > HEAL_THRESHOLD_SEC) {
           console.warn(`[wrapper-nvidia] heal_in_flight: ${s.label} in_flight ${s.inFlight} stuck since lastUsed ${Math.round(now - s.lastUsed)}s ago -> 0`);
           s.inFlight = 0;
           totalFixed++;

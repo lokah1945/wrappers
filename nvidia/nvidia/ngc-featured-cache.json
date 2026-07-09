@@ -1,0 +1,26 @@
+{
+  "source": "live",
+  "syncedAt": "2026-07-09T19:45:18.393Z",
+  "map": {
+    "nvidia/nemotron-3-ultra-550b-a55b": {
+      "context": 1048576,
+      "maxOutput": 8192
+    },
+    "nemotron-3-super-120b-a12b": {
+      "context": 1000000,
+      "maxOutput": 8192
+    },
+    "z-ai/glm-5.2": {
+      "context": 202752,
+      "maxOutput": 8192
+    },
+    "minimaxai/minimax-m3": {
+      "context": 196608,
+      "maxOutput": 8192
+    },
+    "deepseek-ai/deepseek-v4-pro": {
+      "context": 262144,
+      "maxOutput": 16384
+    }
+  }
+}

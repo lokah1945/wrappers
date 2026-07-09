@@ -130,7 +130,11 @@ function testAnthropicCompat() {
             }
             return Promise.resolve({ done: true, value: undefined });
           },
-          releaseLock() {}
+          releaseLock() {},
+          // Stream-protocol cancel is optional; the generator's finally
+          // gate now checks `typeof reader.cancel === 'function'`. Provide it
+          // anyway so any other consumer that calls it on a mock doesn't crash.
+          cancel() {}
         };
       }
     };
@@ -153,6 +157,39 @@ function testAnthropicCompat() {
     assert.ok(events.some(e => e.includes('content_block_delta') && e.includes('Hello')), 'Should yield text delta in stream');
   };
 
+  // Synthetic thinking shim: when extended thinking is requested but the model
+  // returns only plain text (no reasoning), a `thinking` block must precede the
+  // text block so Claude Code's content-ordering contract holds.
+  const runSyntheticThinkingTest = async () => {
+    const mockChunks = [
+      'data: {"choices": [{"delta": {"content": "Direct answer" }}]}\n'
+    ];
+    const capture = { _startMs: Date.now() };
+    const sseGen = streamOpenaiToAnthropic(makeMockStream(mockChunks), 'model', capture, 15, 'test_req_002', true);
+    const events = [];
+    for await (const chunk of sseGen) events.push(chunk);
+    const all = events.join('');
+    const thinkingPos = all.indexOf('"type":"thinking"');
+    const textPos = all.indexOf('"type":"text"');
+    assert.ok(thinkingPos > -1, 'Synthetic thinking block must be present');
+    assert.ok(textPos > -1, 'Text block must be present');
+    assert.ok(thinkingPos < textPos, 'Thinking block must come before text block');
+    // The FIRST content_block_start event must carry a thinking block.
+    const firstBlockLine = events.find(e => e.includes('event: content_block_start'));
+    const firstData = JSON.parse(firstBlockLine.split('data: ')[1]);
+    assert.strictEqual(firstData.content_block.type, 'thinking', 'First content block must be the synthetic thinking block');
+    assert.ok(all.includes('responding directly'), 'Synthetic thinking note present');
+
+    // And the non-streaming shim:
+    const oaiResp = {
+      choices: [{ message: { role: 'assistant', content: 'Direct answer' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 3 }
+    };
+    const anthro = openaiToAnthropic(oaiResp, 'model', 'reqX', true);
+    assert.strictEqual(anthro.content[0].type, 'thinking', 'Non-stream first block must be synthetic thinking');
+    assert.strictEqual(anthro.content[1].type, 'text', 'Non-stream second block must be text');
+  };
+
   // Test malformed payload resilience
   const badRequest1 = anthropicToOpenai(null);
   assert.deepStrictEqual(badRequest1, { model: '', messages: [] });
@@ -166,6 +203,52 @@ function testAnthropicCompat() {
   // Run async stream tests synchronously in a promise wait (or since this function is synchronous, we run it and handle completion in runAll)
   testAnthropicCompat.asyncTests = runStreamTest();
 
+  // Verify the generator terminates cleanly on upstream mid-stream error:
+  // it must NOT emit message_delta/message_stop (would produce a silent
+  // truncation or an `event: error` after `message_stop`), and must flag
+  // capture.errored so the HTTP handler can emit a single `event: error`.
+  const makeErrStream = (chunks) => {
+    let index = 0;
+    return {
+      getReader() {
+        return {
+          read() {
+            if (index < chunks.length) {
+              const val = chunks[index++];
+              return Promise.resolve({ done: false, value: new TextEncoder().encode(val) });
+            }
+            return Promise.reject(new Error('socket hang up'));
+          },
+          releaseLock() {},
+          cancel() { return Promise.resolve(); }
+        };
+      }
+    };
+  };
+  const runStreamErrTest = async () => {
+    const mockChunks = [
+      'data: {"choices": [{"delta": {"content": "hello" }}]}\n',
+      'data: {"choices": [{"delta": {"content": " world" }}]}\n'
+    ];
+    const capture = { _startMs: Date.now() };
+    const sseGen = streamOpenaiToAnthropic(makeErrStream(mockChunks), 'model', capture, 5, 'req_err_001');
+    const events = [];
+    let threw = false;
+    try {
+      for await (const chunk of sseGen) events.push(chunk);
+    } catch (e) {
+      threw = true;
+    }
+    const all = events.join('');
+    assert.strictEqual(threw, false, 'Generator must not throw the read error to the consumer');
+    assert.strictEqual(capture.errored, true, 'capture.errored must be set on upstream read failure');
+    assert.strictEqual(all.includes('message_stop'), false, 'Must NOT emit message_stop on error');
+    assert.strictEqual(all.includes('message_delta'), false, 'Must NOT emit message_delta on error');
+    assert.strictEqual(all.includes('content_block_stop'), true, 'Open block must still be closed');
+    assert.strictEqual(all.includes('hello') && all.includes('world'), true, 'Content deltas before the error must be preserved');
+  };
+  testAnthropicCompat.asyncTests = Promise.all([runStreamTest(), runStreamErrTest(), runSyntheticThinkingTest()]);
+
   console.log('✔ Anthropic compatibility tests passed successfully.');
 }
 
@@ -174,15 +257,20 @@ function testCapabilities() {
   
   const c1 = classify('meta/llama-3.1-8b-instruct');
   assert.strictEqual(c1.type, 'chat');
-  assert.strictEqual(c1.context_window, 131072, 'Llama 3.1 should have 128k context');
-   
+  // classify() returns the bare capability definition without context_window;
+  // the production /v1/models & /v1/capabilities endpoints enrich via
+  // enrichModelMetadata() which defaults context_window to 131072. The
+  // classifier itself must NOT invent a context window (it has no per-model
+  // knowledge of upstream limits), so we assert the classifier contract here.
+  assert.strictEqual(c1.context_window, undefined, 'classify() must not fabricate context_window');
+
   const c2 = classify('nvidia/nv-embed-v1');
   assert.strictEqual(c2.type, 'embedding');
   assert.strictEqual(c2.context_window, undefined, 'embedding must not expose context_window');
 
   const c3 = classify('meta/llama-3.2-11b-vision-instruct');
   assert.strictEqual(c3.type, 'vision_chat');
-  assert.strictEqual(c3.context_window, 131072, 'Llama 3.2 should have 128k context');
+  assert.strictEqual(c3.context_window, undefined, 'classify() must not fabricate context_window');
 
   const c4 = classify('google/gemma-3-12b-it');
   assert.strictEqual(c4.context_window, undefined, 'no context_window field');

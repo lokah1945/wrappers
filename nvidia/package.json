@@ -6,9 +6,11 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "node --watch src/index.js",
-    "test": "node test/test.js"
+    "test": "node test/test.js",
+    "test:regression": "node test/regression-timeout.js",
+    "test:e2e": "node test/e2e-mock.js"
   },
-  "engines": { "node": ">=18.0.0" },
+  "engines": { "node": ">=20.18.1" },
   "dependencies": {
     "sql.js": "^1.11.0",
     "dotenv": "^16.4.7",
