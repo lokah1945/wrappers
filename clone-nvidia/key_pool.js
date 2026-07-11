@@ -239,6 +239,13 @@ class KeyPool {
     this.queueLimit = QUEUE_LIMIT_PER_KEY_PER_SEC;
     this.maxQueueSize = MAX_QUEUE_SIZE;
     this._admitInterval = this.queueLimit > 0 ? 1.0 / this.queueLimit : 0.0;
+    // B10 FIX: cache version string at construction time instead of reading
+    // package.json on every healthJson() call.
+    this._version = '8.6.0-node';
+    try {
+      const pkg = require('./package.json');
+      if (pkg && pkg.version) this._version = `${pkg.version}-node`;
+    } catch { /* keep default */ }
     this._lock = new Mutex();
     this._recent429 = [];
     this._modelTs = {};
@@ -981,12 +988,6 @@ class KeyPool {
   // ── Health JSON ──────────────────────────────────────────────────────
 
   healthJson() {
-    // Read version from package.json at call time (lazy, cached by require).
-    let version = '8.6.0-node';
-    try {
-      const pkg = require('./package.json');
-      if (pkg && pkg.version) version = `${pkg.version}-node`;
-    } catch { /* keep default */ }
     return {
       status: this.availableKeys > 0 ? 'ok' : 'degraded',
       total_keys: this.totalKeys,
@@ -996,7 +997,7 @@ class KeyPool {
       hard_limit_rpm: this.hardLimit,
       queue_limit_per_key_per_sec: this.queueLimit,
       models_cached: this._modelsCache.length,
-      version,
+      version: this._version,
     };
   }
 

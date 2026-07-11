@@ -135,10 +135,86 @@ async function testNormalTransition() {
   console.log('✔ testNormalTransition PASSED');
 }
 
+async function testDsmlToolCallsParsing() {
+  console.log('Testing: Streaming DSML tool call parsing and translation...');
+  
+  const chunks = [
+    makeOpenAIChoiceChunk(undefined, 'Hmm, let me run a check.'),
+    makeOpenAIChoiceChunk(undefined, '</think>\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n'),
+    makeOpenAIChoiceChunk(undefined, '<｜DSML｜parameter name="command" string="true">node --version</｜DSML｜parameter>\n'),
+    makeOpenAIChoiceChunk(undefined, '</｜DSML｜invoke>\n</｜DSML｜tool_calls>\nAll done!'),
+    makeOpenAIChoiceChunk(undefined, undefined, 'stop')
+  ];
+
+  const mockStream = makeMockStream(chunks);
+  const capture = {};
+  const generator = streamOpenaiToAnthropic(mockStream, MODEL, capture, 100, 'test-req-3', true);
+  const events = await collectEvents(generator);
+
+  const contentBlockStarts = events.filter(e => e.type === 'content_block_start');
+  console.log('  Content blocks started:', contentBlockStarts.map(e => e.data.content_block.type));
+  
+  assert.strictEqual(contentBlockStarts[0].data.content_block.type, 'thinking');
+  assert.strictEqual(contentBlockStarts[1].data.content_block.type, 'text');
+  assert.strictEqual(contentBlockStarts[2].data.content_block.type, 'tool_use');
+  assert.strictEqual(contentBlockStarts[2].data.content_block.name, 'Bash');
+  assert.strictEqual(contentBlockStarts[3].data.content_block.type, 'text');
+
+  // Verify tool delta json input
+  const toolDeltas = events.filter(e => e.type === 'content_block_delta' && e.data.delta.type === 'input_json_delta');
+  const inputStr = toolDeltas.map(e => e.data.delta.partial_json).join('');
+  console.log('  Parsed Tool Input:', inputStr);
+  const parsedInput = JSON.parse(inputStr);
+  assert.strictEqual(parsedInput.command, 'node --version');
+
+  // Verify trailing text delta
+  const textDeltas = events.filter(e => e.type === 'content_block_delta' && e.data.delta.type === 'text_delta');
+  const textContent = textDeltas.map(e => e.data.delta.text).join('');
+  console.log('  Trailing text content:', JSON.stringify(textContent));
+  assert.strictEqual(textContent.trim(), 'All done!');
+
+  console.log('✔ testDsmlToolCallsParsing PASSED');
+}
+
+async function testDsmlNonStreaming() {
+  console.log('Testing: Non-streaming DSML tool call parsing...');
+  
+  const { openaiToAnthropic } = require('../src/anthropic_compat');
+  const mockOpenaiResponse = {
+    choices: [{
+      message: {
+        role: 'assistant',
+        content: 'Pre-text\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n<｜DSML｜parameter name="command" string="true">node -v</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>\nPost-text',
+        reasoning_content: 'Thinking details'
+      }
+    }]
+  };
+  
+  const result = openaiToAnthropic(mockOpenaiResponse, MODEL);
+  console.log('  Parsed Content Blocks:', result.content);
+  
+  assert.strictEqual(result.content[0].type, 'thinking');
+  assert.strictEqual(result.content[0].thinking, 'Thinking details');
+  
+  assert.strictEqual(result.content[1].type, 'tool_use');
+  assert.strictEqual(result.content[1].name, 'Bash');
+  assert.strictEqual(result.content[1].input.command, 'node -v');
+  
+  assert.strictEqual(result.content[2].type, 'text');
+  assert.strictEqual(result.content[2].text, 'Pre-text');
+  
+  assert.strictEqual(result.content[3].type, 'text');
+  assert.strictEqual(result.content[3].text, 'Post-text');
+
+  console.log('✔ testDsmlNonStreaming PASSED');
+}
+
 async function runAll() {
   try {
     await testReasoningOnlyTransition();
     await testNormalTransition();
+    await testDsmlToolCallsParsing();
+    await testDsmlNonStreaming();
     console.log('\n✔ All thinking parser regression tests PASSED!');
   } catch (err) {
     console.error('\n✗ Test failed:', err);

@@ -371,6 +371,45 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
   if (reasoning) {
     content.push({ type: 'thinking', thinking: reasoning });
   }
+
+  // Parse unstructured DSML tool calls if present in the content
+  if (rawContent.includes("<｜DSML｜tool_calls>") || rawContent.includes("<\uff5cDSML\uff5ctool_calls>")) {
+    const normalized = rawContent.replace(/\uff5c/g, '|');
+    const startIdx = normalized.indexOf("<|DSML|tool_calls>");
+    const endIdx = normalized.indexOf("</|DSML|tool_calls>");
+    if (startIdx !== -1 && endIdx !== -1) {
+      const beforeText = rawContent.substring(0, startIdx).trim();
+      const dsmlBlock = normalized.substring(startIdx, endIdx + 19);
+      const afterText = rawContent.substring(endIdx + 19).trim();
+      
+      let invokeMatch;
+      const invokeRegex = /<\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|invoke>/g;
+      while ((invokeMatch = invokeRegex.exec(dsmlBlock)) !== null) {
+        const name = invokeMatch[1];
+        const inner = invokeMatch[2];
+        const params = {};
+        
+        let paramMatch;
+        const paramRegex = /<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/g;
+        while ((paramMatch = paramRegex.exec(inner)) !== null) {
+          params[paramMatch[1]] = paramMatch[2];
+        }
+        
+        const toolCallId = `call_dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+        content.push({ type: 'tool_use', id: toolCallId, name, input: params });
+      }
+      
+      if (beforeText) {
+        content.push({ type: 'text', text: beforeText });
+      }
+      if (afterText) {
+        content.push({ type: 'text', text: afterText });
+      }
+      
+      rawContent = "";
+    }
+  }
+
   if (rawContent) {
     content.push({ type: 'text', text: rawContent });
   }
@@ -444,6 +483,12 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   let usage = {};
   let inThinkTag = false;
   let completedThinking = false;
+  let inDsmlMode = false;
+  let dsmlBuffer = '';
+  let currentToolIndex = null;
+  let currentToolName = '';
+  let currentToolId = '';
+  let currentToolInput = {};
   let generatedChars = 0;
   // Tracks whether a REAL thinking block was produced by the upstream model.
   // When the client requested extended thinking (Claude Code sends
@@ -542,7 +587,132 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
     });
   };
 
+  const processDsml = async function* (chunk) {
+    dsmlBuffer += chunk;
+    
+    while (true) {
+      const normalized = dsmlBuffer.replace(/\uff5c/g, '|');
+      
+      // 1. Check for invoke start
+      const invokeMatch = normalized.match(/<\|DSML\|invoke\s+name="([^"]+)"[^>]*>/);
+      if (invokeMatch) {
+        const fullTag = invokeMatch[0];
+        const toolName = invokeMatch[1];
+        const matchIdx = normalized.indexOf(fullTag);
+        
+        if (currentToolIndex === null) {
+          const ai = nextIndex++;
+          currentToolIndex = ai;
+          currentToolName = toolName;
+          currentToolId = `toolu_dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}_${ai}`;
+          currentToolInput = {};
+          
+          sentTextOrToolBlock = true;
+          yield* stopOpen();
+          openIdx = ai;
+          
+          yield _sse('content_block_start', {
+            type: 'content_block_start',
+            index: ai,
+            content_block: {
+              type: 'tool_use',
+              id: currentToolId,
+              name: currentToolName,
+              input: {}
+            }
+          });
+        }
+        
+        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+        continue;
+      }
+      
+      // 2. Check for parameter value
+      const paramMatch = normalized.match(/<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/);
+      if (paramMatch) {
+        const fullTag = paramMatch[0];
+        const paramName = paramMatch[1];
+        const paramValueRaw = paramMatch[2];
+        const matchIdx = normalized.indexOf(fullTag);
+        
+        if (currentToolIndex !== null) {
+          currentToolInput[paramName] = paramValueRaw;
+        }
+        
+        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+        continue;
+      }
+      
+      // 3. Check for invoke end
+      const endInvokeMatch = normalized.match(/<\/\|DSML\|invoke>/);
+      if (endInvokeMatch) {
+        const fullTag = endInvokeMatch[0];
+        const matchIdx = normalized.indexOf(fullTag);
+        
+        if (currentToolIndex !== null) {
+          yield _sse('content_block_delta', {
+            type: 'content_block_delta',
+            index: currentToolIndex,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: JSON.stringify(currentToolInput)
+            }
+          });
+          
+          yield _sse('content_block_stop', {
+            type: 'content_block_stop',
+            index: currentToolIndex
+          });
+          
+          if (openIdx === currentToolIndex) openIdx = null;
+          currentToolIndex = null;
+          currentToolName = '';
+          currentToolId = '';
+          currentToolInput = {};
+        }
+        
+        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+        continue;
+      }
+      
+      // 4. Check for tool_calls end
+      const endToolCallsMatch = normalized.match(/<\/\|DSML\|tool_calls>/);
+      if (endToolCallsMatch) {
+        const fullTag = endToolCallsMatch[0];
+        const matchIdx = normalized.indexOf(fullTag);
+        
+        inDsmlMode = false;
+        const after = dsmlBuffer.substring(matchIdx + fullTag.length);
+        dsmlBuffer = '';
+        
+        if (after) {
+          yield* parseAndEmit(after, false);
+        }
+        continue;
+      }
+      
+      // 5. Check for tool_calls start (if not removed earlier)
+      const startToolCallsMatch = normalized.match(/<\|DSML\|tool_calls>/);
+      if (startToolCallsMatch) {
+        const fullTag = startToolCallsMatch[0];
+        const matchIdx = normalized.indexOf(fullTag);
+        
+        inDsmlMode = true;
+        
+        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+        continue;
+      }
+      
+      break;
+    }
+  };
+
   const parseAndEmit = async function* (chunk, isReasoning) {
+    if (inDsmlMode) {
+      yield* processDsml(chunk);
+      return;
+    }
+
     if (completedThinking) {
       isReasoning = false;
     }
@@ -592,7 +762,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
         }
         yield* stopOpen();
         inThinkTag = false;
-        completedThinking = true; // Mark completed when end tag is hit
+        completedThinking = true;
 
         if (after) {
           yield* parseAndEmit(after, false);
@@ -601,6 +771,21 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
         yield* emitThinkingDelta(chunk);
       }
     } else {
+      // Look for tool calls start
+      const dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>");
+      if (dsmlStartIdx !== -1) {
+        const before = chunk.substring(0, dsmlStartIdx);
+        const after = chunk.substring(dsmlStartIdx);
+        
+        if (before) {
+          yield* emitText(before);
+        }
+        
+        inDsmlMode = true;
+        yield* processDsml(after);
+        return;
+      }
+
       let startIdx = -1;
       let tagLen = 0;
 

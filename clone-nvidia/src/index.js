@@ -3472,6 +3472,14 @@ if (method === "POST" && path === "/v1/ranking") {
   }
 }
 
+// B8 FIX: Documented why this reads the .env file directly instead of using
+// process.env like pool.loadFromEnv(). The background key reload needs to
+// detect key ADDITIONS and REMOVALS without resetting per-key state (timestamps,
+// blocks, inFlight). pool.syncKeys() diffs old vs new and only adds/removes
+// changed keys. Reading the file directly ensures we see the raw configured
+// keys even if dotenv hasn't reloaded yet (though reloadDotenv runs first).
+// The parsing logic mirrors pool.loadFromEnv() — same key prefix matching,
+// same validation (nvapi- prefix, length >= 10), same dedup.
 function loadConfigFromEnvFile() {
   const fs = require('fs');
   const envPath = path.join(WRAPPER_DIR, '.env');
