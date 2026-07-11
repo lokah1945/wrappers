@@ -209,12 +209,59 @@ async function testDsmlNonStreaming() {
   console.log('✔ testDsmlNonStreaming PASSED');
 }
 
+async function testHistorySelfHealing() {
+  console.log('Testing: History translation self-healing guard...');
+  
+  const { anthropicToOpenai } = require('../src/anthropic_compat');
+  
+  const mockAnthropicRequest = {
+    model: 'deepseek-ai/deepseek-v4-pro',
+    messages: [
+      {
+        role: 'user',
+        content: 'Please list files.'
+      },
+      {
+        role: 'assistant',
+        content: 'Pre-text\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>'
+      },
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'tool_result',
+            tool_use_id: 'toolu_dsml_12345',
+            content: 'src/ package.json'
+          }
+        ]
+      }
+    ]
+  };
+  
+  const result = anthropicToOpenai(mockAnthropicRequest);
+  console.log('  OpenAI Translated Messages:', JSON.stringify(result.messages, null, 2));
+  
+  const assistantMsg = result.messages[1];
+  assert.strictEqual(assistantMsg.role, 'assistant');
+  assert.ok(assistantMsg.tool_calls, 'Assistant message should have been healed to include tool_calls');
+  assert.strictEqual(assistantMsg.tool_calls.length, 1);
+  assert.strictEqual(assistantMsg.tool_calls[0].id, 'toolu_dsml_12345');
+  assert.strictEqual(assistantMsg.tool_calls[0].function.name, 'Bash');
+
+  const toolMsg = result.messages[2];
+  assert.strictEqual(toolMsg.role, 'tool');
+  assert.strictEqual(toolMsg.tool_call_id, 'toolu_dsml_12345');
+
+  console.log('✔ testHistorySelfHealing PASSED');
+}
+
 async function runAll() {
   try {
     await testReasoningOnlyTransition();
     await testNormalTransition();
     await testDsmlToolCallsParsing();
     await testDsmlNonStreaming();
+    await testHistorySelfHealing();
     console.log('\n✔ All thinking parser regression tests PASSED!');
   } catch (err) {
     console.error('\n✗ Test failed:', err);

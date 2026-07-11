@@ -83,6 +83,79 @@ function hasToolResultBlock(msg) {
   return false;
 }
 
+function findToolUseInHistory(a, toolUseId) {
+  if (!a || !Array.isArray(a.messages)) return null;
+  for (const m of a.messages) {
+    if (m && Array.isArray(m.content)) {
+      for (const blk of m.content) {
+        if (blk && blk.type === 'tool_use' && blk.id === toolUseId) {
+          return blk;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function getToolMetadata(a, toolUseId) {
+  const found = findToolUseInHistory(a, toolUseId);
+  if (found) {
+    return { name: found.name, input: found.input || {} };
+  }
+  
+  if (a && Array.isArray(a.messages)) {
+    for (const m of a.messages) {
+      if (m && m.role === 'assistant') {
+        const text = typeof m.content === 'string' ? m.content : _flattenText(m.content || []);
+        const normalized = text.replace(/\uff5c/g, '|');
+        
+        const match = normalized.match(new RegExp(`<\\|DSML\\|invoke\\s+name="([^"]+)"[^>]*>[\\s\\S]*?${toolUseId}`));
+        if (match) {
+          return { name: match[1], input: {} };
+        }
+        
+        const genericMatch = normalized.match(/<\|DSML\|invoke\s+name="([^"]+)"[^>]*>/);
+        if (genericMatch) {
+          return { name: genericMatch[1], input: {} };
+        }
+      }
+    }
+  }
+  
+  return { name: 'unknown_tool', input: {} };
+}
+
+function ensurePrecedingToolCall(msgs, toolCallId, a) {
+  let lastAssistant = null;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'assistant') {
+      lastAssistant = msgs[i];
+      break;
+    }
+  }
+  if (!lastAssistant) {
+    lastAssistant = { role: 'assistant', content: '', tool_calls: [] };
+    msgs.push(lastAssistant);
+  }
+  
+  if (!lastAssistant.tool_calls) {
+    lastAssistant.tool_calls = [];
+  }
+  
+  const exists = lastAssistant.tool_calls.some(tc => tc.id === toolCallId);
+  if (!exists) {
+    const meta = getToolMetadata(a, toolCallId);
+    lastAssistant.tool_calls.push({
+      id: toolCallId,
+      type: 'function',
+      function: {
+        name: meta.name,
+        arguments: JSON.stringify(meta.input)
+      }
+    });
+  }
+}
+
 function anthropicToOpenai(a, officialContext) {
   console.log('[anthropicToOpenai] Called with:', JSON.stringify(a).slice(0, 500));
   if (!a || typeof a !== 'object') return { model: '', messages: [] };
@@ -162,6 +235,7 @@ function anthropicToOpenai(a, officialContext) {
         if (blk && blk.type === 'tool_result') {
           let c = blk.content || '';
           c = Array.isArray(c) ? _flattenText(c) : c;
+          ensurePrecedingToolCall(msgs, blk.tool_use_id, a);
           msgs.push({
             role: 'tool',
             tool_call_id: blk.tool_use_id,
@@ -222,6 +296,9 @@ function anthropicToOpenai(a, officialContext) {
 
     if (role === 'user') {
       if (toolResults.length > 0) {
+        for (const tr of toolResults) {
+          ensurePrecedingToolCall(msgs, tr.tool_call_id, a);
+        }
         msgs.push(...toolResults);
       }
       if (parts.length > 0) {
