@@ -195,19 +195,30 @@ async function main() {
       assert.strictEqual(r.status, 200);
     });
 
-    await check('/v1/models returns claude-* discovery ids', async () => {
+    await check('/v1/models default: clean list (no claude-* duplicates)', async () => {
       const r = await fetch(`${W}/v1/models`, { headers: { Authorization: `Bearer ${TOKEN}` } });
       const j = await r.json();
       const ids = j.data.map((m) => m.id);
-      assert.ok(ids.some((id) => id.startsWith('claude-')), 'no claude-* id found');
-      assert.ok(ids.includes('claude-meta-llama-3.1-8b-instruct'), 'discovery alias missing');
+      // Default must NOT contain claude-* duplicates — clean NIM IDs only.
+      assert.ok(!ids.some((id) => id.startsWith('claude-')), 'claude-* ids leaked in default response');
+      assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'original NIM id missing');
+    });
+
+    await check('/v1/models?gateway=1 returns claude-* discovery aliases', async () => {
+      const r = await fetch(`${W}/v1/models?gateway=1`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+      const j = await r.json();
+      const ids = j.data.map((m) => m.id);
+      assert.ok(ids.some((id) => id.startsWith('claude-')), 'no claude-* id in gateway mode');
+      assert.ok(ids.includes('claude-meta-llama-3.1-8b-instruct'), 'discovery alias missing in gateway mode');
+      // Gateway mode must also still include original NIM IDs.
+      assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'original NIM id missing in gateway mode');
     });
 
     await check('NGC-synced context window on /v1/models (deepseek-v4-pro=262144)', async () => {
       const r = await fetch(`${W}/v1/models`, { headers: { Authorization: `Bearer ${TOKEN}` } });
       const j = await r.json();
-      // Catalog surfaces the discovery alias id; the real NIM id is in original_id.
-      const d = j.data.find((m) => m.id === 'claude-deepseek-ai-deepseek-v4-pro' || m.original_id === 'deepseek-ai/deepseek-v4-pro');
+      // Default response now uses original NIM IDs (no claude-* prefix).
+      const d = j.data.find((m) => m.id === 'deepseek-ai/deepseek-v4-pro' || m.original_id === 'deepseek-ai/deepseek-v4-pro');
       assert.ok(d, 'deepseek model not in catalog');
       // Registry seeds deepseek-v4-pro context=262144 (or live NGC); enrichModelMetadata
       // is invoked with the REAL id before the alias is applied, so it must propagate.

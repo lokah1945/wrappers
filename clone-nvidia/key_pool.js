@@ -439,12 +439,14 @@ class KeyPool {
     let onAbort = null;
     let abortPromise = null;
 
-    if (this._waiting.size >= this.maxQueueSize) {
-      console.warn(`[wrapper-nvidia] Queue backpressure load shed: waiting queue size ${this._waiting.size} exceeds max ${this.maxQueueSize}. Rejecting request.`);
-      return [null, 0.0];
-    }
+    // B2 FIX: queue size check was OUTSIDE the Mutex lock while _waiting.add()
+    // was INSIDE — two concurrent requests could both pass the check and both
+    // add, exceeding maxQueueSize. Now the check is inside the lock (below,
+    // right before _waiting.add) so it's atomic with the add.
+    // Early-exit checks that don't touch _waiting stay outside the lock:
+    // load shedding (inFlight cap) and signal abort.
 
-    // Check in-flight soft cap (load shedding)
+    // Check in-flight soft cap (load shedding) — safe outside lock (reads only)
     if (process.env.LOAD_SHEDDING_ENABLED !== 'false') {
       const totalInFlight = this.keys.reduce((sum, k) => sum + k.inFlight, 0);
       if (totalInFlight >= INFLIGHT_SOFT_CAP) {
@@ -475,6 +477,14 @@ class KeyPool {
         let shouldSleep = true;
         try {
           if (myTicket === null) {
+            // B2 FIX: queue size check is now INSIDE the Mutex lock, atomic
+            // with _waiting.add(). Previously the check was outside the lock
+            // so two concurrent requests could both pass and both add.
+            if (this._waiting.size >= this.maxQueueSize) {
+              console.warn(`[wrapper-nvidia] Queue backpressure load shed: waiting queue size ${this._waiting.size} exceeds max ${this.maxQueueSize}. Rejecting request.`);
+              shouldSleep = false;
+              break; // exits while(true) loop, cleanup in finally below
+            }
             myTicket = this._ticketSeq++;
             this._waiting.add(myTicket);
           }
@@ -971,6 +981,12 @@ class KeyPool {
   // ── Health JSON ──────────────────────────────────────────────────────
 
   healthJson() {
+    // Read version from package.json at call time (lazy, cached by require).
+    let version = '8.6.0-node';
+    try {
+      const pkg = require('./package.json');
+      if (pkg && pkg.version) version = `${pkg.version}-node`;
+    } catch { /* keep default */ }
     return {
       status: this.availableKeys > 0 ? 'ok' : 'degraded',
       total_keys: this.totalKeys,
@@ -980,7 +996,7 @@ class KeyPool {
       hard_limit_rpm: this.hardLimit,
       queue_limit_per_key_per_sec: this.queueLimit,
       models_cached: this._modelsCache.length,
-      version: '8.6.0-node',
+      version,
     };
   }
 

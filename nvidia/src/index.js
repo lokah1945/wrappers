@@ -23,7 +23,7 @@ const WRAPPER_DIR = path.resolve(__dirname, '..');
 
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('../key_pool');
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
-const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, CURATED_GENAI, getCapabilityParams } = require('./capabilities');
+const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, CURATED_GENAI, getCapabilityParams, MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, getContextWindow } = require('./capabilities');
 const { Metrics } = require('./metrics');
 const { Registry } = require('./registry');
 
@@ -39,44 +39,15 @@ const BASE_NVCF   = (process.env.NVIDIA_NVCF_URL || NVIDIA_NVCF_URL).replace(/\/
 const DB_PATH     = process.env.METRICS_DB || path.join(WRAPPER_DIR, 'metrics.db');
 const QUIET_RETRIED_429 = parseInt(process.env.QUIET_RETRIED_429 || '3', 10);
 const MAX_RETRIES = QUIET_RETRIED_429;
-const VERSION     = '8.6.0-node'; // bumped 2026-07-05 forensic audit (REVISI): ReferenceError landmines + image-gen/ranking passthrough + /v1/models curated
-const DEFAULT_CONTEXT_WINDOW = parseInt(process.env.DEFAULT_CONTEXT_WINDOW || '131072', 10);
-// P1-2: Model-specific context windows (can be overridden per model)
-const MODEL_CONTEXT_WINDOWS = {
-  'claude': 200000,
-  'gpt-4': 128000,
-  'llama-3.1': 128000,
-  'llama-3.2': 128000,
-  'llama-3.3': 128000,
-  'llama-3': 128000,
-  'gemma-3': 128000,
-  'gemma-2': 8192,
-  'phi-3.5': 128000,
-  'phi-4': 16384,
-  // NGC-verified: deepseek-v4-pro context=262144 (was 64000 — stale heuristic)
-  'deepseek-v4': 262144,
-  'deepseek-coder': 262144,
-  'qwen2.5': 128000,
-  'qwen': 32768,
-  // NGC-verified: nemotron-3-ultra-550b context=1048576 (was 131072)
-  'nemotron': 1048576,
-  'yi': 1000000,
-  'mistral': 32000,
-  'mixtral': 32000,
-  // NGC-verified: glm-5.2 context=202752 (was 32000)
-  'glm': 202752,
-};
-
-function getContextWindow(modelId) {
-  if (!modelId) return DEFAULT_CONTEXT_WINDOW;
-  const lower = modelId.toLowerCase();
-  for (const [pattern, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
-    if (lower.includes(pattern)) {
-      return size;
-    }
-  }
-  return DEFAULT_CONTEXT_WINDOW;
-}
+// Read version from package.json — single source of truth (no more hardcoded
+// duplicates in index.js, key_pool.js healthJson, etc.).
+let VERSION = '8.6.0-node';
+try {
+  const pkg = require(path.join(WRAPPER_DIR, 'package.json'));
+  if (pkg && pkg.version) VERSION = `${pkg.version}-node`;
+} catch { /* keep default */ }
+// MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, and getContextWindow() are now
+// imported from capabilities.js — single source of truth shared with anthropic_compat.js.
 
 // ── Centralized Reasoning Config ──────────────────────────────────────────
 // Ordered by specificity (most specific first).
@@ -177,15 +148,13 @@ const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
 // between consecutive body chunks, but headersTimeout monitors the gap BEFORE
 // the FIRST response byte (status line + headers). A reasoning model that thinks
 // silently for >300s with no body chunks must NOT trip bodyTimeout — so bodyTimeout
-// stays 0. BUT headersTimeout=0 was wrong: a dead/blackholed upstream that accepts
-// the TLS connection yet never sends any HTTP response would make the wrapper hang
-// for the full STREAM_REQUEST_TIMEOUT_SEC (900s) until the client disconnects and
-// close-abort breaks it. Keeping headersTimeout disabled conflated two distinct
-// timeouts. Re-enable headersTimeout (30s) so undici aborts promptly when the
-// upstream never even starts responding; long silent thinking gaps in the BODY
-// still survive because bodyTimeout stays 0. connectTimeout guards a stalled TCP
+// stays 0. headersTimeout guards a stalled upstream that accepts TLS but never sends
+// HTTP headers back (blackhole). Set to 15s (was 30s) so a dead upstream fails fast
+// per key attempt — with 5 keys × 15s = 75s < PRE_RESPONSE_TIMEOUT_MS=180s, all keys
+// are tried before the global watchdog fires. connectTimeout guards a stalled TCP
 // handshake. The overall streaming time budget is still owned by AbortSignal.timeout.
-const agent   = new Agent({ connections: MAX_CONNECTIONS, pipelining: 10, bodyTimeout: 0, headersTimeout: 30000, connectTimeout: 15000 });
+const HEADERS_TIMEOUT_MS = parseInt(process.env.HEADERS_TIMEOUT_MS || '15000', 10);
+const agent   = new Agent({ connections: MAX_CONNECTIONS, pipelining: 10, bodyTimeout: 0, headersTimeout: HEADERS_TIMEOUT_MS, connectTimeout: 15000 });
 pool.setExternalAgent(agent);
 let inFlight  = 0;
 
@@ -204,6 +173,8 @@ function broadcastSSE(event, data) {
       // make Node buffer every broadcast in memory indefinitely → OOM under
       // load. Drop clients whose write buffer grows past 1MB instead.
       if (client.writableLength > 1024 * 1024) {
+        // B9 FIX: log warning so operators can debug dashboard client drops.
+        console.warn(`[SSE] Dropping slow dashboard client (buffer ${Math.round(client.writableLength/1024)}KB > 1MB)`);
         sseClients.delete(client);
         try { client.destroy(); } catch {}
         continue;
@@ -635,11 +606,23 @@ function parseUnsupportedParams(bodyText) {
     return [];
   }
   const matches = [];
-  const regex = /`([^`]+)`|'([^']+)'/g;
+  // B7 FIX: previous regex only matched backtick (`param`) and single-quote
+  // ('param') formats. NVIDIA NIM also returns parameters in double quotes
+  // ("param"), bare words (param), and JSON pointer format (/body/param).
+  // Now we match all common formats so the retry loop can strip them.
+  const regex = /`([^`]+)`|'([^']+)'|"([^"]+)"|\/([a-z_]+)$/gm;
   let m;
   while ((m = regex.exec(msg)) !== null) {
-    const p = m[1] || m[2];
+    const p = m[1] || m[2] || m[3] || m[4];
     if (p && p.trim()) matches.push(p.trim());
+  }
+  // Fallback: also scan for bare parameter names after "unsupported parameter:"
+  if (matches.length === 0) {
+    const bareRegex = /unsupported parameter:?\s*([a-z_][a-z0-9_]*)/gi;
+    let bm;
+    while ((bm = bareRegex.exec(msg)) !== null) {
+      if (bm[1] && bm[1].trim()) matches.push(bm[1].trim());
+    }
   }
   return matches;
 }
@@ -714,7 +697,18 @@ const MODEL_GRACE_FAILS = 5;
 const modelFailCount = {};
 
 function isModelUnavailable(modelId) {
-  // Transparent proxy mode: never block requests proactively.
+  // BLOCK_UNAVAILABLE_MODELS: set to 'true' to enable proactive blocking of
+  // models that the verification sweep has marked unavailable (404, DEGRADED,
+  // or consecutive timeouts). Default 'false' = transparent proxy mode: all
+  // models pass through, upstream returns the real error. The verification
+  // infrastructure (probeModel, markModel, verifyModels, verifyLoop) still
+  // runs and populates unavailableModels + the metrics DB regardless of this
+  // toggle — it always informs the dashboard and /metrics/model-status.
+  // Enable this when you want the wrapper to short-circuit known-dead models
+  // with an immediate 404 instead of wasting a key slot and upstream timeout.
+  if (process.env.BLOCK_UNAVAILABLE_MODELS === 'true') {
+    return unavailableModels.has(modelId);
+  }
   return false;
 }
 
@@ -921,12 +915,28 @@ function sanitizeNvidiaPayload(body) {
         j++;
       }
       i = j - 1;
+      // B3 FIX: msg.content can be a string, null, or an array (multimodal).
+      // Only the first split message gets the text content; the rest get "".
+      // For array content, extract only text blocks — image_url blocks are
+      // stripped earlier for non-vision models, but vision models could have
+      // them. NIM does not expect array content on assistant tool_call messages.
+      let firstContent = "";
+      if (typeof msg.content === 'string') {
+        firstContent = msg.content;
+      } else if (Array.isArray(msg.content)) {
+        firstContent = msg.content
+          .filter(c => c && c.type === 'text')
+          .map(c => c.text || '')
+          .join('');
+      } else if (msg.content === null || msg.content === undefined) {
+        firstContent = null;
+      }
       for (let k = 0; k < originalToolCalls.length; k++) {
         const tc = originalToolCalls[k];
         const matchingResult = toolResults.find(r => r.tool_call_id === tc.id);
         newMessages.push({
           role: 'assistant',
-          content: k === 0 ? msg.content : "",
+          content: k === 0 ? firstContent : "",
           tool_calls: [tc]
         });
         if (matchingResult) {
@@ -1011,6 +1021,10 @@ Object.assign(body, preservedParams);
   let lastUpstream = null;
   let key = null;
   let keyReleased = false;
+  // FIX: Track consecutive network/blackhole errors per attempt. If all keys
+  // produce the same blackhole timeout, fail fast with 503 instead of waiting
+  // for the global pre-response watchdog to fire and return a confusing 504.
+  let consecutiveNetworkErrors = 0;
   while (attempt < maxAttempts) {
     let keyResult = null;
     key = null;
@@ -1283,25 +1297,30 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
         if (!keyReleased) { pool.releaseSuccess(key); decInFlight(); keyReleased = true; }
         return { status: serverAborted ? 504 : 499, data: { error: { message: serverAborted ? 'Upstream did not respond within the pre-response timeout' : 'Client disconnected', type: serverAborted ? 'upstream_error' : 'client_error' } } };
       }
-      
 
-      
+      // Count consecutive blackhole/network errors across key attempts
+      consecutiveNetworkErrors++;
+
       if (attempt < maxAttempts - 1) {
-        console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
+        console.warn(`[NETWORK ERROR] ${e.message} — retrying (attempt ${attempt + 1}/${maxAttempts}, consecutive_net_errors=${consecutiveNetworkErrors})`);
         if (!keyReleased) { pool.releaseSuccess(key); decInFlight(); keyReleased = true; }
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        // Short pause between retries so we don't immediately slam the next key
+        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 1000)));
         continue;
       }
+      // All key attempts exhausted with network/timeout errors — upstream is blackholing
+      // Return 503 (service unavailable) to clearly indicate the model/upstream is down
       const latencyMs = Date.now() - startMs;
+      console.warn(`[BLACKHOLE] All ${maxAttempts} key attempts failed for model=${modelId} with network errors — upstream appears down`);
       metrics.recordRequest({
         method: 'POST', path: metricPath,
         model: modelId, keyLabel: key.label,
-        streaming: !!body.stream, statusCode: e.name === 'TimeoutError' ? 408 : 502, latencyMs,
+        streaming: !!body.stream, statusCode: 503, latencyMs,
         wasRateLimited: false, pacingMs
       });
       if (!keyReleased) { pool.releaseSuccess(key); decInFlight(); keyReleased = true; }
-      return { status: e.name === 'TimeoutError' ? 408 : 502, data: { error: { message: `Network error: ${e.message}`, type: 'upstream_error' } } };
+      return { status: 503, data: { error: { message: `Upstream model ${modelId} is not responding (all ${maxAttempts} API keys timed out). The model may be temporarily unavailable — please try again in a moment or switch to an available model.`, type: 'upstream_error' } } };
     } finally {
       if (!keyReleased && key) {
         pool.releaseSuccess(key);
@@ -1571,21 +1590,23 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         return jsonResp(res, 499, { error: { message: 'Client disconnected', type: 'client_error' } });
       }
       if (attempt < maxAttempts - 1) {
-        console.warn(`[NETWORK ERROR] ${e.message} — retrying`);
+        console.warn(`[NETWORK ERROR] ${e.message} — retrying (attempt ${attempt + 1}/${maxAttempts})`);
         pool.releaseSuccess(key);
         decInFlight();
         attempt++;
-        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 2000)));
+        await new Promise(resolve => setTimeout(resolve, Math.min(200 * attempt, 1000)));
         continue;
       }
+      // All key attempts exhausted with network/timeout errors — upstream is blackholing
+      console.warn(`[BLACKHOLE] All ${maxAttempts} key attempts failed for model=${modelId} (proxyPost) — upstream appears down`);
       metrics.recordRequest({
         method: 'POST', path, model: modelId, keyLabel: key.label,
-        streaming: false, statusCode: e.name === 'TimeoutError' ? 408 : 502, latencyMs: Date.now() - startMs,
+        streaming: false, statusCode: 503, latencyMs: Date.now() - startMs,
         wasRateLimited: false, requestBytes: rawBody.length, pacingMs
       });
       pool.releaseSuccess(key);
       decInFlight();
-      return jsonResp(res, e.name === 'TimeoutError' ? 408 : 502, { error: { message: e.message, type: 'upstream_error' } });
+      return jsonResp(res, 503, { error: { message: `Upstream model ${modelId} is not responding (all ${maxAttempts} API keys timed out). The model may be temporarily unavailable.`, type: 'upstream_error' } });
     }
   }
   if (lastUpstream) return jsonResp(res, lastUpstream.status, lastUpstream.data);
@@ -1850,7 +1871,15 @@ async function handleAnthropicMessages(rawBody, req, res) {
           console.error('[stream error] handleAnthropicMessages:', e.message);
         }
         const connDead = res.writableEnded || res.destroyed;
-        if (connDead) { attemptStatus = 499; return; }
+        if (connDead) {
+          attemptStatus = 499;
+          // B1 FIX: use break instead of return so the finally block releases
+          // the key AND the post-loop metrics block (lines 1900-1958) still
+          // records the disconnect event. Previously `return` skipped metrics.
+          finalStreamStatus = 499;
+          finalCapture = null;
+          break;
+        }
         if (!connDead) {
           const streamEmittedStop = capture.stop !== undefined;
           const errored = streamError || capture.errored;
@@ -2082,29 +2111,48 @@ function enrichModelMetadata(id, desc) {
  *  client that never calls /v1/capabilities — the §8 "metadata only in
  *  /v1/capabilities" bug class. /v1/capabilities already used buildCatalog;
  *  now /v1/models does too, so the two surfaces stay consistent.
+ *
+ *  DEFAULT: clean list — only original NIM IDs (no claude-* duplicates).
+ *    Claude Code alias mapping (claude-<slug> → real NIM id) still works
+ *    behind the scenes via DISCOVERY_TO_NIM + resolveTargetModel(), so
+ *    clients CAN still send claude-* model names and they resolve correctly.
+ *    They just don't clutter the discovery surface.
+ *
+ *  Query params:
+ *    ?refresh=true   Force a live re-fetch from upstream (bypasses cache).
+ *    ?gateway=1      Include claude-* discovery aliases (for Claude Code
+ *                     gateway model picker — Claude Code only lists ids that
+ *                     start with "claude"/"anthropic").
  */
 async function handleModels(res, url = null) {
   const force = url?.searchParams?.get('refresh') === 'true';
+  const gateway = url?.searchParams?.get('gateway') === '1';
   const ids = await pool.refreshModels(force);
+  // Always rebuild the DISCOVERY_TO_NIM map so behind-the-scenes claude-*
+  // alias resolution works even when aliases are not in the response.
   refreshDiscoveryMap(ids);
   const catalog = buildCatalog(ids, BASE_LLM, BASE_GENAI);
   const data = [];
   for (const d of catalog) {
-    // 1) Add original raw model object
+    // 1) Original NIM ID (always included — the clean default view)
     const raw = enrichModelMetadata(d.id, d);
     raw.owned_by = d.id.split('/')[0] || 'nvidia';
     raw.original_id = d.id;
     raw.aliases = [d.id];
     data.push(raw);
 
-    // 2) Add Claude-prefixed aliased model object for Claude Code
-    const m = enrichModelMetadata(d.id, d);
-    const alias = discoveryAlias(d.id);
-    m.owned_by = d.id.split('/')[0] || 'nvidia';
-    m.original_id = d.id;
-    m.aliases = [d.id];
-    m.id = alias;
-    data.push(m);
+    // 2) Claude-prefixed alias — ONLY when ?gateway=1 (Claude Code model picker).
+    //    The DISCOVERY_TO_NIM map is always built (above), so claude-* IDs
+    //    resolve correctly via resolveTargetModel() regardless of this flag.
+    if (gateway) {
+      const m = enrichModelMetadata(d.id, d);
+      const alias = discoveryAlias(d.id);
+      m.owned_by = d.id.split('/')[0] || 'nvidia';
+      m.original_id = d.id;
+      m.aliases = [d.id];
+      m.id = alias;
+      data.push(m);
+    }
   }
   jsonResp(res, 200, { object: 'list', data });
 }
@@ -2412,16 +2460,11 @@ async function handleCatchAll(req, res, path, url) {
           }
         } catch (e) { console.error('[stream error] handleCatchAll:', e.message); }
         try { reader.cancel(); } catch {}
-        if (res.destroyed) { pool.releaseSuccess(key); decInFlight(); return; }
-        try {
-          if (!hasContent) {
-            const friendlyMsg = `The context/history for model "${modelId}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
-            const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
-            try { if (!res.destroyed) res.write(errChunk); } catch {}
-          }
-          if (!res.destroyed) { try { res.end(); } catch {} }
-        } catch {}
-
+        // B5 FIX: previously `if (res.destroyed) { release; return; }` skipped
+        // the usage-extraction + metrics-recording block below entirely, so
+        // client disconnects during streaming left no trace in the dashboard.
+        // Now we always run usage extraction + metrics, then check destroyed
+        // only to decide whether to write the friendly-error chunk.
         let lastUsage = null;
         try {
           if (lastUsageSnippet) {
@@ -2457,7 +2500,7 @@ async function handleCatchAll(req, res, path, url) {
           const { pt, ct, tt, cacht } = extractUsageFields(lastUsage);
           metrics.recordRequest({
             method, path, model: modelId, keyLabel: key.label,
-            streaming: true, statusCode: resp.status, latencyMs: Date.now() - startMs,
+            streaming: true, statusCode: res.destroyed ? 499 : resp.status, latencyMs: Date.now() - startMs,
             ttftMs,
             promptTokens: pt, completionTokens: ct, cachedTokens: cacht, totalTokens: tt,
             wasRateLimited: false, requestBytes: rawBody.length, pacingMs
@@ -2466,6 +2509,16 @@ async function handleCatchAll(req, res, path, url) {
           pool.releaseSuccess(key);
           decInFlight();
         }
+
+        if (res.destroyed) return;
+        try {
+          if (!hasContent) {
+            const friendlyMsg = `The context/history for model "${modelId}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
+            const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
+            try { if (!res.destroyed) res.write(errChunk); } catch {}
+          }
+          if (!res.destroyed) { try { res.end(); } catch {} }
+        } catch {}
         return;
       }
 
@@ -2576,7 +2629,12 @@ async function handleRequest(req, res) {
   // a clean 502/504 instead of stalling indefinitely. Once headers are sent
   // (streaming or any response) the handler is committed and the watchdog is
   // inert — it only checks res.headersSent before acting.
-  const PRE_RESPONSE_TIMEOUT_MS = parseInt(process.env.PRE_RESPONSE_TIMEOUT_MS || '45000', 10);
+  // PRE_RESPONSE_TIMEOUT_MS: global watchdog that aborts the ENTIRE request if we have
+  // not sent any response headers within this budget. Must be >= headersTimeout * maxKeyAttempts
+  // so all key retries complete before the watchdog fires. With headersTimeout=15s and
+  // 5 keys, worst case = 15s * 5 = 75s. Default = 180s gives generous safety margin.
+  // Previously was 45s which caused it to fire mid-retry (after ~1.5 key attempts).
+  const PRE_RESPONSE_TIMEOUT_MS = parseInt(process.env.PRE_RESPONSE_TIMEOUT_MS || '180000', 10);
   const preRespTimer = setTimeout(() => {
     if (!res.headersSent && !res.writableEnded && !res.destroyed) {
       req._preRespTimedOut = true;

@@ -236,6 +236,9 @@ function getCapabilityParams(capType) {
 
 const _classifyCache = new Map();
 const _CLASSIFY_CACHE_MAX = 500;
+// B6 FIX: TTL-based eviction so retired/deprecated models don't stay cached
+// indefinitely. Entries older than 1 hour are evicted on next access.
+const _CLASSIFY_CACHE_TTL_MS = 3600 * 1000;
 
 /** Deep-clone a cached classify result so callers cannot corrupt the cache. */
 function _cloneResult(obj) {
@@ -252,7 +255,14 @@ function _cloneResult(obj) {
 function classify(modelId) {
   const mid = (modelId || '').toLowerCase();
   const cached = _classifyCache.get(mid);
-  if (cached) return _cloneResult(cached);
+  // B6 FIX: check TTL before returning cached entry. Stale entries (>1h) are
+  // evicted and re-classified so retired/deprecated models don't stay cached.
+  if (cached) {
+    if (Date.now() - cached._cachedAt < _CLASSIFY_CACHE_TTL_MS) {
+      return _cloneResult(cached);
+    }
+    _classifyCache.delete(mid);
+  }
 
   // Find matching classification rule
   // The last rule has patterns:[] which acts as a catch-all fallback.
@@ -286,6 +296,7 @@ function classify(modelId) {
         const firstKey = _classifyCache.keys().next().value;
         if (firstKey !== undefined) _classifyCache.delete(firstKey);
       }
+      result._cachedAt = Date.now();
       _classifyCache.set(mid, result);
       return _cloneResult(result);
     }
@@ -308,11 +319,12 @@ function classify(modelId) {
   if (mid.includes('code') || mid.includes('coder')) {
     result.capabilities = [...new Set([...result.capabilities, 'code_generation', 'code_completion'])];
   }
-  
+
   if (_classifyCache.size >= _CLASSIFY_CACHE_MAX) {
     const firstKey = _classifyCache.keys().next().value;
     if (firstKey !== undefined) _classifyCache.delete(firstKey);
   }
+  result._cachedAt = Date.now();
   _classifyCache.set(mid, result);
   return _cloneResult(result);
 }
@@ -391,7 +403,52 @@ function summarize(catalog) {
   return { total: catalog.length, by_type: byType };
 }
 
+// ── Authoritative Model Context Windows ──────────────────────────────────
+// SINGLE SOURCE OF TRUTH for context-window heuristics. Used by both the
+// OpenAI path (index.js) and the Anthropic translation path (anthropic_compat.js).
+// The NGC registry (registry.js) always wins over these heuristics when it has
+// an entry for the model. These are fallbacks only.
+// UPDATE HERE FIRST — both consumers pick up changes automatically.
+const MODEL_CONTEXT_WINDOWS = {
+  'claude': 200000,
+  'gpt-4': 128000,
+  'llama-3.1': 128000,
+  'llama-3.2': 128000,
+  'llama-3.3': 128000,
+  'llama-3': 128000,
+  'gemma-3': 128000,
+  'gemma-2': 8192,
+  'phi-3.5': 128000,
+  'phi-4': 16384,
+  // NGC-verified: deepseek-v4-pro context=262144 (was 64000 — stale heuristic)
+  'deepseek-v4': 262144,
+  'deepseek-coder': 262144,
+  'qwen2.5': 128000,
+  'qwen': 32768,
+  // NGC-verified: nemotron-3-ultra-550b context=1048576 (was 131072)
+  'nemotron': 1048576,
+  'yi': 1000000,
+  'mistral': 32000,
+  'mixtral': 32000,
+  // NGC-verified: glm-5.2 context=202752 (was 32000)
+  'glm': 202752,
+};
+
+const DEFAULT_CONTEXT_WINDOW = 131072;
+
+function getContextWindow(modelId) {
+  if (!modelId) return DEFAULT_CONTEXT_WINDOW;
+  const lower = modelId.toLowerCase();
+  for (const [pattern, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
+    if (lower.includes(pattern)) {
+      return size;
+    }
+  }
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
 module.exports = {
   LLM, GENAI, classify, describe, buildCatalog, summarize,
   getCapabilityParams, CAPABILITY_PARAMS, RETIRED_MODELS, CURATED_GENAI,
+  MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, getContextWindow,
 };

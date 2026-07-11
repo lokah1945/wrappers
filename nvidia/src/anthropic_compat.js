@@ -8,6 +8,11 @@
  *  - streamOpenaiToAnthropic(stream, ...)  response O→A  (SSE async generator)
  */
 
+// Import authoritative context-window map from capabilities.js (single source of
+// truth shared with index.js). Previously this file kept its own duplicate
+// COMPAT_MODEL_CONTEXT_WINDOWS map that drifted independently.
+const { MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, getContextWindow: getCapContextWindow } = require('./capabilities');
+
 const _FINISH_TO_STOP = {
   stop: 'end_turn',
   length: 'max_tokens',
@@ -60,42 +65,13 @@ function isAnthropicMessageOrderValid(messages) {
   return true;
 }
 
-const COMPAT_MODEL_CONTEXT_WINDOWS = {
-  'claude': 200000,
-  'gpt-4': 128000,
-  'llama-3.1': 128000,
-  'llama-3.2': 128000,
-  'llama-3.3': 128000,
-  'llama-3': 128000,
-  'gemma-3': 128000,
-  'gemma-2': 8192,
-  'phi-3.5': 128000,
-  'phi-4': 16384,
-  // NGC-verified: deepseek-v4-pro context=262144 (was 64000 — stale heuristic)
-  'deepseek-v4': 262144,
-  'deepseek-coder': 262144,
-  'qwen2.5': 128000,
-  'qwen': 32768,
-  // NGC-verified: nemotron-3-ultra-550b context=1048576 (was 131072)
-  'nemotron': 1048576,
-  'yi': 1000000,
-  'mistral': 32000,
-  'mixtral': 32000,
-  // NGC-verified: glm-5.2 context=202752 (was 32000)
-  'glm': 202752,
-};
-
+// Context-window lookup for Anthropic translation path.
+// Uses the shared MODEL_CONTEXT_WINDOWS from capabilities.js (single source of
+// truth). Authoritative NGC registry value always wins over heuristic map.
 function getCompatContextWindow(modelId, officialContext) {
   // Authoritative NGC registry value always wins over heuristic map.
   if (officialContext && officialContext.context > 0) return officialContext.context;
-  if (!modelId) return 131072;
-  const lower = modelId.toLowerCase();
-  for (const [pattern, size] of Object.entries(COMPAT_MODEL_CONTEXT_WINDOWS)) {
-    if (lower.includes(pattern)) {
-      return size;
-    }
-  }
-  return 131072;
+  return getCapContextWindow(modelId);
 }
 
 function hasToolResultBlock(msg) {
@@ -214,7 +190,7 @@ function anthropicToOpenai(a, officialContext) {
       if (t === 'text') {
         parts.push({ type: 'text', text: blk.text || '' });
       } else if (t === 'thinking') {
-        parts.push({ type: 'text', text: `<thinking>\n${blk.thinking || ''}\n</thinking>\n` });
+        parts.push({ type: 'text', text: `<think>\n${blk.thinking || ''}\n</think>\n` });
       } else if (t === 'image') {
         const src = blk.source || {};
         let url;
@@ -374,12 +350,21 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
   let rawContent = msg.content || "";
   let reasoning = msg.reasoning_content || msg.reasoning || "";
 
-  // Parse unstructured <think>...</think> if present in the content
-  if (!reasoning && rawContent.startsWith("<think>")) {
-    const endIdx = rawContent.indexOf("</think>");
-    if (endIdx !== -1) {
-      reasoning = rawContent.substring(7, endIdx).trim();
-      rawContent = rawContent.substring(endIdx + 8).trim();
+  // Parse unstructured <think>...</think> or <thinking>...</thinking> if present in the content
+  if (!reasoning) {
+    const trimmed = rawContent.trim();
+    if (trimmed.startsWith("<think>")) {
+      const endIdx = trimmed.indexOf("</think>");
+      if (endIdx !== -1) {
+        reasoning = trimmed.substring(7, endIdx).trim();
+        rawContent = trimmed.substring(endIdx + 8).trim();
+      }
+    } else if (trimmed.startsWith("<thinking>")) {
+      const endIdx = trimmed.indexOf("</thinking>");
+      if (endIdx !== -1) {
+        reasoning = trimmed.substring(10, endIdx).trim();
+        rawContent = trimmed.substring(endIdx + 11).trim();
+      }
     }
   }
 
@@ -401,6 +386,19 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
   // `thinking` block so Claude Code's content-ordering contract is satisfied.
   if (expectThinking && !content.some(c => c.type === 'thinking') && content.length > 0) {
     content.unshift({ type: 'thinking', thinking: '[Reasoning not supported by this model; responding directly.]' });
+  }
+
+  // GUARD: Anthropic SDK throws "model output must contain either output text
+  // or tool calls" if content has no text or tool_use block. This triggers in
+  // two scenarios:
+  //   (a) content is completely empty ([]) — no text, thinking, or tool calls
+  //   (b) content has ONLY a thinking block — reasoning-only response when
+  //       max_tokens runs out mid-think, or model returns reasoning_content
+  //       but empty/null content (observed with deepseek-v4-pro, deepseek-r1).
+  // Fix: ensure at least one {type:'text'} or {type:'tool_use'} block always
+  // exists so the SDK validation always passes.
+  if (!content.some(c => c.type === 'text' || c.type === 'tool_use')) {
+    content.push({ type: 'text', text: '' });
   }
 
   const u = o.usage || {};
@@ -438,9 +436,14 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   let nextIndex = 0;
   let openIdx = null;
   let sentContentBlockStart = false;
+  // Tracks whether at least one text or tool_use block was emitted in the stream.
+  // The Anthropic SDK requires "output text OR tool calls" — a thinking-only
+  // stream also triggers the "model output must contain..." SDK error.
+  let sentTextOrToolBlock = false;
   let finalStop = 'end_turn';
   let usage = {};
   let inThinkTag = false;
+  let completedThinking = false;
   let generatedChars = 0;
   // Tracks whether a REAL thinking block was produced by the upstream model.
   // When the client requested extended thinking (Claude Code sends
@@ -470,6 +473,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
   };
 
   const emitText = async function* (text) {
+    // Once we emit text, thinking phase is completed
+    completedThinking = true;
     // Contract shim: if extended thinking was requested but the model produced
     // no real thinking yet, emit a minimal synthetic thinking block BEFORE the
     // first text block so Claude Code's content-ordering requirement holds.
@@ -481,6 +486,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       textIndex = nextIndex++;
       openIdx = textIndex;
       sentContentBlockStart = true;
+      sentTextOrToolBlock = true;
       yield _sse('content_block_start', {
         type: 'content_block_start', index: textIndex,
         content_block: { type: 'text', text: '' },
@@ -524,6 +530,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       delta: { type: 'thinking_delta', thinking: '[Reasoning not supported by this model; responding directly.]' },
     });
     yield _sse('content_block_stop', { type: 'content_block_stop', index: thinkingIndex });
+    completedThinking = true; // Set completedThinking = true after synthetic thinking completes
     if (openIdx === thinkingIndex) { openIdx = null; thinkingIndex = null; }
   };
 
@@ -534,6 +541,100 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       delta: { type: 'thinking_delta', thinking: text },
     });
   };
+
+  const parseAndEmit = async function* (chunk, isReasoning) {
+    if (completedThinking) {
+      isReasoning = false;
+    }
+
+    if (!isReasoning && inThinkTag && thinkingIndex !== null) {
+      yield* stopOpen();
+      inThinkTag = false;
+      completedThinking = true;
+    }
+
+    if (isReasoning && !inThinkTag && thinkingIndex !== null) {
+      yield* emitText(chunk);
+      return;
+    }
+    if (isReasoning && !inThinkTag) {
+      inThinkTag = true;
+      yield* emitThinkingStart();
+    }
+
+    if (inThinkTag) {
+      let endIdx = -1;
+      let tagLen = 0;
+
+      const end1 = chunk.indexOf("</think>");
+      const end2 = chunk.indexOf("</thinking>");
+      const end3 = chunk.indexOf("<｜DSML｜tool_calls>");
+
+      if (end1 !== -1) {
+        endIdx = end1;
+        tagLen = 8;
+      }
+      if (end2 !== -1 && (endIdx === -1 || end2 < endIdx)) {
+        endIdx = end2;
+        tagLen = 11;
+      }
+      if (end3 !== -1 && (endIdx === -1 || end3 < endIdx)) {
+        endIdx = end3;
+        tagLen = 0;
+      }
+
+      if (endIdx !== -1) {
+        const inside = chunk.substring(0, endIdx);
+        const after = chunk.substring(endIdx + tagLen);
+
+        if (inside) {
+          yield* emitThinkingDelta(inside);
+        }
+        yield* stopOpen();
+        inThinkTag = false;
+        completedThinking = true; // Mark completed when end tag is hit
+
+        if (after) {
+          yield* parseAndEmit(after, false);
+        }
+      } else {
+        yield* emitThinkingDelta(chunk);
+      }
+    } else {
+      let startIdx = -1;
+      let tagLen = 0;
+
+      const start1 = chunk.indexOf("<think>");
+      const start2 = chunk.indexOf("<thinking>");
+
+      if (start1 !== -1) {
+        startIdx = start1;
+        tagLen = 7;
+      }
+      if (start2 !== -1 && (startIdx === -1 || start2 < startIdx)) {
+        startIdx = start2;
+        tagLen = 10;
+      }
+
+      if (startIdx !== -1) {
+        const before = chunk.substring(0, startIdx);
+        const after = chunk.substring(startIdx + tagLen);
+
+        if (before) {
+          yield* emitText(before);
+        }
+        inThinkTag = true;
+        yield* emitThinkingStart();
+
+        if (after) {
+          yield* parseAndEmit(after, false);
+        }
+      } else {
+        yield* emitText(chunk);
+      }
+    }
+  };
+
 
   yield _sse('message_start', {
     type: 'message_start',
@@ -617,47 +718,13 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
         let contentText = delta.content || "";
         const reasoning = delta.reasoning_content || delta.reasoning;
 
-        // Some NIM models emit BOTH reasoning_content and content in a single
-        // delta. The previous `if (reasoning) ... else if (contentText)` form
-        // dropped the content text whenever reasoning was present, silently
-        // losing output. Emit each independently so neither is lost.
         if (reasoning) {
           generatedChars += reasoning.length;
-          yield* emitThinkingDelta(reasoning);
+          yield* parseAndEmit(reasoning, true);
         }
         if (contentText) {
           generatedChars += contentText.length;
-          if (!inThinkTag && contentText.includes("<think>")) {
-            inThinkTag = true;
-            const parts = contentText.split("<think>");
-            const before = parts[0];
-            const after = parts.slice(1).join("<think>");
-            if (before) {
-              yield* emitText(before);
-            }
-            yield* emitThinkingStart();
-            contentText = after;
-          }
-
-          if (inThinkTag) {
-            if (contentText.includes("</think>")) {
-              inThinkTag = false;
-              const parts = contentText.split("</think>");
-              const inside = parts[0];
-              const after = parts.slice(1).join("</think>");
-              if (inside) {
-                yield* emitThinkingDelta(inside);
-              }
-              yield* stopOpen();
-              if (after) {
-                yield* emitText(after);
-              }
-            } else {
-              yield* emitThinkingDelta(contentText);
-            }
-          } else {
-            yield* emitText(contentText);
-          }
+          yield* parseAndEmit(contentText, false);
         }
 
         // tool-call deltas
@@ -685,6 +752,7 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
             // turn's tool_result). The previous `toolu_wrapper_${ai}` fallback
             // collided across turns because msgId is the constant 'msg_wrapper'.
             const toolCallId = tc.id || `toolu_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}_${ai}`;
+            sentTextOrToolBlock = true;
             yield _sse('content_block_start', {
               type: 'content_block_start', index: ai,
               content_block: {
@@ -774,6 +842,21 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
     capture.errored = true;
     capture.errorMessage = errorMessage || 'upstream connection error';
     return;
+  }
+
+  // GUARD: Anthropic SDK throws "model output must contain either output text
+  // or tool calls" in two scenarios:
+  //   (a) no content block was emitted at all (sentContentBlockStart=false)
+  //   (b) ONLY thinking blocks were emitted with no text/tool_use block
+  //       (sentTextOrToolBlock=false) — reasoning-only responses.
+  // Emit a minimal empty text block to satisfy the SDK contract in both cases.
+  if (!sentTextOrToolBlock && !errored) {
+    const emptyIdx = nextIndex++;
+    yield _sse('content_block_start', {
+      type: 'content_block_start', index: emptyIdx,
+      content_block: { type: 'text', text: '' },
+    });
+    yield _sse('content_block_stop', { type: 'content_block_stop', index: emptyIdx });
   }
 
   const estimatedOutput = Math.max(1, Math.ceil(generatedChars / 4));
