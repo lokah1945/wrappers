@@ -210,7 +210,7 @@ async function testDsmlNonStreaming() {
 }
 
 async function testHistorySelfHealing() {
-  console.log('Testing: History translation self-healing guard...');
+  console.log('Testing: History translation self-healing guard (alternating plaintext model)...');
   
   const { anthropicToOpenai } = require('../src/anthropic_compat');
   
@@ -223,7 +223,18 @@ async function testHistorySelfHealing() {
       },
       {
         role: 'assistant',
-        content: 'Pre-text\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name="Bash">\n<｜DSML｜parameter name="command" string="true">ls</｜DSML｜parameter>\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>'
+        content: [
+          {
+            type: 'text',
+            text: 'Pre-text'
+          },
+          {
+            type: 'tool_use',
+            id: 'toolu_dsml_12345',
+            name: 'Bash',
+            input: { command: 'ls' }
+          }
+        ]
       },
       {
         role: 'user',
@@ -241,16 +252,20 @@ async function testHistorySelfHealing() {
   const result = anthropicToOpenai(mockAnthropicRequest);
   console.log('  OpenAI Translated Messages:', JSON.stringify(result.messages, null, 2));
   
-  const assistantMsg = result.messages[1];
-  assert.strictEqual(assistantMsg.role, 'assistant');
-  assert.ok(assistantMsg.tool_calls, 'Assistant message should have been healed to include tool_calls');
-  assert.strictEqual(assistantMsg.tool_calls.length, 1);
-  assert.strictEqual(assistantMsg.tool_calls[0].id, 'toolu_dsml_12345');
-  assert.strictEqual(assistantMsg.tool_calls[0].function.name, 'Bash');
-
-  const toolMsg = result.messages[2];
-  assert.strictEqual(toolMsg.role, 'tool');
-  assert.strictEqual(toolMsg.tool_call_id, 'toolu_dsml_12345');
+  assert.strictEqual(result.messages.length, 3);
+  
+  assert.strictEqual(result.messages[0].role, 'user');
+  assert.strictEqual(result.messages[0].content, 'Please list files.');
+  
+  assert.strictEqual(result.messages[1].role, 'assistant');
+  assert.ok(result.messages[1].content.includes('Pre-text'));
+  assert.ok(result.messages[1].content.includes('<｜DSML｜tool_calls>'));
+  assert.ok(result.messages[1].content.includes('<｜DSML｜invoke name="Bash">'));
+  assert.ok(result.messages[1].content.includes('ls'));
+  
+  assert.strictEqual(result.messages[2].role, 'user');
+  assert.ok(result.messages[2].content.includes('<tool_result id="toolu_dsml_12345">'));
+  assert.ok(result.messages[2].content.includes('src/ package.json'));
 
   console.log('✔ testHistorySelfHealing PASSED');
 }

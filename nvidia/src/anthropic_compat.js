@@ -83,77 +83,20 @@ function hasToolResultBlock(msg) {
   return false;
 }
 
-function findToolUseInHistory(a, toolUseId) {
-  if (!a || !Array.isArray(a.messages)) return null;
-  for (const m of a.messages) {
-    if (m && Array.isArray(m.content)) {
-      for (const blk of m.content) {
-        if (blk && blk.type === 'tool_use' && blk.id === toolUseId) {
-          return blk;
-        }
-      }
+function formatToolCallsAsDsml(toolUses) {
+  if (toolUses.length === 0) return '';
+  const invokes = [];
+  for (const blk of toolUses) {
+    const name = blk.name || '';
+    const params = [];
+    const input = blk.input || {};
+    for (const [k, v] of Object.entries(input)) {
+      const valStr = typeof v === 'string' ? v : JSON.stringify(v);
+      params.push(`<｜DSML｜parameter name="${k}" string="true">${valStr}</｜DSML｜parameter>`);
     }
+    invokes.push(`<｜DSML｜invoke name="${name}">\n${params.join('\n')}\n</｜DSML｜invoke>`);
   }
-  return null;
-}
-
-function getToolMetadata(a, toolUseId) {
-  const found = findToolUseInHistory(a, toolUseId);
-  if (found) {
-    return { name: found.name, input: found.input || {} };
-  }
-  
-  if (a && Array.isArray(a.messages)) {
-    for (const m of a.messages) {
-      if (m && m.role === 'assistant') {
-        const text = typeof m.content === 'string' ? m.content : _flattenText(m.content || []);
-        const normalized = text.replace(/\uff5c/g, '|');
-        
-        const match = normalized.match(new RegExp(`<\\|DSML\\|invoke\\s+name="([^"]+)"[^>]*>[\\s\\S]*?${toolUseId}`));
-        if (match) {
-          return { name: match[1], input: {} };
-        }
-        
-        const genericMatch = normalized.match(/<\|DSML\|invoke\s+name="([^"]+)"[^>]*>/);
-        if (genericMatch) {
-          return { name: genericMatch[1], input: {} };
-        }
-      }
-    }
-  }
-  
-  return { name: 'unknown_tool', input: {} };
-}
-
-function ensurePrecedingToolCall(msgs, toolCallId, a) {
-  let lastAssistant = null;
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    if (msgs[i].role === 'assistant') {
-      lastAssistant = msgs[i];
-      break;
-    }
-  }
-  if (!lastAssistant) {
-    lastAssistant = { role: 'assistant', content: '', tool_calls: [] };
-    msgs.push(lastAssistant);
-  }
-  
-  if (!lastAssistant.tool_calls) {
-    lastAssistant.tool_calls = [];
-  }
-  
-  const exists = lastAssistant.tool_calls.some(tc => tc.id === toolCallId);
-  if (!exists) {
-    const meta = getToolMetadata(a, toolCallId);
-    lastAssistant.tool_calls.push({
-      id: toolCallId,
-      type: 'function',
-      function: {
-        name: meta.name,
-        arguments: JSON.stringify(meta.input)
-      }
-    });
-  }
+  return `<｜DSML｜tool_calls>\n${invokes.join('\n')}\n</｜─DSML｜tool_calls>`.replace('</｜─DSML｜tool_calls>', '</｜DSML｜tool_calls>');
 }
 
 function anthropicToOpenai(a, officialContext) {
@@ -231,17 +174,20 @@ function anthropicToOpenai(a, officialContext) {
     // 1. If role is 'tool'
     if (role === 'tool') {
       const toolResultContent = Array.isArray(content) ? content : [];
+      const textParts = [];
       for (const blk of toolResultContent) {
         if (blk && blk.type === 'tool_result') {
           let c = blk.content || '';
           c = Array.isArray(c) ? _flattenText(c) : c;
-          ensurePrecedingToolCall(msgs, blk.tool_use_id, a);
-          msgs.push({
-            role: 'tool',
-            tool_call_id: blk.tool_use_id,
-            content: typeof c === 'string' ? c : JSON.stringify(c),
-          });
+          const textContent = typeof c === 'string' ? c : JSON.stringify(c);
+          textParts.push(`<tool_result id="${blk.tool_use_id}">\n${textContent}\n</tool_result>`);
         }
+      }
+      if (textParts.length > 0) {
+        msgs.push({
+          role: 'user',
+          content: textParts.join('\n\n')
+        });
       }
       continue;
     }
@@ -254,8 +200,7 @@ function anthropicToOpenai(a, officialContext) {
 
     // 3. If content is an array of blocks
     const parts = [];
-    const toolCalls = [];
-    const toolResults = [];
+    const toolUses = [];
 
     const rawContent = Array.isArray(content) ? content : [];
     for (const blk of rawContent) {
@@ -275,46 +220,36 @@ function anthropicToOpenai(a, officialContext) {
         }
         parts.push({ type: 'image_url', image_url: { url } });
       } else if (t === 'tool_use') {
-        toolCalls.push({
-          id: blk.id,
-          type: 'function',
-          function: {
-            name: blk.name,
-            arguments: JSON.stringify(blk.input || {}),
-          },
-        });
+        toolUses.push(blk);
       } else if (t === 'tool_result') {
         let c = blk.content || '';
         c = Array.isArray(c) ? _flattenText(c) : c;
-        toolResults.push({
-          role: 'tool',
-          tool_call_id: blk.tool_use_id,
-          content: typeof c === 'string' ? c : JSON.stringify(c),
-        });
+        const textContent = typeof c === 'string' ? c : JSON.stringify(c);
+        parts.push({ type: 'text', text: `<tool_result id="${blk.tool_use_id}">\n${textContent}\n</tool_result>` });
       }
     }
 
+    if (toolUses.length > 0) {
+      const dsml = formatToolCallsAsDsml(toolUses);
+      parts.push({ type: 'text', text: dsml });
+    }
+
     if (role === 'user') {
-      if (toolResults.length > 0) {
-        for (const tr of toolResults) {
-          ensurePrecedingToolCall(msgs, tr.tool_call_id, a);
-        }
-        msgs.push(...toolResults);
-      }
       if (parts.length > 0) {
         if (parts.every(p => p.type === 'text')) {
-          msgs.push({ role: 'user', content: parts.map(p => p.text).join('') });
+          msgs.push({ role: 'user', content: parts.map(p => p.text).join('\n\n') });
         } else {
-          msgs.push({ role: 'user', content: parts });
+          const formattedParts = parts.map(p => {
+            if (p.type === 'text') return { type: 'text', text: p.text };
+            return p;
+          });
+          msgs.push({ role: 'user', content: formattedParts });
         }
       }
     } else if (role === 'assistant') {
       const am = { role: 'assistant' };
-      const txt = parts.filter(p => p.type === 'text').map(p => p.text).join('');
-      am.content = txt || (toolCalls.length > 0 ? null : '');
-      if (toolCalls.length > 0) {
-        am.tool_calls = toolCalls;
-      }
+      const txt = parts.filter(p => p.type === 'text').map(p => p.text).join('\n\n');
+      am.content = txt || '';
       msgs.push(am);
     }
   }
