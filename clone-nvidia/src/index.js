@@ -3514,7 +3514,11 @@ function loadConfigFromEnvFile() {
       if (!key || !val) continue;
 
       if (key.startsWith('NVIDIA_API_KEY')) {
-        if (val.length >= 10 && val.startsWith('nvapi-')) {
+        // Match pool.loadFromEnv() validation: only check minimum length.
+        // Do NOT require 'nvapi-' prefix — NVIDIA API keys can have different
+        // formats and the prefix check would reject valid keys on reload that
+        // were accepted on initial load (inconsistency bug C2).
+        if (val.length >= 10) {
           config.keys.push(val);
         } else if (val.length > 0) {
           console.warn(`[wrapper-nvidia] Ignoring invalid or placeholder key in .env: ${key}`);
@@ -3617,7 +3621,9 @@ async function main() {
   const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
   const antiSilence = parseInt(process.env.ANTI_SILENCE_TIMEOUT_MS || process.env.SERVER_REQUEST_TIMEOUT_MS || String(Math.max(ttftMs + 30000, 60000)), 10);
   serverInstance.timeout = antiSilence;
-  serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_MS || '10000', 10);
+  // Default 65000 matches .env.example — 10s was dangerously low and would kill
+// healthy streaming connections (reasoning models think silently for minutes).
+serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_MS || '65000', 10);
   serverInstance.maxHeadersCount = 100;
   serverInstance.headersTimeout = parseInt(process.env.SERVER_HEADERS_TIMEOUT_MS || '15000', 10);
 

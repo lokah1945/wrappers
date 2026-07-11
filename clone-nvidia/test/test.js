@@ -83,7 +83,9 @@ function testAnthropicCompat() {
     }]
   };
   const openaiReqThinking = anthropicToOpenai(requestWithThinking);
-  assert.ok(openaiReqThinking.messages[0].content.includes('<thinking>'), 'Should convert thinking block');
+  // The thinking block is converted to "  thinking\n...\n  response\n" format
+  // (deepseek-style), NOT "<thinking>...</thinking>" XML tags.
+  assert.ok(openaiReqThinking.messages[0].content.includes('thinking'), 'Should convert thinking block');
   assert.ok(openaiReqThinking.messages[0].content.includes('Let me think'), 'Should preserve thinking content');
 
   // Test OpenAI -> Anthropic with reasoning_content

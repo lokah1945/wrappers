@@ -270,6 +270,50 @@ async function testHistorySelfHealing() {
   console.log('✔ testHistorySelfHealing PASSED');
 }
 
+async function testThinkingTagsInNormalText() {
+  console.log('Testing: Thinking tags inside normal text block after completion...');
+  
+  const { streamOpenaiToAnthropic } = require('../src/anthropic_compat');
+  
+  const chunks = [
+    JSON.stringify({
+      choices: [{
+        delta: { reasoning_content: 'Let me think first.' }
+      }]
+    }) + '\n',
+    JSON.stringify({
+      choices: [{
+        delta: { reasoning_content: '\nDone thinking.', content: 'Here is the code explaining `<think>` tag:\n' }
+      }]
+    }) + '\n',
+    JSON.stringify({
+      choices: [{
+        delta: { content: 'To use it, write <think>hello</think> or </thinking> tag.' }
+      }]
+    }) + '\n',
+  ];
+  
+  const stream = makeMockStream(chunks.map(c => 'data: ' + c));
+  const capture = {};
+  const events = [];
+  
+  for await (const event of streamOpenaiToAnthropic(stream, 'deepseek-ai/deepseek-v4-pro', capture)) {
+    const lines = event.split('\n');
+    for (const line of lines) {
+      if (line.startsWith('data:')) {
+        events.push(JSON.parse(line.substring(5).trim()));
+      }
+    }
+  }
+  
+  const contentStartEvents = events.filter(e => e.type === 'content_block_start');
+  assert.strictEqual(contentStartEvents.length, 2);
+  assert.strictEqual(contentStartEvents[0].content_block.type, 'thinking');
+  assert.strictEqual(contentStartEvents[1].content_block.type, 'text');
+  
+  console.log('✔ testThinkingTagsInNormalText PASSED');
+}
+
 async function runAll() {
   try {
     await testReasoningOnlyTransition();
@@ -277,6 +321,7 @@ async function runAll() {
     await testDsmlToolCallsParsing();
     await testDsmlNonStreaming();
     await testHistorySelfHealing();
+    await testThinkingTagsInNormalText();
     console.log('\n✔ All thinking parser regression tests PASSED!');
   } catch (err) {
     console.error('\n✗ Test failed:', err);
