@@ -1,0 +1,19 @@
+[Unit]
+Description=wrapper-nvidia CLONE (staging) Node.js proxy
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper/clone-nvidia
+ExecStart=/usr/bin/node /root/wrapper/clone-nvidia/src/index.js
+Restart=on-failure
+RestartSec=5
+EnvironmentFile=/root/wrapper/clone-nvidia/.env
+Environment=LISTEN_PORT=9910
+Environment=METRICS_DB=/root/wrapper/clone-nvidia/metrics-clone.db
+TimeoutStopSec=15
+MemoryMax=512M
+TasksMax=512
+
+[Install]
+WantedBy=multi-user.target

@@ -25,7 +25,7 @@ At minimum, `.env` must have at least one API key:
 ```ini
 NVIDIA_API_KEY_1=nvapi-xxxx...
 NVIDIA_API_KEY_2=nvapi-yyyy...
-LISTEN_PORT=9100
+LISTEN_PORT=9910
 ```
 
 ### Run
@@ -38,18 +38,18 @@ npm start
 
 ```bash
 # Health check
-curl http://localhost:9100/health
+curl http://localhost:9910/health
 
 # List models
-curl http://localhost:9100/v1/models | jq '.data | length'
+curl http://localhost:9910/v1/models | jq '.data | length'
 
 # Chat completion (OpenAI format)
-curl http://localhost:9100/v1/chat/completions \
+curl http://localhost:9910/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"model":"meta/llama-3.1-8b-instruct","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
 
 # Chat completion (Anthropic format)
-curl http://localhost:9100/v1/messages \
+curl http://localhost:9910/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{"model":"meta/llama-3.1-8b-instruct","messages":[{"role":"user","content":"Hello"}],"max_tokens":100}'
@@ -91,7 +91,7 @@ curl http://localhost:9100/v1/messages \
 
 ```bash
 # Streaming (OpenAI format)
-curl -N http://localhost:9100/v1/chat/completions \
+curl -N http://localhost:9910/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "meta/llama-3.1-8b-instruct",
@@ -101,7 +101,7 @@ curl -N http://localhost:9100/v1/chat/completions \
   }'
 
 # Streaming (Anthropic format)
-curl -N http://localhost:9100/v1/messages \
+curl -N http://localhost:9910/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
@@ -112,7 +112,7 @@ curl -N http://localhost:9100/v1/messages \
   }'
 
 # Embeddings
-curl http://localhost:9100/v1/embeddings \
+curl http://localhost:9910/v1/embeddings \
   -H "Content-Type: application/json" \
   -d '{
     "model": "nvidia/nv-embed-v1",
@@ -127,7 +127,7 @@ curl http://localhost:9100/v1/embeddings \
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:9100/v1",
+    base_url="http://localhost:9910/v1",
     api_key="ignored-by-wrapper"
 )
 
@@ -144,7 +144,7 @@ print(r.choices[0].message.content)
 from anthropic import Anthropic
 
 client = Anthropic(
-    base_url="http://localhost:9100",
+    base_url="http://localhost:9910",
     api_key="ignored-by-wrapper"
 )
 
@@ -165,7 +165,7 @@ function post(path, body) {
   return new Promise((resolve, reject) => {
     const data = JSON.stringify(body);
     const req = http.request({
-      hostname: 'localhost', port: 9100, path,
+      hostname: 'localhost', port: 9910, path,
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(data) }
     }, res => {
@@ -212,7 +212,7 @@ All config via `.env` file (auto-reloaded):
 | Variable | Default | Description |
 |---|---|---|
 | `NVIDIA_API_KEY_N` | — | NVIDIA API key(s) |
-| `LISTEN_PORT` | 9100 | HTTP listen port |
+| `LISTEN_PORT` | 9910 | HTTP listen port |
 | `SOFT_LIMIT_RPM` | 30 | Soft RPM limit per key |
 | `HARD_LIMIT_RPM` | 40 | Hard RPM limit per key |
 | `QUEUE_LIMIT` | 1.0 | Queue admission rate (req/s per key) |
@@ -278,7 +278,7 @@ Client ──HTTP──► wrapper-nvidia (Node.js)
 npm test
 
 # E2E tests (requires running server)
-curl http://localhost:9100/health
+curl http://localhost:9910/health
 ```
 
 ### Test Results (2026-07-06)

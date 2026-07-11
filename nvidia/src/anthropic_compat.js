@@ -209,7 +209,7 @@ function anthropicToOpenai(a, officialContext) {
       if (t === 'text') {
         parts.push({ type: 'text', text: blk.text || '' });
       } else if (t === 'thinking') {
-        parts.push({ type: 'text', text: `<think>\n${blk.thinking || ''}\n</think>\n` });
+        parts.push({ type: 'text', text: `  thinking\n${blk.thinking || ''}\n  response\n` });
       } else if (t === 'image') {
         const src = blk.source || {};
         let url;
@@ -291,12 +291,23 @@ function anthropicToOpenai(a, officialContext) {
   }
 
   const tc = a.tool_choice;
-  if (tc && typeof tc === 'object') {
-    const tt = tc.type;
-    if (tt === 'auto') oai.tool_choice = 'auto';
-    else if (tt === 'any') oai.tool_choice = 'required';
-    else if (tt === 'none') oai.tool_choice = 'none';
-    else if (tt === 'tool') oai.tool_choice = { type: 'function', function: { name: tc.name } };
+  // Anthropic API accepts tool_choice as both an object {type:"auto"|"any"|"none"|"tool"}
+  // AND a plain string "auto"|"any"|"none" for convenience. Non-Claude-Code clients
+  // (OpenCode, Kilo Code, Hermes) may send the string form. Previously only the object
+  // form was handled; string values were silently dropped → tool_choice ignored.
+  if (tc) {
+    if (typeof tc === 'string') {
+      if (tc === 'auto') oai.tool_choice = 'auto';
+      else if (tc === 'any') oai.tool_choice = 'required';
+      else if (tc === 'none') oai.tool_choice = 'none';
+      // string "tool" without a name is invalid — ignore
+    } else if (typeof tc === 'object') {
+      const tt = tc.type;
+      if (tt === 'auto') oai.tool_choice = 'auto';
+      else if (tt === 'any') oai.tool_choice = 'required';
+      else if (tt === 'none') oai.tool_choice = 'none';
+      else if (tt === 'tool') oai.tool_choice = { type: 'function', function: { name: tc.name } };
+    }
   }
 
   // Passthrough extra_body + nvext for NVIDIA-specific params through the
@@ -618,7 +629,15 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
           currentToolName = toolName;
           currentToolId = `toolu_dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}_${ai}`;
           currentToolInput = {};
-          
+
+          // Contract shim: if extended thinking was requested but the model
+          // produced no real reasoning yet, emit a minimal synthetic thinking
+          // block BEFORE the first tool_use block so Claude Code's
+          // content-ordering contract holds (first block must be thinking).
+          // Mirrors the same guard in the native tool_calls path and emitText.
+          if (expectThinking && !realThinkingEmitted && !syntheticThinkingEmitted) {
+            yield* emitSyntheticThinking();
+          }
           sentTextOrToolBlock = true;
           yield* stopOpen();
           openIdx = ai;
@@ -733,6 +752,23 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       yield* stopOpen();
       inThinkTag = false;
       completedThinking = true;
+    }
+
+    if (completedThinking) {
+      // Once thinking is completed, everything else is strictly text (or DSML)
+      const dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>");
+      if (dsmlStartIdx !== -1) {
+        const before = chunk.substring(0, dsmlStartIdx);
+        const after = chunk.substring(dsmlStartIdx);
+        if (before) {
+          yield* emitText(before);
+        }
+        inDsmlMode = true;
+        yield* processDsml(after);
+        return;
+      }
+      yield* emitText(chunk);
+      return;
     }
 
     if (isReasoning && !inThinkTag && thinkingIndex !== null) {

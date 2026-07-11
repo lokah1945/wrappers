@@ -605,26 +605,37 @@ function parseUnsupportedParams(bodyText) {
   if (!msg.toLowerCase().includes('unsupported parameter') && !msg.toLowerCase().includes('extra fields') && !msg.toLowerCase().includes('unexpected')) {
     return [];
   }
-  const matches = [];
-  // B7 FIX: previous regex only matched backtick (`param`) and single-quote
-  // ('param') formats. NVIDIA NIM also returns parameters in double quotes
-  // ("param"), bare words (param), and JSON pointer format (/body/param).
-  // Now we match all common formats so the retry loop can strip them.
-  const regex = /`([^`]+)`|'([^']+)'|"([^"]+)"|\/([a-z_]+)$/gm;
+  const matches = new Set();
+  // Main regex: match backtick, single-quote, double-quote, and JSON pointer
+  // formats. Also support nested paths with dots.
+  const regex = /`([^`]+)`|'([^']+)'|"([^"]+)"|\/([a-z_][a-z0-9_/]*)/gm;
   let m;
   while ((m = regex.exec(msg)) !== null) {
     const p = m[1] || m[2] || m[3] || m[4];
-    if (p && p.trim()) matches.push(p.trim());
-  }
-  // Fallback: also scan for bare parameter names after "unsupported parameter:"
-  if (matches.length === 0) {
-    const bareRegex = /unsupported parameter:?\s*([a-z_][a-z0-9_]*)/gi;
-    let bm;
-    while ((bm = bareRegex.exec(msg)) !== null) {
-      if (bm[1] && bm[1].trim()) matches.push(bm[1].trim());
+    if (p && p.trim()) {
+      let param = p.trim();
+      // Convert JSON pointer (/body/chat_template_kwargs/thinking) to dot notation.
+      // Group 4 (m[4]) captures the path WITHOUT the leading slash (e.g., "body/chat_template_kwargs/thinking").
+      if (m[4] !== undefined) {
+        const parts = param.split('/');
+        if (parts.length >= 2) {
+          param = parts.slice(1).join('.');
+        }
+      }
+      matches.add(param);
     }
   }
-  return matches;
+  // Fallback: scan for bare nested parameter paths after keywords like
+  // "unsupported parameter", "extra fields", "unexpected field", etc.
+  const keywordRegex = /(?:unsupported parameters?|extra fields?|unexpected fields?)(?: not permitted)?:?\s*([a-z_][a-z0-9_.]*(?:,\s*[a-z_][a-z0-9_.]*)*)/gi;
+  let bm;
+  while ((bm = keywordRegex.exec(msg)) !== null) {
+    if (bm[1] && bm[1].trim()) {
+      const parts = bm[1].split(',').map(s => s.trim());
+      for (const part of parts) matches.add(part);
+    }
+  }
+  return Array.from(matches);
 }
 
 // ── Upstream Routing Table ─────────────────────────────────────────────
@@ -1168,10 +1179,34 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
         }
         if (resp.status === 400 && attempt < maxAttempts - 1) {
           const badParams = parseUnsupportedParams(respText);
-          const toStrip = badParams.filter(p => body[p] !== undefined && !strippedParams.has(p));
+          const toStrip = badParams.filter(p => {
+            if (strippedParams.has(p)) return false;
+            if (p.includes('.')) {
+              const parts = p.split('.');
+              let obj = body;
+              for (let i = 0; i < parts.length - 1; i++) {
+                if (obj && typeof obj === 'object' && parts[i] in obj) {
+                  obj = obj[parts[i]];
+                } else {
+                  return false;
+                }
+              }
+              return obj && typeof obj === 'object' && parts[parts.length - 1] in obj;
+            }
+            return body[p] !== undefined;
+          });
           if (toStrip.length > 0) {
             for (const p of toStrip) {
-              delete body[p];
+              if (p.includes('.')) {
+                const parts = p.split('.');
+                let obj = body;
+                for (let i = 0; i < parts.length - 1; i++) {
+                  obj = obj[parts[i]];
+                }
+                delete obj[parts[parts.length - 1]];
+              } else {
+                delete body[p];
+              }
               strippedParams.add(p);
             }
             console.warn(`[PARAM STRIP] Stripping unsupported params ${JSON.stringify(toStrip)} and retrying`);
@@ -1632,6 +1667,17 @@ async function handleChatCompletions(body, req, res) {
       res.writeHead(200, respHeaders);
       const reader = result.stream.getReader();
       const decoder = new TextDecoder();
+      // FIX: periodic SSE keepalive for OpenAI clients (Hermes, OpenAI SDK,
+      // LiteLLM, …). When the upstream is silent for a long stretch (reasoning
+      // models "thinking", or a large cached prefill), an idle socket makes the
+      // client's read timeout fire and it closes the connection mid-response
+      // ("Connection closed mid-response"). A comment-frame heartbeat every
+      // HEARTBEAT_INTERVAL_MS keeps the stream alive. (The Anthropic path
+      // already does this inside streamOpenaiToAnthropic.)
+      const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '5000', 10);
+      let hbTimer = null;
+      const hbTick = () => { try { if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n'); } catch {} };
+      hbTimer = setInterval(hbTick, HEARTBEAT_MS);
       let lastUsage = null;
       let ttftMs = 0;
       // P1-3 FIX: Streaming buffer configurable via MAX_STREAM_BUFFER_KB env
@@ -1746,11 +1792,12 @@ async function handleChatCompletions(body, req, res) {
         retries: 0,
         pacingMs: result.pacingMs || 0
       });
-    } finally {
-      try { reader.cancel(); } catch {}
-      pool.releaseSuccess(result.key);
-      decInFlight();
-    }
+      } finally {
+        if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+        try { reader.cancel(); } catch {}
+        pool.releaseSuccess(result.key);
+        decInFlight();
+      }
     return;
   }
 
@@ -2127,7 +2174,23 @@ function enrichModelMetadata(id, desc) {
 async function handleModels(res, url = null) {
   const force = url?.searchParams?.get('refresh') === 'true';
   const gateway = url?.searchParams?.get('gateway') === '1';
-  const ids = await pool.refreshModels(force);
+  const allIds = await pool.refreshModels(force);
+  // Only expose models that are genuinely usable. Unavailable models (retired,
+  // or marked unavailable by the boot/periodic verify-sweep, live 404s, or
+  // upstream degradation) are tracked in `unavailableModels` and still 404/503
+  // if requested directly — so transparent-proxy routing is unchanged. They
+  // simply don't appear in discovery, so clients (Claude Code model picker,
+  // OpenAI SDK, dashboards) only see models that actually work on NVIDIA NIM.
+  // Only expose models that are genuinely usable. `unavailableModels` is the
+  // live record maintained by the boot/periodic verify-sweep, live 404s, and
+  // upstream degradation (and loaded from the metrics DB at boot). We filter
+  // the DISCOVERY list directly against it — independent of the
+  // BLOCK_UNAVAILABLE_MODELS toggle, which only governs request-time short-
+  // circuiting. Routing stays a transparent proxy: a request to a model not in
+  // this list still passes through to NVIDIA NIM and gets the real upstream
+  // error. Clients (Claude Code picker, OpenAI SDK, dashboards) only see models
+  // that currently work.
+  const ids = allIds.filter(id => !unavailableModels.has(id));
   // Always rebuild the DISCOVERY_TO_NIM map so behind-the-scenes claude-*
   // alias resolution works even when aliases are not in the response.
   refreshDiscoveryMap(ids);
@@ -2604,6 +2667,34 @@ async function handleRequest(req, res) {
     url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     path = url.pathname;
     method = req.method;
+
+    // ── OpenAI-compatible path normalization (FIX: missing /v1 prefix) ──
+    // Many OpenAI-SDK based clients and agents (Hermes, LiteLLM, OpenCode,
+    // Kilo Code, OpenAI SDK, curl scripts, …) send requests to
+    // `/chat/completions`, `/embeddings`, `/models`, `/images/generations`,
+    // `/ranking`, `/infer`, `/responses`, … WITHOUT the `/v1` prefix. Previously
+    // these fell through to handleCatchAll, which forwarded the *unprefixed*
+    // path to NVIDIA (e.g. https://integrate.api.nvidia.com/chat/completions)
+    // and got a 404 — breaking EVERY text model for those clients. Here we
+    // transparently rewrite the well-known OpenAI endpoint stems to their /v1
+    // form so they hit the real handlers. We never touch /v1, /v2, /api
+    // (Ollama), /metrics, /health, /dashboard, /events, /props, /version, ….
+    if (!path.startsWith('/v1') && !path.startsWith('/v2') && !path.startsWith('/api')) {
+      const OPENAI_NORMALIZE_STEMS = [
+        '/chat/completions', '/completions', '/embeddings', '/models', '/engines',
+        '/images/generations', '/images/edits', '/images/variations',
+        '/audio/transcriptions', '/audio/translations', '/audio/speech',
+        '/moderations', '/responses', '/files', '/fine_tuning', '/batches',
+        '/ranking', '/infer',
+      ];
+      for (const stem of OPENAI_NORMALIZE_STEMS) {
+        if (path === stem || path.startsWith(stem + '/')) {
+          path = '/v1' + path;
+          console.log(`[normalize] Rewrote path -> ${path}`);
+          break;
+        }
+      }
+    }
 
   } catch (e) {
     console.warn(`[${requestId}] Malformed request URL: ${req.url}`);

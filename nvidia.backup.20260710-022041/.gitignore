@@ -1,6 +1,0 @@
-clone-nvidia/
-*.db
-*.db-wal
-*.db-shm
-metrics.db*
-

@@ -209,7 +209,7 @@ function anthropicToOpenai(a, officialContext) {
       if (t === 'text') {
         parts.push({ type: 'text', text: blk.text || '' });
       } else if (t === 'thinking') {
-        parts.push({ type: 'text', text: `<think>\n${blk.thinking || ''}\n</think>\n` });
+        parts.push({ type: 'text', text: `  thinking\n${blk.thinking || ''}\n  response\n` });
       } else if (t === 'image') {
         const src = blk.source || {};
         let url;
@@ -629,7 +629,15 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
           currentToolName = toolName;
           currentToolId = `toolu_dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}_${ai}`;
           currentToolInput = {};
-          
+
+          // Contract shim: if extended thinking was requested but the model
+          // produced no real reasoning yet, emit a minimal synthetic thinking
+          // block BEFORE the first tool_use block so Claude Code's
+          // content-ordering contract holds (first block must be thinking).
+          // Mirrors the same guard in the native tool_calls path and emitText.
+          if (expectThinking && !realThinkingEmitted && !syntheticThinkingEmitted) {
+            yield* emitSyntheticThinking();
+          }
           sentTextOrToolBlock = true;
           yield* stopOpen();
           openIdx = ai;

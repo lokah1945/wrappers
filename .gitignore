@@ -57,3 +57,7 @@ nvidia/.env.pre-stable-*.bak
 # DB files
 netrics.db
 netrics.db-*
+
+# Local backup directories — never push to GitHub
+nvidia_backup_*/
+nvidia.backup.*/

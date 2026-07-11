@@ -94,6 +94,54 @@ curl -fsS http://127.0.0.1:9100/health
 
 ---
 
+## Production Release — 2026-07-12
+
+**Phase:** production migration of the wrapper-nvidia fix (staging in `clone-nvidia/`, live in `nvidia/`).
+
+### Root cause (found from Claude Code usage, model `z-ai/glm-5.2`)
+OpenAI-compatible clients — **Hermes, OpenAI SDK, LiteLLM, OpenCode, Kilo Code, and
+any `/chat/completions` caller** — send requests to paths **without the `/v1`
+prefix** (e.g. `/chat/completions`). The wrapper fell through to `handleCatchAll`,
+which forwarded the *unprefixed* path straight to NVIDIA
+(`https://integrate.api.nvidia.com/chat/completions`) and got a **404 — breaking
+every text model for those clients**. Claude Code (`/v1/messages`) was unaffected,
+which is why the failure only surfaced for non-Anthropic agents. The production
+metrics DB showed repeated `404` on `/chat/completions` for `z-ai/glm-5.2`.
+
+### Fixes applied
+1. **OpenAI path normalization** (`handleRequest`, `src/index.js`): well-known
+   OpenAI endpoint stems (`/chat/completions`, `/embeddings`, `/models`,
+   `/images/*`, `/ranking`, `/infer`, `/responses`, `/audio/*`, `/moderations`,
+   …) are transparently rewritten to their `/v1/...` form so they hit the real
+   handlers. `/v1`, `/v2`, `/api` (Ollama), `/metrics`, `/health`, etc. are left
+   untouched.
+2. **SSE keepalive heartbeat** for the OpenAI streaming path (`handleChatCompletions`)
+   — emits a comment frame every `HEARTBEAT_INTERVAL_MS` so clients don't time out
+   and drop the connection mid-response during upstream silence (reasoning models,
+   large prefill). The Anthropic path already had this.
+3. **Capacity / timeout tuning** (`.env`): `INFLIGHT_SOFT_CAP 50 → 100`,
+   `HEADERS_TIMEOUT_MS 15s → 30s`, `PACING_MAX_WAIT → 120`.
+
+### Validation (end-to-end, via curl)
+- `z-ai/glm-5.2`: `/chat/completions` (no `/v1`) → **200** (was 404);
+  `/v1/chat/completions` → 200; `/v1/messages` → 200; streaming + `tool_use`
+  returns a clean `tool_use` block + `message_stop`.
+- **Full sweep of 109 text I/O models**: `/chat/completions` (no `/v1`) now returns
+  **identical** status to `/v1/chat/completions` for every model. Remaining
+  non-200s are genuine NVIDIA upstream errors (model unavailable on this account,
+  cold-start latency, or specialized params), never a wrapper-introduced 404.
+
+### Layout in this repo
+| Path | Role | Port | systemd unit |
+|------|------|------|--------------|
+| `nvidia/` | **production** (live) | 9100 | `wrapper-nvidia.service` |
+| `clone-nvidia/` | staging / pre-prod validation | 9910 | `wrapper-nvidia-clone.service` |
+
+> Backup directories (`nvidia_backup_*`, `nvidia.backup.*`) are **local-only**
+> and intentionally excluded from this repository.
+
+---
+
 ## Roadmap (planned siblings)
 
 | Wrapper        | Port | Provider backing         | Status |
