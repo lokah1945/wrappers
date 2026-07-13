@@ -99,10 +99,71 @@ function formatToolCallsAsDsml(toolUses) {
   return `<｜DSML｜tool_calls>\n${invokes.join('\n')}\n</｜─DSML｜tool_calls>`.replace('</｜─DSML｜tool_calls>', '</｜DSML｜tool_calls>');
 }
 
+// ── Claude Code / agent extension-field hygiene ─────────────────────────────
+// Claude Code (and other modern Anthropic clients) routinely attach
+// Anthropic-first-party fields that NVIDIA NIM / open-weight models do NOT
+// understand: `cache_control` (ephemeral prompt-cache hint), `defer_loading`
+// (tool-deferral hint), and `tool_search_tool_*` pseudo-tools (the API-side
+// Tool Search feature). NIM has no Anthropic-style prompt cache; forwarding
+// `cache_control` risks a 400 ("Extra inputs are not permitted") on strict
+// models or at best a silently-ignored field. `tool_search_tool_*` tools are
+// executed by Anthropic's *infrastructure*, not by the model — forwarding them
+// raw to NIM yields a 400 (shape does not match a normal function schema) or
+// confuses the model. We strip these safely and transparently so the request
+// that reaches NIM only contains fields it understands. See §6.11 / §6.13.
+
+// Recursively delete `cache_control` from anywhere it may appear in an
+// Anthropic request body: top-level `system` array blocks, every message's
+// `content` blocks, and tool definitions. Mutates in place (the body is a
+// freshly-parsed request we own) and returns the same object.
+function stripCacheControl(node) {
+  if (Array.isArray(node)) {
+    for (const item of node) stripCacheControl(item);
+    return node;
+  }
+  if (node && typeof node === 'object') {
+    delete node.cache_control;
+    for (const k of Object.keys(node)) {
+      const v = node[k];
+      if (v && typeof v === 'object') stripCacheControl(v);
+    }
+  }
+  return node;
+}
+
+// Filter the Anthropic `tools` array down to what NIM can consume:
+//  - drop any tool whose `type` starts with `tool_search_tool_` (these are
+//    API-side search tools Claude Code may inject when ENABLE_TOOL_SEARCH is
+//    on; the NIM model cannot execute them and the wrapper does not implement
+//    API-side tool search, so they must not reach upstream)
+//  - clear `defer_loading` on the remaining tools (NIM has no deferred-loading
+//    concept; leaving it is at best ignored, at worst rejected)
+// Returns { tools, droppedSearchTool } where droppedSearchTool is true if at
+// least one tool_search_tool_* was removed (so callers can log/observe).
+function sanitizeAnthropicTools(tools) {
+  if (!Array.isArray(tools) || tools.length === 0) return { tools: tools || [], droppedSearchTool: false };
+  let droppedSearchTool = false;
+  const out = [];
+  for (const t of tools) {
+    const type = typeof t === 'object' && t !== null ? t.type : undefined;
+    if (typeof type === 'string' && type.startsWith('tool_search_tool_')) {
+      droppedSearchTool = true;
+      continue;
+    }
+    if (t && typeof t === 'object') delete t.defer_loading;
+    out.push(t);
+  }
+  return { tools: out, droppedSearchTool };
+}
+
 function anthropicToOpenai(a, officialContext) {
   console.log('[anthropicToOpenai] Called with:', JSON.stringify(a).slice(0, 500));
   if (!a || typeof a !== 'object') return { model: '', messages: [] };
   if (!Array.isArray(a.messages)) return { model: '', messages: [] };
+
+  // Strip Anthropic-first-party fields NIM cannot understand BEFORE any
+  // translation. Claude Code sends `cache_control` on (almost) every request.
+  stripCacheControl(a);
 
   // Sliding window context pruning.
   // Uses authoritative NGC registry context when available; falls back to heuristic map.
@@ -280,14 +341,21 @@ function anthropicToOpenai(a, officialContext) {
   if (a.stream) oai.stream = true;
 
   if (a.tools && a.tools.length > 0) {
-    oai.tools = a.tools.map(t => ({
-      type: 'function',
-      function: {
-        name: t.name,
-        description: t.description || '',
-        parameters: t.input_schema || {},
-      },
-    }));
+    // Drop API-side Tool Search pseudo-tools and clear `defer_loading` (§6.11).
+    const { tools: cleaned, droppedSearchTool } = sanitizeAnthropicTools(a.tools);
+    if (droppedSearchTool) {
+      console.log('[anthropic_compat] Dropped tool_search_tool_* pseudo-tool(s) before forwarding to NIM (not supported upstream).');
+    }
+    if (cleaned.length > 0) {
+      oai.tools = cleaned.map(t => ({
+        type: 'function',
+        function: {
+          name: t.name,
+          description: t.description || '',
+          parameters: t.input_schema || {},
+        },
+      }));
+    }
   }
 
   const tc = a.tool_choice;
@@ -1171,5 +1239,7 @@ module.exports = {
   streamOpenaiToAnthropic,
   estimateInputTokens,
   anthropicError,
+  stripCacheControl,
+  sanitizeAnthropicTools,
   _finalizeCapture,
 };

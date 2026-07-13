@@ -40,8 +40,13 @@ const TOKEN = 'e2e-token';
 // ── Mock NVIDIA upstream ────────────────────────────────────────────────────
 function sseChunk(obj) { return `data: ${JSON.stringify(obj)}\n\n`; }
 
+// Captured last translated request the wrapper forwarded to "NVIDIA" (so tests
+// can assert the wrapper stripped/translated fields correctly before egress).
+let lastChatBody = null;
+
 function mockChat(body, res) {
   const model = body.model || 'unknown';
+  lastChatBody = body;
   // Only the explicit error-passthrough test model 404s; everything else is served.
   if (model === 'does-not-exist/model') {
     res.writeHead(404, { 'Content-Type': 'application/json' });
@@ -294,6 +299,33 @@ async function main() {
       assert.ok(toolUse, 'no tool_use block');
       assert.strictEqual(toolUse.name, 'get_weather');
       assert.strictEqual(toolUse.input.location, 'NYC');
+    });
+
+    await check('Claude Code extensions stripped before NIM (cache_control + tool_search)', async () => {
+      // Claude Code (or any modern Anthropic client) routinely sends cache_control
+      // and, when ENABLE_TOOL_SEARCH is on, tool_search_tool_* pseudo-tools. None
+      // of these are understood by NVIDIA NIM. The wrapper must strip them so the
+      // translated request that reaches NIM only contains fields it understands.
+      const r = await post('/v1/messages', {
+        model: 'claude-llama-3-1-8b-instruct',
+        system: [{ type: 'text', text: 'You are helpful.', cache_control: { type: 'ephemeral' } }],
+        messages: [{ role: 'user', content: 'weather?' }],
+        max_tokens: 100,
+        tools: [
+          { type: 'tool_search_tool_regex_20251119', name: 'tool_search_tool_regex' },
+          { name: 'get_weather', description: 'g', input_schema: { type: 'object', properties: { location: { type: 'string' } } }, defer_loading: true },
+        ],
+        tool_choice: { type: 'auto' },
+      });
+      const j = await r.json();
+      assert.strictEqual(r.status, 200);
+      // The mock NIM recorded the *translated* body it received:
+      assert.ok(lastChatBody, 'mock never received a chat body');
+      assert.ok(!JSON.stringify(lastChatBody).includes('cache_control'), 'cache_control leaked to upstream');
+      assert.ok(!JSON.stringify(lastChatBody.tools || []).includes('tool_search'), 'tool_search_tool_* leaked to upstream');
+      const toolUse = j.content.find((b) => b.type === 'tool_use');
+      assert.ok(toolUse, 'no tool_use block returned to client');
+      assert.strictEqual(toolUse.name, 'get_weather');
     });
 
     await check('Extended thinking (Anthropic thinking block)', async () => {
