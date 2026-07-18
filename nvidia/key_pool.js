@@ -176,6 +176,10 @@ class KeyEntry {
     const now = Date.now() / 1000;
     this.total429s++;
     this.totalRotationsCaused++;
+    // Count the 429 against RPM history (Bug K8). Without this, currentRpm()
+    // is artificially low after a block expires, so the key is reused at full
+    // RPM immediately → rapid re-429.
+    this.timestamps.push(now);
     const rawSecs = retryAfter ? retryAfter : MODEL_BLOCK_DEFAULT_SECS;
     let blockSecs;
     if (scope === 'model' && model) {
@@ -254,7 +258,7 @@ class KeyPool {
     this._modelTsByKey = {};
     this._rrIndex = 0;
     this._ticketSeq = 0;
-    this._waiting = new Set();
+    this._waiting = new Map();   // ticket -> requested model (for per-model pacing rank, Bug K6)
 
     this._idx = 0;
     this._modelsCache = [];
@@ -290,8 +294,12 @@ class KeyPool {
       envKeys.push(v.trim());
     }
 
+    // PATCH-B: Allow 0 keys (discovery-only mode). Inference requests
+    // will fail at acquire(), but /v1/models discovery still works via
+    // anonymous upstream fetch.
     if (envKeys.length === 0) {
-      throw new Error('No NVIDIA_API_KEY* found in environment');
+      console.warn('[wrapper-nvidia] No NVIDIA_API_KEY* found in environment ' +
+        '--- running in discovery-only mode. Inference requests will be rejected.');
     }
 
     this.keys = envKeys.map((k, i) => new KeyEntry(`key${i + 1}`, k));
@@ -302,6 +310,14 @@ class KeyPool {
   /** Count helpers. */
   get totalKeys()       { return this.keys.length; }
   get availableKeys()   { return this.keys.filter(k => !k.isHardBlocked() && k.currentRpm() < k.effectiveHardLimit(this.hardLimit)).length; }
+  // Model-aware availability (Bug K3): a key model-blocked for `model` is
+  // counted as available by availableKeys (it's key-healthy + under RPM) yet
+  // acquire(model) will reject it. Expose the true per-model count so callers
+  // and /health can report accurate capacity for the model actually requested.
+  availableForModel(model) {
+    if (!model) return this.availableKeys;
+    return this.keys.filter(k => !k.isHardBlocked() && !k.isModelBlocked(model) && k.currentRpm() < k.effectiveHardLimit(this.hardLimit)).length;
+  }
   get blockedKeys()     { return this.keys.filter(k => k.isHardBlocked()).length; }
   get exhaustedCount()  { return this.keys.filter(k => k.currentRpm() >= k.effectiveHardLimit(this.hardLimit)).length; }
 
@@ -371,15 +387,20 @@ class KeyPool {
   _classify429(state, model, bodyText, rpmAt429, effHard) {
     const txt = (bodyText || '').toLowerCase();
 
-    // Signal 1
-    if (model && txt.includes(model.toLowerCase())) {
-      return ['model', 'model-name-in-body'];
+    // Signal 1 — prefer explicit KEY hints BEFORE the model-name substring
+    // test. NVIDIA account/key-level 429 bodies frequently contain the model
+    // identifier (e.g. "Rate limit reached for model meta/..."), so the
+    // model-name check MUST NOT win or a true key-level 429 is misclassified
+    // as model-level → key reused immediately at full speed → cascade 429s
+    // (Bug K5).
+    if (KEY_429_HINTS.some(h => txt.includes(h))) {
+      return ['key', 'key-hint-in-body'];
     }
     if (MODEL_429_HINTS.some(h => txt.includes(h))) {
       return ['model', 'model-hint-in-body'];
     }
-    if (KEY_429_HINTS.some(h => txt.includes(h))) {
-      return ['key', 'key-hint-in-body'];
+    if (model && txt.includes(model.toLowerCase())) {
+      return ['model', 'model-name-in-body'];
     }
 
     // Signal 2
@@ -493,7 +514,7 @@ class KeyPool {
               break; // exits while(true) loop, cleanup in finally below
             }
             myTicket = this._ticketSeq++;
-            this._waiting.add(myTicket);
+            this._waiting.set(myTicket, model);
           }
           const now = Date.now() / 1000;
           const avail = this.keys.filter(s => !s.isHardBlocked() && !s.isModelBlocked(model));
@@ -542,7 +563,11 @@ class KeyPool {
               });
             }
 
-            const rank = Array.from(this._waiting).filter(t => t < myTicket).length;
+            // Per-model pacing rank (Bug K6): a burst of requests for model A
+            // must not starve a request for model B that has free capacity.
+            // Count only waiters queued for the SAME requested model.
+            const rank = Array.from(this._waiting.entries())
+              .filter(([t, m]) => t < myTicket && (model ? m === model : true)).length;
 
             // P1-4 FIX: Per-model block should not trigger load shedding for other models
             // Only shed if ALL models on ALL keys are saturated
@@ -713,8 +738,16 @@ class KeyPool {
         return false; // No change needed
       }
 
-      // Always create NEW KeyEntry objects to avoid state corruption on reorder
-      const newKeys = keysList.map((k, i) => new KeyEntry(`key${i + 1}`, k));
+      // Reuse existing KeyEntry objects keyed by apiKey so in-flight counters,
+      // timestamps, detectedLimit, and modelBlocks survive a hot-reload.
+      // Re-creating them orphans requests holding the old object and lets
+      // concurrency be under-counted → 429 storms under agent load (Bug K1).
+      const byApi = new Map(this.keys.map(k => [k.apiKey, k]));
+      const newKeys = keysList.map((k, i) => {
+        const ex = byApi.get(k);
+        if (ex) { ex.label = `key${i + 1}`; return ex; }
+        return new KeyEntry(`key${i + 1}`, k);
+      });
 
       const added = keysList.filter(k => !oldSet.has(k));
       const removed = Array.from(oldSet).filter(k => !newSet.has(k));
@@ -849,40 +882,73 @@ class KeyPool {
   }
 
   async _fetchModels() {
-    const key = this.peekKey();
-    if (!key) return [];
     const agent = this._agent || undefined;
 
+    // ── KEYLESS-FIRST model discovery ──────────────────────────────────────
+    // NVIDIA's OpenAI-compatible catalog endpoint (/v1/models) is publicly
+    // readable WITHOUT an API key. Prefer keyless so the catalog is available
+    // even when every key is exhausted / unset. Fall back to keyed fetch if
+    // keyless fails (future auth requirement, network partition, etc.).
+    try {
+      const resp = await undiciFetch(`${NVIDIA_BASE_URL}/v1/models`, {
+        headers: { 'Accept': 'application/json' },
+        dispatcher: agent,
+        signal: AbortSignal.timeout(20000),
+      });
+      if (resp.ok) {
+        const body = await resp.json();
+        const modelsRaw = Array.isArray(body.data) ? body.data
+          : Array.isArray(body.models) ? body.models : [];
+        const parsed = [];
+        this._modelsMetadata = this._modelsMetadata || {};
+        for (const m of modelsRaw) {
+          const id = typeof m === 'string' ? m : m.id;
+          if (!id) continue;
+          const cleanId = id.replace(/^(stg|dev|test)\//i, '');
+          parsed.push(cleanId);
+          if (typeof m === 'object') this._modelsMetadata[cleanId] = m;
+        }
+        if (parsed.length > 0) {
+          parsed.sort();
+          if (!this._keylessDiscoveryLogged) {
+            console.info(`[wrapper-nvidia] Model catalog fetched KEYLESS from ${NVIDIA_BASE_URL}/v1/models (${parsed.length} models)`);
+            this._keylessDiscoveryLogged = true;
+          }
+          return parsed;
+        }
+        console.warn(`[wrapper-nvidia] Keyless /v1/models returned 0 usable models; falling back to keyed fetch`);
+      } else {
+        console.warn(`[wrapper-nvidia] Keyless /v1/models returned HTTP ${resp.status}; falling back to keyed fetch`);
+      }
+    } catch (e) {
+      console.warn(`[wrapper-nvidia] Keyless /v1/models failed (${e.message}); falling back to keyed fetch`);
+    }
+
+    // ── KEYED fallback ─────────────────────────────────────────────────────
+    const key = this.peekKey();
+    if (!key) {
+      console.warn(`[wrapper-nvidia] No key available for model-discovery fallback; serving cached/empty list`);
+      return [];
+    }
     try {
       const resp = await undiciFetch(`${NVIDIA_BASE_URL}/v1/models`, {
         headers: { 'Authorization': `Bearer ${key.apiKey}`, 'Accept': 'application/json' },
         dispatcher: agent,
+        signal: AbortSignal.timeout(20000),
       });
-      if (!resp.ok) {
-        return [];
-      }
+      if (!resp.ok) return [];
       const body = await resp.json();
-      let modelsRaw = [];
-      if (Array.isArray(body.data)) {
-        modelsRaw = body.data;
-      } else if (Array.isArray(body.models)) {
-        modelsRaw = body.models;
-      }
-      
+      const modelsRaw = Array.isArray(body.data) ? body.data
+        : Array.isArray(body.models) ? body.models : [];
       const parsedModels = [];
       this._modelsMetadata = this._modelsMetadata || {};
-      
       for (const m of modelsRaw) {
         const id = typeof m === 'string' ? m : m.id;
         if (!id) continue;
         const cleanId = id.replace(/^(stg|dev|test)\//i, '');
         parsedModels.push(cleanId);
-        
-        if (typeof m === 'object') {
-          this._modelsMetadata[cleanId] = m;
-        }
+        if (typeof m === 'object') this._modelsMetadata[cleanId] = m;
       }
-      
       parsedModels.sort();
       return parsedModels;
     } catch (e) {

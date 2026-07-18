@@ -303,6 +303,25 @@ class Metrics {
     } catch { return new Set(); }
   }
 
+  /**
+   * Unavailable models WITH their last_status + reason, so the caller can
+   * distinguish "definitively dead" (404/410/DEGRADED → hide from discovery)
+   * from "slow/timeout" (last_status 0 → keep in discovery, just telemetry).
+   * Returns an array of { model, last_status, reason }.
+   */
+  getUnavailableModelsDetailed() {
+    try {
+      return this._withStmt("SELECT model, last_status, reason FROM model_status WHERE ok=0", (stmt) => {
+        const out = [];
+        while (stmt.step()) {
+          const r = stmt.getAsObject();
+          out.push({ model: r.model, last_status: r.last_status, reason: r.reason });
+        }
+        return out;
+      });
+    } catch { return []; }
+  }
+
   /** Average latency for last 24h. */
   avgLatency24h() {
     try {

@@ -286,6 +286,12 @@ function testCapabilities() {
   const c7 = classify('baai/bge-m3');
   assert.strictEqual(c7.context_window, undefined, 'no context_window field');
 
+  // Curated override: nvidia/cosmos-reason2-8b contains "cosmos" (which the
+  // generic video rule would catch) but is a REASONING LLM served on
+  // /v1/chat/completions. It must classify as chat, not video.
+  const c8 = classify('nvidia/cosmos-reason2-8b');
+  assert.strictEqual(c8.type, 'chat', 'cosmos-reason2-8b must classify as chat (reasoning LLM), not video');
+
   console.log('✔ Capabilities tests passed successfully.');
 }
 

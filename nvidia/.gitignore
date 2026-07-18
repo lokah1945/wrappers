@@ -2,7 +2,6 @@ node_modules/
 .env
 .env.local
 .env.*.local
-clone-nvidia/
 *.db
 *.db-wal
 *.db-shm

@@ -57,6 +57,22 @@ function mockChat(body, res) {
     res.writeHead(400, { 'Content-Type': 'application/json' });
     return res.end(JSON.stringify({ error: { message: 'Requested context length of 200001 exceeds the limit of 131072 tokens. Please reduce the input size.', type: 'invalid_request_error', param: 'messages' } }));
   }
+  // 422 "Unknown parameter" test (mirrors nvidia/gliner-pii, which rejects top_p):
+  // first request (still carrying the wrapper-injected top_p) gets a 422; once the
+  // wrapper strips the offending param and retries, we serve 200. This proves the
+  // proxyOpenai param-strip + retry path works for HTTP 422.
+  if (model === 'reject-top_p/model') {
+    if (body.top_p !== undefined) {
+      res.writeHead(422, { 'Content-Type': 'application/json' });
+      return res.end(JSON.stringify({
+        detail: "Unknown parameter 'top_p' is not allowed. Please check the API documentation for valid parameters.",
+        error: 'Invalid request parameters',
+        details: [{ field: 'top_p', message: "Unknown parameter 'top_p' is not allowed." }],
+      }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    return res.end(JSON.stringify({ id: 'chatcmpl-e2e', choices: [{ message: { role: 'assistant', content: 'stripped ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 1, completion_tokens: 2, total_tokens: 3 }, model }));
+  }
   const usage = { prompt_tokens: 7, completion_tokens: 12, total_tokens: 19 };
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const isReasoning = /deepseek/.test(model) || body.chat_template_kwargs || body.reasoning_effort;
@@ -151,6 +167,10 @@ function startWrapper() {
     CLAUDE_CODE_DEFAULT_SONNET_MODEL: 'deepseek-ai/deepseek-v4-pro',
     CLAUDE_CODE_DEFAULT_OPUS_MODEL: 'nvidia/nemotron-3-ultra-550b-a55b',
     PRE_RESPONSE_TIMEOUT_MS: '20000',
+    // Exercise the DEFAULT_PARAMS injection + 422 param-strip retry path:
+    WRAPPER_PARAMS: 'temperature,top_p',
+    DEFAULT_TEMPERATURE: '0.7',
+    DEFAULT_TOP_P: '1.0',
   };
   const child = spawn('node', [path.join(ROOT, 'src', 'index.js')], { env, stdio: 'ignore' });
   return child;
@@ -228,6 +248,32 @@ async function main() {
       // Registry seeds deepseek-v4-pro context=262144 (or live NGC); enrichModelMetadata
       // is invoked with the REAL id before the alias is applied, so it must propagate.
       assert.ok((d.context_window || d.contextWindow) >= 200000, `context_window too small: ${d.context_window}`);
+    });
+
+    await check('Keyless /v1/models (NO auth header) returns full catalog', async () => {
+      // Discovery must work WITHOUT any API key/auth: the wrapper fetches
+      // NVIDIA's /v1/models keyless-first, and /v1/models is a public endpoint.
+      const r = await fetch(`${W}/v1/models`);
+      assert.strictEqual(r.status, 200, 'keyless /v1/models should return 200');
+      const j = await r.json();
+      assert.ok(j.data && j.data.length > 0, 'keyless discovery returned no models');
+    });
+
+    await check('/v1/models exposes the correct call method per model', async () => {
+      // Each model must advertise HOW to call it (base_url + endpoint + auth +
+      // protocol) so clients can route correctly without hardcoding.
+      const r = await fetch(`${W}/v1/models`, { headers: { Authorization: `Bearer ${TOKEN}` } });
+      const j = await r.json();
+      const chat = j.data.find((m) => m.id === 'meta/llama-3.1-8b-instruct');
+      assert.ok(chat, 'llama model missing from catalog');
+      assert.ok(chat.call, 'model is missing the call field');
+      assert.strictEqual(chat.call.protocol, 'openai-compatible');
+      assert.strictEqual(chat.call.endpoint, '/v1/chat/completions');
+      assert.strictEqual(chat.call.method, 'POST');
+      assert.strictEqual(chat.call.auth, 'Bearer');
+      assert.ok(chat.call.base_url && chat.call.base_url.length > 0, 'call.base_url missing');
+      const missing = j.data.filter((m) => !m.call || !m.call.endpoint);
+      assert.strictEqual(missing.length, 0, `${missing.length} models missing call method`);
     });
 
     await check('OpenAI chat non-stream', async () => {
@@ -385,6 +431,20 @@ async function main() {
       // Must NOT contain wrapper-generated friendly text.
       assert.ok(!j.error.message.includes('start a clean session'), `wrapper envelope leaked: ${j.error.message}`);
     });
+
+    await check('422 unsupported-param stripped + retried (gliner-pii top_p)', async () => {
+      // The wrapper injects top_p (WRAPPER_PARAMS) by default. The mock returns a
+      // NVIDIA-style 422 "Unknown parameter 'top_p'" on the first attempt, then 200
+      // once top_p has been stripped. This proves proxyOpenai handles HTTP 422 the
+      // same as 400: parse the offending field, strip it, and retry transparently.
+      const r = await post('/v1/chat/completions', { model: 'reject-top_p/model', messages: [{ role: 'user', content: 'hi' }] });
+      const j = await r.json();
+      assert.strictEqual(r.status, 200, `expected 200 after param strip+retry, got ${r.status}: ${JSON.stringify(j).slice(0, 160)}`);
+      assert.strictEqual(j.choices[0].message.content, 'stripped ok');
+      // The body that finally reached the mock must NOT contain top_p anymore.
+      assert.ok(lastChatBody && lastChatBody.top_p === undefined, 'top_p was not stripped before retry');
+    });
+
 
     await check('Ollama /api/tags discovery', async () => {
       const r = await fetch(`${W}/api/tags`, { headers: { Authorization: `Bearer ${TOKEN}` } });

@@ -14,6 +14,10 @@ Restart=on-failure
 RestartSec=5
 EnvironmentFile=/root/wrapper/nvidia/.env
 Environment=LISTEN_PORT=9100
+# Also bind 9910 on the SAME http.Server so Claude Code's gateway model
+# discovery URL (CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL=http://localhost:9910/v1/models)
+# keeps working without editing client configs. Hermes ILMA + Claude base URL use 9100.
+Environment=ANY_ALSO_PORTS=9910
 Environment=METRICS_DB=/root/wrapper/nvidia/metrics.db
 # (BUGFIX audit-2026-06-30 R-handle: tighten server timeouts so a stuck
 # handler / socket doesn't snowball into a 5-minute silent hang from

@@ -131,6 +131,13 @@ const CLASSIFICATION_RULES = [
   // Audio generation models
   { patterns: ['fugatto', 'audiogen', 'musicgen', 'audio2', 'audioldm', 'musiclm', 'audiocraft', 'encodec'], type: 'audio' },
 
+  // Curated override — BEFORE the generic video rule below. nvidia/cosmos-reason2-8b
+  // contains "cosmos" (which the video rule would catch) but is actually a REASONING
+  // LLM (text-in/text-out) served on /v1/chat/completions, NOT a video-diffuser.
+  // Forcing chat here routes it to the correct OpenAI-compatible endpoint so it can
+  // actually be called. Keep this ahead of the 'cosmos' video pattern.
+  { patterns: ['cosmos-reason', 'cosmos-reason2'], type: 'chat', extraCaps: ['reasoning'] },
+
   // Video generation models
   { patterns: ['cosmos', 'stable-video', 'svd', 'video', 'ltx', 'wan2', 'mochi', 'videocrafter', 'modelscope', 'videopoet', 'phenaki', 'make-a-video'], type: 'video' },
 
@@ -409,29 +416,58 @@ function summarize(catalog) {
 // The NGC registry (registry.js) always wins over these heuristics when it has
 // an entry for the model. These are fallbacks only.
 // UPDATE HERE FIRST — both consumers pick up changes automatically.
+// PATCH-E: Updated context windows — verified live + NGC-featured.
+// NGC registry (registry.js) always wins when it has an entry.
 const MODEL_CONTEXT_WINDOWS = {
   'claude': 200000,
   'gpt-4': 128000,
+  'gpt-oss': 128000,
   'llama-3.1': 128000,
   'llama-3.2': 128000,
   'llama-3.3': 128000,
   'llama-3': 128000,
+  'llama-4': 131072,
+  'llama2': 4096,
   'gemma-3': 128000,
+  'gemma-4': 131072,
   'gemma-2': 8192,
   'phi-3.5': 128000,
   'phi-4': 16384,
-  // NGC-verified: deepseek-v4-pro context=262144 (was 64000 — stale heuristic)
+  'phi-4-mini': 131072,
+  'phi-3': 128000,
+  // NGC-verified: deepseek-v4-pro context=262144
   'deepseek-v4': 262144,
   'deepseek-coder': 262144,
+  'deepseek-r1': 131072,
   'qwen2.5': 128000,
+  'qwen3': 131072,
+  'qwen3.5': 131072,
+  'qwen3-next': 131072,
   'qwen': 32768,
-  // NGC-verified: nemotron-3-ultra-550b context=1048576 (was 131072)
+  'kimi': 131072,
+  'step': 131072,
+  'seed-oss': 131072,
+  // NGC-verified: nemotron-3-ultra-550b context=1048576
   'nemotron': 1048576,
+  'nemotron-3': 1048576,
   'yi': 1000000,
-  'mistral': 32000,
+  'mistral': 131072,
+  'mistral-large': 131072,
+  'mistral-medium': 131072,
+  'mistral-small': 131072,
   'mixtral': 32000,
-  // NGC-verified: glm-5.2 context=202752 (was 32000)
+  'ministral': 131072,
+  'codestral': 32768,
+  // NGC-verified: glm-5.2 context=202752
   'glm': 202752,
+  'minimax': 196608,
+  'dbrx': 131072,
+  'jamba': 256000,
+  'granite': 32768,
+  'solar': 32768,
+  'kosmos': 8192,
+  'dracarys': 131072,
+  'zamba': 131072,
 };
 
 const DEFAULT_CONTEXT_WINDOW = 131072;

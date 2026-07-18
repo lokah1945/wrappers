@@ -74,13 +74,23 @@ try {
 // families MUST be added here explicitly. The warning log messages will tell
 // you when an unknown model is hit with a thinking request.
 const REASONING_CONFIGS = [
+  // REQUIRES reasoning toggle: model HANGS with no response unless thinking is on.
   { patterns: ['deepseek-v4', 'deepseek-r1', 'deepseek-reasoner'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true, thinking: true }, requires_reasoning: true },
+  { patterns: ['deepseek-coder'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  // NVIDIA NIM reasoning variants (suffix `-reasoning`) use chat-template thinking.
+  { patterns: ['-reasoning', 'reason'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true, thinking: true }, requires_reasoning: true },
+  // Thinking Machines / "inkling" — reasoning model family.
+  { patterns: ['thinkingmachines', 'inkling'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  // Qwen3 / Qwen3.5 (incl. qwen3.5-*, qwen3-next) all support thinking.
   { patterns: ['qwen'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  // GLM (z-ai/glm-*) — thinking toggle.
   { patterns: ['glm'], mechanism: 'chat_template_kwargs', params: { thinking: true }, requires_reasoning: false },
+  // Phi-4 reasoning variants.
   { patterns: ['phi-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['yi-'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
-  { patterns: ['llama-3.3', 'llama-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  { patterns: ['llama-3.3', 'llama-3.2', 'llama-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['gemma-3'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  // reasoning_effort families (NIM accepts `reasoning_effort` for these).
   { patterns: ['nemotron', 'gpt-oss', 'kimi', 'mistral-'], mechanism: 'reasoning_effort', params: { effort: 'high' }, requires_reasoning: false },
 ];
 
@@ -163,6 +173,7 @@ const pool    = new KeyPool();   // keys loaded in main() after dotenv
 const responsesHandler = createResponsesHandler({
   pool, resolveTargetModel, proxyOpenai, forwardHeaders,
   incInFlight, decInFlight, BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
+  translateThinkingToNim,
 });
 let metrics;                      // initialized in main() after dotenv sets METRICS_DB
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
@@ -2558,14 +2569,15 @@ async function handleModels(res, url = null) {
     raw.aliases = [d.id];
     data.push(raw);
 
-    // 2) Claude-prefixed alias — always emitted for the gateway model picker.
-    //    Claude Code's CLADUE_CODE_GATEWAY_MODEL_DISCOVERY_URL hits /v1/models
-    //    WITHOUT ?gateway=1, so gating on that flag hid every claude-* id and
-    //    left the picker empty. The DISCOVERY_TO_NIM map is always built (above),
-    //    so claude-* IDs resolve correctly via resolveTargetModel() regardless.
-    //    Emitting these aliases unconditionally is harmless for OpenAI clients
-    //    (they just see extra model ids) and required for Anthropic clients.
-    {
+    // 2) Claude-prefixed alias — emitted ONLY in gateway mode. Claude Code's
+    //    model picker (CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL) requests
+    //    /v1/models?gateway=1, so we expose the alias there. For every other
+    //    client (Hermes, Codex, OpenAI SDK, OpenCode, …) the default surface
+    //    is a CLEAN list of original NIM ids only — no claude-* duplicates.
+    //    The DISCOVERY_TO_NIM map is ALWAYS rebuilt (above) regardless of this
+    //    flag, so claude-* IDs still RESOLVE correctly via resolveTargetModel()
+    //    when a client sends them; they merely don't clutter discovery.
+    if (gateway) {
       const m = enrichModelMetadata(d.id, d);
       const alias = discoveryAlias(d.id);
       m.owned_by = d.id.split('/')[0] || 'nvidia';
@@ -4142,7 +4154,7 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
   //     custom_providers[wrapper-nvidia].base_url = http://127.0.0.1:9100
   //   - Claude Code settings: ANTHROPIC_BASE_URL = http://localhost:9100
   //     and CLADUE_CODE_GATEWAY_MODEL_DISCOVERY_URL = http://localhost:9910/v1/models
-  // The clone previously bound only LISTEN_PORT (9910 via .env + service), so
+  // Previously this wrapper bound only LISTEN_PORT (9910 via .env + service), so
   // every 9100-targeting client got ECONNREFUSED. We keep LISTEN_PORT as the
   // primary and additionally bind ANY_ALSO_PORTS (comma-separated) on the SAME
   // http.Server/handler, so one OS process serves all expected addresses.
@@ -4216,7 +4228,7 @@ if (process.env.NODE_ENV === 'test_integration') {
   const _ready = main()
     .then(() => ({ handleRequest, metrics, pool, registry }))
     .catch(e => { console.error(`[wrapper-nvidia][test_integration] init error: ${e.message}`); throw e; });
-  module.exports = { handleRequest, ready: _ready };
+  module.exports = { handleRequest, ready: _ready, translateThinkingToNim };
 } else {
   main().catch(e => {
     console.error(`[wrapper-nvidia] Fatal: ${e.message}`);

@@ -18,6 +18,7 @@ module.exports = function createResponsesHandler(deps) {
   const {
     pool, resolveTargetModel, proxyOpenai, forwardHeaders,
     BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
+    translateThinkingToNim,
   } = deps;
 
   function isNvidiaModel(modelId) {
@@ -32,9 +33,20 @@ module.exports = function createResponsesHandler(deps) {
     if (instructions && typeof instructions === 'string' && instructions.length) {
       messages.push({ role: 'system', content: instructions });
     }
-    const items = Array.isArray(input) ? input : (input ? [input] : []);
+    // OpenAI Responses API accepts input as a bare string OR an array of
+    // items. A bare string is the most common shape (one-shot prompt) and MUST
+    // become a single user message. Previously a string was wrapped into [input]
+    // but then skipped by `typeof item !== 'object'`, yielding an EMPTY messages
+    // array -> upstream NIM rejects with 400 "messages field cannot be empty"
+    // -> wrapper surfaces HTTP 502, breaking /v1/responses clients (Codex,
+    // Hermes). This is the root cause of the Hermes ILMA / Codex 502 failure.
+    const items = typeof input === 'string' ? [{ role: 'user', content: input }] :
+                  Array.isArray(input) ? input : (input ? [input] : []);
     for (const item of items) {
-      if (!item || typeof item !== 'object') continue;
+      if (!item || typeof item !== 'object') {
+        if (typeof item === 'string') messages.push({ role: 'user', content: item });
+        continue;
+      }
       const role = item.role;
       if (item.type === 'message' || ['user', 'system', 'developer', 'assistant'].includes(role)) {
         let content = item.content;
@@ -157,9 +169,23 @@ module.exports = function createResponsesHandler(deps) {
       }
     }
 
+    // Translate the OpenAI Responses `reasoning` control (Codex / OpenAI SDK)
+    // into the model-specific NIM toggle, using the SAME single-source logic the
+    // Anthropic path uses. Without this, reasoning models (deepseek-v4-pro,
+    // qwen3-thinking, glm, etc.) reached via /v1/responses never think and
+    // some HANG with no response. Client-provided chat_template_kwargs /
+    // reasoning_effort in extra_body always win inside translateThinkingToNim.
+    if (body && body.reasoning !== undefined) {
+      translateThinkingToNim(chatBody, model, body.reasoning);
+    }
+
     const result = await proxyOpenai(chatBody, forwardHeaders(req), model, req);
     if (!result.stream && result.status && result.status !== 200 && result.data) {
-      return result.data; // error envelope from upstream (verbatim)
+      // Preserve the upstream HTTP status verbatim (400/422/429/500) instead of
+      // collapsing every non-2xx to 502. The caller below maps the OpenAI
+      // error envelope type to the correct status, so a "Bad Request" (400)
+      // is returned as 400, not 502.
+      return { status: result.status, data: result.data };
     }
 
     if (!chatBody.stream) {
@@ -332,7 +358,18 @@ module.exports = function createResponsesHandler(deps) {
 
     if (result === null) return null;            // already streamed
     if (result && result.error) {
-      const status = result.error.type === 'invalid_request_error' ? 400 : 502;
+      // Map the OpenAI error envelope `type` to the correct HTTP status so the
+      // client gets a faithful code: invalid_request_error -> 400,
+      // rate_limit_error -> 429, everything else (Bad Request / Unprocessable /
+      // server error) -> 500. (Upstream 4xx bodies carry `type: "Bad Request"`
+      // etc., so a naive "invalid_request_error ? 400 : 502" always wrongly
+      // returned 502 for client errors.)
+      const et = (result.error.type || '').toLowerCase();
+      const status = et === 'invalid_request_error' ? 400
+        : et.includes('rate') ? 429
+        : et.includes('unprocessable') ? 422
+        : et.includes('bad') ? 400
+        : 500;
       res.writeHead(status, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: result.error }));
       return null;

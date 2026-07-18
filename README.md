@@ -1,216 +1,118 @@
-# ILMA Wrappers (Mono-Repo)
+# wrapper-nvidia
 
-> LLM provider wrappers for the ILMA / Hermes Agent platform.
-> Each wrapper is a thin proxy that fronts a cloud LLM provider (OpenAI-compatible),
-> adds load-balancing, retries, circuit breaking, and metrics on top.
+> OpenAI- and Anthropic-compatible transparent proxy for the NVIDIA NIM API.
+> Adds multi-key rotation, rate-limit pacing, per-model failover, and
+> Prometheus-style metrics on top of NVIDIA NIM.
 
----
+This repository contains the production **wrapper-nvidia** service only.
 
-## Repository Status (2026-07-01)
+- Service: `wrapper-nvidia.service` (systemd)
+- Ports: `9100` primary, `9910` additionally bound on the same server (gateway model discovery)
+- Provider: NVIDIA NIM (`https://integrate.api.nvidia.com/v1`)
+- Models: 120+ free models via the NVIDIA NIM catalog
 
-| Aspect | State |
-|--------|-------|
-| GitHub repo | `lokah1945/wrappers` (public) |
-| Default branch | `main` |
-| Active wrappers | `nvidia` (v8.2+) |
-| Planned wrappers | `codex`, `claude-code`, `blackbox`, `opencode`, `cloudflare`, `antigravity` |
-| Source SOT | `/root/wrapper/` on the production host (single mono-repo) |
-
-> **Note on current layout.** As of 2026-07-01, the `nvidia` wrapper occupies the
-> repository root. This preserves the upstream git history (12 commits, 10 unique
-> after `subtree split` deduplication). Future wrappers will be added as siblings
-> so the final layout becomes:
->
-> ```
-> wrappers/
-> ├── nvidia/           ← already here at root (legacy)
-> ├── codex/            ← planned
-> ├── claude-code/      ← planned
-> ├── blackbox/         ← planned
-> └── ...
-> ```
->
-> A future migration will move `nvidia/` into its own subfolder while keeping
-> the existing tag/branch history. Until that migration, treat the **root
-> directory** as the `nvidia` wrapper.
-
----
-
-## Active Wrapper: NVIDIA
-
-`index.js` is the source of truth for the NVIDIA wrapper.
-
-| Field        | Value |
-|--------------|-------|
-| Service name | `wrapper-nvidia.service` (systemd --user) |
-| Default port | `9100` |
-| Provider     | NVIDIA NIM (`https://integrate.api.nvidia.com/v1`) |
-| Models       | 120+ free models via NVIDIA NIM catalog |
-
-### Key features
-
-- Adaptive backpressure (workload-aware queue sizing)
-- Provider circuit breaker (5 fails / 60s → OPEN 120s, half-open recovery)
-- Stream heartbeat (env-gated, default OFF, `STREAM_HEARTBEAT=true`, 5 s interval)
-- Retry budget cap (15 s) + jittered exponential backoff
-- Score-based key selector with model + provider penalty + fallback
-- Minimal 4-class error taxonomy: `MODEL | KEY | PROVIDER | NETWORK`
-- Two-way credential sync with MongoDB SOT
-
-### Files of interest
+## Repository layout
 
 ```
-src/
-  index.js                 ← proxyOpenai() entry, retry loops, ANTI-SILENCE watchdog
-  key_pool.js              ← score-based key selector + provider penalty
-  metrics.js               ← Prometheus-style metrics
-  error_taxonomy.js        ← 4-class error classification
-  stream_heartbeat.js      ← SSE heartbeat emitter
-wrapper-nvidia.service     ← systemd --user template
-install.sh                 ← idempotent installer
-.env.example               ← canonical config keys
-AUDIT_REPORT_2026-06-30.md ← production-readiness audit
-CHANGELOG.md               ← all patches since v8.2
-README_AGENT.md            ← detailed agent runbook
+wrapper-nvidia/
+├── install.sh                 # idempotent systemd installer
+├── wrapper-nvidia.service     # systemd unit (copied to /etc/systemd/system)
+├── .env.example               # canonical config keys
+├── .gitignore
+├── README.md                  # this file
+└── nvidia/                    # wrapper source + assets
+    ├── src/
+    │   ├── index.js            # server entry, routing, retry/backoff, SSE keepalive
+    │   ├── anthropic_compat.js # Anthropic <-> OpenAI translation
+    │   ├── responses_compat.js # OpenAI Responses API (Codex / Hermes)
+    │   ├── capabilities.js     # model classification
+    │   ├── metrics.js          # SQLite-backed telemetry
+    │   ├── registry.js         # dynamic NGC-synced model registry
+    │   ├── alert_history.js    # alert historian
+    │   └── loki_push.js        # optional Loki push
+    ├── key_pool.js             # multi-key pool with pacing
+    ├── dashboard.html          # ops dashboard
+    ├── test/                   # unit + regression + e2e tests
+    ├── package.json
+    ├── .env.example
+    ├── CHANGELOG.md
+    └── README.md               # deep-dive docs / runbook
 ```
 
-### Quick start
+## Features
 
+- Transparent proxy: model names pass through exactly as the client sends them.
+- Multi-key rotation with even distribution and per-(key, model) rate-limit isolation.
+- Internal token-bucket pacing that converts capacity limits into latency instead of 429s.
+- OpenAI Chat Completions + Anthropic Messages API translation, plus OpenAI Responses API.
+- SSE stream heartbeat so long-running / reasoning streams don't time out.
+- Adaptive backpressure (workload-aware queue sizing) and a provider circuit breaker.
+- Retry budget cap with jittered exponential backoff; minimal 4-class error taxonomy.
+- Prometheus-style metrics on `/metrics/prom`, plus `/health`, `/stats`, `/version`.
+
+## Quick start
+
+### Prerequisites
+- Node.js >= 18
+- One or more NVIDIA API keys (`nvapi-...`)
+
+### Configure
 ```bash
-# 1. Install
-cd ~ && ./wrapper/nvidia/install.sh
-
-# 2. Configure environment
+cd /root/wrapper/nvidia
 cp .env.example .env
-$EDITOR .env  # fill NVIDIA_API_KEY
-
-# 3. Start (it auto-enables in systemd --user)
-systemctl --user start wrapper-nvidia.service
-systemctl --user status wrapper-nvidia.service
-
-# 4. Smoke test
-curl -fsS http://127.0.0.1:9100/health
+# edit .env: set NVIDIA_API_KEY_1, NVIDIA_API_KEY_2, ...
 ```
 
----
-
-## Production Release — 2026-07-12
-
-**Phase:** production migration of the wrapper-nvidia fix (staging in `clone-nvidia/`, live in `nvidia/`).
-
-### Root cause (found from Claude Code usage, model `z-ai/glm-5.2`)
-OpenAI-compatible clients — **Hermes, OpenAI SDK, LiteLLM, OpenCode, Kilo Code, and
-any `/chat/completions` caller** — send requests to paths **without the `/v1`
-prefix** (e.g. `/chat/completions`). The wrapper fell through to `handleCatchAll`,
-which forwarded the *unprefixed* path straight to NVIDIA
-(`https://integrate.api.nvidia.com/chat/completions`) and got a **404 — breaking
-every text model for those clients**. Claude Code (`/v1/messages`) was unaffected,
-which is why the failure only surfaced for non-Anthropic agents. The production
-metrics DB showed repeated `404` on `/chat/completions` for `z-ai/glm-5.2`.
-
-### Fixes applied
-1. **OpenAI path normalization** (`handleRequest`, `src/index.js`): well-known
-   OpenAI endpoint stems (`/chat/completions`, `/embeddings`, `/models`,
-   `/images/*`, `/ranking`, `/infer`, `/responses`, `/audio/*`, `/moderations`,
-   …) are transparently rewritten to their `/v1/...` form so they hit the real
-   handlers. `/v1`, `/v2`, `/api` (Ollama), `/metrics`, `/health`, etc. are left
-   untouched.
-2. **SSE keepalive heartbeat** for the OpenAI streaming path (`handleChatCompletions`)
-   — emits a comment frame every `HEARTBEAT_INTERVAL_MS` so clients don't time out
-   and drop the connection mid-response during upstream silence (reasoning models,
-   large prefill). The Anthropic path already had this.
-3. **Capacity / timeout tuning** (`.env`): `INFLIGHT_SOFT_CAP 50 → 100`,
-   `HEADERS_TIMEOUT_MS 15s → 30s`, `PACING_MAX_WAIT → 120`.
-
-### Validation (end-to-end, via curl)
-- `z-ai/glm-5.2`: `/chat/completions` (no `/v1`) → **200** (was 404);
-  `/v1/chat/completions` → 200; `/v1/messages` → 200; streaming + `tool_use`
-  returns a clean `tool_use` block + `message_stop`.
-- **Full sweep of 109 text I/O models**: `/chat/completions` (no `/v1`) now returns
-  **identical** status to `/v1/chat/completions` for every model. Remaining
-  non-200s are genuine NVIDIA upstream errors (model unavailable on this account,
-  cold-start latency, or specialized params), never a wrapper-introduced 404.
-
-### Layout in this repo
-| Path | Role | Port | systemd unit |
-|------|------|------|--------------|
-| `nvidia/` | **production** (live) | 9100 | `wrapper-nvidia.service` |
-| `clone-nvidia/` | staging / pre-prod validation | 9910 | `wrapper-nvidia-clone.service` |
-
-> Backup directories (`nvidia_backup_*`, `nvidia.backup.*`) are **local-only**
-> and intentionally excluded from this repository.
-
----
-
-## Roadmap (planned siblings)
-
-| Wrapper        | Port | Provider backing         | Status |
-|----------------|------|--------------------------|--------|
-| `nvidia`       | 9100 | NVIDIA NIM               | ✅ live |
-| `codex`        | 9103 | OpenAI Codex             | 🟡 filesystem-only |
-| `claude-code`  | 9102 | Anthropic Claude         | 🟡 filesystem-only |
-| `blackbox`     | —    | BlackBox AI              | 🔴 stub |
-| `opencode`     | —    | OpenCode local           | 🔴 stub |
-| `cloudflare`   | —    | Cloudflare AI gateway    | 🔴 stub |
-| `antigravity`  | —    | Antigravity              | 🔴 stub |
-
-🟡 filesystem-only = source exists at `/root/wrapper/<name>/` but is **not
-tracked by this repository yet**. They will be `.git subtree add`-ed one-by-one
-as they reach production-ready status (each promotion gated by an audit report
-similar to `nvidia/AUDIT_REPORT_2026-06-30.md`).
-
-🔴 stub = directory exists with placeholder content only. Cleanup planned.
-
----
-
-## Multi-account credentials (SOT)
-
-This repository's `wrappers` are wired against the ILMA MongoDB SOT, where
-multi-account credentials are stored canonically:
-
-```js
-{
-  provider: "github",
-  git_host: "github.com",
-  accounts: {
-    "smahud@gmail.com":   { api_token: "***SAN***", validated: true,  added: "2026-06-09" },
-    "lokah2150@gmail.com":{ api_token: "***SAN***", validated: true,  added: "2026-07-01",
-                            github_login: "lokah1945", github_user_id: 243200618 }
-  },
-  default_account: "lokah2150@gmail.com",
-  schema_version: 3
-}
+### Run (systemd, recommended)
+```bash
+sudo ./install.sh            # installs unit, enables + starts service, smoke-tests /health
+sudo ./install.sh --status   # show service status
 ```
 
-> Repository push automation uses `default_account`. Token rotation policy:
-> 90-day cycle, oldest = `smahud` (2026-06-09), next rotation 2026-09-29.
+### Run (manual)
+```bash
+cd /root/wrapper/nvidia
+npm install
+npm start
+curl http://localhost:9100/health
+```
 
-Tokens are loaded at runtime via `ilma_sot_credential_retrieval`. They are
-**never** committed to this repository.
+## Endpoints
 
----
+OpenAI-compatible: `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`,
+`/v1/images/generations`, `/v1/ranking`.
 
-## Contributing
+Anthropic-compatible: `/v1/messages`, `/v1/messages/count_tokens`.
 
-Each wrapper follows the same meta-template:
+Management: `/health`, `/stats`, `/metrics/prom`, `/metrics/activity`,
+`/metrics/model-status`, `/version`.
 
-1. `src/index.js`    — proxy loop (one HTTP method per provider family)
-2. `src/key_pool.js` — credential selector + health tracking
-3. `src/metrics.js`  — Prometheus counter/gauge/histogram
-4. `install.sh`      — idempotent systemd registration
-5. `*.service`       — user systemd unit
-6. `AUDIT_REPORT.md` — production-readiness gate
-7. `CHANGELOG.md`    — patch-by-patch narrative
+See [nvidia/README.md](nvidia/README.md) for full examples and the configuration
+reference.
 
-Promotion criteria before subtree-adding a new wrapper here:
+## Configuration
 
-- [ ] All three retest types pass (`test_*.py`, `test_*.js`, e2e)
-- [ ] Audit report shows zero `R-CRITICAL` findings
-- [ ] Service runs 24 hours continuous with zero unhandled crash
-- [ ] MongoDB SOT has a validating credential for the backing provider
+All configuration is via `.env` (auto-reloaded). Key variables:
 
----
+| Variable | Default | Description |
+|---|---|---|
+| `NVIDIA_API_KEY_N` | — | NVIDIA API key(s) |
+| `LISTEN_PORT` | 9100 | Primary HTTP listen port |
+| `ANY_ALSO_PORTS` | 9910 | Extra ports bound on the same server |
+| `SOFT_LIMIT_RPM` | 30 | Soft RPM limit per key |
+| `HARD_LIMIT_RPM` | 40 | Hard RPM limit per key |
+| `REQUEST_TIMEOUT` | 600 | Upstream timeout (seconds) |
+| `HEARTBEAT_INTERVAL_MS` | 5000 | Stream heartbeat interval (ms) |
+| `DROP_PARAMS` | think | Params to strip proactively |
+
+Secrets (`*.env`, `*.db`, `backups/`, `node_modules/`) are git-ignored and never committed.
+
+## Testing
+```bash
+cd /root/wrapper/nvidia
+npm test                 # unit tests
+node test/test.js
+```
 
 ## License
-
-Internal — Huda Choirul Anam / ILMA. Not for public redistribution.
+Internal use only.

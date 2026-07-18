@@ -196,18 +196,45 @@ async function testDsmlNonStreaming() {
   assert.strictEqual(result.content[0].type, 'thinking');
   assert.strictEqual(result.content[0].thinking, 'Thinking details');
   
-  assert.strictEqual(result.content[1].type, 'tool_use');
-  assert.strictEqual(result.content[1].name, 'Bash');
-  assert.strictEqual(result.content[1].input.command, 'node -v');
-  
-  assert.strictEqual(result.content[2].type, 'text');
-  assert.strictEqual(result.content[2].text, 'Pre-text');
+  // Blocks are emitted in SOURCE ORDER (text before the tool_use it precedes),
+  // consistent with the streaming path (testDsmlToolCallsParsing): Pre-text,
+  // tool_use, Post-text. This matters for Claude Code's content-positioning
+  // contract (a tool_use must not appear before the text that precedes it).
+  assert.strictEqual(result.content[1].type, 'text');
+  assert.strictEqual(result.content[1].text, 'Pre-text');
+
+  assert.strictEqual(result.content[2].type, 'tool_use');
+  assert.strictEqual(result.content[2].name, 'Bash');
+  assert.strictEqual(result.content[2].input.command, 'node -v');
   
   assert.strictEqual(result.content[3].type, 'text');
   assert.strictEqual(result.content[3].text, 'Post-text');
 
   console.log('✔ testDsmlNonStreaming PASSED');
 }
+
+async function testDsmlMultipleWrappersNoLeak() {
+  console.log('Testing: Multiple <|DSML|tool_calls> wrappers must not leak raw DSML...');
+  const B = '｜';
+  const content =
+    'Pre\n' +
+    '<' + B + 'DSML' + B + 'tool_calls>\n<' + B + 'DSML' + B + 'invoke name="a">\n<' + B + 'DSML' + B + 'parameter name="q" string="true">1</' + B + 'DSML' + B + 'parameter>\n</' + B + 'DSML' + B + 'invoke>\n</' + B + 'DSML' + B + 'tool_calls>\n' +
+    'Mid\n' +
+    '<' + B + 'DSML' + B + 'tool_calls>\n<' + B + 'DSML' + B + 'invoke name="b">\n<' + B + 'DSML' + B + 'parameter name="r" string="true">2</' + B + 'DSML' + B + 'parameter>\n</' + B + 'DSML' + B + 'invoke>\n</' + B + 'DSML' + B + 'tool_calls>\n' +
+    'Post';
+  const { openaiToAnthropic } = require('../src/anthropic_compat');
+  const mockOpenaiResponse = { choices: [{ message: { role: 'assistant', content } }] };
+  const result = openaiToAnthropic(mockOpenaiResponse, MODEL);
+  const allText = result.content.filter(c => c.type === 'text').map(c => c.text).join('|');
+  const toolNames = result.content.filter(c => c.type === 'tool_use').map(c => c.name);
+  console.log('  Blocks:', JSON.stringify(result.content.map(c => c.type + ':' + (c.text || c.name))));
+  assert.deepStrictEqual(toolNames, ['a', 'b']);
+  assert.ok(!allText.includes('DSML'), 'Raw DSML leaked into text: ' + allText);
+  assert.ok(allText.includes('Pre') && allText.includes('Mid') && allText.includes('Post'), 'Missing expected text: ' + allText);
+  assert.strictEqual(result.content[0].type, 'text'); // source order
+  console.log('✔ testDsmlMultipleWrappersNoLeak PASSED');
+}
+
 
 async function testHistorySelfHealing() {
   console.log('Testing: History translation self-healing guard (alternating plaintext model)...');
@@ -314,12 +341,35 @@ async function testThinkingTagsInNormalText() {
   console.log('✔ testThinkingTagsInNormalText PASSED');
 }
 
+async function testStreamDsmlMultipleInvokesOneWrapper() {
+  console.log('Testing: Streaming DSML, multiple <invoke> in ONE wrapper (sequential tools)...');
+  const B = '｜';
+  const chunks = [
+    makeOpenAIChoiceChunk(undefined, '<' + B + 'DSML' + B + 'tool_calls>\n<' + B + 'DSML' + B + 'invoke name="get_weather">\n<' + B + 'DSML' + B + 'parameter name="location" string="true">Jakarta</' + B + 'DSML' + B + 'parameter>\n</' + B + 'DSML' + B + 'invoke>\n<' + B + 'DSML' + B + 'invoke name="get_time">\n<' + B + 'DSML' + B + 'parameter name="tz" string="true">WIB</' + B + 'DSML' + B + 'parameter>\n</' + B + 'DSML' + B + 'invoke>\n</' + B + 'DSML' + B + 'tool_calls>\nAll done!'),
+    makeOpenAIChoiceChunk(undefined, undefined, 'stop')
+  ];
+  const mockStream = makeMockStream(chunks);
+  const capture = {};
+  const generator = streamOpenaiToAnthropic(mockStream, MODEL, capture, 100, 'test-req-multi', false);
+  const events = await collectEvents(generator);
+  const names = events.filter(e => e.type === 'content_block_start' && e.data.content_block.type === 'tool_use').map(e => e.data.content_block.name);
+  assert.deepStrictEqual(names, ['get_weather', 'get_time'], 'expected both tools in order');
+  const deltas = events.filter(e => e.type === 'content_block_delta' && e.data.delta.type === 'input_json_delta').map(e => JSON.parse(e.data.delta.partial_json));
+  assert.deepStrictEqual(deltas[0], { location: 'Jakarta' }, 'first tool params');
+  assert.deepStrictEqual(deltas[1], { tz: 'WIB' }, 'second tool params');
+  const textDeltas = events.filter(e => e.type === 'content_block_delta' && e.data.delta.type === 'text_delta').map(e => e.data.delta.text).join('');
+  assert.strictEqual(textDeltas, '\nAll done!', 'trailing text');
+  console.log('✔ testStreamDsmlMultipleInvokesOneWrapper PASSED');
+}
+
 async function runAll() {
   try {
     await testReasoningOnlyTransition();
     await testNormalTransition();
     await testDsmlToolCallsParsing();
     await testDsmlNonStreaming();
+    await testDsmlMultipleWrappersNoLeak();
+    await testStreamDsmlMultipleInvokesOneWrapper();
     await testHistorySelfHealing();
     await testThinkingTagsInNormalText();
     console.log('\n✔ All thinking parser regression tests PASSED!');

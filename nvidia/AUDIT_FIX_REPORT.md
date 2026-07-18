@@ -1,6 +1,6 @@
 # AUDIT-FIX REPORT — NVIDIA NIM Wrapper Comprehensive Audit
 
-**Component:** `clone-nvidia` NVIDIA NIM API proxy wrapper
+**Component:** `wrapper-nvidia` NVIDIA NIM API proxy wrapper
 **Date:** 2026-07-09
 **Scope:** Full end-to-end audit of every aspect: transparent proxy behavior, OpenAI +
 Anthropic compatibility, Claude Code integration, dynamic model registry, key/model
@@ -10,7 +10,7 @@ failover, testing coverage, stale artifacts, and failure reporting.
 
 ## Executive Summary
 
-The clone-nvidia wrapper is a **mature, production-grade** transparent proxy. It
+The wrapper-nvidia wrapper is a **mature, production-grade** transparent proxy. It
 correctly implements OpenAI Chat Completions + Anthropic Messages API translation,
 Claude Code model aliasing + gateway discovery, a dynamic NGC-synced model registry,
 and multi-key failover with per-(key,model) rate-limit isolation. All 20 E2E tests,
