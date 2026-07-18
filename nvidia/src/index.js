@@ -24,8 +24,21 @@ const WRAPPER_DIR = path.resolve(__dirname, '..');
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('../key_pool');
 const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
 const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, CURATED_GENAI, getCapabilityParams, MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, getContextWindow } = require('./capabilities');
+const createResponsesHandler = require('./responses_compat');
 const { Metrics } = require('./metrics');
 const { Registry } = require('./registry');
+
+// Bug R2: structural request fields that must NEVER be stripped, even if an
+// upstream 400 error message mentions them (e.g. "extra fields not permitted:
+// messages"). Stripping these mutilates / empties the conversation on retry.
+// Structural fields that must NEVER be stripped even if an upstream 422 lists
+// them (stripping them would break the request contract). Sampling params
+// (temperature/top_p/top_k) are intentionally NOT protected: some NIM models
+// reject them (e.g. nvidia/gliner-pii → 422 "Unknown parameter 'top_p'"), and
+// the param-strip retry path must be free to drop them and re-send.
+const PROTECTED_PARAMS = new Set([
+  'messages', 'model', 'stream', 'tools', 'tool_choice', 'system',
+]);
 
 // Dynamic, NGC-synced authoritative context registry (no more silent guesses).
 const registry = new Registry();
@@ -142,6 +155,15 @@ let UPSTREAM_ROUTES_SORTED = [];
 
 // ── Globals ────────────────────────────────────────────────────────────
 const pool    = new KeyPool();   // keys loaded in main() after dotenv
+
+// OpenAI Responses API handler (codex >=0.144 requires wire_api="responses").
+// NVIDIA-native models are translated to chat/completions; non-NVIDIA models
+// are rejected (wrapper-nvidia is NVIDIA-NIM-only; no third-party OpenRouter
+// routing -- see responses_compat.js isNvidiaModel()).
+const responsesHandler = createResponsesHandler({
+  pool, resolveTargetModel, proxyOpenai, forwardHeaders,
+  incInFlight, decInFlight, BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
+});
 let metrics;                      // initialized in main() after dotenv sets METRICS_DB
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
 // Fix dead-upstream hang (REVISI audit): undici's bodyTimeout monitors the GAP
@@ -149,11 +171,18 @@ const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
 // the FIRST response byte (status line + headers). A reasoning model that thinks
 // silently for >300s with no body chunks must NOT trip bodyTimeout — so bodyTimeout
 // stays 0. headersTimeout guards a stalled upstream that accepts TLS but never sends
-// HTTP headers back (blackhole). Set to 15s (was 30s) so a dead upstream fails fast
-// per key attempt — with 5 keys × 15s = 75s < PRE_RESPONSE_TIMEOUT_MS=180s, all keys
-// are tried before the global watchdog fires. connectTimeout guards a stalled TCP
-// handshake. The overall streaming time budget is still owned by AbortSignal.timeout.
-const HEADERS_TIMEOUT_MS = parseInt(process.env.HEADERS_TIMEOUT_MS || '15000', 10);
+// HTTP headers back (blackhole).
+//
+// CAVEAT (2026 fix): heavy reasoning models (e.g. z-ai/glm-5.2, deepseek reasoning,
+// nemotron ultra) hold the HTTP response headers until they START emitting the
+// first token — which can be 35-150s+ of silent "thinking". undici cannot tell
+// this apart from a blackhole, so a short headersTimeout (the old 15-30s) aborted
+// these models with "fetch failed" across ALL keys → the model looked dead even
+// though it was merely slow. We therefore set headersTimeout generously (120s) so
+// slow-TTFT reasoning models can respond. The client-facing PRE_RESPONSE_TIMEOUT_MS
+// watchdog still caps the total wait for a genuine blackhole, and the overall
+// streaming time budget is owned by AbortSignal.timeout (STREAM_REQUEST_TIMEOUT_SEC).
+const HEADERS_TIMEOUT_MS = parseInt(process.env.HEADERS_TIMEOUT_MS || '120000', 10);
 const agent   = new Agent({ connections: MAX_CONNECTIONS, pipelining: 10, bodyTimeout: 0, headersTimeout: HEADERS_TIMEOUT_MS, connectTimeout: 15000 });
 pool.setExternalAgent(agent);
 let inFlight  = 0;
@@ -207,6 +236,22 @@ function decInFlight() {
   if (inFlight > 0) inFlight--;
 }
 const unavailableModels = new Set();
+// Subset of unavailableModels that are DEFINITIVELY dead (upstream 404/410,
+// end-of-life, or DEGRADED). Only THESE are hidden from /v1/models discovery.
+// Slow models that merely time out on the probe (status 0) stay in
+// `unavailableModels` for telemetry but remain visible/callable, because a
+// probe timeout means "slow", not "gone" — hiding them made heavy reasoning
+// models (e.g. z-ai/glm-5.2, ~35-90s TTFT) silently disappear from the catalog.
+const retiredModels = new Set();
+
+// Classify a verify/live failure as "definitively dead" (→ hide from discovery)
+// vs merely slow/transient. 404/410 and DEGRADED/end-of-life are definitive.
+function isDefinitiveDeadStatus(status, reason) {
+  if (status === 404 || status === 410) return true;
+  const r = String(reason || '').toLowerCase();
+  return r.includes('degraded') || r.includes('end of life') ||
+         r.includes('gone') || r.includes('retired') || r.includes('not found');
+}
 
 // Generate unique request ID for tracing
 function generateRequestId() {
@@ -226,16 +271,44 @@ const DISCOVERY_PREFIX = 'claude-';
 
 function _normAliasKey(s) { return (s || '').toLowerCase().trim(); }
 
+// Alias targets must be real NIM ids (owner/model). Client-side Claude Code
+// env vars (ANTHROPIC_DEFAULT_* / ANTHROPIC_MODEL) often carry OpenRouter-style
+// ids like "tencent/hy3:free" when the wrapper is launched from an agent shell.
+// Those are NOT valid NIM routes and would 404 every haiku/sonnet/opus request.
+// Accept only owner/model shapes without OpenRouter ":tag" suffixes.
+function _isValidNimAliasTarget(id) {
+  if (!id || typeof id !== 'string') return false;
+  const s = id.trim();
+  if (!s || s.includes(':') || s.includes(' ')) return false;
+  // Prefer owner/model; also allow bare curated ids without slash only if they
+  // look like dotted org-less names used by a few NIM models (rare). Require
+  // at least one alphanumeric segment.
+  return /^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$/.test(s);
+}
+
+function _pickAliasTarget(envKeys, fallback, family) {
+  for (const k of envKeys) {
+    const v = process.env[k];
+    if (!v) continue;
+    if (_isValidNimAliasTarget(v)) return v.trim();
+    console.warn(`[alias] Ignoring invalid ${family} alias from ${k}="${v}" (not a NIM owner/model id). Using default ${fallback}`);
+  }
+  return fallback;
+}
+
 function loadAliasConfig() {
-  const haiku = process.env.CLAUDE_CODE_DEFAULT_HAIKU_MODEL
-    || process.env.ANTHROPIC_DEFAULT_HAIKU_MODEL
-    || 'meta/llama-3.1-8b-instruct';
-  const sonnet = process.env.CLAUDE_CODE_DEFAULT_SONNET_MODEL
-    || process.env.ANTHROPIC_DEFAULT_SONNET_MODEL
-    || 'deepseek-ai/deepseek-v4-pro';
-  const opus = process.env.CLAUDE_CODE_DEFAULT_OPUS_MODEL
-    || process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
-    || 'nvidia/nemotron-3-ultra-550b-a55b';
+  // Wrapper-side vars (CLAUDE_CODE_DEFAULT_*) are preferred. ANTHROPIC_DEFAULT_*
+  // is accepted only when it looks like a NIM id — otherwise it is treated as
+  // client-shell pollution (Claude Code / OpenRouter meta session) and ignored.
+  const haiku = _pickAliasTarget(
+    ['CLAUDE_CODE_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'],
+    'meta/llama-3.1-8b-instruct', 'haiku');
+  const sonnet = _pickAliasTarget(
+    ['CLAUDE_CODE_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL'],
+    'deepseek-ai/deepseek-v4-pro', 'sonnet');
+  const opus = _pickAliasTarget(
+    ['CLAUDE_CODE_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'],
+    'nvidia/nemotron-3-ultra-550b-a55b', 'opus');
 
   const map = {
     haiku, sonnet, opus,
@@ -286,9 +359,12 @@ function resolveTargetModel(requestedModel) {
   }
   // 2) explicit alias map (by normalized key)
   if (ALIAS_TO_NIM[lower]) return ALIAS_TO_NIM[lower];
-  // 3) family match (contains haiku/sonnet/opus) so any claude-* variant maps
+  // 3) family match (contains haiku/sonnet/opus) so any claude-* variant maps.
+  // Bug R3: restrict to claude-*-prefixed ids so a raw NIM id that merely
+  // contains "opus"/"sonnet"/"haiku" is NOT silently remapped to the alias
+  // target (transparent passthrough must be preserved for non-alias ids).
   for (const fam of ['opus', 'sonnet', 'haiku']) {
-    if (lower.includes(fam) && ALIAS_TO_NIM[fam]) return ALIAS_TO_NIM[fam];
+    if (m.startsWith('claude-') && lower.includes(fam) && ALIAS_TO_NIM[fam]) return ALIAS_TO_NIM[fam];
   }
   // 4) transparent passthrough (raw NIM id for OpenAI-compatible clients)
   return m;
@@ -318,7 +394,7 @@ function clientIp(req) {
     || 'unknown';
 }
 
-function jsonResp(res, code, obj, keyLabel) {
+function jsonResp(res, code, obj, keyLabel, extraHeaders) {
   // Defensive: never attempt to write a response twice (e.g. a streaming path
   // that falls through, or a race with res.on('close')). A second writeHead on
   // an already-finished response throws and crashes the request handler.
@@ -330,6 +406,13 @@ function jsonResp(res, code, obj, keyLabel) {
   };
   if (code < 400 && keyLabel) {
     addRateLimitHeaders(respHeaders, keyLabel, pool);
+  }
+  // Forward any caller-supplied headers (e.g. Retry-After on 429 so OpenAI/
+  // Anthropic clients honor the upstream backoff window).
+  if (extraHeaders && typeof extraHeaders === 'object') {
+    for (const [k, v] of Object.entries(extraHeaders)) {
+      if (v !== undefined && v !== null && v !== '') respHeaders[k] = v;
+    }
   }
   res.writeHead(code, respHeaders);
   res.end(body);
@@ -411,8 +494,23 @@ async function convertVisionImages(body) {
   const MAX_IMAGE_SIZE = parseInt(process.env.MAX_IMAGE_SIZE_MB || '10', 10) * 1024 * 1024; // default 10MB
   const ALLOWED_IMAGE_TYPES = (process.env.ALLOWED_IMAGE_TYPES || 'image/jpeg,image/png,image/webp,image/gif').split(',');
 
-  // P1-9: SSRF Protection - block internal/private IP ranges
-  const BLOCKED_IP_PREFIXES = ['127.0.0.1', '169.254.169.254', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.'];
+  // Bug R1: SSRF Protection - block internal/private IP ranges. The previous
+  // check was a string-prefix test on url.hostname only, which is bypassable
+  // via DNS rebinding, IPv6 literals ([::1]), encoded IPv4 (2130706433 /
+  // 0x7f000001 / 127.1), and case-variant schemes. Now we resolve DNS and
+  // reject any resolved IP in a private/link-local/loopback range (fail-closed).
+  const dns = require('dns').promises;
+  const BLOCKED_IP_PREFIXES = ['127.', '10.', '172.16.', '172.17.', '172.18.', '172.19.', '172.20.', '172.21.', '172.22.', '172.23.', '172.24.', '172.25.', '172.26.', '172.27.', '172.28.', '172.29.', '172.30.', '172.31.', '192.168.', '169.254.', '100.64.', '0.0.0.0'];
+  const _hostBlocked = async (host) => {
+    if (BLOCKED_IP_PREFIXES.some(p => host === p || host.startsWith(p))) return true; // literal / range
+    let addrs;
+    try { addrs = await dns.lookup(host, { all: true }); } catch { return true; } // fail closed
+    for (const { address, family } of addrs) {
+      if (family === 6 && (address === '::1' || address.startsWith('fe80:') || address.startsWith('fc') || address.startsWith('fd'))) return true;
+      if (BLOCKED_IP_PREFIXES.some(p => address === p || address.startsWith(p))) return true;
+    }
+    return false;
+  };
 
   for (const msg of body.messages) {
     if (!msg || !msg.content) continue;
@@ -420,12 +518,12 @@ async function convertVisionImages(body) {
       for (const item of msg.content) {
         if (item && item.type === 'image_url' && item.image_url && typeof item.image_url.url === 'string') {
           const imgUrl = item.image_url.url;
-          if (imgUrl.startsWith('http://') || imgUrl.startsWith('https://')) {
-            // SSRF Protection: check if URL points to internal IP
+          if (/^https?:\/\//i.test(imgUrl)) {
+            // SSRF Protection: resolve host and reject internal IPs (DNS rebind safe)
             try {
               const url = new URL(imgUrl);
-              if (BLOCKED_IP_PREFIXES.some(prefix => url.hostname.startsWith(prefix))) {
-                console.warn(`[SSRF] Blocked internal IP access attempt: ${url.hostname}`);
+              if (await _hostBlocked(url.hostname)) {
+                console.warn(`[SSRF] Blocked internal/private host access attempt: ${url.hostname}`);
                 continue;
               }
             } catch (e) {
@@ -476,6 +574,54 @@ function addRateLimitHeaders(headers, keyLabel, pool) {
     headers['X-RateLimit-Remaining'] = remaining;
     headers['X-RateLimit-Reset'] = Math.ceil(Date.now() / 1000) + 60;
   }
+}
+
+// Reshape an arbitrary upstream error body into the canonical
+// OpenAI/Anthropic error envelope { error: { message, type } } while keeping
+// the REAL upstream HTTP status and wording. Returns { body, changed } where
+// `body === input` when the input is already well-formed so callers can keep
+// verbatim bodies. FastAPI errors arrive as {detail:"..."} or {detail:[...]}
+// (array of {loc,msg,type}) — neither is OpenAI-shaped; an OpenAI SDK
+// (e.g. Hermes) reads resp.error.message and throws on a raw `detail` object.
+function normalizeErrorEnvelope(input, status, modelId) {
+  if (input && input.error && typeof input.error.message === 'string') {
+    // Already a valid envelope — leave verbatim (preserves upstream error.type
+    // that clients such as Claude Code match for retry/recovery).
+    return { body: input, changed: false };
+  }
+  let message = '';
+  if (input && typeof input === 'object') {
+    const detail = input.detail;
+    if (typeof detail === 'string') {
+      message = detail;
+    } else if (Array.isArray(detail)) {
+      message = detail.map(x => {
+        if (typeof x === 'string') return x;
+        if (x && typeof x === 'object') {
+          const loc = Array.isArray(x.loc) ? x.loc.join('.') : (x.loc || '');
+          return [x.msg, x.message, loc].filter(Boolean).join(' ');
+        }
+        return String(x);
+      }).join(' ') || 'Validation error';
+    } else if (typeof input.message === 'string') {
+      message = input.message;
+    } else {
+      message = JSON.stringify(input).slice(0, 500);
+    }
+  } else if (typeof input === 'string') {
+    message = input;
+  } else {
+    message = `Upstream error ${status}`;
+  }
+  const type = status === 429 ? 'rate_limit_error'
+    : status === 401 ? 'authentication_error'
+    : status === 403 ? 'permission_error'
+    : status === 404 ? 'not_found_error'
+    : status === 413 ? 'request_too_large'
+    : status >= 400 && status < 500 ? 'invalid_request_error'
+    : 'api_error';
+  if (!message) message = `Upstream error ${status}`;
+  return { body: { error: { message, type } }, changed: true };
 }
 
 function extractUsageFields(usage) {
@@ -598,14 +744,57 @@ function parseUnsupportedParams(bodyText) {
   let msg = '';
   try {
     const d = JSON.parse(bodyText);
-    msg = d.message || d.detail || (d.error && d.error.message) || '';
+    // FastAPI validation errors return `detail` as an ARRAY of
+    // {loc,msg,type} objects (e.g. NIM 422 "extra fields not permitted"), and
+    // some upstreams return a STRING. Coerce both to a string so the rest of
+    // this function (which calls msg.toLowerCase()) never throws. Previously an
+    // array `detail` threw `msg.toLowerCase is not a function`, which was
+    // swallowed by the param-strip try/catch and silently turned a clean 422
+    // into up to 4 masked NETWORK-ERROR retries + a raw, non-OpenAI-shaped body
+    // passthrough that broke OpenAI clients (Hermes).
+    const detail = d.detail;
+    if (typeof detail === 'string') {
+      msg = d.message || detail || (d.error && d.error.message) || '';
+    } else if (Array.isArray(detail)) {
+      msg = detail.map(x => {
+        if (typeof x === 'string') return x;
+        if (x && typeof x === 'object') {
+          const loc = Array.isArray(x.loc) ? x.loc.join('.') : (x.loc || '');
+          return [x.msg, x.message, loc].filter(Boolean).join(' ');
+        }
+        return String(x);
+      }).join(' ');
+      msg = d.message || msg || (d.error && d.error.message) || '';
+    } else {
+      msg = d.message || (d.error && d.error.message) || '';
+    }
   } catch {
     msg = bodyText || '';
   }
-  if (!msg.toLowerCase().includes('unsupported parameter') && !msg.toLowerCase().includes('extra fields') && !msg.toLowerCase().includes('unexpected')) {
+  const lower = msg.toLowerCase();
+  if (!lower.includes('unsupported parameter') && !lower.includes('extra fields') && !lower.includes('unexpected') && !lower.includes('unknown parameter') && !lower.includes('not allowed') && !lower.includes('not permitted')) {
     return [];
   }
   const matches = new Set();
+  // NVIDIA NIM 422 envelopes often carry a structured `details`/`errors` array
+  // with an explicit `field` (e.g. gliner-pii: "Unknown parameter 'top_p' is not
+  // allowed" + details:[{field:"top_p",...}]). Pull those out directly so we
+  // strip exactly the offending param without regex guessing.
+  try {
+    const d = JSON.parse(bodyText);
+    for (const key of ['details', 'errors']) {
+      if (Array.isArray(d[key])) {
+        for (const item of d[key]) {
+          const f = item && (item.field || item.loc);
+          if (typeof f === 'string') {
+            // loc may be a JSON pointer like ["body","top_p"] or "body.top_p"
+            const cleaned = String(f).replace(/^body[.\/]?/, '').replace(/^["\[]?body["\]]\.?\/?/, '');
+            matches.add(cleaned.replace(/^["']|["']$/g, ''));
+          }
+        }
+      }
+    }
+  } catch {}
   // Main regex: match backtick, single-quote, double-quote, and JSON pointer
   // formats. Also support nested paths with dots.
   const regex = /`([^`]+)`|'([^']+)'|"([^"]+)"|\/([a-z_][a-z0-9_/]*)/gm;
@@ -707,6 +896,17 @@ function modelFromPath(path) {
 const MODEL_GRACE_FAILS = 5;
 const modelFailCount = {};
 
+// Verify-sweep probe timeout. Heavy reasoning models (e.g. z-ai/glm-5.2,
+// deepseek reasoning, nemotron ultra) can take 60-120s TTFT even for a 1-token
+// "ping". A short probe timeout (the old hardcoded 15s) times these out and the
+// grace mechanism then marks them "unavailable" → they vanish from /v1/models,
+// and because they're hidden no live call ever recovers them (circular). Align
+// the probe timeout with the real request TTFT budget so slow-but-alive models
+// still verify. Configurable via PROBE_TIMEOUT_MS (default = TTFT_TIMEOUT_MS or 120s).
+const PROBE_TIMEOUT_MS = parseInt(
+  process.env.PROBE_TIMEOUT_MS || process.env.TTFT_TIMEOUT_MS || '120000', 10
+);
+
 function isModelUnavailable(modelId) {
   // BLOCK_UNAVAILABLE_MODELS: set to 'true' to enable proactive blocking of
   // models that the verification sweep has marked unavailable (404, DEGRADED,
@@ -729,10 +929,19 @@ function markModel(modelId, ok, status, path, reason) {
       console.log(`[verify] Model recovered: ${modelId} (${reason})`);
       unavailableModels.delete(modelId);
     }
+    retiredModels.delete(modelId);
   } else {
     if (!unavailableModels.has(modelId)) {
       console.warn(`[verify] Model marked unavailable: ${modelId} (${reason})`);
       unavailableModels.add(modelId);
+    }
+    // Only DEFINITIVELY-dead failures hide the model from /v1/models discovery.
+    // Timeouts (status 0) keep the model visible/callable — they are slow, not gone.
+    // PATCH-A: Only hide from discovery when DISCOVERY_HIDE_PROBE_FAILED=true
+    if (process.env.DISCOVERY_HIDE_PROBE_FAILED === 'true' && isDefinitiveDeadStatus(status, reason)) {
+      retiredModels.add(modelId);
+    } else {
+      retiredModels.delete(modelId);
     }
   }
   metrics.setModelStatus(modelId, ok, status, reason, path);
@@ -817,7 +1026,7 @@ async function probeModel(modelId) {
       },
       body: JSON.stringify(body),
       dispatcher: agent,
-      signal: AbortSignal.timeout(15000)
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS)
     });
 
     if (resp.status === 200 || resp.status === 422 || resp.status === 400) {
@@ -869,7 +1078,7 @@ async function verifyModels() {
   });
 
   await Promise.all(workers);
-  console.log(`[verify] Model verification done: ${unavailableModels.size} unavailable models.`);
+  console.log(`[verify] Model verification done: ${unavailableModels.size} unavailable (${retiredModels.size} hidden from discovery; the rest are slow-but-callable).`);
 }
 
 let serverInstance = null;
@@ -888,11 +1097,17 @@ async function verifyLoop() {
 
 async function loadUnavailableModelsFromDb() {
   try {
-    const unav = metrics.getUnavailableModels();
-    for (const m of unav) {
-      unavailableModels.add(m);
+    const detailed = metrics.getUnavailableModelsDetailed();
+    for (const row of detailed) {
+      unavailableModels.add(row.model);
+      // Persisted "definitively dead" models stay hidden from discovery across
+      // restarts; persisted slow/timeout models are re-shown (the next verify
+      // sweep, with the aligned PROBE_TIMEOUT_MS, will confirm them).
+      if (isDefinitiveDeadStatus(row.last_status, row.reason)) {
+        retiredModels.add(row.model);
+      }
     }
-    console.log(`[verify] Loaded ${unavailableModels.size} unavailable models from database.`);
+    console.log(`[verify] Loaded ${unavailableModels.size} unavailable models from database (${retiredModels.size} definitively retired/hidden).`);
   } catch (e) {
     console.error('[verify] Failed to load unavailable models:', e.message);
   }
@@ -979,8 +1194,14 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
   // FIX B1b: Always inject stream_options.include_usage for streaming requests
   // so NVIDIA NIM includes usage in the final streaming chunk. This ensures
   // the dashboard Activity tab always shows accurate prompt/completion tokens.
-  if (body.stream && !body.stream_options) {
-    body.stream_options = { include_usage: true };
+  // FORCE include_usage regardless of what the client sent: some clients
+  // (Hermes, OpenAI SDK, Claude Code) send stream_options:{} or
+  // stream_options:{include_usage:false}, in which case NIM omits the final
+  // usage chunk and usage is silently dropped/estimated. We always request it
+  // and let the downstream translation layer honor the client's reporting
+  // preference separately.
+  if (body.stream) {
+    body.stream_options = Object.assign({}, body.stream_options, { include_usage: true });
   }
 
   const headers = { ...reqHeaders };
@@ -1063,13 +1284,18 @@ Object.assign(body, preservedParams);
       await pool.healInFlight();
       
       // Revalidate: unblock keys/models that are close to unblocking early to retry
+      // Bug K2: only unblock keys/models that are within a small grace of true
+      // expiry. KEY_BLOCK_CAP=30 and MODEL_BLOCK_CAP=10, so the old thresholds
+      // (45 / 30) cleared EVERY block on the very next retry cycle (~1.5–3s
+      // later), defeating the cooldown → immediate re-429 → premature 503.
+      const GRACE = 3;
       for (const s of pool.keys) {
-        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < 45) {
+        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < GRACE) {
           s.hardBlockedUntil = 0;
         }
         if (modelId && s.modelBlocks[modelId]) {
           const rem = s.modelBlocks[modelId] - (Date.now() / 1000);
-          if (rem < 30) {
+          if (rem < GRACE) {
             delete s.modelBlocks[modelId];
           }
         }
@@ -1077,7 +1303,7 @@ Object.assign(body, preservedParams);
     }
 
     if (!key) {
-      return { status: 503, data: { error: { message: 'All API keys exhausted — no capacity available after revalidation cycles', type: 'server_error' } } };
+      return { status: 503, data: { error: { message: `All API keys exhausted — no capacity available after revalidation cycles${modelId ? ` for model ${modelId} (${pool.availableForModel(modelId)} key(s) available, ${pool.availableKeys} total)` : ''}`, type: 'server_error' } } };
     }
 
     const startMs = Date.now();
@@ -1143,10 +1369,10 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
           await new Promise(resolve => setTimeout(resolve, 50));
           continue;
         }
-        return { status: 429, data: { error: { message: `Rate limited (retry-after ${ra}s). Scope: ${scope}, Reason: ${reason}`, type: 'rate_limit_error' } } };
+        return { status: 429, retryAfter: String(ra), data: { error: { message: `Rate limited (retry-after ${ra}s). Scope: ${scope}, Reason: ${reason}`, type: 'rate_limit_error' } } };
       }
 
-      if (resp.status === 400 || resp.status === 413) {
+      if (resp.status === 400 || resp.status === 413 || resp.status === 422) {
         let respText = '';
         try { respText = await resp.text(); } catch {}
         if (isDegradedResponse(respText || '')) {
@@ -1177,10 +1403,11 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
           if (!keyReleased) { pool.releaseSuccess(key); decInFlight(); keyReleased = true; }
           return { status: resp.status, data: errBody };
         }
-        if (resp.status === 400 && attempt < maxAttempts - 1) {
+        if ((resp.status === 400 || resp.status === 422) && attempt < maxAttempts - 1) {
           const badParams = parseUnsupportedParams(respText);
           const toStrip = badParams.filter(p => {
             if (strippedParams.has(p)) return false;
+            if (PROTECTED_PARAMS.has(p)) return false; // Bug R2: never strip structural fields
             if (p.includes('.')) {
               const parts = p.split('.');
               let obj = body;
@@ -1225,7 +1452,12 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
           wasRateLimited: false, pacingMs
         });
         if (!keyReleased) { pool.releaseSuccess(key); decInFlight(); keyReleased = true; }
-        lastUpstream = { status: resp.status, data: errBody || { error: { message: respText || 'Bad Request', type: 'invalid_request_error' } } };
+        // Keep the real upstream HTTP status + wording, but always reshape the
+        // body into the canonical {error:{message,type}} envelope so OpenAI
+        // clients (Hermes) can parse resp.error.message even when upstream sent
+        // a FastAPI {detail} body.
+        const normalized = normalizeErrorEnvelope(errBody || { _raw: respText }, resp.status, modelId);
+        lastUpstream = { status: resp.status, data: normalized.changed ? normalized.body : (errBody || { error: { message: respText || 'Bad Request', type: 'invalid_request_error' } }) };
         return lastUpstream;
       }
 
@@ -1266,23 +1498,17 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
         try { errBody = await resp.json(); } catch {}
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} | error: ${JSON.stringify(errBody).slice(0, 500)}`);
         const latencyMs = Date.now() - startMs;
-        // TRANSPARENT ERROR PASSTHROUGH: return the REAL upstream status and body
-        // verbatim (never a synthetic 503 envelope). Clients such as Claude Code
-        // match the upstream error wording/type for retry & recovery; wrapping it
-        // in a custom message breaks that mechanism. Only when the upstream body
-        // is truly unparseable do we synthesize a standard Anthropic error type
-        // with the original upstream HTTP status preserved.
-        if (!errBody) {
-          const synthType =
-            resp.status === 429 ? 'rate_limit_error' :
-            resp.status === 401 ? 'authentication_error' :
-            resp.status === 403 ? 'permission_error' :
-            resp.status === 404 ? 'not_found_error' :
-            resp.status === 413 ? 'request_too_large' :
-            resp.status >= 400 && resp.status < 500 ? 'invalid_request_error' :
-            'api_error';
-          errBody = { error: { message: `Upstream ${resp.status}`, type: synthType } };
-        }
+        // TRANSPARENT passthrough of the upstream HTTP STATUS + wording, but we
+        // ALWAYS reshape the body into the canonical OpenAI/Anthropic error
+        // envelope {error:{message,type}}. Many NVIDIA/NIM FastAPI errors come
+        // back as {detail:"..."} or {detail:[...]} (not OpenAI-shaped), and an
+        // OpenAI client (e.g. Hermes) reads resp.error.message — a raw `detail`
+        // object makes it throw. We preserve the real status + wording while
+        // giving every client a parseable envelope. Already-well-formed bodies
+        // (including upstream OpenAI-shaped {error:{...}}) pass through verbatim
+        // so Claude Code's upstream-type matching still works.
+        const normalized = normalizeErrorEnvelope(errBody, resp.status, modelId);
+        if (normalized.changed) errBody = normalized.body;
         metrics.recordRequest({
           method: 'POST', path: metricPath,
           model: modelId, keyLabel: key.label,
@@ -1412,13 +1638,18 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       await pool.healInFlight();
       
       // Revalidate: unblock keys/models that are close to unblocking early to retry
+      // Bug K2: only unblock keys/models that are within a small grace of true
+      // expiry. KEY_BLOCK_CAP=30 and MODEL_BLOCK_CAP=10, so the old thresholds
+      // (45 / 30) cleared EVERY block on the very next retry cycle (~1.5–3s
+      // later), defeating the cooldown → immediate re-429 → premature 503.
+      const GRACE = 3;
       for (const s of pool.keys) {
-        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < 45) {
+        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < GRACE) {
           s.hardBlockedUntil = 0;
         }
         if (modelId && s.modelBlocks[modelId]) {
           const rem = s.modelBlocks[modelId] - (Date.now() / 1000);
-          if (rem < 30) {
+          if (rem < GRACE) {
             delete s.modelBlocks[modelId];
           }
         }
@@ -1426,7 +1657,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
     }
 
     if (!key) {
-      return jsonResp(res, 503, { error: { message: 'All API keys exhausted — no capacity available after revalidation cycles', type: 'server_error' } });
+      return jsonResp(res, 503, { error: { message: `All API keys exhausted — no capacity available after revalidation cycles${modelId ? ` for model ${modelId} (${pool.availableForModel(modelId)} key(s) available, ${pool.availableKeys} total)` : ''}`, type: 'server_error' } });
     }
 
     const startMs = Date.now();
@@ -1490,7 +1721,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         return jsonResp(res, 429, { error: { message: `Rate limited (retry-after ${ra}s)`, type: 'rate_limit_error' } });
       }
 
-      if (resp.status === 400 || resp.status === 413) {
+      if (resp.status === 400 || resp.status === 413 || resp.status === 422) {
         let respText = '';
         try { respText = await resp.text(); } catch {}
         if (isDegradedResponse(respText || '')) {
@@ -1522,9 +1753,9 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
           decInFlight();
           return jsonResp(res, resp.status, errBody);
         }
-        if (resp.status === 400 && attempt < maxAttempts - 1) {
+        if ((resp.status === 400 || resp.status === 422) && attempt < maxAttempts - 1) {
           const badParams = parseUnsupportedParams(respText);
-          const toStrip = badParams.filter(p => body[p] !== undefined && !strippedParams.has(p));
+          const toStrip = badParams.filter(p => body[p] !== undefined && !strippedParams.has(p) && !PROTECTED_PARAMS.has(p));
           if (toStrip.length > 0) {
             for (const p of toStrip) {
               delete body[p];
@@ -1565,8 +1796,10 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
         let errBody = null;
         try { errBody = JSON.parse(respText); } catch {}
         if (!errBody) {
-          const synthType = resp.status >= 400 && resp.status < 500 ? 'invalid_request_error' : 'api_error';
-          errBody = { error: { message: `Upstream ${resp.status}`, type: synthType } };
+          errBody = normalizeErrorEnvelope(null, resp.status, modelId).body;
+        } else {
+          const normalized = normalizeErrorEnvelope(errBody, resp.status, modelId);
+          if (normalized.changed) errBody = normalized.body;
         }
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} — all retries exhausted`);
         metrics.recordRequest({
@@ -1644,7 +1877,7 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
       return jsonResp(res, 503, { error: { message: `Upstream model ${modelId} is not responding (all ${maxAttempts} API keys timed out). The model may be temporarily unavailable.`, type: 'upstream_error' } });
     }
   }
-  if (lastUpstream) return jsonResp(res, lastUpstream.status, lastUpstream.data);
+  if (lastUpstream) return jsonResp(res, lastUpstream.status, lastUpstream.data, undefined, lastUpstream.retryAfter ? { "Retry-After": lastUpstream.retryAfter } : undefined);
   return jsonResp(res, 502, { error: { message: 'All attempts failed to reach upstream NVIDIA NIM', type: 'api_error' } });
 }
 
@@ -1656,6 +1889,9 @@ async function handleChatCompletions(body, req, res) {
   const result = await proxyOpenai(body, forwardHeaders(req), body.model, req);
 
   if (result.stream) {
+    const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '5000', 10);
+    let hbTimer = null;
+    const hbTick = () => { try { if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n'); } catch {} };
     try {
       const respHeaders = {
         'Content-Type': 'text/event-stream',
@@ -1665,18 +1901,11 @@ async function handleChatCompletions(body, req, res) {
       };
       addRateLimitHeaders(respHeaders, result.key.label, pool);
       res.writeHead(200, respHeaders);
+      // FIX A-2: swallow async EPIPE/CONNRESET on client disconnect so a
+      // dead socket never becomes an uncaught exception (Bug A-2).
+      res.on('error', () => {});
       const reader = result.stream.getReader();
       const decoder = new TextDecoder();
-      // FIX: periodic SSE keepalive for OpenAI clients (Hermes, OpenAI SDK,
-      // LiteLLM, …). When the upstream is silent for a long stretch (reasoning
-      // models "thinking", or a large cached prefill), an idle socket makes the
-      // client's read timeout fire and it closes the connection mid-response
-      // ("Connection closed mid-response"). A comment-frame heartbeat every
-      // HEARTBEAT_INTERVAL_MS keeps the stream alive. (The Anthropic path
-      // already does this inside streamOpenaiToAnthropic.)
-      const HEARTBEAT_MS = parseInt(process.env.HEARTBEAT_INTERVAL_MS || '5000', 10);
-      let hbTimer = null;
-      const hbTick = () => { try { if (!res.writableEnded && !res.destroyed) res.write(': keepalive\n\n'); } catch {} };
       hbTimer = setInterval(hbTick, HEARTBEAT_MS);
       let lastUsage = null;
       let ttftMs = 0;
@@ -1691,7 +1920,13 @@ async function handleChatCompletions(body, req, res) {
         while (true) {
           if (res.writableEnded || res.destroyed) break;
           const { done, value } = await reader.read();
-          if (done) break;
+          if (done) {
+            // FIX A-4: flush any trailing bytes still buffered in the
+            // TextDecoder (multi-byte sequences split across a chunk
+            // boundary) so a final partial UTF-8 char is NOT silently dropped.
+            try { const tail = decoder.decode(); if (tail) res.write(tail); } catch {}
+            break;
+          }
           if (isFirstChunk) {
             ttftMs = Date.now() - result.startMs;
             isFirstChunk = false;
@@ -1723,14 +1958,39 @@ async function handleChatCompletions(body, req, res) {
           }
         }
       } catch (e) { console.error('[stream error] handleChatCompletions:', e.message); }
-      if (res.writableEnded || res.destroyed) return;
+      // Bug M-B: on client disconnect mid-stream, release the key + clear the
+      // heartbeat timer. The early return previously skipped the cleanup
+      // `finally` (which only wraps the metrics block below), leaking
+      // key.inFlight and leaving an orphaned setInterval writing to a dead
+      // socket → inflated effectiveLoad → premature 503s under agent load.
+      if (res.writableEnded || res.destroyed) {
+        if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
+        // FIX: reader.cancel() returns a Promise that REJECTS with AbortError
+        // when the upstream stream was aborted (client disconnect / timeout).
+        // A bare `try { reader.cancel(); } catch {}` only swallows a
+        // SYNCHRONOUS throw — the async rejection was leaked as an
+        // `unhandledRejection` ([FATAL] in logs; potential instability
+        // under agent load where streams are aborted constantly). Resolve
+        // and swallow the rejection explicitly instead.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
+        pool.releaseSuccess(result.key);
+        decInFlight();
+        return;
+      }
       try {
-        if (!hasContent) {
+        // FIX A-3/A-5: only treat the stream as "empty" when the
+        // upstream never emitted a terminal [DONE] (any SSE-legal spacing
+        // variant). A valid completion that ends with ONLY a usage chunk
+        // (no content delta) must NOT be misclassified as context-too-large.
+        const upDone = /data:\s*\[DONE\]/.test(streamBuffer);
+        if (!hasContent && !upDone) {
           const friendlyMsg = `The context/history for model "${body.model}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
           const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
           try { if (!res.destroyed) res.write(errChunk); } catch {}
         }
-        if (!streamBuffer.includes('data: [DONE]')) {
+        // Emit exactly ONE canonical data: [DONE] — never a second one
+        // even if upstream used a non-canonical spacing variant.
+        if (!upDone) {
           try { if (!res.destroyed) res.write('data: [DONE]\n\n'); } catch {}
         }
         if (!res.destroyed) { try { res.end(); } catch {} }
@@ -1794,31 +2054,38 @@ async function handleChatCompletions(body, req, res) {
       });
       } finally {
         if (hbTimer) { clearInterval(hbTimer); hbTimer = null; }
-        try { reader.cancel(); } catch {}
+        // FIX: reader.cancel() returns a Promise that REJECTS with AbortError
+        // when the upstream stream was aborted (client disconnect / timeout).
+        // A bare `try { reader.cancel(); } catch {}` only swallows a
+        // SYNCHRONOUS throw — the async rejection was leaked as an
+        // `unhandledRejection` ([FATAL] in logs; potential instability
+        // under agent load where streams are aborted constantly). Resolve
+        // and swallow the rejection explicitly instead.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
         pool.releaseSuccess(result.key);
         decInFlight();
       }
     return;
   }
 
-  try { jsonResp(res, result.status, result.data, result.key?.label); } catch {}
+  try { jsonResp(res, result.status, result.data, result.key?.label, result.retryAfter ? { 'Retry-After': result.retryAfter } : undefined); } catch {}
 }
 
 /** POST /v1/messages — Anthropic-compatible endpoint */
 async function handleAnthropicMessages(rawBody, req, res) {
-  console.log('[handleAnthropicMessages] Raw request:', rawBody.slice(0, 500));
+  if (process.env.WRAPPER_DEBUG) console.log('[handleAnthropicMessages] Raw request:', rawBody.slice(0, 500));
   let aBody;
   try { aBody = JSON.parse(rawBody); } catch (e) {
     console.error('[JSON PARSE ERROR] messages raw:', JSON.stringify(rawBody).slice(0, 1000), 'err:', e.message);
     return jsonResp(res, 400, anthropicError('invalid_request_error', 'Invalid JSON body: ' + e.message));
   }
-  console.log('[handleAnthropicMessages] Parsed body:', JSON.stringify(aBody).slice(0, 500));
+  if (process.env.WRAPPER_DEBUG) console.log('[handleAnthropicMessages] Parsed body:', JSON.stringify(aBody).slice(0, 500));
 
   if (!aBody.model) {
     return jsonResp(res, 400, anthropicError('invalid_request_error', 'model is required'));
   }
 
-  console.log('[handleAnthropicMessages] Calling anthropicToOpenai...');
+  if (process.env.WRAPPER_DEBUG) console.log('[handleAnthropicMessages] Calling anthropicToOpenai...');
   // Estimate input tokens BEFORE translation — anthropicToOpenai() performs
   // context-window pruning that mutates aBody.messages (shifts off old turns),
   // so computing it afterwards would under-report usage to Claude Code.
@@ -1827,9 +2094,14 @@ async function handleAnthropicMessages(rawBody, req, res) {
   // anthropicToOpenai returns either a valid OpenAI body or {error:{type,message}}.
   // Pass the authoritative NGC registry context so pruning uses the real context
   // window (e.g. deepseek-v4-pro=262144) instead of the stale hardcoded heuristic.
-  const officialContext = registry.getOfficialContext(aBody.model);
+  // Bug R-M-A: resolve the alias to the real NIM id BEFORE looking up the
+  // authoritative context window. registry.getOfficialContext does not know
+  // Claude Code aliases (sonnet/opus/claude-*), so using aBody.model caused
+  // getContextWindow() to fall back to a far-too-small heuristic window and
+  // over-prune long conversations (e.g. opus → 131072 instead of 1,048,576).
+  const officialContext = registry.getOfficialContext(resolveTargetModel(aBody.model));
   const translated = anthropicToOpenai(aBody, officialContext);
-  console.log('[handleAnthropicMessages] anthropicToOpenai result:', JSON.stringify(translated).slice(0, 500));
+  if (process.env.WRAPPER_DEBUG) console.log('[handleAnthropicMessages] anthropicToOpenai result:', JSON.stringify(translated).slice(0, 500));
   if (translated.error) {
     return jsonResp(res, 400, anthropicError(translated.error.type || 'invalid_request_error', translated.error.message));
   }
@@ -1860,8 +2132,10 @@ async function handleAnthropicMessages(rawBody, req, res) {
   // NVIDIA NIM includes usage in the final streaming chunk. Without this,
   // capture.usage in streamOpenaiToAnthropic frequently misses prompt_tokens
   // resulting in zero-token records in the dashboard Activity tab.
-  if (oaiBody.stream && !oaiBody.stream_options) {
-    oaiBody.stream_options = { include_usage: true };
+  // FORCE include_usage (same rationale as B1b) so a client that sends
+  // stream_options:{} or {include_usage:false} does not lose the usage chunk.
+  if (oaiBody.stream) {
+    oaiBody.stream_options = Object.assign({}, oaiBody.stream_options, { include_usage: true });
   }
 
   const result = await proxyOpenai(oaiBody, forwardHeaders(req), oaiBody.model, req, '/v1/messages');
@@ -1883,6 +2157,10 @@ async function handleAnthropicMessages(rawBody, req, res) {
       return;
     }
     res.writeHead(200, respHeaders);
+    // FIX A-2: swallow async EPIPE/CONNRESET on client disconnect
+    // for the Anthropic streaming path too (same rationale as the
+    // OpenAI path — a dead socket must not become an uncaught exception).
+    res.on('error', () => {});
 
     const MAX_STREAM_RETRIES = 2;
     let streamRetries = 0;
@@ -1900,18 +2178,40 @@ async function handleAnthropicMessages(rawBody, req, res) {
 
       try {
         try {
+          // Bug S1: buffer upstream SSE chunks until the FIRST content delta
+          // (text/tool) arrives, then flush. If the upstream errors before any
+          // content delta, the buffered message_start/ping is discarded and a
+          // retry emits a FRESH, single message_start — instead of a duplicate
+          // message_start that breaks the Anthropic SDK contract.
+          const streamBuf = [];
+          let flushed = false;
+          const flushStreamBuf = () => {
+            if (!flushed) {
+              for (const c of streamBuf) {
+                if (res.writableEnded || res.destroyed) break;
+                try { res.write(c); } catch { break; }
+              }
+              streamBuf.length = 0;
+              flushed = true;
+            }
+          };
           for await (const chunk of streamOpenaiToAnthropic(retryResult.stream, aBody.model, capture, inputTokens, req.requestId, !!aBody.thinking)) {
             if (res.writableEnded || res.destroyed) break;
-            try {
-              res.write(chunk);
-            } catch (writeErr) {
-              console.error('[stream write error] handleAnthropicMessages:', writeErr.message);
-              break;
+            const isContent = chunk.includes('content_block_delta') || chunk.includes('text_delta') || chunk.includes('input_json_delta');
+            if (!flushed) {
+              streamBuf.push(chunk);
+              if (isContent) flushStreamBuf();
+            } else {
+              try {
+                res.write(chunk);
+              } catch (writeErr) {
+                console.error('[stream write error] handleAnthropicMessages:', writeErr.message);
+                break;
+              }
             }
-            if (chunk.includes('content_block_delta') || chunk.includes('text_delta') || chunk.includes('input_json_delta')) {
-              hasContent = true;
-            }
+            if (isContent) hasContent = true;
           }
+          if (!flushed) streamBuf.length = 0; // discard partial stream on error-before-content
         } catch (e) {
           streamError = e;
           attemptStatus = 502;
@@ -1985,7 +2285,23 @@ async function handleAnthropicMessages(rawBody, req, res) {
         await new Promise(r => setTimeout(r, backoffMs));
         retryResult = await proxyOpenai(oaiBody, forwardHeaders(req), oaiBody.model, req, '/v1/messages');
         if (!retryResult.stream) {
-          try { if (!res.destroyed) res.write(`data: ${JSON.stringify(retryResult.data || {})}\n\n`); } catch {}
+          // FIX: a non-stream retry result is an OpenAI-shaped error
+          // {error:{message,type}}. This is an ANTHROPIC SSE stream, so
+          // we must emit a proper Anthropic `event: error` frame — NOT a
+          // raw OpenAI `data: {...}` chunk, which is invalid for the
+          // Anthropic Messages SSE contract and confuses the SDK
+          // (Claude Code treats a bare `data:` as a message_delta and
+          // throws on the malformed JSON / missing `type`).
+          const oe = retryResult.data?.error || {};
+          const mappedType =
+            oe.type === 'rate_limit_error' ? 'rate_limit_error' :
+            oe.type === 'invalid_request_error' ? 'invalid_request_error' :
+            oe.type === 'authentication_error' ? 'authentication_error' :
+            oe.type === 'permission_error' ? 'permission_error' :
+            oe.type === 'not_found_error' ? 'not_found_error' :
+            'api_error';
+          const errEvent = `event: error\ndata: ${JSON.stringify({ type: 'error', error: { type: mappedType, message: oe.message || `Upstream error ${retryResult.status}` } })}\n\n`;
+          try { if (!res.destroyed) res.write(errEvent); } catch {}
           break;
         }
       }
@@ -2001,10 +2317,14 @@ async function handleAnthropicMessages(rawBody, req, res) {
         try { res.end(); } catch {}
       }
       // Record metrics even for exhausted retries so the dashboard reflects the failure.
+      // Bug: must log the RESOLVED NIM model id (oaiBody.model), not the raw client
+      // alias (aBody.model e.g. 'sonnet'/'haiku'/'opus'). The dashboard Activity tab
+      // is a per-model view of NVIDIA NIM usage; logging bare Claude aliases mixes
+      // virtual labels into the real catalog and breaks per-model filtering.
       metrics.recordRequest({
         method: 'POST',
         path: '/v1/messages',
-        model: aBody.model,
+        model: oaiBody.model,
         keyLabel: retryResult.key?.label || 'unknown',
         streaming: true,
         statusCode: finalStreamStatus,
@@ -2032,10 +2352,12 @@ async function handleAnthropicMessages(rawBody, req, res) {
         cacht = 0;
       }
       tt = pt + ct;
+      // Bug: record the RESOLVED NIM model id (oaiBody.model), not the raw client
+      // alias. Keeps the dashboard Activity tab aligned with the upstream catalog.
       metrics.recordRequest({
         method: 'POST',
         path: '/v1/messages',
-        model: aBody.model,
+        model: oaiBody.model,
         keyLabel: retryResult.key.label,
         streaming: true,
         statusCode: finalStreamStatus,
@@ -2056,7 +2378,7 @@ async function handleAnthropicMessages(rawBody, req, res) {
   // Non-streaming Anthropic response — proxyOpenai already recorded under
   // /v1/chat/completions with result.data.usage.  Just transform and return.
   if (result.status === 200 && result.data) {
-    const anthroResp = openaiToAnthropic(result.data, aBody.model, req.requestId, !!aBody.thinking);
+    const anthroResp = openaiToAnthropic(result.data, aBody.model, req.requestId, !!aBody.thinking, estimateInputTokens(aBody));
     try { jsonResp(res, 200, anthroResp, result.key?.label); } catch {}
     return;
   }
@@ -2065,7 +2387,11 @@ async function handleAnthropicMessages(rawBody, req, res) {
   const errMsg = errData?.error?.message || `Upstream error ${result.status}`;
   // Preserve original upstream error type; fall back to status-derived type
   const originalType = errData?.error?.type;
-  const errType = originalType || (
+  // HTTP 404 must map to Anthropic not_found_error even when upstream
+  // returned an OpenAI-shaped type (e.g. invalid_request_error).
+  const errType = (result.status === 404)
+    ? 'not_found_error'
+    : originalType || (
     result.status === 429 ? 'rate_limit_error' :
     result.status === 401 ? 'authentication_error' :
     result.status === 403 ? 'permission_error' :
@@ -2144,6 +2470,27 @@ function enrichModelMetadata(id, desc) {
     supports_logprobs: isChat && !desc.type?.includes('embedding'),
     supports_embedding: desc.type === 'embedding',
     supports_batch: false,
+    // ── Correct call method (per NVIDIA NIM API reference) ──────────────
+    // How to actually invoke this model: base_url + endpoint + auth + protocol.
+    // Clients (Claude Code picker, Hermes, OpenAI SDK) use this as the
+    // authoritative "how to call" field. Multimodal models live on BASE_GENAI;
+    // text/embedding/rerank on BASE_LLM.
+    call: (() => {
+      const primary = (desc.endpoints && desc.endpoints[0]) || null;
+      if (!primary) return null;
+      const openaiKinds = new Set(['chat', 'embeddings', 'ranking', 'asr', 'tts', 'openai_image']);
+      const protocol = openaiKinds.has(primary.kind) ? 'openai-compatible' : 'native-nvidia';
+      return {
+        protocol,
+        base_url: primary.base_url,
+        endpoint: primary.path,
+        method: 'POST',
+        auth: 'Bearer',
+      };
+    })(),
+    // PATCH-A: Probe status annotation for client filtering
+    probe_status: unavailableModels.has(id) ? (metrics.modelStatusCache?.[id]?.last_status || null) : null,
+    probe_reason: unavailableModels.has(id) ? (metrics.modelStatusCache?.[id]?.reason || null) : null,
     provider: 'nvidia',
     model_family: id.includes('/') ? id.split('/')[1]?.split('-')[0] || id : id.split('-')[0] || id,
   };
@@ -2190,7 +2537,14 @@ async function handleModels(res, url = null) {
   // this list still passes through to NVIDIA NIM and gets the real upstream
   // error. Clients (Claude Code picker, OpenAI SDK, dashboards) only see models
   // that currently work.
-  const ids = allIds.filter(id => !unavailableModels.has(id));
+  // PATCH-A: Discovery transparency — show ALL upstream models by default.
+  // Verify-sweep telemetry still runs and populates unavailableModels/retiredModels,
+  // but these sets no longer control discovery visibility. Upstream errors are
+  // returned verbatim (transparent proxy). Set DISCOVERY_HIDE_PROBE_FAILED=true
+  // to restore the old behavior of hiding probe-failed models from discovery.
+  const DISCOVERY_HIDE_FAILED = process.env.DISCOVERY_HIDE_PROBE_FAILED === 'true';
+  const ids = DISCOVERY_HIDE_FAILED ? allIds.filter(id => !retiredModels.has(id)) : allIds;
+  console.log('[discovery] ' + ids.length + '/' + allIds.length + ' models (hide_failed=' + DISCOVERY_HIDE_FAILED + ')');
   // Always rebuild the DISCOVERY_TO_NIM map so behind-the-scenes claude-*
   // alias resolution works even when aliases are not in the response.
   refreshDiscoveryMap(ids);
@@ -2204,10 +2558,14 @@ async function handleModels(res, url = null) {
     raw.aliases = [d.id];
     data.push(raw);
 
-    // 2) Claude-prefixed alias — ONLY when ?gateway=1 (Claude Code model picker).
-    //    The DISCOVERY_TO_NIM map is always built (above), so claude-* IDs
-    //    resolve correctly via resolveTargetModel() regardless of this flag.
-    if (gateway) {
+    // 2) Claude-prefixed alias — always emitted for the gateway model picker.
+    //    Claude Code's CLADUE_CODE_GATEWAY_MODEL_DISCOVERY_URL hits /v1/models
+    //    WITHOUT ?gateway=1, so gating on that flag hid every claude-* id and
+    //    left the picker empty. The DISCOVERY_TO_NIM map is always built (above),
+    //    so claude-* IDs resolve correctly via resolveTargetModel() regardless.
+    //    Emitting these aliases unconditionally is harmless for OpenAI clients
+    //    (they just see extra model ids) and required for Anthropic clients.
+    {
       const m = enrichModelMetadata(d.id, d);
       const alias = discoveryAlias(d.id);
       m.owned_by = d.id.split('/')[0] || 'nvidia';
@@ -2325,13 +2683,18 @@ async function handleCatchAll(req, res, path, url) {
       await pool.healInFlight();
       
       // Revalidate: unblock keys/models that are close to unblocking early to retry
+      // Bug K2: only unblock keys/models that are within a small grace of true
+      // expiry. KEY_BLOCK_CAP=30 and MODEL_BLOCK_CAP=10, so the old thresholds
+      // (45 / 30) cleared EVERY block on the very next retry cycle (~1.5–3s
+      // later), defeating the cooldown → immediate re-429 → premature 503.
+      const GRACE = 3;
       for (const s of pool.keys) {
-        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < 45) {
+        if (s.isHardBlocked() && s.hardBlockedUntil - (Date.now() / 1000) < GRACE) {
           s.hardBlockedUntil = 0;
         }
         if (modelId && s.modelBlocks[modelId]) {
           const rem = s.modelBlocks[modelId] - (Date.now() / 1000);
-          if (rem < 30) {
+          if (rem < GRACE) {
             delete s.modelBlocks[modelId];
           }
         }
@@ -2339,7 +2702,7 @@ async function handleCatchAll(req, res, path, url) {
     }
 
     if (!key) {
-      return jsonResp(res, 503, { error: { message: 'All API keys exhausted — no capacity available after revalidation cycles', type: 'server_error' } });
+      return jsonResp(res, 503, { error: { message: `All API keys exhausted — no capacity available after revalidation cycles${modelId ? ` for model ${modelId} (${pool.availableForModel(modelId)} key(s) available, ${pool.availableKeys} total)` : ''}`, type: 'server_error' } });
     }
 
     const startMs = Date.now();
@@ -2423,9 +2786,9 @@ async function handleCatchAll(req, res, path, url) {
           decInFlight();
           return jsonResp(res, resp.status, errBody);
         }
-        if (resp.status === 400 && attempt < maxAttempts - 1) {
+        if ((resp.status === 400 || resp.status === 422) && attempt < maxAttempts - 1) {
           const badParams = parseUnsupportedParams(respText);
-          const toStrip = badParams.filter(p => body[p] !== undefined && !strippedParams.has(p));
+          const toStrip = badParams.filter(p => body[p] !== undefined && !strippedParams.has(p) && !PROTECTED_PARAMS.has(p));
           if (toStrip.length > 0) {
             for (const p of toStrip) {
               delete body[p];
@@ -2466,8 +2829,10 @@ async function handleCatchAll(req, res, path, url) {
         let errBody = null;
         try { errBody = JSON.parse(respText); } catch {}
         if (!errBody) {
-          const synthType = resp.status >= 400 && resp.status < 500 ? 'invalid_request_error' : 'api_error';
-          errBody = { error: { message: `Upstream ${resp.status}`, type: synthType } };
+          errBody = normalizeErrorEnvelope(null, resp.status, modelId).body;
+        } else {
+          const normalized = normalizeErrorEnvelope(errBody, resp.status, modelId);
+          if (normalized.changed) errBody = normalized.body;
         }
         console.warn(`[UPSTREAM ERROR] status: ${resp.status} for model: ${modelId} — all retries exhausted`);
         metrics.recordRequest({
@@ -2489,6 +2854,10 @@ async function handleCatchAll(req, res, path, url) {
           'Connection': 'keep-alive',
           'X-Accel-Buffering': 'no',
         });
+        // FIX A-2: swallow async EPIPE/CONNRESET on client disconnect
+        // for the catch-all streaming path too (same rationale as the
+        // OpenAI / Anthropic paths).
+        res.on('error', () => {});
 
         const reader = resp.body.getReader();
         const decoder = new TextDecoder();
@@ -2522,7 +2891,14 @@ async function handleCatchAll(req, res, path, url) {
             }
           }
         } catch (e) { console.error('[stream error] handleCatchAll:', e.message); }
-        try { reader.cancel(); } catch {}
+        // FIX: reader.cancel() returns a Promise that REJECTS with AbortError
+        // when the upstream stream was aborted (client disconnect / timeout).
+        // A bare `try { reader.cancel(); } catch {}` only swallows a
+        // SYNCHRONOUS throw — the async rejection was leaked as an
+        // `unhandledRejection` ([FATAL] in logs; potential instability
+        // under agent load where streams are aborted constantly). Resolve
+        // and swallow the rejection explicitly instead.
+        try { Promise.resolve(reader.cancel()).catch(() => {}); } catch {}
         // B5 FIX: previously `if (res.destroyed) { release; return; }` skipped
         // the usage-extraction + metrics-recording block below entirely, so
         // client disconnects during streaming left no trace in the dashboard.
@@ -2652,7 +3028,7 @@ async function handleCatchAll(req, res, path, url) {
       return jsonResp(res, e.name === 'TimeoutError' ? 408 : 502, { error: { message: e.message, type: 'upstream_error' } });
     }
   }
-  if (lastUpstream) return jsonResp(res, lastUpstream.status, lastUpstream.data);
+  if (lastUpstream) return jsonResp(res, lastUpstream.status, lastUpstream.data, undefined, lastUpstream.retryAfter ? { "Retry-After": lastUpstream.retryAfter } : undefined);
   return jsonResp(res, 502, { error: { message: 'All attempts failed to reach upstream NVIDIA NIM', type: 'api_error' } });
 }
 
@@ -2766,7 +3142,11 @@ async function handleRequest(req, res) {
   // discovery endpoints needed by dashboards and client model-pickers.
   const publicPaths = ['/health', '/metrics/prom', '/', '/dashboard.html', '/dashboard', '/favicon.ico', '/events'];
   const isPublic = publicPaths.includes(path)
-    || (method === 'GET' && path.startsWith('/metrics'))
+    // Bug R6: only the Prometheus scrape is public. The previous
+    // path.startsWith('/metrics') made every GET /metrics/* (keys, rate-limits,
+    // activity, model-status) readable without the bearer token. Expose only
+    // /metrics/prom explicitly.
+    || path === '/metrics/prom'
     || (method === 'GET' && path === '/v1/models')
     || (method === 'GET' && path.startsWith('/v1/models/'))
     || (method === 'GET' && path === '/v1/engines')
@@ -2786,6 +3166,13 @@ async function handleRequest(req, res) {
     const token = authHeader.replace(/^Bearer\s+/i, '') || apiKeyHeader;
     if (token !== BEARER_TOKEN) {
       console.warn(`[${requestId}] Auth failed for ${method} ${path}`);
+      // Route-aware error envelope: the Anthropic Messages API expects
+      // {"type":"error","error":{type,message}}; OpenAI expects
+      // {"error":{message,type}}. Return the correct shape per route so
+      // strict Anthropic clients (Claude Code) get a parseable 401.
+      if (path === '/v1/messages' || path.startsWith('/v1/messages/')) {
+        return jsonResp(res, 401, { type: 'error', error: { type: 'authentication_error', message: 'Unauthorized' } });
+      }
       return jsonResp(res, 401, { error: { message: 'Unauthorized', type: 'authentication_error' } });
     }
   }
@@ -3062,6 +3449,19 @@ async function handleRequest(req, res) {
       // model here AND in handleChatCompletions (double work) and left a
       // dangling `requestedModel` local; both are removed.
       return await handleChatCompletions(body, req, res);
+    }
+
+    // ─ OpenAI Responses API (codex >=0.144 wire_api="responses") ──
+    if (method === 'POST' && path === '/v1/responses') {
+      const raw = await readBody(req);
+      // handleResponsesApi writes the response itself (SSE/JSON) or returns an
+      // error object; jsonResp is only used for the parse/dispatch failures.
+      const out = await responsesHandler.handleResponsesApi(req, res, raw);
+      if (out && out.error) {
+        const status = out.error.type === 'invalid_request_error' ? 400 : 502;
+        return jsonResp(res, status, { error: out.error });
+      }
+      return;
     }
 
     // ─ Anthropic Messages ──
@@ -3371,7 +3771,7 @@ if (method === "POST" && path === "/v1/ranking") {
         return jsonResp(res, 200, ollamaResp, result.key?.label);
       }
 
-      return jsonResp(res, result.status, result.data, result.key?.label);
+      return jsonResp(res, result.status, result.data, result.key?.label, result.retryAfter ? { "Retry-After": result.retryAfter } : undefined);
     }
 
     // ─ Ollama /api/generate — convert to OpenAI format ──
@@ -3534,7 +3934,7 @@ if (method === "POST" && path === "/v1/ranking") {
         return jsonResp(res, 200, ollamaResp, result.key?.label);
       }
 
-      return jsonResp(res, result.status, result.data, result.key?.label);
+      return jsonResp(res, result.status, result.data, result.key?.label, result.retryAfter ? { "Retry-After": result.retryAfter } : undefined);
     }
 
     // ─ Fallback to Catch-all Proxy ──
@@ -3553,7 +3953,14 @@ if (method === "POST" && path === "/v1/ranking") {
       inFlight = 0;
     }
     console.error(`[${requestId}] ${method} ${path} 500 ${duration}ms: ${e.message}`, e.stack);
-    try { jsonResp(res, 500, { error: { message: 'Internal server error', type: 'server_error' } }); } catch {}
+    // Route-aware envelope: Anthropic Messages API wants
+    // {"type":"error","error":{type:"api_error",message}}, OpenAI wants
+    // {"error":{message,type:"server_error"}}.
+    if (path === '/v1/messages' || path.startsWith('/v1/messages/')) {
+      try { jsonResp(res, 500, { type: 'error', error: { type: 'api_error', message: 'Internal server error' } }); } catch {}
+    } else {
+      try { jsonResp(res, 500, { error: { message: 'Internal server error', type: 'server_error' } }); } catch {}
+    }
   } finally {
     clearTimeout(preRespTimer);
     const duration = Date.now() - startTime;
@@ -3699,10 +4106,13 @@ async function main() {
 
   serverInstance = http.createServer(handleRequest);
   serverInstance.on('error', (err) => {
-    if (err.code === 'EADDRINUSE') {
-      console.error(`[FATAL] Port ${LISTEN_PORT} already in use. Is another instance running?`);
-      process.exit(1);
-    }
+    // Any listen failure must terminate loudly instead of hanging silently.
+    // The callback only fires on success, so an unhandled error (EADDRINUSE,
+    // EACCES/EPERM, EINVAL) would otherwise leave the process alive but not
+    // bound to any port -- every client gets ECONNREFUSED with no log/exit.
+    console.error(`[FATAL] listen() error on ${BIND_HOST}:${LISTEN_PORT}: ${err.code || err.message}`);
+    console.error(err.stack || err);
+    process.exit(1);
   });
   // Server-level socket timeouts. Critical: must be >= TTFT_TIMEOUT_MS + a
   // safety margin, otherwise upstream hangs longer than that would be killed
@@ -3725,6 +4135,29 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
     console.log(`[wrapper-nvidia] Upstream: LLM=${BASE_LLM}`);
     console.log(`[wrapper-nvidia] Metrics DB: ${dbPath}`);
   });
+
+  // FIX P0: multi-port bind so every client config is satisfied without
+  // editing client configs (which live outside this repo):
+  //   - Hermes ILMA profile: base_url = http://127.0.0.1:9100 (main) AND
+  //     custom_providers[wrapper-nvidia].base_url = http://127.0.0.1:9100
+  //   - Claude Code settings: ANTHROPIC_BASE_URL = http://localhost:9100
+  //     and CLADUE_CODE_GATEWAY_MODEL_DISCOVERY_URL = http://localhost:9910/v1/models
+  // The clone previously bound only LISTEN_PORT (9910 via .env + service), so
+  // every 9100-targeting client got ECONNREFUSED. We keep LISTEN_PORT as the
+  // primary and additionally bind ANY_ALSO_PORTS (comma-separated) on the SAME
+  // http.Server/handler, so one OS process serves all expected addresses.
+  const extraPorts = (process.env.ANY_ALSO_PORTS || '')
+    .split(',').map(x => parseInt((x || '').trim(), 10))
+    .filter(p => Number.isInteger(p) && p > 0 && p !== LISTEN_PORT)
+    // de-dup
+    .filter((p, i, arr) => arr.indexOf(p) === i);
+  for (const p of extraPorts) {
+    // A single http.Server can call .listen() multiple times; Node adds an
+    // extra handle per call while reusing the same request handler.
+    serverInstance.listen(p, BIND_HOST, () => {
+      console.log(`[wrapper-nvidia] also listening on ${BIND_HOST}:${p}`);
+    });
+  }
 
   pool.startModelRefresh();
 
@@ -3775,7 +4208,18 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
   });
 }
 
-main().catch(e => {
-  console.error(`[wrapper-nvidia] Fatal: ${e.message}`);
-  process.exit(1);
-});
+// INTEGRATION HOOK (audit only): under NODE_ENV=test_integration we let main()
+// run for real (with listen neutralized by the harness + undici intercepted) so
+// routing/auth/translation exercise the production code paths, then expose a
+// `ready` promise and `handleRequest`. No behavior change in normal runs.
+if (process.env.NODE_ENV === 'test_integration') {
+  const _ready = main()
+    .then(() => ({ handleRequest, metrics, pool, registry }))
+    .catch(e => { console.error(`[wrapper-nvidia][test_integration] init error: ${e.message}`); throw e; });
+  module.exports = { handleRequest, ready: _ready };
+} else {
+  main().catch(e => {
+    console.error(`[wrapper-nvidia] Fatal: ${e.message}`);
+    process.exit(1);
+  });
+}

@@ -57,7 +57,10 @@ function isAnthropicMessageOrderValid(messages) {
     if (msg.role === 'system') continue;
     if (msg.role === 'tool') {
       hasToolResult = true;
-    } else if (hasToolResult && msg.role !== 'assistant') {
+    } else if (hasToolResult && msg.role !== 'assistant' && msg.role !== 'tool') {
+      // Bug R-m4: allow consecutive tool messages (some clients emit multiple
+      // role:'tool' results in a row). Only reject a true order violation:
+      // a non-assistant, non-tool message after a tool result.
       console.log('[anthropic_compat] Invalid order: "tool" followed by "' + msg.role + '". Rejecting.');
       return false;
     }
@@ -176,15 +179,24 @@ function anthropicToOpenai(a, officialContext) {
       // Never prune a leading system prompt (or any system message) — dropping
       // it silently corrupts every subsequent turn's instructions.
       if (a.messages[0] && a.messages[0].role === 'system') break;
-      a.messages.shift();
-      while (a.messages.length > 0 && a.messages[0]) {
-        if (a.messages[0].role === 'system') break;
-        if (a.messages[0].role !== 'user' || hasToolResultBlock(a.messages[0]) || a.messages[0].role === 'tool') {
+      // Bug R4: keep at least one user turn so the conversation is never
+      // emptied (a long assistant chain anchored by a single user turn used to
+      // be shifted entirely away → NIM 400 → agent session break).
+      const remainingUsers = a.messages.filter(m => m && m.role === 'user').length;
+      if (remainingUsers <= 1) break;
+      if (a.messages[0].role !== 'user') {
+        a.messages.shift(); // peel a non-user prefix
+      } else {
+        a.messages.shift(); // drop leading user
+        while (a.messages.length > 0 && a.messages[0] && a.messages[0].role !== 'user') {
           a.messages.shift();
-        } else {
-          break;
         }
       }
+      // Safety: never leave a non-user/non-system message at the head.
+      while (a.messages.length > 0 && a.messages[0] && a.messages[0].role !== 'user' && a.messages[0].role !== 'system') {
+        a.messages.shift();
+      }
+      if (a.messages.length === 0) break; // protect against emptying
       currentTokens = estimateInputTokens(a);
     }
     console.log(`[anthropic_compat] Pruned history. New estimated tokens: ${currentTokens}, messages count: ${a.messages.length}`);
@@ -232,7 +244,12 @@ function anthropicToOpenai(a, officialContext) {
       continue;
     }
 
-    // 1. If role is 'tool'
+    // Multi-turn tool history for NIM (esp. deepseek-v4 / DSML models):
+    // embed prior tool_use as DSML plaintext in assistant content and
+    // tool_result as <tool_result> user text. Native OpenAI {role:'tool'} +
+    // assistant.tool_calls breaks multi-turn agent loops on several NIM
+    // chat templates (history self-healing / Claude Code continuation).
+    // See commit cfe13e2 and regression-think-parser.js.
     if (role === 'tool') {
       const toolResultContent = Array.isArray(content) ? content : [];
       const textParts = [];
@@ -433,7 +450,7 @@ function estimateInputTokens(a) {
 
 // ── Response: OpenAI → Anthropic (non-streaming) ─────────────────────────
 
-function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
+function openaiToAnthropic(o, model, requestId = null, expectThinking = false, estimatedInput = null) {
   const choice = (o.choices?.length > 0 ? o.choices[0] : {});
   const msg = choice?.message || {};
   const content = [];
@@ -463,42 +480,62 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
     content.push({ type: 'thinking', thinking: reasoning });
   }
 
-  // Parse unstructured DSML tool calls if present in the content
-  if (rawContent.includes("<｜DSML｜tool_calls>") || rawContent.includes("<\uff5cDSML\uff5ctool_calls>")) {
-    const normalized = rawContent.replace(/\uff5c/g, '|');
-    const startIdx = normalized.indexOf("<|DSML|tool_calls>");
-    const endIdx = normalized.indexOf("</|DSML|tool_calls>");
-    if (startIdx !== -1 && endIdx !== -1) {
-      const beforeText = rawContent.substring(0, startIdx).trim();
-      const dsmlBlock = normalized.substring(startIdx, endIdx + 19);
-      const afterText = rawContent.substring(endIdx + 19).trim();
-      
+  // Parse unstructured DSML tool calls if present in the content.
+  // One pass, segmented strictly on the (possibly multiple) "<|DSML|tool_calls>"
+  // wrappers so that, unlike the single-index version, a response that emits
+  // MORE THAN ONE tool-calls wrapper does NOT leak raw DSML into a trailing
+  // text block (which makes Claude Code reject the message). Blocks are emitted
+  // in source order (text before the tool_use it precedes) so the Anthropic
+  // content-positioning contract holds.
+  // Normalize the full content ONCE: collapse fullwidth '|' (U+FF5C) to '|'
+  // and strip the leading '<' that real upstreams emit on DSML open tags
+  // ("<｜DSML｜tool_calls>" -> "|DSML|tool_calls>"). Everything below is
+  // computed against `normalized`, so indices and substring bounds stay
+  // consistent — the prior code mixed a normalized index with the raw
+  // string, which shifted the after-text split by the 9 chars removed by
+  // normalization and leaked "</|DSML..." into the trailing text output.
+  // Normalize BEFORE the guard (not only inside it) so the branch triggers on
+  // both fullwidth and already-normalized DSML markers; otherwise a body whose
+  // open tag was normalized elsewhere would skip parsing and leak raw DSML as
+  // a text block (Claude Code then rejects the message).
+  const normalizedRaw = rawContent.replace(/\uff5c/g, '|').replace(/<\|DSML\|/g, '|DSML|');
+  if (normalizedRaw.includes('|DSML|tool_calls>')) {
+    const normalized = normalizedRaw;
+    const OPEN = '|DSML|tool_calls>';
+    const CLOSE = '</|DSML|tool_calls>'; // length 19
+    const segments = [];
+    let cursor = 0;
+    while (true) {
+      const sIdx = normalized.indexOf(OPEN, cursor);
+      if (sIdx === -1) { segments.push({ type: 'text', text: normalized.slice(cursor) }); break; }
+      if (sIdx > cursor) segments.push({ type: 'text', text: normalized.slice(cursor, sIdx) });
+      const eIdx = normalized.indexOf(CLOSE, sIdx);
+      if (eIdx === -1) { segments.push({ type: 'text', text: normalized.slice(sIdx) }); break; }
+      segments.push({ type: 'dsml', text: normalized.slice(sIdx, eIdx + CLOSE.length) });
+      cursor = eIdx + CLOSE.length;
+    }
+    for (const seg of segments) {
+      if (seg.type === 'text') {
+        const t = seg.text.trim();
+        if (t) content.push({ type: 'text', text: t });
+        continue;
+      }
       let invokeMatch;
-      const invokeRegex = /<\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|invoke>/g;
-      while ((invokeMatch = invokeRegex.exec(dsmlBlock)) !== null) {
+      const invokeRegex = /\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|invoke>/g;
+      while ((invokeMatch = invokeRegex.exec(seg.text)) !== null) {
         const name = invokeMatch[1];
         const inner = invokeMatch[2];
         const params = {};
-        
         let paramMatch;
-        const paramRegex = /<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/g;
+        const paramRegex = /\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/g;
         while ((paramMatch = paramRegex.exec(inner)) !== null) {
           params[paramMatch[1]] = paramMatch[2];
         }
-        
         const toolCallId = `call_dsml_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
         content.push({ type: 'tool_use', id: toolCallId, name, input: params });
       }
-      
-      if (beforeText) {
-        content.push({ type: 'text', text: beforeText });
-      }
-      if (afterText) {
-        content.push({ type: 'text', text: afterText });
-      }
-      
-      rawContent = "";
     }
+    rawContent = "";
   }
 
   if (rawContent) {
@@ -533,9 +570,22 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false) {
 
   const u = o.usage || {};
   const cached = ((u.prompt_tokens_details) || {}).cached_tokens || 0;
+  // FIX C-2.1: mirror the streaming path — when NIM omits `usage`
+  // (some reasoning / big-context responses return 200 with an empty
+  // usage object), fall back to an estimate instead of reporting
+  // 0/0. We estimate output from the bytes we actually emit
+  // (text block lengths + serialized tool_use inputs), and input from
+  // the caller-supplied pre-request estimate (which the handler
+  // computes from the real prompt). This keeps the dashboard
+  // Activity tab consistent between streaming and non-streaming calls.
+  let outChars = 0;
+  for (const b of content) {
+    if (b.type === 'text' && typeof b.text === 'string') outChars += b.text.length;
+    if (b.type === 'tool_use' && b.input) outChars += JSON.stringify(b.input).length;
+  }
   const usage = {
-    input_tokens: u.prompt_tokens || 0,
-    output_tokens: u.completion_tokens || 0,
+    input_tokens: u.prompt_tokens ?? estimatedInput ?? 0,
+    output_tokens: u.completion_tokens ?? (outChars > 0 ? Math.max(1, Math.ceil(outChars / 4)) : 0),
     cache_creation_input_tokens: 0,
     cache_read_input_tokens: cached,
   };
@@ -682,15 +732,23 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
     dsmlBuffer += chunk;
     
     while (true) {
-      const normalized = dsmlBuffer.replace(/\uff5c/g, '|');
+      const normalized = dsmlBuffer.replace(/\uff5c/g, '|').replace(/<\|DSML\|/g, '|DSML|');
       
-      // 1. Check for invoke start
-      const invokeMatch = normalized.match(/<\|DSML\|invoke\s+name="([^"]+)"[^>]*>/);
-      if (invokeMatch) {
-        const fullTag = invokeMatch[0];
-        const toolName = invokeMatch[1];
-        const matchIdx = normalized.indexOf(fullTag);
-        
+      // Consume exactly ONE complete <invoke>..</invoke> pair per iteration using a
+      // single regex anchored at the first opening tag. Using one match object for
+      // both the name AND the end-of-invoke index is essential: the previous code
+      // computed matchIdx via normalized.indexOf(fullTag) (searching the whole
+      // buffer), which, once two invokes were buffered, resolved to the FIRST
+      // opening tag and made the SECOND </invoke> and second tool unreachable
+      // (only the first tool was emitted, with the second tool's params). The
+      // non-greedy group here guarantees we close the pair we opened.
+      const invokePair = normalized.match(/\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|invoke>/);
+      if (invokePair) {
+        const toolName = invokePair[1];
+        const inner = invokePair[2];
+        const pairStart = invokePair.index;          // start of "<|DSML|invoke"
+        const pairEnd = pairStart + invokePair[0].length; // end of "</|DSML|invoke>"
+
         if (currentToolIndex === null) {
           const ai = nextIndex++;
           currentToolIndex = ai;
@@ -702,14 +760,13 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
           // produced no real reasoning yet, emit a minimal synthetic thinking
           // block BEFORE the first tool_use block so Claude Code's
           // content-ordering contract holds (first block must be thinking).
-          // Mirrors the same guard in the native tool_calls path and emitText.
           if (expectThinking && !realThinkingEmitted && !syntheticThinkingEmitted) {
             yield* emitSyntheticThinking();
           }
           sentTextOrToolBlock = true;
           yield* stopOpen();
           openIdx = ai;
-          
+
           yield _sse('content_block_start', {
             type: 'content_block_start',
             index: ai,
@@ -721,33 +778,48 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
             }
           });
         }
-        
-        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
-        continue;
-      }
-      
-      // 2. Check for parameter value
-      const paramMatch = normalized.match(/<\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/);
-      if (paramMatch) {
-        const fullTag = paramMatch[0];
-        const paramName = paramMatch[1];
-        const paramValueRaw = paramMatch[2];
-        const matchIdx = normalized.indexOf(fullTag);
-        
-        if (currentToolIndex !== null) {
-          currentToolInput[paramName] = paramValueRaw;
+
+        // Parse the parameters scoped to THIS invoke's inner content only.
+        const params = {};
+        let paramMatch;
+        const paramRegex = /\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>/g;
+        while ((paramMatch = paramRegex.exec(inner)) !== null) {
+          params[paramMatch[1]] = paramMatch[2];
         }
-        
-        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+
+        if (currentToolIndex !== null) {
+          yield _sse('content_block_delta', {
+            type: 'content_block_delta',
+            index: currentToolIndex,
+            delta: {
+              type: 'input_json_delta',
+              partial_json: JSON.stringify(params)
+            }
+          });
+
+          yield _sse('content_block_stop', {
+            type: 'content_block_stop',
+            index: currentToolIndex
+          });
+
+          if (openIdx === currentToolIndex) openIdx = null;
+        }
+        currentToolIndex = null;
+        currentToolName = '';
+        currentToolId = '';
+        currentToolInput = {};
+
+        dsmlBuffer = dsmlBuffer.substring(pairEnd);
         continue;
       }
-      
-      // 3. Check for invoke end
-      const endInvokeMatch = normalized.match(/<\/\|DSML\|invoke>/);
-      if (endInvokeMatch) {
-        const fullTag = endInvokeMatch[0];
+
+      // Tool_calls close: emit any pending tool (defensive) and switch back to
+      // normal text parsing for whatever follows the wrapper.
+      const endToolCallsMatch = normalized.match(/<\/\|DSML\|tool_calls>/);
+      if (endToolCallsMatch) {
+        const fullTag = endToolCallsMatch[0];
         const matchIdx = normalized.indexOf(fullTag);
-        
+
         if (currentToolIndex !== null) {
           yield _sse('content_block_delta', {
             type: 'content_block_delta',
@@ -757,51 +829,35 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
               partial_json: JSON.stringify(currentToolInput)
             }
           });
-          
           yield _sse('content_block_stop', {
             type: 'content_block_stop',
             index: currentToolIndex
           });
-          
           if (openIdx === currentToolIndex) openIdx = null;
           currentToolIndex = null;
           currentToolName = '';
           currentToolId = '';
           currentToolInput = {};
         }
-        
-        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
-        continue;
-      }
-      
-      // 4. Check for tool_calls end
-      const endToolCallsMatch = normalized.match(/<\/\|DSML\|tool_calls>/);
-      if (endToolCallsMatch) {
-        const fullTag = endToolCallsMatch[0];
-        const matchIdx = normalized.indexOf(fullTag);
-        
+
         inDsmlMode = false;
         const after = dsmlBuffer.substring(matchIdx + fullTag.length);
         dsmlBuffer = '';
-        
+
         if (after) {
           yield* parseAndEmit(after, false);
         }
         continue;
       }
-      
-      // 5. Check for tool_calls start (if not removed earlier)
-      const startToolCallsMatch = normalized.match(/<\|DSML\|tool_calls>/);
+
+      // Tool_calls start (if not already consumed).
+      const startToolCallsMatch = normalized.match(/\|DSML\|tool_calls>/);
       if (startToolCallsMatch) {
-        const fullTag = startToolCallsMatch[0];
-        const matchIdx = normalized.indexOf(fullTag);
-        
         inDsmlMode = true;
-        
-        dsmlBuffer = dsmlBuffer.substring(matchIdx + fullTag.length);
+        dsmlBuffer = dsmlBuffer.substring(startToolCallsMatch.index + startToolCallsMatch[0].length);
         continue;
       }
-      
+
       break;
     }
   };
@@ -824,7 +880,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
 
     if (completedThinking) {
       // Once thinking is completed, everything else is strictly text (or DSML)
-      const dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>");
+      let dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>"); if (dsmlStartIdx === -1) dsmlStartIdx = chunk.indexOf("｜DSML｜tool_calls>")
+      if (dsmlStartIdx === -1) dsmlStartIdx = chunk.indexOf("<|DSML|tool_calls>");
       if (dsmlStartIdx !== -1) {
         const before = chunk.substring(0, dsmlStartIdx);
         const after = chunk.substring(dsmlStartIdx);
@@ -854,7 +911,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
 
       const end1 = chunk.indexOf("</think>");
       const end2 = chunk.indexOf("</thinking>");
-      const end3 = chunk.indexOf("<｜DSML｜tool_calls>");
+      let end3 = chunk.indexOf("<｜DSML｜tool_calls>"); if (end3 === -1) end3 = chunk.indexOf("｜DSML｜tool_calls>")
+      if (end3 === -1) end3 = chunk.indexOf("<|DSML|tool_calls>");
 
       if (end1 !== -1) {
         endIdx = end1;
@@ -888,7 +946,8 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
       }
     } else {
       // Look for tool calls start
-      const dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>");
+      let dsmlStartIdx = chunk.indexOf("<｜DSML｜tool_calls>"); if (dsmlStartIdx === -1) dsmlStartIdx = chunk.indexOf("｜DSML｜tool_calls>")
+      if (dsmlStartIdx === -1) dsmlStartIdx = chunk.indexOf("<|DSML|tool_calls>");
       if (dsmlStartIdx !== -1) {
         const before = chunk.substring(0, dsmlStartIdx);
         const after = chunk.substring(dsmlStartIdx);
@@ -1121,6 +1180,21 @@ async function* streamOpenaiToAnthropic(stream, model, capture, inputTokens = 0,
     if (openIdx !== null) {
       try { yield _sse('content_block_stop', { type: 'content_block_stop', index: openIdx }); } catch {}
       openIdx = null;
+    }
+
+    // Bug S2: if the upstream stream was cut mid-DSML-tool-call (before the
+    // closing </invoke> tag), currentToolInput was never flushed and the
+    // client would receive a tool_use block with input:{}. Emit whatever we
+    // accumulated as a final input_json_delta so the agent gets real args.
+    if (currentToolIndex !== null) {
+      try {
+        yield _sse('content_block_delta', {
+          type: 'content_block_delta', index: currentToolIndex,
+          delta: { type: 'input_json_delta', partial_json: JSON.stringify(currentToolInput) },
+        });
+      } catch {}
+      try { yield _sse('content_block_stop', { type: 'content_block_stop', index: currentToolIndex }); } catch {}
+      currentToolIndex = null; currentToolName = ''; currentToolId = ''; currentToolInput = {};
     }
 
     // FIX B2: Correct capture.usage inside finally so it runs even when the
