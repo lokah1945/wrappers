@@ -284,16 +284,6 @@ Removed stale planning documents:
 - `nvidia/PATCH_PLAN.md` — initial build planning doc (superseded by implementation)
 - `nvidia/ANALYSIS_E2E_WRAPPER_NVIDIA.md` — initial analysis doc (superseded by implementation)
 
-### 8.2 Clone (`/root/wrapper/clone-nvidia`)
-
-Current .md files are all active:
-- `README.md` — project documentation
-- `CHANGELOG.md` — version history
-- `TEST_REPORT.md` — test coverage report (updated)
-- `AUDIT_FIX_REPORT.md` — this report
-
-No stale files to remove.
-
 ---
 
 ## 9. Code Quality Notes
