@@ -1,7 +1,7 @@
 const assert = require('assert');
 
 const BASE_URL = 'http://127.0.0.1:9910';
-const AUTH_HEADER = 'Bearer bearer-token-clone';
+const AUTH_HEADER = 'Bearer bearer-token-local';
 
 async function request(path, options = {}) {
   const url = `${BASE_URL}${path}`;
@@ -114,7 +114,7 @@ async function testAnthropicMessageNonStream() {
     const res = await request('/v1/messages', {
       method: 'POST',
       headers: {
-        'x-api-key': 'bearer-token-clone',
+        'x-api-key': 'bearer-token-local',
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
@@ -138,7 +138,7 @@ async function testAnthropicMessageStream() {
     const res = await request('/v1/messages', {
       method: 'POST',
       headers: {
-        'x-api-key': 'bearer-token-clone',
+        'x-api-key': 'bearer-token-local',
         'anthropic-version': '2023-06-01'
       },
       body: JSON.stringify({
