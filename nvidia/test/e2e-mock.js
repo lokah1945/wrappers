@@ -7,7 +7,7 @@
  * ranking, image generation, /v1/models) and drives the wrapper against it to
  * validate EVERY feature surface:
  *   - /health
- *   - /v1/models → exact NVIDIA NIM ids (gateway mode = same exact ids, no claude-* prefix) + NGC-synced context windows
+ *   - /v1/models → exact NVIDIA NIM ids (clean list); ?gateway=1 → claude-* routing ids labelled with exact NIM names for Claude Code picker + NGC-synced context windows
  *   - OpenAI non-stream + stream (SSE)
  *   - Anthropic non-stream + stream (message_start/delta/stop)
  *   - Claude Code alias routing (haiku/sonnet/opus)
@@ -229,15 +229,18 @@ async function main() {
       assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'original NIM id missing');
     });
 
-    await check('/v1/models?gateway=1 returns EXACT NIM ids (no claude-* prefix)', async () => {
+    await check('/v1/models?gateway=1 emits claude-* routing ids labelled with exact NIM name', async () => {
       const r = await fetch(`${W}/v1/models?gateway=1`, { headers: { Authorization: `Bearer ${TOKEN}` } });
       const j = await r.json();
       const ids = j.data.map((m) => m.id);
-      // Gateway mode surfaces the EXACT NVIDIA NIM id verbatim (e.g.
-      // "meta/llama-3.1-8b-instruct"), never a claude-* alias, so the picker
-      // shows upstream naming exactly. Inbound claude-* aliases still resolve
-      // (see "Gateway discovery alias (claude-<slug>->real id)").
-      assert.ok(!ids.some((id) => id.startsWith('claude-')), 'gateway mode must not emit claude-* ids');
+      // Claude Code's picker ONLY displays ids beginning with "claude"/"anthropic"
+      // and sends the selected id back as the model. So gateway mode must emit a
+      // "claude-<slug>" routing id per model, labelled with display_name = exact NIM id.
+      const alias = j.data.find((m) => m.id === 'claude-meta-llama-3.1-8b-instruct');
+      assert.ok(alias, 'gateway mode must emit a claude-* routing id');
+      assert.strictEqual(alias.display_name, 'meta/llama-3.1-8b-instruct', 'alias missing exact NIM display_name');
+      assert.strictEqual(alias.original_id, 'meta/llama-3.1-8b-instruct', 'alias missing original_id');
+      // The exact NIM id is still present (first entry) for OpenAI-compatible clients.
       assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'exact NIM id missing in gateway mode');
     });
 

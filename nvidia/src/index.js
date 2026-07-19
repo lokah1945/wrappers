@@ -2571,15 +2571,29 @@ async function handleModels(res, url = null) {
 
     // 2) Gateway discovery mode. Claude Code's model picker
     //    (CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL) requests /v1/models?gateway=1.
-    //    The wrapper surfaces the EXACT NVIDIA NIM model id — the same name
-    //    NVIDIA NIM uses — and never a claude-* alias, so the picker shows the
-    //    real upstream catalog naming verbatim (e.g. "z-ai/glm-5.2", not
-    //    "claude-z-ai-glm-5.2"). Inbound claude-* aliases are STILL resolved by
-    //    resolveTargetModel() via the DISCOVERY_TO_NIM map (rebuilt above from
-    //    the exact ids), so removing them from discovery only changes what the
-    //    picker displays, not routing. The exact id is already pushed above, so
-    //    gateway mode adds nothing extra here.
-    //    (No claude-* alias is emitted in the discovery payload.)
+    //    The picker ONLY displays entries whose id begins with "claude"/"anthropic"
+    //    and sends the selected id straight back as the model. So in gateway mode we
+    //    MUST emit a "claude-<slug>" routing id (the key resolveTargetModel maps back
+    //    to the exact NIM id) and label it with display_name = the exact NVIDIA NIM
+    //    name. The picker then shows the real upstream name (e.g. "z-ai/glm-5.2")
+    //    while the selected id routes deterministically through the DISCOVERY_TO_NIM
+    //    reverse map. The exact NIM id is still the FIRST entry (clean passthrough for
+    //    OpenAI-compatible clients like Codex/Hermes); the alias is an ADDITIONAL
+    //    entry, not a replacement -- and it never clutters the default (non-gateway)
+    //    discovery surface.
+    if (gateway) {
+      const alias = discoveryAlias(d.id);
+      if (alias !== d.id) {
+        const m = enrichModelMetadata(d.id, d);
+        m.id = alias;
+        m.original_id = d.id;
+        m.aliases = [d.id, alias];
+        m.nim_id = d.id;
+        m.display_name = d.id;
+        m.owned_by = d.id.split("/")[0] || "nvidia";
+        data.push(m);
+      }
+    }
   }
   jsonResp(res, 200, { object: 'list', data });
 }
