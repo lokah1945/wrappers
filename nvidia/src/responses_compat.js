@@ -14,6 +14,23 @@ function rand(suffix) {
   return suffix + '_' + Math.random().toString(36).slice(2, 12) + Date.now().toString(36).slice(-4);
 }
 
+// Map an OpenAI-style error envelope ({message,type,status?}) to the most
+// faithful HTTP status. We prefer an upstream status carried on the error
+// (proxyOpenai stamps it there) and otherwise fall back to the canonical
+// mapping by error.type so client errors stay 4xx and server errors stay 5xx.
+function httpStatusFromError(err) {
+  if (err && typeof err.status === 'number') return err.status;
+  const t = (err && err.type || '').toLowerCase();
+  if (t === 'rate_limit_error') return 429;
+  if (t === 'invalid_request_error') return 400;
+  if (t === 'authentication_error') return 401;
+  if (t === 'permission_error') return 403;
+  if (t === 'not_found_error') return 404;
+  if (t === 'request_too_large') return 413;
+  if (t === 'unprocessable_entity_error') return 422;
+  return 500;
+}
+
 module.exports = function createResponsesHandler(deps) {
   const {
     pool, resolveTargetModel, proxyOpenai, forwardHeaders,
@@ -35,11 +52,11 @@ module.exports = function createResponsesHandler(deps) {
     }
     // OpenAI Responses API accepts input as a bare string OR an array of
     // items. A bare string is the most common shape (one-shot prompt) and MUST
-    // become a single user message. Previously a string was wrapped into [input]
-    // but then skipped by `typeof item !== 'object'`, yielding an EMPTY messages
-    // array -> upstream NIM rejects with 400 "messages field cannot be empty"
-    // -> wrapper surfaces HTTP 502, breaking /v1/responses clients (Codex,
-    // Hermes). This is the root cause of the Hermes ILMA / Codex 502 failure.
+    // become a single user message. Wrapping a string into [input] and then
+    // skipping non-object items yields an EMPTY messages array -> upstream NIM
+    // rejects with 400 "messages field cannot be empty" -> wrapper surfaces
+    // HTTP 502, breaking /v1/responses clients (Codex, Hermes). This is the
+    // root cause of the Hermes ILMA / Codex 502 failure.
     const items = typeof input === 'string' ? [{ role: 'user', content: input }] :
                   Array.isArray(input) ? input : (input ? [input] : []);
     for (const item of items) {
@@ -121,11 +138,25 @@ module.exports = function createResponsesHandler(deps) {
     };
   }
 
+  // OpenAI Responses `reasoning` item (parity with Anthropic /v1/messages
+  // `thinking` blocks). NIM exposes reasoning via `reasoning_content` (and
+  // sometimes a final `reasoning` field); we surface it as a first-class
+  // Responses `reasoning` item so Codex (wire_api="responses") does not lose
+  // the semantic content that the Claude Code path keeps.
+  function makeReasoningItem(text) {
+    return { id: rand('rsn'), type: 'reasoning', status: 'completed', summary: '', text };
+  }
+
   function respondNonStreaming(res, data, model) {
     const msg = data.choices && data.choices[0] && data.choices[0].message;
     const text = (msg && msg.content) || '';
     const toolCalls = msg && msg.tool_calls;
     const respId = rand('resp');
+    // Preserve NIM structured reasoning so the Responses path is consistent
+    // with the Anthropic /v1/messages path (which surfaces upstream reasoning
+    // as a `thinking` block).
+    const reasonRaw = msg && (msg.reasoning_content || msg.reasoning);
+    const reasonText = typeof reasonRaw === 'string' ? reasonRaw : '';
     let output;
     if (toolCalls && toolCalls.length) {
       output = toolCalls.map((tc) => ({
@@ -139,6 +170,8 @@ module.exports = function createResponsesHandler(deps) {
         content: [{ type: 'output_text', text, annotations: [] }],
       }];
     }
+    // Reasoning item leads the output array (index 0) when present.
+    if (reasonText) output.unshift(makeReasoningItem(reasonText));
     return {
       id: respId, object: 'response', created_at: Math.floor(Date.now() / 1000),
       model: data.model || model, status: 'completed', output,
@@ -180,12 +213,11 @@ module.exports = function createResponsesHandler(deps) {
     }
 
     const result = await proxyOpenai(chatBody, forwardHeaders(req), model, req);
-    if (!result.stream && result.status && result.status !== 200 && result.data) {
-      // Preserve the upstream HTTP status verbatim (400/422/429/500) instead of
-      // collapsing every non-2xx to 502. The caller below maps the OpenAI
-      // error envelope type to the correct status, so a "Bad Request" (400)
-      // is returned as 400, not 502.
-      return { status: result.status, data: result.data };
+    // Non-stream error: proxyOpenai returns { status, data: {error:{...}} }.
+    // Surface the upstream error envelope verbatim so the caller maps it to
+    // the correct HTTP status (faithful 4xx/5xx, not a blanket 502).
+    if (!result.stream && result.status && result.status !== 200 && result.data && result.data.error) {
+      return { error: Object.assign({}, result.data.error, { status: result.status }) };
     }
 
     if (!chatBody.stream) {
@@ -196,6 +228,9 @@ module.exports = function createResponsesHandler(deps) {
     // Streaming: translate chat.completion.chunk SSE -> Responses SSE
     const respId = rand('resp');
     const msgId = rand('msg');
+    const rsnId = rand('rsn');
+    const RSN_INDEX = 0;     // reasoning item
+    const MSG_INDEX = 1;     // assistant message item
     const seq = { n: 0 };
     const nextSeq = () => ++seq.n;
     const emit = (obj) => {
@@ -214,22 +249,40 @@ module.exports = function createResponsesHandler(deps) {
     const base = baseResponse(respId, model, 'in_progress');
     emit({ type: 'response.created', sequence_number: nextSeq(), response: base });
     emit({ type: 'response.in_progress', sequence_number: nextSeq(), response: base });
+
+    // Reasoning item (index 0). Emitted lazily: only opened once the first
+    // NIM reasoning_content/reasoning delta actually arrives, so we never
+    // leave a dangling output_item.added (added but never completed).
+    let rsnStarted = false;
+    let accReason = '';
+    const openReasoning = () => {
+      rsnStarted = true;
+      emit({
+        type: 'response.output_item.added', sequence_number: nextSeq(), output_index: RSN_INDEX,
+        item: { id: rsnId, type: 'reasoning', status: 'in_progress', summary: '', content: [] },
+      });
+      emit({
+        type: 'response.reasoning_text.delta', sequence_number: nextSeq(),
+        item_id: rsnId, output_index: RSN_INDEX, content_index: 0, delta: '',
+      });
+    };
+
+    // Message item (index 1) — distinct index from the reasoning item so the
+    // two never collide (the prior edit reused output_index 0 for both).
     emit({
-      type: 'response.output_item.added', sequence_number: nextSeq(), output_index: 0,
+      type: 'response.output_item.added', sequence_number: nextSeq(), output_index: MSG_INDEX,
       item: { id: msgId, type: 'message', status: 'in_progress', role: 'assistant', content: [] },
     });
     emit({
       type: 'response.content_part.added', sequence_number: nextSeq(),
-      item_id: msgId, output_index: 0, content_index: 0,
+      item_id: msgId, output_index: MSG_INDEX, content_index: 0,
       part: { type: 'output_text', text: '', annotations: [] },
     });
 
     let accText = '';
     // Per-tool-call accumulators keyed by OpenAI tool index so PARALLEL tool
-    // calls are emitted as SEPARATE Responses function_call items. The previous
-    // single `toolAcc` merged every delta into one name/args blob, producing a
-    // single malformed function_call for parallel tools (Codex clients hang or
-    // mis-invoke). Each entry gets a stable id/call_id generated at first sight.
+    // calls are emitted as SEPARATE Responses function_call items. Each entry
+    // gets a stable id/call_id generated at first sight.
     let toolAccs = null;
     let hasTool = false;
     let usage = null;
@@ -255,7 +308,19 @@ module.exports = function createResponsesHandler(deps) {
             accText += d.content;
             emit({
               type: 'response.output_text.delta', sequence_number: nextSeq(),
-              response_id: respId, item_id: msgId, output_index: 0, content_index: 0, delta: d.content,
+              response_id: respId, item_id: msgId, output_index: MSG_INDEX, content_index: 0, delta: d.content,
+            });
+          }
+          // NIM reasoning_content/reasoning -> Responses reasoning item for
+          // parity with Anthropic /v1/messages thinking blocks.
+          const reasonDelta = (typeof d.reasoning_content === 'string' && d.reasoning_content)
+            ? d.reasoning_content : ((typeof d.reasoning === 'string' && d.reasoning) ? d.reasoning : '');
+          if (reasonDelta) {
+            if (!rsnStarted) openReasoning();
+            accReason += reasonDelta;
+            emit({
+              type: 'response.reasoning_text.delta', sequence_number: nextSeq(),
+              item_id: rsnId, output_index: RSN_INDEX, content_index: 0, delta: reasonDelta,
             });
           }
           if (Array.isArray(d.tool_calls)) {
@@ -278,6 +343,19 @@ module.exports = function createResponsesHandler(deps) {
       console.error('[responses:nim stream]', e && e.message);
     }
 
+    const outputs = [];
+    if (rsnStarted) {
+      emit({
+        type: 'response.reasoning_text.done', sequence_number: nextSeq(),
+        item_id: rsnId, output_index: RSN_INDEX, content_index: 0, text: accReason,
+      });
+      emit({
+        type: 'response.output_item.done', sequence_number: nextSeq(), output_index: RSN_INDEX,
+        item: { id: rsnId, type: 'reasoning', status: 'completed', summary: '', text: accReason },
+      });
+      outputs.push(makeReasoningItem(accReason));
+    }
+
     if (hasTool && toolAccs && toolAccs.length) {
       const toolItems = toolAccs.filter(Boolean).map((acc) => ({
         id: acc.id, type: 'function_call', status: 'completed', call_id: acc.callId,
@@ -285,24 +363,25 @@ module.exports = function createResponsesHandler(deps) {
       }));
       emit({
         type: 'response.output_text.done', sequence_number: nextSeq(),
-        response_id: respId, item_id: msgId, output_index: 0, content_index: 0, text: accText,
+        response_id: respId, item_id: msgId, output_index: MSG_INDEX, content_index: 0, text: accText,
       });
       emit({
         type: 'response.content_part.done', sequence_number: nextSeq(),
-        item_id: msgId, output_index: 0, content_index: 0,
+        item_id: msgId, output_index: MSG_INDEX, content_index: 0,
         part: { type: 'output_text', text: accText, annotations: [] },
       });
       emit({
-        type: 'response.output_item.done', sequence_number: nextSeq(), output_index: 0,
+        type: 'response.output_item.done', sequence_number: nextSeq(), output_index: MSG_INDEX,
         item: { id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] },
       });
-      // Emit one function_call item PER parallel tool call (output_index 1..N).
-      const outputs = [{ id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] }];
+      // Emit one function_call item PER parallel tool call (output_index 2..N).
       toolItems.forEach((fcItem, i) => {
-        emit({ type: 'response.output_item.added', sequence_number: nextSeq(), output_index: i + 1, item: fcItem });
-        emit({ type: 'response.output_item.done', sequence_number: nextSeq(), output_index: i + 1, item: fcItem });
+        const oi = i + 2;
+        emit({ type: 'response.output_item.added', sequence_number: nextSeq(), output_index: oi, item: fcItem });
+        emit({ type: 'response.output_item.done', sequence_number: nextSeq(), output_index: oi, item: fcItem });
         outputs.push(fcItem);
       });
+      outputs.push({ id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] });
       emit({
         type: 'response.completed', sequence_number: nextSeq(),
         response: baseResponse(respId, model, 'completed', outputs, usage),
@@ -310,21 +389,21 @@ module.exports = function createResponsesHandler(deps) {
     } else {
       emit({
         type: 'response.output_text.done', sequence_number: nextSeq(),
-        response_id: respId, item_id: msgId, output_index: 0, content_index: 0, text: accText,
+        response_id: respId, item_id: msgId, output_index: MSG_INDEX, content_index: 0, text: accText,
       });
       emit({
         type: 'response.content_part.done', sequence_number: nextSeq(),
-        item_id: msgId, output_index: 0, content_index: 0,
+        item_id: msgId, output_index: MSG_INDEX, content_index: 0,
         part: { type: 'output_text', text: accText, annotations: [] },
       });
       emit({
-        type: 'response.output_item.done', sequence_number: nextSeq(), output_index: 0,
+        type: 'response.output_item.done', sequence_number: nextSeq(), output_index: MSG_INDEX,
         item: { id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] },
       });
+      outputs.push({ id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] });
       emit({
         type: 'response.completed', sequence_number: nextSeq(),
-        response: baseResponse(respId, model, 'completed',
-          [{ id: msgId, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: accText, annotations: [] }] }], usage),
+        response: baseResponse(respId, model, 'completed', outputs, usage),
       });
     }
     try { res.end(); } catch {}
@@ -358,20 +437,15 @@ module.exports = function createResponsesHandler(deps) {
 
     if (result === null) return null;            // already streamed
     if (result && result.error) {
-      // Map the OpenAI error envelope `type` to the correct HTTP status so the
-      // client gets a faithful code: invalid_request_error -> 400,
-      // rate_limit_error -> 429, everything else (Bad Request / Unprocessable /
-      // server error) -> 500. (Upstream 4xx bodies carry `type: "Bad Request"`
-      // etc., so a naive "invalid_request_error ? 400 : 502" always wrongly
-      // returned 502 for client errors.)
-      const et = (result.error.type || '').toLowerCase();
-      const status = et === 'invalid_request_error' ? 400
-        : et.includes('rate') ? 429
-        : et.includes('unprocessable') ? 422
-        : et.includes('bad') ? 400
-        : 500;
+      // Faithful HTTP status: prefer the upstream status carried on the error,
+      // else derive from the normalized error.type so client errors stay 4xx
+      // and server errors stay 5xx. The internal status field is stripped
+      // before serialization.
+      const err = result.error;
+      const status = typeof err.status === 'number' ? err.status : httpStatusFromError(err);
+      const { status: _omit, ...errorOut } = err;
       res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ error: result.error }));
+      res.end(JSON.stringify({ error: errorOut }));
       return null;
     }
     if (result && result.id) {                    // non-streaming Response object
