@@ -436,6 +436,14 @@ module.exports = function createResponsesHandler(deps) {
       return { error: { message: `Model "${depR.from}" has been renamed to "${depR.to}" in the NVIDIA NIM catalog. Update your request to use "${depR.to}".`, type: 'invalid_request_error' } };
     }
 
+    // Fix E: reject stream=true for non-chat model types (embedding/rerank/
+    // image/video/asr/tts/audio/ocr) with a clear 400 instead of forwarding a
+    // non-streamable SSE request the upstream rejects confusingly.
+    const streamGuard = guardStreamUnsupported ? guardStreamUnsupported(body, body.model) : null;
+    if (streamGuard) {
+      return { error: { message: streamGuard.data.error.message, type: streamGuard.data.error.type } };
+    }
+
     if (!isNvidiaModel(model)) {
       return {
         error: {

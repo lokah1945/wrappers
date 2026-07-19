@@ -197,7 +197,7 @@ const pool    = new KeyPool();   // keys loaded in main() after dotenv
 const responsesHandler = createResponsesHandler({
   pool, resolveTargetModel, proxyOpenai, forwardHeaders,
   incInFlight, decInFlight, BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
-  translateThinkingToNim, getDeprecatedRedirectInfo,
+  translateThinkingToNim, getDeprecatedRedirectInfo, guardStreamUnsupported,
 });
 let metrics;                      // initialized in main() after dotenv sets METRICS_DB
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
@@ -1122,6 +1122,22 @@ function isModelUnavailable(modelId) {
   return false;
 }
 
+// ── Streaming support guard (Fix E) ──────────────────────────────────────
+// Non-chat model types (embedding, rerank, image, video, tts, asr, audio, ocr)
+// cannot stream through /v1/chat/completions. When a client (Claude Code,
+// Codex, Hermes, OpenClaw) requests stream=true against one, reject early with
+// a clear 400 instead of forwarding a nonsense SSE request the upstream rejects
+// with a confusing error. Only chat / vision_chat / parse support streaming.
+function guardStreamUnsupported(body, modelId) {
+  if (!body || body.stream !== true) return null;
+  const type = classify(modelId).type;
+  if (type === 'chat' || type === 'vision_chat' || type === 'parse') return null;
+  return {
+    status: 400,
+    data: { error: { message: `Model "${modelId}" (type=${type}) does not support streaming via /v1/chat/completions. Streaming is only available for chat/vision_chat/parse models. Send stream=false or use a chat model.`, type: 'invalid_request_error' } },
+  };
+}
+
 function markModel(modelId, ok, status, path, reason) {
   if (ok) {
     if (unavailableModels.has(modelId)) {
@@ -1381,6 +1397,11 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
   if (isModelUnavailable(modelId)) {
     return { status: 404, data: { error: { message: `Model ${modelId} is retired or unavailable`, type: 'invalid_request_error' } } };
   }
+  // Fix E: reject stream=true for non-chat model types (embedding/rerank/
+  // image/video/asr/tts/audio/ocr/parse) with a clear 400 instead of forwarding
+  // a non-streamable SSE request the upstream rejects confusingly.
+  const streamGuard = guardStreamUnsupported(body, modelId);
+  if (streamGuard) return streamGuard;
 
   await convertVisionImages(body);
 
@@ -1814,6 +1835,11 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
   if (!modelId || typeof modelId !== 'string' || modelId.trim() === '') {
     console.warn(`[proxyPost] Empty modelId for path ${path}, rejecting request`);
     return jsonResp(res, 400, { error: { message: 'Model is required', type: 'invalid_request_error' } });
+  }
+  // Fix E: reject stream=true for non-chat model types with a clear 400.
+  const streamGuard = guardStreamUnsupported(body, modelId);
+  if (streamGuard) {
+    return jsonResp(res, streamGuard.status, streamGuard.data);
   }
 
   const strippedParams = new Set();
