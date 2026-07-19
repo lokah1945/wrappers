@@ -37,6 +37,7 @@ module.exports = function createResponsesHandler(deps) {
     BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
     translateThinkingToNim,
     getDeprecatedRedirectInfo,
+    extractInternalReasoning,
   } = deps;
 
   function isNvidiaModel(modelId) {
@@ -159,11 +160,14 @@ module.exports = function createResponsesHandler(deps) {
     const text = (msg && msg.content) || '';
     const toolCalls = msg && msg.tool_calls;
     const respId = rand('resp');
-    // Preserve NIM structured reasoning so the Responses path is consistent
-    // with the Anthropic /v1/messages path (which surfaces upstream reasoning
-    // as a `thinking` block).
-    const reasonRaw = msg && (msg.reasoning_content || msg.reasoning);
-    const reasonText = typeof reasonRaw === 'string' ? reasonRaw : '';
+    // Normalize reasoning to a single internal representation so the Responses
+    // path matches the Anthropic /v1/messages path (which surfaces upstream
+    // reasoning as a thinking block) REGARDLESS of how NIM emitted it: a
+    // dedicated field (reasoning_content/reasoning) OR inline <think> tags
+    // inside content (deepseek-ai, z-ai/glm, moonshotai/kimi, qwen3.x,
+    // minimaxai, ...). extractInternalReasoning handles both shapes.
+    const _nr = extractInternalReasoning(msg);
+    const reasonText = _nr.reasoning || '';
     let output;
     if (toolCalls && toolCalls.length) {
       output = toolCalls.map((tc) => ({

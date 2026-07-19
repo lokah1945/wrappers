@@ -22,7 +22,7 @@ const { fetch: undiciFetch, Agent } = require('undici');
 const WRAPPER_DIR = path.resolve(__dirname, '..');
 
 const { KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL } = require('../key_pool');
-const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError } = require('./anthropic_compat');
+const { anthropicToOpenai, openaiToAnthropic, streamOpenaiToAnthropic, estimateInputTokens, anthropicError, extractInternalReasoning } = require('./anthropic_compat');
 const { classify, describe, buildCatalog, summarize, CAPABILITY_PARAMS, CURATED_GENAI, getCapabilityParams, MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, getContextWindow } = require('./capabilities');
 const createResponsesHandler = require('./responses_compat');
 const { Metrics } = require('./metrics');
@@ -197,7 +197,7 @@ const pool    = new KeyPool();   // keys loaded in main() after dotenv
 const responsesHandler = createResponsesHandler({
   pool, resolveTargetModel, proxyOpenai, forwardHeaders,
   incInFlight, decInFlight, BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
-  translateThinkingToNim, getDeprecatedRedirectInfo, guardStreamUnsupported,
+  translateThinkingToNim, getDeprecatedRedirectInfo, guardStreamUnsupported, extractInternalReasoning,
 });
 let metrics;                      // initialized in main() after dotenv sets METRICS_DB
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
@@ -1749,6 +1749,20 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
       }
 
       const data = await resp.json();
+      // Normalize reasoning to a consistent internal shape for OpenAI clients.
+      // Some publishers (deepseek-ai, z-ai/glm, moonshotai/kimi, qwen3.x,
+      // minimaxai, ...) return reasoning as inline <think> tags in content
+      // instead of a separate reasoning_content field. Promote those tags into
+      // reasoning_content so OpenAI-compatible clients (Hermes, OpenClaw, the
+      // OpenAI SDK) that read reasoning_content receive it. Upstreams that
+      // already populate reasoning_content are left verbatim.
+      if (data && data.choices && data.choices[0] && data.choices[0].message) {
+        const _nr = extractInternalReasoning(data.choices[0].message);
+        if (_nr.reasoning && !data.choices[0].message.reasoning_content) {
+          data.choices[0].message.reasoning_content = _nr.reasoning;
+        }
+        if (_nr.content !== undefined) data.choices[0].message.content = _nr.content;
+      }
       // Normalize model name in response — NVIDIA sometimes prefixes with stg/
       if (data.model && modelId && data.model !== modelId) {
         data.model = modelId;
