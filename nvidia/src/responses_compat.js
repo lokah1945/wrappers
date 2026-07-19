@@ -36,6 +36,7 @@ module.exports = function createResponsesHandler(deps) {
     pool, resolveTargetModel, proxyOpenai, forwardHeaders,
     BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
     translateThinkingToNim,
+    getDeprecatedRedirectInfo,
   } = deps;
 
   function isNvidiaModel(modelId) {
@@ -428,6 +429,12 @@ module.exports = function createResponsesHandler(deps) {
       return { error: { message: 'Missing "model" in /v1/responses request', type: 'invalid_request_error' } };
     }
     const model = resolveTargetModel(body.model);
+
+    // Fix D: clear error for renamed/deprecated ids (Responses route envelope).
+    const depR = getDeprecatedRedirectInfo ? getDeprecatedRedirectInfo(body.model) : null;
+    if (depR) {
+      return { error: { message: `Model "${depR.from}" has been renamed to "${depR.to}" in the NVIDIA NIM catalog. Update your request to use "${depR.to}".`, type: 'invalid_request_error' } };
+    }
 
     if (!isNvidiaModel(model)) {
       return {

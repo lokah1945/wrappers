@@ -183,7 +183,7 @@ const pool    = new KeyPool();   // keys loaded in main() after dotenv
 const responsesHandler = createResponsesHandler({
   pool, resolveTargetModel, proxyOpenai, forwardHeaders,
   incInFlight, decInFlight, BASE_LLM, BASE_GENAI, describe, CURATED_GENAI,
-  translateThinkingToNim,
+  translateThinkingToNim, getDeprecatedRedirectInfo,
 });
 let metrics;                      // initialized in main() after dotenv sets METRICS_DB
 const MAX_CONNECTIONS = parseInt(process.env.MAX_CONNECTIONS || '200', 10);
@@ -370,6 +370,43 @@ function _stripContextSuffix(modelId) {
 // raw NIM ids) to the real NIM model id. Raw NIM ids pass through unchanged
 // (transparent proxy for OpenAI-compatible clients). Claude Code family aliases
 // (haiku/sonnet/opus + their claude-* variants) resolve to configured NIM models.
+// ── Deprecated / Renamed Model ID Redirects (Fix D) ──────────────────────
+// The NVIDIA NIM catalog renames/retires model ids over time (e.g. minimax-m2.5
+// -> minimax-m2.7, glm5 -> glm-5.1). A request to a stale id would otherwise
+// return a confusing generic 404 ("model not found") that sends clients down a
+// dead-end. We instead either (a) transparently redirect to the current id, or
+// (b) if DEPRECATED_MODEL_REDIRECT_ERROR=1, return a clear 410 with the new id
+// so the client/prompt can be updated explicitly.
+// Key = requested (deprecated) id (lowercase). Value = current NIM id.
+const DEPRECATED_MODEL_REDIRECTS = {
+  'minimaxai/minimax-m2.5': 'minimaxai/minimax-m2.7',
+  'minimaxai/minimax-m2.1': 'minimaxai/minimax-m2.7',
+  'minimax/minimax-m2.5': 'minimaxai/minimax-m2.7',
+  'z-ai/glm5': 'z-ai/glm-5.2',
+  'z-ai/glm-5': 'z-ai/glm-5.2',
+  'z-ai/glm-5.1': 'z-ai/glm-5.2',
+  'zai/glm5': 'z-ai/glm-5.2',
+  'zai/glm-5.1': 'z-ai/glm-5.2',
+  'deepseek-ai/deepseek-v4': 'deepseek-ai/deepseek-v4-pro',
+  'nvidia/llama-3.3-nemotron-super-49b': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+  'nvidia/llama-3.3-nemotron-super-49b-v1': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
+};
+
+// Resolve a deprecated id to its current id, or null if not deprecated.
+function resolveDeprecatedRedirect(requestedId) {
+  if (!requestedId) return null;
+  const lower = String(requestedId).toLowerCase();
+  if (DEPRECATED_MODEL_REDIRECTS[lower]) return DEPRECATED_MODEL_REDIRECTS[lower];
+  // Looser contains-based fallback for common rename patterns (e.g. glm5-*
+  // with a suffix). Kept conservative: only matches known deprecated stems.
+  for (const [dep, cur] of Object.entries(DEPRECATED_MODEL_REDIRECTS)) {
+    const stem = dep.split('/')[1];
+    const got = String(requestedId).toLowerCase().split('/')[1];
+    if (stem && got && got !== cur.split('/')[1] && got.startsWith(stem)) return cur;
+  }
+  return null;
+}
+
 function resolveTargetModel(requestedModel) {
   let m = _stripContextSuffix(requestedModel);
   if (!m) return requestedModel;
@@ -387,8 +424,27 @@ function resolveTargetModel(requestedModel) {
   for (const fam of ['opus', 'sonnet', 'haiku']) {
     if (m.startsWith('claude-') && lower.includes(fam) && ALIAS_TO_NIM[fam]) return ALIAS_TO_NIM[fam];
   }
-  // 4) transparent passthrough (raw NIM id for OpenAI-compatible clients)
+  // 4) deprecated / renamed id redirect (Fix D). Avoids confusing generic
+  // 404s for ids the catalog has renamed (minimax-m2.5->m2.7, glm5->glm-5.x).
+  // By default we transparently redirect; if DEPRECATED_MODEL_REDIRECT_ERROR=1
+  // the entry-point handlers emit a clear 410 via getDeprecatedRedirectInfo().
+  const redirect = resolveDeprecatedRedirect(m);
+  if (redirect) {
+    console.warn(`[redirect] deprecated model "${m}" -> "${redirect}" (NIM catalog rename)`);
+    return redirect;
+  }
+  // 5) transparent passthrough (raw NIM id for OpenAI-compatible clients)
   return m;
+}
+
+// Fix D (error mode): when DEPRECATED_MODEL_REDIRECT_ERROR=1, return the
+// {from,to} of a renamed id so entry-point handlers can emit a clear 410
+// instead of silently swapping. Returns null when not deprecated / not enabled.
+function getDeprecatedRedirectInfo(modelId) {
+  if (process.env.DEPRECATED_MODEL_REDIRECT_ERROR !== '1') return null;
+  const to = resolveDeprecatedRedirect(modelId);
+  if (!to) return null;
+  return { from: modelId, to };
 }
 
 function discoveryAlias(nimId) {
@@ -2022,6 +2078,11 @@ async function proxyPost({ req, res, body, rawBody, modelId, path, getTargetUrl 
 
 /** POST /v1/chat/completions */
 async function handleChatCompletions(body, req, res) {
+  // Fix D: clear error for renamed/deprecated ids when strict mode is enabled.
+  const dep = getDeprecatedRedirectInfo(body.model || '');
+  if (dep) {
+    return jsonResp(res, 410, { error: { message: `Model "${dep.from}" has been renamed to "${dep.to}" in the NVIDIA NIM catalog. Update your request to use "${dep.to}".`, type: 'invalid_request_error' } });
+  }
   body.model = resolveTargetModel(body.model);
   const result = await proxyOpenai(body, forwardHeaders(req), body.model, req);
 
@@ -2245,6 +2306,11 @@ async function handleAnthropicMessages(rawBody, req, res) {
   // From here on, `translated` is a valid OpenAI-format body (error already handled above).
 
   const requestedModel = aBody.model;
+  // Fix D: clear error for renamed/deprecated ids (Anthropic route envelope).
+  const depA = getDeprecatedRedirectInfo(aBody.model || '');
+  if (depA) {
+    return jsonResp(res, 410, anthropicError('invalid_request_error', `Model "${depA.from}" has been renamed to "${depA.to}" in the NVIDIA NIM catalog. Update your request to use "${depA.to}".`));
+  }
   const oaiBody = translated;
   oaiBody.model = resolveTargetModel(oaiBody.model);
 
