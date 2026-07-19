@@ -229,6 +229,16 @@ function anthropicToOpenai(a, officialContext) {
       const mText = typeof m.content === 'string' ? m.content : _flattenText(m.content);
       if (mText) systemTexts.push(mText);
     }
+    // FIX A-1: Normalize the OpenAI Responses / Anthropic-beta `developer` role
+    // to `system`. NVIDIA NIM chat templates do not understand a `developer`
+    // role; when combined with chat_template_kwargs reasoning toggles it
+    // returns HTTP 500. OpenAI-compatible clients/agents (Codex, Hermes, the
+    // OpenAI SDK) emit `developer` as a first-class role, so fold it into the
+    // system block instead of leaking it upstream.
+    if (m && m.role === 'developer') {
+      const dText = typeof m.content === 'string' ? m.content : _flattenText(m.content);
+      if (dText) systemTexts.push(dText);
+    }
   }
 
   if (systemTexts.length > 0) {
@@ -241,6 +251,13 @@ function anthropicToOpenai(a, officialContext) {
     const content = m.content;
 
     if (role === 'system') {
+      continue;
+    }
+
+    // FIX A-1 (cont.): the `developer` role was merged into the system block
+    // above; forwarding it as its own message would 500 upstream or duplicate
+    // the system instructions.
+    if (role === 'developer') {
       continue;
     }
 

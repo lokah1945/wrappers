@@ -65,6 +65,12 @@ module.exports = function createResponsesHandler(deps) {
         continue;
       }
       const role = item.role;
+      // FIX A-1 (Responses path): normalize `developer` -> `system`. NVIDIA
+      // NIM chat templates reject a `developer` role (HTTP 500, especially
+      // when chat_template_kwargs reasoning toggle is also sent). The OpenAI
+      // Responses API treats `developer` as a privileged system-equivalent
+      // role, so we map it to `system` and keep the content verbatim.
+      const normalizedRole = (role === 'developer') ? 'system' : role;
       if (item.type === 'message' || ['user', 'system', 'developer', 'assistant'].includes(role)) {
         let content = item.content;
         if (Array.isArray(content)) {
@@ -79,7 +85,7 @@ module.exports = function createResponsesHandler(deps) {
             return { type: 'text', text: '' };
           });
         }
-        messages.push({ role: item.role || 'user', content: content ?? '' });
+        messages.push({ role: normalizedRole || 'user', content: content ?? '' });
       } else if (item.type === 'function_call') {
         messages.push({
           role: 'assistant',
