@@ -88,6 +88,30 @@ function testAnthropicCompat() {
   assert.ok(openaiReqThinking.messages[0].content.includes('thinking'), 'Should convert thinking block');
   assert.ok(openaiReqThinking.messages[0].content.includes('Let me think'), 'Should preserve thinking content');
 
+  // FIX: /v1/messages must accept OpenAI-shaped tools ({type:'function',
+  // function:{name,description,parameters}}) as well as Anthropic-native ones
+  // (Codex/Hermes/OpenAI-SDK clients POST OpenAI-shaped tools to /v1/messages).
+  // Regression: reading only t.name produced {function:{description,parameters}}
+  // with no name -> upstream 400 "missing field function.name".
+  const reqOpenAI = anthropicToOpenai({
+    model: 'claude-3-5-sonnet',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ type: 'function', function: { name: 'get_time', description: 't', parameters: { type: 'object', properties: {} } } }],
+  });
+  assert.strictEqual(reqOpenAI.tools.length, 1, 'OpenAI-shaped tool preserved');
+  assert.strictEqual(reqOpenAI.tools[0].type, 'function');
+  assert.strictEqual(reqOpenAI.tools[0].function.name, 'get_time', 'OpenAI-shaped tool name preserved');
+  assert.deepStrictEqual(reqOpenAI.tools[0].function.parameters, { type: 'object', properties: {} });
+
+  const reqAnthropic = anthropicToOpenai({
+    model: 'claude-3-5-sonnet',
+    messages: [{ role: 'user', content: 'hi' }],
+    tools: [{ name: 'get_time', description: 't', input_schema: { type: 'object', properties: {} } }],
+  });
+  assert.strictEqual(reqAnthropic.tools[0].function.name, 'get_time', 'Anthropic-shaped tool name preserved');
+  assert.deepStrictEqual(reqAnthropic.tools[0].function.parameters, { type: 'object', properties: {} });
+
+
   // Test OpenAI -> Anthropic with reasoning_content
   const oaiResponseReasoning = {
     choices: [{

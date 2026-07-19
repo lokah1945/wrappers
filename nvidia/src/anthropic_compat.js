@@ -50,6 +50,41 @@ function _flattenText(content) {
   return '';
 }
 
+// Shared internal reasoning extraction. Upstream NVIDIA NIM returns
+// reasoning in two shapes depending on the publisher:
+//   - a dedicated field (reasoning_content / reasoning), or
+//   - inline <think>...</think> / <thinking>...</thinking> tags inside the
+//     content string (deepseek-ai, z-ai/glm, moonshotai/kimi, qwen3.x,
+//     minimaxai, and others). Publishers that use inline tags do NOT populate
+//     the separate field. This helper normalizes BOTH into a single internal
+//     representation { reasoning, content } so downstream rendering (Anthropic
+//     thinking block, Responses reasoning item, chat passthrough) is consistent
+//     regardless of how the upstream emitted it. Never throws on odd input.
+function extractInternalReasoning(msg) {
+  const m = msg || {};
+  let rawContent = (typeof m.content === 'string') ? m.content : (m.content == null ? '' : String(m.content));
+  // Some publishers emit an array with a single text block; best-effort.
+  if (Array.isArray(m.content)) {
+    const t = m.content.filter(b => b && b.type === 'text').map(b => b.text || '').join('');
+    if (t) rawContent = t;
+  }
+  let reasoning = (typeof m.reasoning_content === 'string' && m.reasoning_content) ? m.reasoning_content
+    : (typeof m.reasoning === 'string' && m.reasoning ? m.reasoning : '');
+
+  let content = rawContent;
+  if (!reasoning) {
+    const trimmed = (content || '').trim();
+    let end = -1, start = -1;
+    if (trimmed.startsWith('<think>')) { start = 7; end = trimmed.indexOf('</think>'); }
+    else if (trimmed.startsWith('<thinking>')) { start = 10; end = trimmed.indexOf('</thinking>'); }
+    if (end !== -1 && start !== -1) {
+      reasoning = trimmed.substring(start, end).trim();
+      content = trimmed.substring(end + (trimmed.startsWith('<thinking>') ? 11 : 8)).trim();
+    }
+  }
+  return { reasoning: reasoning || '', content };
+}
+
 function isAnthropicMessageOrderValid(messages) {
   let hasToolResult = false;
   for (const msg of messages) {
@@ -381,14 +416,24 @@ function anthropicToOpenai(a, officialContext) {
       console.log('[anthropic_compat] Dropped tool_search_tool_* pseudo-tool(s) before forwarding to NIM (not supported upstream).');
     }
     if (cleaned.length > 0) {
-      oai.tools = cleaned.map(t => ({
-        type: 'function',
-        function: {
-          name: t.name,
-          description: t.description || '',
-          parameters: t.input_schema || {},
-        },
-      }));
+      // Accept both tool shapes a /v1/messages client may send:
+      //  - Anthropic-native: { name, description, input_schema }
+      //  - OpenAI-shaped (Codex/Hermes/OpenAI-SDK posting tools to /v1/messages):
+      //    { type:'function', function:{ name, description, parameters } }. NIM
+      //  consumes the OpenAI shape, so always emit it, but read name/parameters
+      //  from whichever wrapper the client used. Reading only t.name produced
+      //  {function:{description,parameters}} with no name -> NIM 400.
+      oai.tools = cleaned.map(t => {
+        const fn = (t && t.function) ? t.function : t;
+        return {
+          type: 'function',
+          function: {
+            name: fn && fn.name,
+            description: (fn && fn.description) || '',
+            parameters: (fn && fn.parameters) || (t && t.input_schema) || {},
+          },
+        };
+      });
     }
   }
 
@@ -472,26 +517,14 @@ function openaiToAnthropic(o, model, requestId = null, expectThinking = false, e
   const msg = choice?.message || {};
   const content = [];
 
-  let rawContent = msg.content || "";
-  let reasoning = msg.reasoning_content || msg.reasoning || "";
-
-  // Parse unstructured <think>...</think> or <thinking>...</thinking> if present in the content
-  if (!reasoning) {
-    const trimmed = rawContent.trim();
-    if (trimmed.startsWith("<think>")) {
-      const endIdx = trimmed.indexOf("</think>");
-      if (endIdx !== -1) {
-        reasoning = trimmed.substring(7, endIdx).trim();
-        rawContent = trimmed.substring(endIdx + 8).trim();
-      }
-    } else if (trimmed.startsWith("<thinking>")) {
-      const endIdx = trimmed.indexOf("</thinking>");
-      if (endIdx !== -1) {
-        reasoning = trimmed.substring(10, endIdx).trim();
-        rawContent = trimmed.substring(endIdx + 11).trim();
-      }
-    }
-  }
+  // Normalize reasoning to a single internal representation before rendering.
+  // Upstream may return it as a separate field (reasoning_content/reasoning)
+  // OR as inline <think> tags inside the content (deepseek-ai, z-ai/glm,
+  // moonshotai/kimi, qwen3.x, minimaxai, ...). extractInternalReasoning
+  // handles both shapes so the Anthropic thinking block is faithful.
+  const _nr = extractInternalReasoning(msg);
+  let reasoning = _nr.reasoning;
+  let rawContent = _nr.content || "";
 
   if (reasoning) {
     content.push({ type: 'thinking', thinking: reasoning });
@@ -1333,4 +1366,5 @@ module.exports = {
   stripCacheControl,
   sanitizeAnthropicTools,
   _finalizeCapture,
+  extractInternalReasoning,
 };
