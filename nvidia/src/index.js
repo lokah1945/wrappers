@@ -2569,23 +2569,17 @@ async function handleModels(res, url = null) {
     raw.aliases = [d.id];
     data.push(raw);
 
-    // 2) Claude-prefixed alias — emitted ONLY in gateway mode. Claude Code's
-    //    model picker (CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL) requests
-    //    /v1/models?gateway=1, so we expose the alias there. For every other
-    //    client (Hermes, Codex, OpenAI SDK, OpenCode, …) the default surface
-    //    is a CLEAN list of original NIM ids only — no claude-* duplicates.
-    //    The DISCOVERY_TO_NIM map is ALWAYS rebuilt (above) regardless of this
-    //    flag, so claude-* IDs still RESOLVE correctly via resolveTargetModel()
-    //    when a client sends them; they merely don't clutter discovery.
-    if (gateway) {
-      const m = enrichModelMetadata(d.id, d);
-      const alias = discoveryAlias(d.id);
-      m.owned_by = d.id.split('/')[0] || 'nvidia';
-      m.original_id = d.id;
-      m.aliases = [d.id];
-      m.id = alias;
-      data.push(m);
-    }
+    // 2) Gateway discovery mode. Claude Code's model picker
+    //    (CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL) requests /v1/models?gateway=1.
+    //    The wrapper surfaces the EXACT NVIDIA NIM model id — the same name
+    //    NVIDIA NIM uses — and never a claude-* alias, so the picker shows the
+    //    real upstream catalog naming verbatim (e.g. "z-ai/glm-5.2", not
+    //    "claude-z-ai-glm-5.2"). Inbound claude-* aliases are STILL resolved by
+    //    resolveTargetModel() via the DISCOVERY_TO_NIM map (rebuilt above from
+    //    the exact ids), so removing them from discovery only changes what the
+    //    picker displays, not routing. The exact id is already pushed above, so
+    //    gateway mode adds nothing extra here.
+    //    (No claude-* alias is emitted in the discovery payload.)
   }
   jsonResp(res, 200, { object: 'list', data });
 }

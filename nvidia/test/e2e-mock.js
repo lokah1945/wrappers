@@ -7,7 +7,7 @@
  * ranking, image generation, /v1/models) and drives the wrapper against it to
  * validate EVERY feature surface:
  *   - /health
- *   - /v1/models → claude-* discovery ids + NGC-synced context windows
+ *   - /v1/models → exact NVIDIA NIM ids (gateway mode = same exact ids, no claude-* prefix) + NGC-synced context windows
  *   - OpenAI non-stream + stream (SSE)
  *   - Anthropic non-stream + stream (message_start/delta/stop)
  *   - Claude Code alias routing (haiku/sonnet/opus)
@@ -229,14 +229,16 @@ async function main() {
       assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'original NIM id missing');
     });
 
-    await check('/v1/models?gateway=1 returns claude-* discovery aliases', async () => {
+    await check('/v1/models?gateway=1 returns EXACT NIM ids (no claude-* prefix)', async () => {
       const r = await fetch(`${W}/v1/models?gateway=1`, { headers: { Authorization: `Bearer ${TOKEN}` } });
       const j = await r.json();
       const ids = j.data.map((m) => m.id);
-      assert.ok(ids.some((id) => id.startsWith('claude-')), 'no claude-* id in gateway mode');
-      assert.ok(ids.includes('claude-meta-llama-3.1-8b-instruct'), 'discovery alias missing in gateway mode');
-      // Gateway mode must also still include original NIM IDs.
-      assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'original NIM id missing in gateway mode');
+      // Gateway mode surfaces the EXACT NVIDIA NIM id verbatim (e.g.
+      // "meta/llama-3.1-8b-instruct"), never a claude-* alias, so the picker
+      // shows upstream naming exactly. Inbound claude-* aliases still resolve
+      // (see "Gateway discovery alias (claude-<slug>->real id)").
+      assert.ok(!ids.some((id) => id.startsWith('claude-')), 'gateway mode must not emit claude-* ids');
+      assert.ok(ids.includes('meta/llama-3.1-8b-instruct'), 'exact NIM id missing in gateway mode');
     });
 
     await check('NGC-synced context window on /v1/models (deepseek-v4-pro=262144)', async () => {
