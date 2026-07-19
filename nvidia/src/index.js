@@ -798,6 +798,57 @@ const SKIP_HEADERS = new Set([
   'authorization','x-api-key','api-key'
 ]);
 
+
+// ══ Model-Aware Timeouts (Fix C) ════════════════════════════════════════════
+// A single fixed TTFT / pre-response budget is wrong: a 550B reasoning model
+// (nemotron-3-ultra) holds headers for 60-150s+ while "thinking", whereas an
+// 8B chat model answers in 1-3s. A fixed budget either kills big models
+// prematurely (504) or lets tiny models hang far too long. We therefore scale
+// the TTFT warning + the client-facing pre-response watchdog by model size/type
+// instead of using one global constant for all 119 catalog models.
+const MODEL_TIMEOUT_PROFILES = [
+  // NVIDIA Nemotron reasoning Ultra/Super — the heaviest catalog models.
+  { patterns: ['nemotron-3-ultra', 'nemotron-3-super', 'llama-3.3-nemotron-super'], ttft: 240000, pre: 480000 },
+  // General Nemotron reasoning family.
+  { patterns: ['nemotron'], ttft: 180000, pre: 360000 },
+  // Large reasoning Mixture-of-Experts that think for minutes:
+  // deepseek-v4-pro, qwen3.5-*, glm-5.x, kimi-k2, minimax-m2.x, llama-4.
+  { patterns: ['deepseek-v4', 'deepseek-r1', 'qwen3.5', 'glm-5', 'kimi', 'minimax-m', 'llama-4', 'llama-3.3-70b', 'mistral-large-3'], ttft: 150000, pre: 360000 },
+  // Generic 70B+ dense chat/reasoning class.
+  { patterns: ['70b', '235b', '397b', '120b', '122b', '675b', '550b', '32b', '8x'], ttft: 120000, pre: 300000 },
+];
+
+function findTimeoutProfile(modelId) {
+  const m = (modelId || '').toLowerCase();
+  for (const p of MODEL_TIMEOUT_PROFILES) {
+    if (p.patterns.some(pat => m.includes(pat))) return p;
+  }
+  return null;
+}
+
+// TTFT warning threshold — how long we wait before logging "slow upstream".
+// Defaults to the env value (or 120s) for typical models; scales up for heavy
+// reasoning models so we don't spam warnings for models that are merely slow.
+function ttftTimeoutMsFor(modelId) {
+  const envVal = parseInt(process.env.TTFT_TIMEOUT_MS || '120000', 10);
+  const prof = findTimeoutProfile(modelId);
+  return prof ? Math.max(prof.ttft, envVal) : envVal;
+}
+
+// Client-facing pre-response watchdog budget. Must stay >= headersTimeout *
+// maxKeyAttempts so all key retries complete, and must scale with model size so
+// a 550B reasoning model is never 504'd merely for thinking longer than a
+// fixed 180s window. Default env PRE_RESPONSE_TIMEOUT_MS still caps the ceiling.
+function preResponseTimeoutMsFor(modelId) {
+  const envMax = parseInt(process.env.PRE_RESPONSE_TIMEOUT_MS || '180000', 10);
+  const prof = findTimeoutProfile(modelId);
+  if (!prof) return envMax;
+  // If an operator explicitly set a lower budget, honor it (don't auto-extend
+  // past what they configured) — only extend when the env default is in play.
+  if (envMax < 180000) return envMax;
+  return Math.max(prof.pre, envMax);
+}
+
 function forwardHeaders(req) {
   const h = {};
   h['Accept'] = 'application/json, text/event-stream';
@@ -1411,7 +1462,9 @@ const timeoutSec = parseInt(process.env.REQUEST_TIMEOUT || process.env.REQUEST_T
 const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900', 10);
       const timeoutMs = (body.stream ? streamTimeoutSec : timeoutSec) * 1000;
 
-      const ttftMs = parseInt(process.env.TTFT_TIMEOUT_MS || '110000', 10);
+      // Fix C: model-aware TTFT threshold (heavy reasoning models think far
+      // longer before first token; a fixed 110s budget would spam warnings).
+      const ttftMs = ttftTimeoutMsFor(modelId);
       ttftTimer = setTimeout(() => {
         console.warn(`[TTFT] Upstream model=${modelId} slow (>${ttftMs}ms), still waiting for ${body.stream ? 'STREAM_REQUEST_TIMEOUT_SEC=' + streamTimeoutSec + 's' : 'REQUEST_TIMEOUT=' + timeoutSec + 's'}`);
       }, ttftMs);
@@ -3194,7 +3247,10 @@ async function handleRequest(req, res) {
   // so all key retries complete before the watchdog fires. With headersTimeout=15s and
   // 5 keys, worst case = 15s * 5 = 75s. Default = 180s gives generous safety margin.
   // Previously was 45s which caused it to fire mid-retry (after ~1.5 key attempts).
-  const PRE_RESPONSE_TIMEOUT_MS = parseInt(process.env.PRE_RESPONSE_TIMEOUT_MS || '180000', 10);
+  // Fix C: scale the client-facing pre-response watchdog by model size/type so
+  // a 550B reasoning model (nemotron-3-ultra) is never 504'd merely for thinking
+  // longer than a fixed 180s window, while tiny models still get the env budget.
+  const PRE_RESPONSE_TIMEOUT_MS = preResponseTimeoutMsFor(body && body.model ? body.model : '');
   const preRespTimer = setTimeout(() => {
     if (!res.headersSent && !res.writableEnded && !res.destroyed) {
       req._preRespTimedOut = true;
