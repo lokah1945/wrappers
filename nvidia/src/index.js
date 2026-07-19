@@ -1138,6 +1138,70 @@ function guardStreamUnsupported(body, modelId) {
   };
 }
 
+// ── Capability-Aware Fallback Cascade (Fix F) ────────────────────────────
+// When the PRIMARY model fails on every key with a DEFINITIVE upstream error
+// (5xx on all keys, or a blackhole), fall back to sibling models in the SAME
+// capability class instead of immediately 5xx-ing the client. The cascade is
+// capability-aware and reasoning-preserving:
+//   - only models of the same type (chat/vision_chat/parse) are candidates;
+//   - if the request explicitly asked for reasoning, candidates PREFER reasoning
+//     models and the cascade must NOT silently drop to a non-reasoning model;
+//   - models already marked definitively dead (retired/404) are excluded.
+// Falls back at most FALLBACK_MAX_HOPS times. Disabled when MODEL_FALLBACK_ENABLED=false.
+const FALLBACK_MAX_HOPS = parseInt(process.env.MODEL_FALLBACK_MAX_HOPS || '2', 10);
+
+function requestRequiresReasoning(body, modelId) {
+  const b = body || {};
+  if (b.chat_template_kwargs && (b.chat_template_kwargs.enable_thinking || b.chat_template_kwargs.thinking || b.chat_template_kwargs.force_nonempty_content)) return true;
+  if (b.reasoning_effort) return true;
+  if (b.extra_body && (b.extra_body.reasoning_budget || b.extra_body.reasoning_effort || b.extra_body.chat_template_kwargs)) return true;
+  if (b.extended_thinking || (b.thinking && b.thinking.type !== 'disabled')) return true;
+  if (findReasoningConfig(modelId)) return true;
+  return false;
+}
+
+function isReasoningModel(modelId) {
+  return !!findReasoningConfig(modelId);
+}
+
+function buildFallbackCandidates(modelId, wantsReasoning) {
+  if (process.env.MODEL_FALLBACK_ENABLED === 'false') return [];
+  const primary = classify(modelId);
+  const type = primary.type;
+  const owner = String(modelId).includes('/') ? modelId.split('/')[0] : null;
+  // Use the real metrics API (modelStatusCache does NOT exist on
+  // metrics; getModelStatus() returns {model:{last_status,reason,...}}).
+  const modelStatus = (metrics && typeof metrics.getModelStatus === 'function')
+    ? metrics.getModelStatus() : {};
+  const cached = Array.isArray(pool.modelsCached) ? pool.modelsCached : [];
+  const seen = new Set([String(modelId).toLowerCase()]);
+  const cands = [];
+  for (const mid of cached) {
+    if (seen.has(mid.toLowerCase())) continue;
+    const c = classify(mid);
+    if (c.type !== type) continue;
+    const st = modelStatus[mid] ? (modelStatus[mid].last_status || 0) : 0;
+    const reason = modelStatus[mid] ? (modelStatus[mid].reason || '') : '';
+    if (unavailableModels.has(mid) && isDefinitiveDeadStatus(st, reason)) continue;
+    cands.push(mid);
+    seen.add(mid.toLowerCase());
+  }
+  cands.sort((a, b) => {
+    const aOwner = a.includes('/') ? a.split('/')[0] : '';
+    const bOwner = b.includes('/') ? b.split('/')[0] : '';
+    const aSame = aOwner === owner ? 0 : 1;
+    const bSame = bOwner === owner ? 0 : 1;
+    if (aSame !== bSame) return aSame - bSame;
+    if (wantsReasoning) {
+      const ar = isReasoningModel(a) ? 0 : 1;
+      const br = isReasoningModel(b) ? 0 : 1;
+      if (ar !== br) return ar - br;
+    }
+    return 0;
+  });
+  return cands.slice(0, FALLBACK_MAX_HOPS);
+}
+
 function markModel(modelId, ok, status, path, reason) {
   if (ok) {
     if (unavailableModels.has(modelId)) {
@@ -1403,6 +1467,21 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
   const streamGuard = guardStreamUnsupported(body, modelId);
   if (streamGuard) return streamGuard;
 
+  // Fix F: capability-aware fallback cascade. Build the ordered candidate list
+  // (primary + same-type siblings, reasoning-preserving) BEFORE the retry loop
+  // so body mutation below can be reverted per hop. applyDefaultReasoning /
+  // sanitizeNvidiaPayload mutate body, so we snapshot it and restore on each
+  // candidate to avoid bleeding reasoning toggles across models.
+  const wantsReasoning = requestRequiresReasoning(body, modelId);
+  const candidates = [modelId, ...buildFallbackCandidates(modelId, wantsReasoning)];
+  const primaryBody = JSON.parse(JSON.stringify(body));
+  let fallbackUsed = null;
+
+  for (const candModel of candidates) {
+  // Restore the pristine request body for this candidate hop (see Fix F above).
+  body = JSON.parse(JSON.stringify(primaryBody));
+  body.model = candModel;
+  modelId = candModel;
   await convertVisionImages(body);
 
   // Map max_completion_tokens → max_tokens for OpenAI-compatible clients
@@ -1837,16 +1916,34 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
       }
     }
   }
-  // All attempts exhausted - ensure counter is decremented
+  // All attempts exhausted on this candidate - ensure counter is decremented
   if (key && !keyReleased) {
     pool.releaseSuccess(key);
     decInFlight();
   }
+  // Definitive failure for this candidate (all keys 5xx/blackhole, or a 4xx
+  // we do NOT retry on). If more capability-matched candidates remain, fall
+  // through to the next one WITHOUT dropping an explicit reasoning intent.
+  if (candModel !== candidates[candidates.length - 1]) {
+    console.warn(`[FALLBACK] model=${candModel} exhausted all keys (reasoning=${wantsReasoning}); trying next candidate ${candidates[candidates.length - 1]}`);
+    fallbackUsed = candModel;
+    continue;
+  }
   // Pass through the LAST real upstream error verbatim instead of a synthetic
   // envelope. If we somehow have nothing (e.g. pure network failure with no
   // upstream body on any key), surface a 502 with the actual failure note.
-  if (lastUpstream) return lastUpstream;
+  if (lastUpstream) {
+    if (fallbackUsed) {
+      // Annotate that a fallback was attempted so clients can tell the primary
+      // failed and we tried siblings. Status + body stay faithful to upstream.
+      lastUpstream.data = lastUpstream.data || {};
+      lastUpstream.data.fallback_from = fallbackUsed;
+    }
+    return lastUpstream;
+  }
   return { status: 502, data: { error: { message: 'All API keys failed to reach upstream NVIDIA NIM', type: 'api_error' } } };
+}
+
 }
 
 // ── Generic POST Helper (embeddings, images, ranking) ─────────────────
