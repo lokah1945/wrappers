@@ -3047,6 +3047,9 @@ async function handleCatchAll(req, res, path, url) {
     rawBody = await readBody(req);
     try { body = JSON.parse(rawBody); } catch {}
   }
+  // Fix C: catch-all proxy paths (Ollama/legacy) also learn the real model
+  // id here so the watchdog budget reflects model size/type.
+  if (isPost) armPreResp(resolveTargetModel(body.model || ''));
 
   const requestedModel = body.model || modelFromPath(path) || 'unknown';
   let modelId = resolveTargetModel(requestedModel);
@@ -3511,14 +3514,35 @@ async function handleRequest(req, res) {
   // Fix C: scale the client-facing pre-response watchdog by model size/type so
   // a 550B reasoning model (nemotron-3-ultra) is never 504'd merely for thinking
   // longer than a fixed 180s window, while tiny models still get the env budget.
-  const PRE_RESPONSE_TIMEOUT_MS = preResponseTimeoutMsFor(body && body.model ? body.model : '');
-  const preRespTimer = setTimeout(() => {
+  // Fix C: scale the client-facing pre-response watchdog by model size/type so
+  // a 550B reasoning model (nemotron-3-ultra) is never 504'd merely for thinking
+  // longer than a fixed 180s window, while tiny models still get the env budget.
+  //
+  // IMPORTANT: at this point in handleRequest the request body has NOT been
+  // parsed yet (each route parses its own `body` AFTER this line), so the model
+  // id is unknown here. We therefore arm a DEFAULT (env-budget) timer now and
+  // re-arm it per-route via armPreResp() once the real model id is known.
+  // Passing the unparsed `body` here would read an undefined/empty value and
+  // silently defeat Fix C (every request would fall back to the flat 180s).
+  let PRE_RESPONSE_TIMEOUT_MS = preResponseTimeoutMsFor('');
+  const preRespAbort = () => {
     if (!res.headersSent && !res.writableEnded && !res.destroyed) {
       req._preRespTimedOut = true;
       console.warn(`[pre-resp-timeout] request ${requestId} path=${path} exceeded ${PRE_RESPONSE_TIMEOUT_MS}ms with no response headers — aborting upstream`);
       controller.abort();
     }
-  }, PRE_RESPONSE_TIMEOUT_MS);
+  };
+  let preRespTimer = setTimeout(preRespAbort, PRE_RESPONSE_TIMEOUT_MS);
+  // Re-arm the watchdog with the model-aware budget once the route has parsed
+  // the body (and resolved the model id). Cheap no-op when the budget is
+  // unchanged, so routing/alias resolution changes are reflected correctly.
+  function armPreResp(modelId) {
+    const ms = preResponseTimeoutMsFor(modelId || '');
+    if (ms === PRE_RESPONSE_TIMEOUT_MS) return;
+    clearTimeout(preRespTimer);
+    PRE_RESPONSE_TIMEOUT_MS = ms;
+    preRespTimer = setTimeout(preRespAbort, ms);
+  }
 
   // Log incoming request
   const startTime = Date.now();
@@ -3856,6 +3880,9 @@ async function handleRequest(req, res) {
         console.error('[JSON PARSE ERROR] completions raw:', JSON.stringify(raw).slice(0, 1000), 'err:', e.message);
         return jsonResp(res, 400, { error: { message: 'Invalid JSON: ' + e.message, type: 'invalid_request_error' } });
       }
+      // Fix C: re-arm the pre-response watchdog with the model-aware budget
+      // now that we know the (resolved) model id.
+      armPreResp(resolveTargetModel(body.model || ''));
       // handleChatCompletions() calls resolveTargetModel(body.model) itself,
       // so we just pass the body through. The previous block re-resolved the
       // model here AND in handleChatCompletions (double work) and left a
@@ -3879,6 +3906,10 @@ async function handleRequest(req, res) {
     // ─ Anthropic Messages ──
     if (method === 'POST' && path === '/v1/messages') {
       const raw = await readBody(req);
+      // Fix C: the Anthropic body carries a (possibly aliased) `model`; arm
+      // the watchdog with the resolved NIM id so a large/Nemotron model is
+      // not 504'd for merely thinking longer than the flat env budget.
+      try { const mb = JSON.parse(raw); armPreResp(resolveTargetModel(mb.model || '')); } catch {}
       return await handleAnthropicMessages(raw, req, res);
     }
 
