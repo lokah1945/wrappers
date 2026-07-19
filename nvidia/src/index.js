@@ -92,6 +92,16 @@ const REASONING_CONFIGS = [
   { patterns: ['gemma-3'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   // reasoning_effort families (NIM accepts `reasoning_effort` for these).
   { patterns: ['nemotron', 'gpt-oss', 'kimi', 'mistral-'], mechanism: 'reasoning_effort', params: { effort: 'high' }, requires_reasoning: false },
+  // FIX B-1: NVIDIA Nemotron reasoning family (ultra/super/nemotron-3) uses its
+  // OWN chat_template_kwargs schema: { enable_thinking, force_nonempty_content }.
+  // `force_nonempty_content` is REQUIRED — Nemotron reasoning can return an
+  // EMPTY content body (reasoning only) that breaks clients unless the wrapper
+  // guarantees a non-empty content before forwarding (see verifyNonemptyContent
+  // in proxyOpenai). reasoning_budget is read from extra_body.reasoning_budget
+  // and passed through verbatim. We keep BOTH this entry AND the generic
+  // `nemotron` reasoning_effort entry above? No — this more-specific entry must
+  // win, so the generic one is removed and Nemotron is handled solely here.
+  { patterns: ['nemotron'], mechanism: 'nemotron_chat_template', params: { enable_thinking: true, force_nonempty_content: true }, requires_reasoning: false },
 ];
 
 function findReasoningConfig(modelId) {
@@ -661,6 +671,33 @@ function resolveBase(modelId) {
   return ep?.base_url || BASE_LLM;
 }
 
+// FIX B-3: Verify a chat-completion response carries a non-empty assistant
+// content before forwarding it to the client. NVIDIA Nemotron reasoning can
+// return an EMPTY content body (reasoning-only) which breaks OpenAI/Anthropic
+// clients that require output text or tool calls. When content is empty we
+// synthesize a minimal placeholder so the contract is satisfied instead of
+// forwarding a hollow message. Only applied to chat-family models.
+function messageHasContent(data) {
+  const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+  if (!msg) return false;
+  if (typeof msg.content === 'string') return msg.content.trim().length > 0;
+  if (Array.isArray(msg.content)) return msg.content.some(c => (c && c.type === 'text' && (c.text || '').trim()) || (c && c.type === 'tool_use'));
+  if (Array.isArray(msg.tool_calls) && msg.tool_calls.length > 0) return true;
+  return false;
+}
+
+function ensureNonemptyContent(data) {
+  if (!messageHasContent(data)) {
+    const msg = data && data.choices && data.choices[0] && data.choices[0].message;
+    if (msg && typeof msg.content === 'string') {
+      msg.content = '[No text response; the model returned reasoning only.]';
+    } else if (msg) {
+      msg.content = msg.content || '[No text response; the model returned reasoning only.]';
+    }
+  }
+  return data;
+}
+
 // FIX B9: Translate the Anthropic `thinking` param into the NIM model-specific
 // reasoning toggle. CRITICAL for deepseek-v4-pro / deepseek-r1: per
 // MASTER_PROMPT Lampiran A, those models HANG with no response unless
@@ -694,6 +731,23 @@ function translateThinkingToNim(oaiBody, nimModel, anthropicThinking) {
     oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs || {}), ...obj };
   } else if (cfg.mechanism === 'reasoning_effort') {
     oaiBody.reasoning_effort = enabled ? (cfg.params.effort || 'high') : 'low';
+  } else if (cfg.mechanism === 'nemotron_chat_template') {
+    // FIX B-2: NVIDIA Nemotron family reasoning schema. Inject
+    // { enable_thinking, force_nonempty_content } into chat_template_kwargs and
+    // pass reasoning_budget through from extra_body verbatim (client wins).
+    const obj = {};
+    for (const [k, v] of Object.entries(cfg.params)) {
+      obj[k] = enabled ? v : false;
+    }
+    oaiBody.chat_template_kwargs = { ...(oaiBody.chat_template_kwargs || {}), ...obj };
+    // FIX B-2: pass reasoning_budget through verbatim. The gateway brief
+    // specifies extra_body.reasoning_budget; NVIDIA docs also accept
+    // chat_template_kwargs.reasoning_budget. Honor whichever the client sent.
+    const rb = (oaiBody.extra_body && oaiBody.extra_body.reasoning_budget) ??
+      (oaiBody.chat_template_kwargs && oaiBody.chat_template_kwargs.reasoning_budget);
+    if (rb !== undefined && rb !== null) {
+      oaiBody.extra_body = { ...oaiBody.extra_body, reasoning_budget: rb };
+    }
   }
 }
 
@@ -703,7 +757,7 @@ function translateThinkingToNim(oaiBody, nimModel, anthropicThinking) {
 // (e.g. a trivial "PONG") to those models actually return instead of hanging.
 function applyDefaultReasoning(body, modelId) {
   const hasExplicit = !!(body.chat_template_kwargs || body.reasoning_effort ||
-    (body.extra_body && (body.extra_body.chat_template_kwargs || body.extra_body.reasoning_effort)));
+    (body.extra_body && (body.extra_body.chat_template_kwargs || body.extra_body.reasoning_effort || body.extra_body.reasoning_budget)));
   if (hasExplicit) return;
 
   const cfg = findReasoningConfig(modelId);
@@ -722,6 +776,19 @@ function applyDefaultReasoning(body, modelId) {
     body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), ...obj };
   } else if (cfg.mechanism === 'reasoning_effort') {
     body.reasoning_effort = cfg.params.effort || 'high';
+  } else if (cfg.mechanism === 'nemotron_chat_template') {
+    // FIX B-2 (cont.): auto-inject Nemotron reasoning toggle when client did
+    // not send one, and forward reasoning_budget if present.
+    const obj = {};
+    for (const [k, v] of Object.entries(cfg.params)) {
+      obj[k] = v;
+    }
+    body.chat_template_kwargs = { ...(body.chat_template_kwargs || {}), ...obj };
+    const rb = (body.extra_body && body.extra_body.reasoning_budget) ??
+      (body.chat_template_kwargs && body.chat_template_kwargs.reasoning_budget);
+    if (rb !== undefined && rb !== null) {
+      body.extra_body = { ...body.extra_body, reasoning_budget: rb };
+    }
   }
 }
 
@@ -1541,6 +1608,12 @@ const streamTimeoutSec = parseInt(process.env.STREAM_REQUEST_TIMEOUT_SEC || '900
       // Normalize model name in response — NVIDIA sometimes prefixes with stg/
       if (data.model && modelId && data.model !== modelId) {
         data.model = modelId;
+      }
+      // FIX B-3: guarantee a non-empty assistant content for chat models so
+      // downstream clients (Claude Code / OpenAI SDK) never receive a hollow
+      // reasoning-only message from Nemotron family reasoning models.
+      if (classify(modelId).type === 'chat' || classify(modelId).type === 'vision_chat' || classify(modelId).type === 'parse') {
+        ensureNonemptyContent(data);
       }
       const { pt, ct, tt, cacht } = extractUsageFields(data.usage);
       metrics.recordRequest({
