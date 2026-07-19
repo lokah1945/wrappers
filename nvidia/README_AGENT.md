@@ -24,7 +24,7 @@ wrapper-nvidia is a **stateless protocol-translation layer** for NVIDIA NIM. It 
 | `/v1/embeddings` | POST | |
 | `/v1/ranking` | POST | |
 | `/v1/images/generations` | POST | |
-| `/v1/models` | GET | Public; claude-* + NGC-synced context windows. |
+| `/v1/models` | GET | Public; exact NVIDIA NIM ids. `?gateway=1` adds `claude-*` routing ids (with `display_name`) for the Claude Code picker. NGC-synced context windows. |
 | `/v1/capabilities` | GET | Public; single source of model capability truth. |
 | `/v1/capabilities/params` | GET | Public; supported param matrix. |
 | `/health`, `/stats`, `/metrics/prom`, `/metrics/activity`, `/metrics/model-status`, `/version` | GET | Monitoring. |
@@ -43,6 +43,22 @@ wrapper-nvidia is a **stateless protocol-translation layer** for NVIDIA NIM. It 
 ### Hermes Agent (ILMA profile) → `/v1/chat/completions`
 - `base_url=http://127.0.0.1:9100`, `custom:wrapper-nvidia`.
 - Uses OpenAI chat format; `x-hermes-*` headers forwarded to NIM.
+
+## Gateway Model Discovery (Claude Code model picker)
+
+Claude Code's gateway model picker calls `CLAUDE_CODE_GATEWAY_MODEL_DISCOVERY_URL` (configured to
+`http://localhost:9100/v1/models?gateway=1`) and **only displays entries whose `id` begins with
+`claude`/`anthropic`**, sending the selected `id` straight back as the model. To satisfy this
+contract without lying about upstream naming:
+
+- **Default `/v1/models`** returns the EXACT NVIDIA NIM ids only (clean passthrough for OpenAI-compatible
+  clients: Codex, Hermes, OpenAI SDK, OpenCode).
+- **`/v1/models?gateway=1`** emits, per model, the exact NIM id PLUS an additional `claude-<slug>` routing
+  id whose `display_name` = the exact NIM id and `original_id` = the exact NIM id. The picker shows the
+  real upstream name while the selected id routes deterministically.
+- Inbound `claude-<slug>` ids resolve back to the exact NIM id via `resolveTargetModel()` ->
+  `DISCOVERY_TO_NIM` (rebuilt from the exact ids in `refreshDiscoveryMap()`). No routing ambiguity,
+  no hardcoded name maps beyond the capability-driven alias resolution.
 
 ## Reasoning / Thinking Handling
 

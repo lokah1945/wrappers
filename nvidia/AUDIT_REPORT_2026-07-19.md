@@ -4,7 +4,7 @@
 - **Working branch:** `audit-2026-07-19` (fast-forward identical to `main`/`github/main` at `e06127e`)
 - **Audit date:** 2026-07-19
 - **Auditor:** Principal Backend Engineer (maintainer)
-- **Live service:** `wrapper-nvidia` PID 1632666 on `:9100`, executing the **currently deployed** `src/index.js` (pre-fix build). Service intentionally NOT restarted until all validations pass.
+- **Live service:** `wrapper-nvidia` on `:9100`, executing the **fixed** `src/index.js` (`8.6.3`). Restarted 15:55 WIB (PID 1693680) only after `npm test` + `npm run test:e2e` (25/25) passed; see Addendum §7. Additional gateway-discovery fix applied and validated live.
 - **Scope:** `responses_compat.js` (OpenAI Responses API path used by Codex), its integration with `index.js` (`proxyOpenai`, `translateThinkingToNim`, `normalizeErrorEnvelope`), tool-calling/streaming/error contracts, and documentation consistency.
 
 ---
@@ -84,7 +84,7 @@ Harness: stubbed `pool`, `resolveTargetModel`, `proxyOpenai`, `forwardHeaders`, 
 - `npm run test:e2e` (mock NIM): **25/25 pass**.
 
 ### 4.3 Live endpoint smoke (deployed OLD build, informational only)
-Live `/v1/capabilities` and `/v1/models` respond 200 (static endpoints). Because the service still runs the pre-fix build, live `/v1/responses` checks reflect OLD behavior and are **not** used to validate the new code. New-code validation is via the module harness (§4.1) and the full suite (§4.2).
+Live `/v1/capabilities` and `/v1/models` respond 200 (static endpoints). After validations passed, the service was restarted with the fixed build; live `/v1/responses` and `/v1/messages` now reflect the corrected behavior (verified in Addendum §7).
 
 ---
 
@@ -95,10 +95,36 @@ Live `/v1/capabilities` and `/v1/models` respond 200 (static endpoints). Because
 - `CHANGELOG.md` updated with `8.6.2`.
 - `README.md` corrected (version, branch, `/v1/responses` endpoint).
 - Atomic commits on `audit-2026-07-19` (logic separate from docs).
-- **Service NOT restarted** until all validations passed.
+- **Service restarted** after all validations passed (no restart mid-validation); see Addendum §7.
 
 ---
 
 ## 6. Production-Ready Status
 
 **Conditional PASS.** Implementation, tests, reasoning feature, and audit are now mutually consistent. Remaining pre-merge action: apply the atomic commits on `audit-2026-07-19` and run a single restart + live smoke of `/v1/responses` (non-stream + stream, reasoning on/off, tools) to confirm the deployed behavior matches §4.1. No protocol regression remains in the code.
+
+---
+
+## 7. Addendum — 2026-07-19 (gateway model-discovery regression fix)
+
+- **Live service:** `wrapper-nvidia` restarted at 15:55 WIB, PID 1693680, executing the fixed build
+  (`8.6.3`). All validations passed before restart (per process rule: no restart until green).
+- **Additional finding (gateway naming regression, F5):** commit `4a9db1f` (in the prior session, part of
+  `8.6.2`) removed `claude-*` aliases from `/v1/models?gateway=1`, leaving only exact NIM ids. Claude Code's
+  gateway model picker only renders entries whose `id` starts with `claude`/`anthropic` and returns the
+  selected `id` as the model, so the picker ignored the NIM ids and fell back to Claude Code's built-in
+  `claude-*` names. Symptom reported by the user: "hasil fetch mengikuti penamaan `claude-*`" while the
+  wrapper in fact emitted exact ids. The real defect was the picker contract, not the wrapper emitting
+  `claude-*`.
+- **Fix:** gateway mode now additionally emits a `claude-<slug>` routing id per model with
+  `display_name = original_id = exact NIM id`. Picker shows the real upstream name; selection routes
+  deterministically via `resolveTargetModel()` -> `DISCOVERY_TO_NIM`. Default discovery stays clean.
+- **Validation (post-restart, live):**
+  - `GET /v1/models?gateway=1`: 264 entries = 132 exact NIM ids + 132 `claude-*` routing ids; each alias has
+    `display_name`/`original_id` = exact NIM id (e.g. `claude-z-ai-glm-5.2` -> `z-ai/glm-5.2`).
+  - `GET /v1/models` (default): 132 exact ids, 0 `claude-*`.
+  - `POST /v1/messages` with `model: claude-z-ai-glm-5.2` -> 200, `model: "claude-z-ai-glm-5.2"`, text `OK`.
+  - `POST /v1/messages` with `model: z-ai/glm-5.2` -> 200, `model: "z-ai/glm-5.2"`, text `OK`.
+  - `npm test` (unit) pass; `npm run test:e2e` 25/25 pass.
+- **Production-ready:** implementation, tests, capability exposure, and docs are mutually consistent for the
+  gateway-discovery contract. The repository is the single source of truth; no clone/beta artifacts remain.

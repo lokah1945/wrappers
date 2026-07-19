@@ -1,5 +1,25 @@
 # Changelog
 
+## [8.6.3] - 2026-07-19
+
+### Fixed
+
+#### Gateway model discovery emitted wrong names for the Claude Code picker (regression from 8.6.2)
+**File:** src/index.js (`handleModels`, gateway branch)
+**Root cause:** 8.6.2 removed all `claude-*` aliases from `/v1/models?gateway=1`, returning only exact
+NVIDIA NIM ids (e.g. `z-ai/glm-5.2`). Claude Code's gateway model picker only displays entries whose
+`id` begins with `claude`/`anthropic` and sends the selected `id` back as the model, so the exact NIM
+ids were silently ignored and the picker fell back to Claude Code's built-in `claude-*` list — i.e. the
+user saw `claude-*` names even though the wrapper no longer emitted them.
+**Fix:** In gateway mode, emit (in addition to the exact NIM id) a `claude-<slug>` routing id whose
+`display_name` and `original_id` equal the exact NIM id. The picker shows the real upstream name while
+the selected routing id resolves deterministically via `resolveTargetModel()` -> `DISCOVERY_TO_NIM`.
+Default `/v1/models` (non-gateway) stays a clean exact-NIM-id list with no `claude-*` entries, so
+OpenAI-compatible clients (Codex, Hermes, OpenAI SDK) are unaffected.
+**Verified:** `npm test` pass; `npm run test:e2e` 25/25 pass (gateway assertion updated); live
+`/v1/models?gateway=1` returns 132 exact ids + 132 `claude-*` routing ids, each labelled with the exact
+NIM `display_name`; `POST /v1/messages` with `claude-z-ai-glm-5.2` routes to `z-ai/glm-5.2` and returns 200.
+
 ## [8.6.2] - 2026-07-19
 
 ### Fixed
