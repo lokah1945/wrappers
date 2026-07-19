@@ -1435,12 +1435,18 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
   }
 
 
-// Preserve chat_template_kwargs, reasoning_effort, nvext, and extra_body before proactive drop
+// Preserve client-owned control params BEFORE the proactive drop. OpenClaw
+// (and similar NIM-native agents) send per-model chat_template_kwargs and
+// extra_body by DEFAULT; we MUST forward them verbatim and never overwrite or
+// discard them. applyDefaultReasoning / translateThinkingToNim only inject a
+// toggle when the client sent NONE, so a client's explicit reasoning config
+// always wins. extra_body is additionally kept whole (we only ever merge its
+// nvext into body.nvext, never delete the client's own body).
 const preservedParams = {};
-["chat_template_kwargs", "reasoning_effort", "nvext"].forEach(p => {
+["chat_template_kwargs", "reasoning_effort", "extra_body", "nvext"].forEach(p => {
   if (body[p] !== undefined) {
     preservedParams[p] = body[p];
-    console.log(`[proxyOpenai] Preserving ${p}:`, JSON.stringify(body[p]));
+    console.log(`[proxyOpenai] Preserving ${p}:`, JSON.stringify(body[p]).slice(0, 300));
   }
 });
 
