@@ -2682,7 +2682,14 @@ function handleStats(res) {
   });
 }
 
-function enrichModelMetadata(id, desc) {
+function enrichModelMetadata(id, desc, statusMap) {
+  // probe_status / probe_reason come from the metrics DB (model_status table),
+  // read via metrics.getModelStatus() — NOT metrics.modelStatusCache, which does
+  // NOT exist (a prior typo made probe_status/probe_reason always null). The
+  // caller passes an already-fetched status map so we do ONE DB read per
+  // request instead of one per model.
+  const _status = (statusMap && typeof statusMap === 'object') ? statusMap
+    : (metrics && typeof metrics.getModelStatus === 'function' ? metrics.getModelStatus() : {});
   const isChat = desc.type === 'chat' || desc.type === 'vision_chat' || desc.type === 'parse';
   const isVision = desc.type === 'vision_chat' || desc.type === 'parse';
   // context_window / max_output_tokens only make sense for text-generation
@@ -2691,6 +2698,30 @@ function enrichModelMetadata(id, desc) {
   // 131072 for them (the previous unconditional default) misled clients like
   // Claude Code that read /v1/models to size requests.
   const hasContextWindow = isChat;
+  // Capability-driven function calling. NVIDIA NIM does NOT support tools on
+  // vision/parse multimodal models or on a few publisher families that 400 a
+  // tool payload upstream (e.g. llama-3.2-11b-vision rejects tools). We
+  // therefore DENY function calling for non-pure-chat types and for a small
+  // explicit denylist, instead of the old `supports_function_calling: isChat`
+  // which wrongly advertised tools for vision/parse models.
+  const TOOL_DENY = [
+    'vision', 'neva', 'vila', 'paligemma', 'phi-3-vision', 'phi-3.5-vision',
+    'phi-4-multimodal', 'pixtral', 'molmo', 'fuyu', 'internvl', 'cogvlm',
+    'qwen2-vl', 'qwen-vl', 'kosmos', 'florence', 'git-', 'deplot', 'pix2struct',
+    'llava', 'nvclip', 'gemma-3n', 'llama-4-scout', 'aria',
+  ];
+  const lowId = (id || '').toLowerCase();
+  const visionOrParse = desc.type === 'vision_chat' || desc.type === 'parse';
+  const toolDenied = TOOL_DENY.some(p => lowId.includes(p));
+  const supportsFunctionCalling = isChat && !visionOrParse && !toolDenied;
+  // Reasoning support is published capability, derived from the SAME source of
+  // truth (REASONING_CONFIGS) the request path uses, so /v1/capabilities
+  // and the proxy's reasoning injection never disagree.
+  const supportsReasoning = isChat && !!findReasoningConfig(id);
+  // Build a faithful capability array instead of a single boolean so clients
+  // can introspect exactly what the model does (chat/vision/embedding/...).
+  const caps = Array.isArray(desc.capabilities) ? [...new Set(desc.capabilities)] : [];
+  if (supportsReasoning && !caps.includes('reasoning')) caps.push('reasoning');
   // IMPORTANT: spread `...desc` BEFORE the defaulted fields. The previous
   // order (`{context_window: desc.context_window || DEFAULT, ...desc}`) let the
   // spread re-introduce `context_window: undefined` for models without a
@@ -2705,6 +2736,7 @@ function enrichModelMetadata(id, desc) {
     object: 'model',
     owned_by: id.split('/')[0] || 'nvidia',
     created: 0,
+    capabilities: caps,
     // Context window / max output come from the NGC-synced authoritative
     // registry when available (verified live, never a silent guess), then fall
     // back to the curated heuristic map, then a sane default. This fixes the
@@ -2713,7 +2745,7 @@ function enrichModelMetadata(id, desc) {
     context_window: hasContextWindow ? (registry.getOfficialContext(id)?.context ?? desc.context_window ?? getContextWindow(id)) : undefined,
     max_output_tokens: hasContextWindow ? (registry.getOfficialContext(id)?.maxOutput ?? desc.max_output_tokens ?? 4096) : undefined,
     supports_vision: isVision,
-    supports_function_calling: isChat,
+    supports_function_calling: supportsFunctionCalling,
     // NVIDIA NIM only supports a SINGLE tool call per turn (the upstream
     // returns HTTP 500 "only supports single tool-calls at once" for parallel
     // tool calls — see the 500-intercept in proxyOpenai). Advertising
@@ -2722,8 +2754,9 @@ function enrichModelMetadata(id, desc) {
     // real capability so clients serialize their tool calls.
     supports_parallel_tool_calls: false,
     supports_streaming: desc.streaming !== false,
-    supports_structured_output: isChat,
-    supports_tool_choice: isChat,
+    supports_structured_output: supportsFunctionCalling,
+    supports_tool_choice: supportsFunctionCalling,
+    supports_reasoning: supportsReasoning,
     supports_stop_sequences: isChat,
     supports_system_prompt: isChat,
     supports_temperature: isChat,
@@ -2752,8 +2785,8 @@ function enrichModelMetadata(id, desc) {
       };
     })(),
     // PATCH-A: Probe status annotation for client filtering
-    probe_status: unavailableModels.has(id) ? (metrics.modelStatusCache?.[id]?.last_status || null) : null,
-    probe_reason: unavailableModels.has(id) ? (metrics.modelStatusCache?.[id]?.reason || null) : null,
+    probe_status: unavailableModels.has(id) ? (_status[id]?.last_status ?? null) : null,
+    probe_reason: unavailableModels.has(id) ? (_status[id]?.reason ?? null) : null,
     provider: 'nvidia',
     model_family: id.includes('/') ? id.split('/')[1]?.split('-')[0] || id : id.split('-')[0] || id,
   };
@@ -2812,10 +2845,14 @@ async function handleModels(res, url = null) {
   // alias resolution works even when aliases are not in the response.
   refreshDiscoveryMap(ids);
   const catalog = buildCatalog(ids, BASE_LLM, BASE_GENAI);
+  // Fetch probe status ONCE per request (metrics DB read) and thread it through
+  // enrichModelMetadata so probe_status/probe_reason are accurate (Fix: the
+  // old metrics.modelStatusCache field does not exist).
+  const _probeStatus = (metrics && typeof metrics.getModelStatus === 'function') ? metrics.getModelStatus() : {};
   const data = [];
   for (const d of catalog) {
     // 1) Original NIM ID (always included — the clean default view)
-    const raw = enrichModelMetadata(d.id, d);
+    const raw = enrichModelMetadata(d.id, d, _probeStatus);
     raw.owned_by = d.id.split('/')[0] || 'nvidia';
     raw.original_id = d.id;
     raw.aliases = [d.id];
@@ -2836,7 +2873,7 @@ async function handleModels(res, url = null) {
     if (gateway) {
       const alias = discoveryAlias(d.id);
       if (alias !== d.id) {
-        const m = enrichModelMetadata(d.id, d);
+        const m = enrichModelMetadata(d.id, d, _probeStatus);
         m.id = alias;
         m.original_id = d.id;
         m.aliases = [d.id, alias];
@@ -2854,7 +2891,8 @@ async function handleModels(res, url = null) {
 async function handleModelInfo(modelId, res) {
   const targetId = resolveTargetModel(modelId);
   const desc = describe(targetId, BASE_LLM, BASE_GENAI);
-  const m = enrichModelMetadata(targetId, desc);
+  const _statusMI = (metrics && typeof metrics.getModelStatus === 'function') ? metrics.getModelStatus() : {};
+  const m = enrichModelMetadata(targetId, desc, _statusMI);
   if (modelId.startsWith(DISCOVERY_PREFIX)) {
     m.id = modelId;
   } else {
@@ -3666,10 +3704,12 @@ async function handleRequest(req, res) {
         // /v1/capabilities?model=X saw `max_output_tokens: null` /
         // `supports_function_calling: null` while /v1/models showed real values
         // — the §8 "metadata only in one surface" bug class.
-        return jsonResp(res, 200, enrichModelMetadata(modelId, d));
+        const _statusCap = (metrics && typeof metrics.getModelStatus === 'function') ? metrics.getModelStatus() : {};
+        return jsonResp(res, 200, enrichModelMetadata(modelId, d, _statusCap));
       }
       const catalog = buildCatalog(pool.modelsCached, BASE_LLM, BASE_GENAI);
-      const enriched = catalog.map(d => enrichModelMetadata(d.id, d));
+      const _statusList = (metrics && typeof metrics.getModelStatus === 'function') ? metrics.getModelStatus() : {};
+      const enriched = catalog.map(d => enrichModelMetadata(d.id, d, _statusList));
       return jsonResp(res, 200, {
         object: 'list', models: enriched,
         summary: summarize(catalog),
