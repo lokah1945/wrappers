@@ -1,5 +1,27 @@
 # Changelog
 
+## [8.6.2] - 2026-07-19
+
+### Fixed
+
+#### Responses API (/v1/responses) regression + reasoning parity
+**File:** src/responses_compat.js
+**Root cause:** the working-tree edit had been based on a stale pre-fix backup
+(responses_compat.js.bak.audit-20260719), silently reverting three previously
+committed fixes (bare-string input to user message; translateThinkingToNim
+reasoning toggle; faithful upstream error-status mapping) while adding the
+reasoning-visibility feature. Two new defects were also present: a non-stream
+error-shape mismatch that dropped errors, and a streaming output_index collision
+(reasoning + message both at index 0) with the reasoning item missing from the
+final response.completed output.
+**Fix:** re-based on HEAD; preserved all prior fixes; surfaced NIM
+reasoning_content / reasoning as a Responses reasoning item (index 0), message at
+index 1, parallel function calls at index 2..N; reasoning item opened lazily and
+included in the final output; non-stream errors mapped to faithful HTTP status.
+**Impact:** Codex (wire_api="responses") keeps reasoning semantic parity with
+Claude Code; no Hermes/Codex 502 regression; upstream 4xx/5xx preserved.
+
+
 ## [8.6.1] - 2026-07-06
 
 ### Fixed

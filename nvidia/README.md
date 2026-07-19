@@ -2,8 +2,8 @@
 
 > OpenAI- & Anthropic-compatible transparent proxy for NVIDIA NIM API with multi-key rotation, rate-limit pacing, and per-model failover.
 
-**Version:** 8.6.0-node  
-**Branch:** fix/audit-2026-07-06  
+**Version:** 8.6.2  
+**Branch:** audit-2026-07-19  
 **Status:** ✅ Production Ready
 
 ## Quick Start
@@ -62,6 +62,7 @@ curl http://localhost:9100/v1/messages \
 | Endpoint | Method | Description |
 |---|---|---|
 | `/v1/chat/completions` | POST | Chat completions (sync + streaming) |
+| `/v1/responses` | POST | OpenAI Responses API (Codex, wire_api="responses") |
 | `/v1/embeddings` | POST | Text embeddings |
 | `/v1/models` | GET | List all available models |
 | `/v1/images/generations` | POST | Image generation |
