@@ -90,26 +90,40 @@ const REASONING_CONFIGS = [
   { patterns: ['yi-'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['llama-3.3', 'llama-3.2', 'llama-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['gemma-3'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
-  // reasoning_effort families (NIM accepts `reasoning_effort` for these).
-  { patterns: ['nemotron', 'gpt-oss', 'kimi', 'mistral-'], mechanism: 'reasoning_effort', params: { effort: 'high' }, requires_reasoning: false },
+  // reasoning_effort families (NIM accepts `reasoning_effort` for these). Nemotron
+  // is intentionally excluded here — it has its own schema below.
+  { patterns: ['gpt-oss', 'kimi', 'mistral-'], mechanism: 'reasoning_effort', params: { effort: 'high' }, requires_reasoning: false },
   // FIX B-1: NVIDIA Nemotron reasoning family (ultra/super/nemotron-3) uses its
   // OWN chat_template_kwargs schema: { enable_thinking, force_nonempty_content }.
   // `force_nonempty_content` is REQUIRED — Nemotron reasoning can return an
   // EMPTY content body (reasoning only) that breaks clients unless the wrapper
-  // guarantees a non-empty content before forwarding (see verifyNonemptyContent
+  // guarantees a non-empty content before forwarding (see ensureNonemptyContent
   // in proxyOpenai). reasoning_budget is read from extra_body.reasoning_budget
-  // and passed through verbatim. We keep BOTH this entry AND the generic
-  // `nemotron` reasoning_effort entry above? No — this more-specific entry must
-  // win, so the generic one is removed and Nemotron is handled solely here.
-  { patterns: ['nemotron'], mechanism: 'nemotron_chat_template', params: { enable_thinking: true, force_nonempty_content: true }, requires_reasoning: false },
+  // and passed through verbatim.
+  // MUST be ordered before the generic `nemotron` fallback, and findReasoningConfig()
+  // prefers the longest matched pattern, so the Ultra/Super family always gets
+  // force_nonempty_content rather than the plain reasoning_effort toggle.
+  { patterns: ['nemotron-3-ultra', 'nemotron-3-super', 'nemotron-3-', 'nemotron-4', 'llama-3.1-nemotron-ultra', 'llama-3.3-nemotron-super'], mechanism: 'nemotron_chat_template', params: { enable_thinking: true, force_nonempty_content: true }, requires_reasoning: false },
+
+  // Generic Nemotron fallback for any remaining nemotron-* id (e.g. nano/guard
+  // variants) that NIM serves via the reasoning_effort toggle.
+  { patterns: ['nemotron'], mechanism: 'reasoning_effort', params: { effort: 'high' }, requires_reasoning: false },
 ];
 
 function findReasoningConfig(modelId) {
   const m = (modelId || '').toLowerCase();
+  let best = null;
+  let bestLen = -1;
   for (const cfg of REASONING_CONFIGS) {
-    if (cfg.patterns.some(p => m.includes(p))) return cfg;
+    // Prefer the most specific (longest matching pattern) entry so a model like
+    // nvidia/nemotron-3-ultra-550b-a55b resolves to the dedicated
+    // nemotron_chat_template schema (matched pattern length 14) instead of the
+    // generic `nemotron` entry (matched pattern length 8).
+    let maxLen = -1;
+    for (const p of cfg.patterns) { if (m.includes(p)) maxLen = Math.max(maxLen, p.length); }
+    if (maxLen > bestLen) { bestLen = maxLen; best = cfg; }
   }
-  return null;
+  return best;
 }
 
 // ══ Hot-reloadable runtime config ═══════════════════════════════════
