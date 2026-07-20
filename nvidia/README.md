@@ -2,9 +2,9 @@
 
 > OpenAI- & Anthropic-compatible transparent proxy for NVIDIA NIM API with multi-key rotation, rate-limit pacing, and per-model failover.
 
-**Version:** 8.6.2  
-**Branch:** audit-2026-07-19  
-**Status:** ✅ Production Ready
+**Version:** 8.6.4  
+**Branch:** fix/mistral-chat-template  
+**Status:** Conditional — audit fixes verified, not yet merged to `main` or deployed (see `AUDIT_REPORT_2026-07-20.md`)
 
 ## Quick Start
 
