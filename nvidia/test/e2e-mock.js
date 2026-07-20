@@ -76,9 +76,21 @@ function mockChat(body, res) {
   const usage = { prompt_tokens: 7, completion_tokens: 12, total_tokens: 19 };
   const hasTools = Array.isArray(body.tools) && body.tools.length > 0;
   const isReasoning = /deepseek/.test(model) || body.chat_template_kwargs || body.reasoning_effort;
+  // Deterministic reasoning-only case (Nemotron-style): upstream emits ONLY a
+  // reasoning_content delta and a blank final content delta — no assistant
+  // text. The wrapper MUST inject a non-empty placeholder so OpenAI-compatible
+  // clients never receive a hollow message (fix 2026-07-20, index.js:2355).
+  const isReasoningOnly = model === 'reasoning-only/model';
 
   if (body.stream) {
     res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', 'Connection': 'keep-alive' });
+    if (isReasoningOnly) {
+      res.write(sseChunk({ choices: [{ delta: { reasoning_content: 'Let me reason about this carefully. ' }, finish_reason: null }] }));
+      res.write(sseChunk({ choices: [{ delta: { content: '', finish_reason: null } }] }));
+      res.write(sseChunk({ choices: [{ delta: {}, finish_reason: 'stop' }], usage }));
+      res.write(sseChunk('[DONE]'));
+      return res.end();
+    }
     if (isReasoning) {
       res.write(sseChunk({ choices: [{ delta: { reasoning_content: 'Let me reason about this carefully. ' }, finish_reason: null }] }));
       res.write(sseChunk({ choices: [{ delta: { content: 'The answer is 42.' }, finish_reason: null }] }));
@@ -295,6 +307,41 @@ async function main() {
       const text = await r.text();
       assert.ok(text.includes('data:') && text.includes('[DONE]'), 'not SSE');
       assert.ok(text.includes('Hello') && text.includes('world'), 'content missing');
+    });
+
+    await check('OpenAI chat: developer role normalized to system (no NIM 500)', async () => {
+      // OpenAI SDK / Codex / Hermes can send a `developer` role. NVIDIA NIM chat
+      // templates reject it (HTTP 500, worse when combined with reasoning
+      // toggles). The OpenAI-path sanitizer must fold developer->system and
+      // merge consecutive system/developer content before egress.
+      const r = await post('/v1/chat/completions', {
+        model: 'meta/llama-3.1-8b-instruct',
+        messages: [
+          { role: 'developer', content: 'Be terse.' },
+          { role: 'system', content: 'You are helpful.' },
+          { role: 'user', content: 'hi' },
+        ],
+      });
+      assert.strictEqual(r.status, 200);
+      assert.ok(lastChatBody, 'mock never received a forwarded chat body');
+      const roles = lastChatBody.messages.map((m) => m.role);
+      assert.ok(!roles.includes('developer'), 'developer role leaked to upstream: ' + JSON.stringify(roles));
+      const sysIdx = roles.indexOf('system');
+      assert.ok(sysIdx >= 0 && roles[sysIdx + 1] !== 'system', 'consecutive system blocks not merged');
+      const merged = roles.filter((x) => x === 'system').length;
+      assert.strictEqual(merged, 1, 'expected a single merged system message, got ' + merged);
+    });
+
+    await check('OpenAI chat stream: reasoning-only upstream -> non-empty placeholder injected', async () => {
+      // Upstream returns ONLY reasoning_content + empty content (Nemotron-style
+      // reasoning-only). The proxy's streaming passthrough must append a final
+      // content chunk with the placeholder so clients never get a hollow message.
+      const r = await post('/v1/chat/completions', { model: 'reasoning-only/model', messages: [{ role: 'user', content: 'hi' }], max_tokens: 50, stream: true, chat_template_kwargs: { enable_thinking: true } });
+      assert.strictEqual(r.status, 200);
+      const text = await r.text();
+      assert.ok(text.includes('[DONE]'), 'missing [DONE]');
+      assert.ok(text.includes('No text response; the model returned reasoning only.'), 'reasoning-only stream did not get non-empty placeholder');
+      assert.ok(text.includes('reasoning_content'), 'reasoning_content not forwarded');
     });
 
     await check('Anthropic messages non-stream', async () => {
