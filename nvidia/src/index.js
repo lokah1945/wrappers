@@ -1401,7 +1401,21 @@ function sanitizeNvidiaPayload(body) {
   
   for (let i = 0; i < body.messages.length; i++) {
     let msg = body.messages[i];
-    
+    // FIX A-1 (OpenAI path): NVIDIA NIM chat templates reject a `developer`
+    // role (HTTP 500, especially combined with chat_template_kwargs reasoning
+    // toggles). Normalize it to `system` so OpenAI SDK / Codex / Hermes
+    // requests that use `developer` never 500 upstream. Consecutive
+    // system/developer messages are merged below to avoid content loss.
+    if (msg && msg.role === 'developer') msg.role = 'system';
+    if (msg && msg.role === 'system' && newMessages.length &&
+        newMessages[newMessages.length - 1].role === 'system') {
+      const prev = newMessages[newMessages.length - 1];
+      const prevText = typeof prev.content === 'string' ? prev.content : '';
+      const curText = typeof msg.content === 'string' ? msg.content : '';
+      prev.content = prevText + '\n\n' + curText;
+      continue;
+    }
+
     if (!isVision && msg.content && Array.isArray(msg.content)) {
       msg.content = msg.content.map(item => {
         if (item && item.type === 'image_url') {
@@ -2288,9 +2302,11 @@ async function handleChatCompletions(body, req, res) {
           }
           const chunkStr = decoder.decode(value, { stream: true });
           try { res.write(chunkStr); } catch { break; }
-          if (chunkStr.includes('choices') || chunkStr.includes('content') || chunkStr.includes('text')) {
-            hasContent = true;
-          }
+          // NOTE: hasContent must track REAL assistant text, not a substring match
+          // on the word 'content' (which would fire on reasoning_content deltas
+          // and wrongly mark a reasoning-only stream as having text). It is
+          // driven by generatedChars (real d.content deltas) below; the
+          // non-empty-content guard uses generatedChars directly.
           // Accumulate emitted text length so we can estimate output tokens
           // accurately when NIM omits a usage chunk (see metrics below).
           for (const line of chunkStr.split('\n')) {
@@ -2299,7 +2315,7 @@ async function handleChatCompletions(body, req, res) {
               try {
                 const c = JSON.parse(t.slice(5).trim());
                 const d = c.choices?.[0]?.delta?.content;
-                if (typeof d === 'string') generatedChars += d.length;
+                if (typeof d === 'string') { generatedChars += d.length; if (d.length) hasContent = true; }
               } catch {}
             }
           }
@@ -2342,6 +2358,21 @@ async function handleChatCompletions(body, req, res) {
           const friendlyMsg = `The context/history for model "${body.model}" is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.`;
           const errChunk = `data: ${JSON.stringify({ error: { message: friendlyMsg, type: 'invalid_request_error' } })}\n\n`;
           try { if (!res.destroyed) res.write(errChunk); } catch {}
+        }
+        // FIX (2026-07-20): guarantee a non-empty assistant message on the
+        // OpenAI-compatible streaming path. NVIDIA Nemotron reasoning can
+        // return a reasoning-only response with EMPTY content (the upstream
+        // emits only reasoning_content deltas and a blank final content).
+        // The non-streaming path guards this via ensureNonemptyContent
+        // (src/index.js:1859); the streaming passthrough must do the same so
+        // Hermes/OpenClaw/OpenAI-SDK clients never receive a hollow message.
+        // Use generatedChars (real assistant text deltas, NOT the substring-
+        // based hasContent flag, which matches reasoning_content) so the
+        // placeholder fires exactly when no text was produced and no tool
+        // calls were emitted.
+        if (generatedChars === 0 && !streamBuffer.includes('"tool_calls"')) {
+          const ph = 'data: ' + JSON.stringify({ choices: [{ index: 0, delta: { content: '[No text response; the model returned reasoning only.]', role: 'assistant' }, finish_reason: 'stop' }], object: 'chat.completion.chunk' }) + '\n\n';
+          try { if (!res.destroyed) res.write(ph); } catch {}
         }
         // Emit exactly ONE canonical data: [DONE] — never a second one
         // even if upstream used a non-canonical spacing variant.

@@ -38,6 +38,7 @@ module.exports = function createResponsesHandler(deps) {
     translateThinkingToNim,
     getDeprecatedRedirectInfo,
     extractInternalReasoning,
+    guardStreamUnsupported,
   } = deps;
 
   function isNvidiaModel(modelId) {
@@ -417,6 +418,23 @@ module.exports = function createResponsesHandler(deps) {
         response: baseResponse(respId, model, 'completed', outputs, usage),
       });
     }
+    // FIX (2026-07-20): guarantee a non-empty assistant message on the
+    // Responses streaming path too. NVIDIA Nemotron reasoning can return a
+    // reasoning-only response with EMPTY content (no final text delta) — the
+    // non-streaming path already guards this via ensureNonemptyContent
+    // (src/index.js:1859), but this streaming path previously emitted an
+    // empty output_text block, which Codex/Hermes treat as a non-delivery.
+    // When no text was streamed AND no tool calls were produced, emit one
+    // placeholder delta so the client contract (output text or tool calls)
+    // always holds.
+    if (!accText && !hasTool) {
+      emit({
+        type: 'response.output_text.delta', sequence_number: nextSeq(),
+        response_id: respId, item_id: msgId, output_index: MSG_INDEX, content_index: 0,
+        delta: '[No text response; the model returned reasoning only.]',
+      });
+      accText = '[No text response; the model returned reasoning only.]';
+    }
     try { res.end(); } catch {}
     return null;
   }
@@ -443,7 +461,7 @@ module.exports = function createResponsesHandler(deps) {
     // Fix E: reject stream=true for non-chat model types (embedding/rerank/
     // image/video/asr/tts/audio/ocr) with a clear 400 instead of forwarding a
     // non-streamable SSE request the upstream rejects confusingly.
-    const streamGuard = guardStreamUnsupported ? guardStreamUnsupported(body, body.model) : null;
+    const streamGuard = guardStreamUnsupported(body, body.model);
     if (streamGuard) {
       return { error: { message: streamGuard.data.error.message, type: streamGuard.data.error.type } };
     }
