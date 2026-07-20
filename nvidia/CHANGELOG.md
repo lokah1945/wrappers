@@ -1,4 +1,65 @@
+## [8.6.4] - 2026-07-20
+
+### Fixed
+
+#### OpenClaw verbatim `extra_body.nvext.stream` and invalid `chat_template_kwargs` 400s (proxy defects)
+**Files:** `src/index.js` (`sanitizeNvext`, `preservedParams`, `proxyOpenai`)
+**Root cause:** the proxy forwarded `extra_body.nvext.stream` verbatim to NIM, which rejects
+`nvext.stream` as an unknown field (400 "Failed to deserialize …"). Separately, for models whose
+reasoning mechanism is `reasoning_effort` / `nemotron_chat_template` (Mistral, Nemotron, gpt-oss,
+kimi, …), the proxy preserved the client's per-model `chat_template_kwargs` verbatim, which NIM
+rejects for those tokenizers (400 "chat_template is not supported for Mistral tokenizers").
+**Fix:** strip `nvext.stream` (keep every other nvext sub-field verbatim) in `sanitizeNvext()`;
+drop client `chat_template_kwargs` when the model mechanism is not `chat_template_kwargs` (delete
+from both `body` and `preservedParams`, because `Object.assign` only adds keys). Verified live on
+`deepseek-ai/deepseek-v4-pro` (nvext.stream) and `mistralai/mistral-large-3-675b-instruct-2512`
+(client ct_kw) — both now return 200.
+**Verified:** unit `node test/test.js` pass; `node test/e2e-mock.js` 27/27; live matrix path re-checks.
+
+### Audit — 2026-07-20 production-readiness (evidence-based, file:line)
+Full source read of every mandated file. BEFORE/AFTER scores (0-100) per aspect, with
+`file:line` evidence, are in `AUDIT_REPORT_2026-07-20.md`:
+
+- Reliability / Infrastructure: **55 -> 92** (`MODEL_TIMEOUT_PROFILES` `src/index.js:879`,
+  model-aware watchdog re-arm `src/index.js:3614`, `ANTI_SILENCE_TIMEOUT_MS=960000` `.env.example`)
+- API surface (OpenAI + Anthropic): **80 -> 95** (`/v1/responses` fix `src/responses_compat.js`)
+- Per-model / publisher capability intelligence: **88 -> 92** (`enrichModelMetadata` `src/index.js:2857`,
+  Nemotron schema `src/index.js:96-106`, deprecated redirects `src/index.js:395`)
+- Verified client compatibility: **70 -> 95** (Codex/Responses 500 fixed `src/responses_compat.js:41,464`)
+- Documentation / automated tests: **82 -> 92**
+
+### Hermes Agent (Codex Responses) fix — verification status
+Commit `96c8c33` (`fix(responses_compat): re-base on HEAD, add reasoning parity, fix error + SSE index bugs`)
+IS on `github/main` but NOT on local `main` (`e06127e`) and NOT on `origin/main`. The live
+`wrapper-nvidia.service` on `:9100` is **INACTIVE** — never deployed with this fix. The fix is
+functional on the audit test server (`:9213`) and is now present on every fix branch, but it has
+NOT been merged to local `main` or deployed to the running service. This report and README_AGENT.md
+state that status plainly.
+
 # Changelog
+
+## [8.6.5] - 2026-07-20
+
+### Fixed
+
+#### Misclassified `llama-3.3-70b-instruct` as a reasoning model (capability metadata defect)
+**Files:** `src/index.js` (`REASONING_CONFIGS`)
+**Root cause:** the broad `'llama-3.3'` pattern matched `meta/llama-3.3-70b-instruct`, a standard
+instruct model with **no** thinking toggle in NVIDIA NIM. This made `/v1/capabilities` advertise
+`supports_reasoning=true` for it and caused the proxy to inject `enable_thinking` into a
+non-reasoning model (risk of an upstream 400 / unexpected behavior).
+**Fix:** scope the pattern to the reasoning-capable Llama families only
+(`llama-4`, `llama-3.3-nemotron`, `llama-3.1-nemotron`). Verified live: `llama-3.3-70b-instruct`
+now reports `supports_reasoning=false` while `nemotron-3-ultra-550b`, `deepseek-v4-pro`, `glm-5.2`,
+and `qwen3.5` correctly stay `true`. `node test/test.js` and `node test/e2e-mock.js` (27/27) pass.
+
+### Audit addendum — 2026-07-20 (evidence-based, file:line)
+Full matrix re-run (`test/matrix_representative.js` vs the fixed code on `:9213`) and a complete
+source re-read confirm the BEFORE/AFTER scores in `AUDIT_REPORT_2026-07-20.md` hold. Hermes/Codex
+Responses fix (`96c8c33`) remains **on `github/main` + every fix branch, NOT on local `main`/`origin/main`**,
+and `wrapper-nvidia.service` (`:9100`) is **inactive (dead)** — the fix is functional on the audit
+test server but not yet deployed. The `8.6.5` capability fix above is an additional, independently
+verified improvement on top of the prior audit.
 
 ## [8.6.3] - 2026-07-19
 
