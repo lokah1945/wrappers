@@ -1530,29 +1530,73 @@ async function proxyOpenai(body, reqHeaders, model, req = null, metricPath = '/v
 
 // Preserve client-owned control params BEFORE the proactive drop. OpenClaw
 // (and similar NIM-native agents) send per-model chat_template_kwargs and
-// extra_body by DEFAULT; we MUST forward them verbatim and never overwrite or
-// discard them. applyDefaultReasoning / translateThinkingToNim only inject a
-// toggle when the client sent NONE, so a client's explicit reasoning config
-// always wins. extra_body is additionally kept whole (we only ever merge its
-// nvext into body.nvext, never delete the client's own body).
+// extra_body by DEFAULT; we forward them verbatim and never overwrite or
+// discard them EXCEPT where the upstream explicitly rejects a field (see
+// sanitizeNvext / the Mistral chat_template_kwargs drop below). A client's
+// explicit reasoning config always wins over applyDefaultReasoning /
+// translateThinkingToNim (which only inject when the client sent NONE).
 const preservedParams = {};
 ["chat_template_kwargs", "reasoning_effort", "extra_body", "nvext"].forEach(p => {
   if (body[p] !== undefined) {
     preservedParams[p] = body[p];
-    console.log(`[proxyOpenai] Preserving ${p}:`, JSON.stringify(body[p]).slice(0, 300));
   }
 });
 
 // Handle extra_body.nvext (merge into body.nvext if present)
 if (body.extra_body && body.extra_body.nvext) {
   preservedParams.nvext = { ...preservedParams.nvext, ...body.extra_body.nvext };
-  console.log('[proxyOpenai] Merged extra_body.nvext into nvext:', JSON.stringify(body.extra_body.nvext));
+}
+
+// FIX G-2: OpenClaw (and NIM-native agents) echo the top-level stream flag
+// inside nvext.stream. NIM's nvext object does NOT accept a `stream` field
+// (it lists `stream` as an unknown field → 400 "Failed to deserialize …").
+// The streaming decision is carried by the top-level `stream` boolean, so we
+// strip nvext.stream (keeping every other nvext sub-field verbatim, e.g.
+// greed_sampling, max_thinking_tokens, routing_constraints) instead of
+// forwarding a field the upstream rejects.
+function sanitizeNvext(obj) {
+  if (!obj || typeof obj !== 'object') return obj;
+  if ('stream' in obj) {
+    const { stream, ...rest } = obj;
+    console.warn('[proxyOpenai] Dropping nvext.stream (not a valid NIM nvext field; stream is carried by top-level stream):', JSON.stringify(stream));
+    return rest;
+  }
+  return obj;
+}
+if (preservedParams.nvext && typeof preservedParams.nvext === 'object') {
+  preservedParams.nvext = sanitizeNvext(preservedParams.nvext);
+}
+if (preservedParams.extra_body && preservedParams.extra_body.nvext) {
+  const cleaned = sanitizeNvext(preservedParams.extra_body.nvext);
+  if (cleaned && Object.keys(cleaned).length === 0) delete preservedParams.extra_body.nvext;
+  else preservedParams.extra_body = { ...preservedParams.extra_body, nvext: cleaned };
 }
 
 // Proactive drop: silently remove known-incompatible params (after defaults so the drop always wins)
 for (const p of PROACTIVE_DROP) {
   if (["chat_template_kwargs", "reasoning_effort", "nvext"].includes(p)) continue;
   delete body[p];
+}
+
+// FIX G-1: For models whose reasoning mechanism is reasoning_effort or
+// nemotron_chat_template, the proxy already injects the correct NIM toggle
+// (reasoning_effort / chat_template_kwargs with force_nonempty_content).
+// A client-sent chat_template_kwargs (e.g. OpenClaw's per-model default
+// {enable_thinking:false,temperature:0.7}) is INVALID for those models and
+// triggers a 400 ("chat_template is not supported for Mistral tokenizers",
+// or an unknown-field error for Nemotron). Drop the client chat_template_kwargs
+// here so only the proxy's mechanism-correct toggle is forwarded. We KEEP the
+// client chat_template_kwargs verbatim when the model mechanism is itself
+// chat_template_kwargs (deepseek/glm/qwen/kimi/minimax own that schema).
+const _reasoningMechanism = (findReasoningConfig(modelId) || {}).mechanism;
+if (preservedParams.chat_template_kwargs !== undefined &&
+    _reasoningMechanism && _reasoningMechanism !== 'chat_template_kwargs') {
+  // body was restored from primaryBody (which carried the client ct_kw), so we
+  // must delete from BOTH body and preservedParams — Object.assign only ADDS
+  // keys and would otherwise leave the invalid ct_kw on body.
+  console.warn(`[proxyOpenai] Dropping client chat_template_kwargs for model ${modelId} (mechanism=${_reasoningMechanism} already injects the correct toggle)`);
+  delete preservedParams.chat_template_kwargs;
+  delete body.chat_template_kwargs;
 }
 
 // Restore preserved params
