@@ -88,7 +88,13 @@ const REASONING_CONFIGS = [
   // Phi-4 reasoning variants.
   { patterns: ['phi-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['yi-'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
-  { patterns: ['llama-3.3', 'llama-3.2', 'llama-4'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
+  // Llama-4 has native thinking variants (Maverick/Scout) that accept the
+  // chat_template_kwargs enable_thinking toggle. Llama-3.3-70B-Instruct is a
+  // STANDARD instruct model (no thinking toggle in NIM) — the previous broad
+  // 'llama-3.3' pattern wrongly flagged it supports_reasoning=true and made
+  // the proxy inject enable_thinking into a non-reasoning model. Scope the
+  // pattern to the actual reasoning-capable Llama families only.
+  { patterns: ['llama-4', 'llama-3.3-nemotron', 'llama-3.1-nemotron'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   { patterns: ['gemma-3'], mechanism: 'chat_template_kwargs', params: { enable_thinking: true }, requires_reasoning: false },
   // reasoning_effort families (NIM accepts `reasoning_effort` for these). Nemotron
   // is intentionally excluded here — it has its own schema below.
