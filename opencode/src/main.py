@@ -14,6 +14,7 @@ Production features:
 import os
 import json
 import time
+import threading
 import asyncio
 import logging
 from typing import Optional, Dict, Any
@@ -45,7 +46,7 @@ BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
-VERSION = '1.0.3-opencode-zen'
+VERSION = '1.0.4-dynamic-alias'
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""
@@ -77,23 +78,14 @@ def model_allowed(model_id: str) -> bool:
         return True
     if not model_id:
         return False
-    # Check raw id and alias-normalized form
-    raw = str(model_id)
-    if is_free_model(raw):
-        return True
-    # strip opencode/ prefix
+    raw = str(model_id).strip()
     if raw.lower().startswith('opencode/'):
         raw = raw.split('/', 1)[1]
-    if is_free_model(raw):
-        return True
-    # known aliases map
-    aliases = {
-        'sonnet': os.environ.get('ALIAS_SONNET', 'claude-sonnet-4-6'),
-        'opus': os.environ.get('ALIAS_OPUS', 'claude-opus-4-6'),
-        'haiku': os.environ.get('ALIAS_HAIKU', 'claude-haiku-4-5'),
-    }
-    target = aliases.get(raw.lower(), raw)
-    return is_free_model(target)
+    if is_alias_name(raw):
+        tgt = get_dynamic_alias_target()
+        return bool(tgt) and is_free_model(tgt)
+    return is_free_model(raw)
+
 
 def free_only_error(model_id: str) -> dict:
     return {
@@ -119,6 +111,42 @@ def free_only_anthropic_error(model_id: str) -> dict:
             'message': free_only_error(model_id)['error']['message'],
         },
     }
+
+# Dynamic aliases: NO hardcoded model targets.
+# Calling minimaxai/minimax-m3 or z-ai/glm-5.2 binds sonnet/haiku/opus/claude-* to that id.
+_ALIAS_NAME_SET = {
+    'sonnet', 'opus', 'haiku',
+    'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5',
+    'claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-4-20250514',
+    'claude-sonnet-4', 'claude-opus-4', 'claude-haiku-4',
+    'claude-sonnet', 'claude-opus', 'claude-haiku',
+    'claude-3-5-sonnet-20241022', 'claude-3-5-haiku-20241022',
+}
+_dynamic_alias_target = ''
+_dynamic_alias_lock = threading.Lock()
+
+def is_alias_name(model_id: str) -> bool:
+    if not model_id:
+        return False
+    return str(model_id).lower().strip() in _ALIAS_NAME_SET
+
+def get_dynamic_alias_target() -> str:
+    with _dynamic_alias_lock:
+        return _dynamic_alias_target or ''
+
+def set_dynamic_alias_target(model_id: str) -> None:
+    global _dynamic_alias_target
+    if not model_id or is_alias_name(model_id):
+        return
+    mid = str(model_id).strip()
+    if mid.lower().startswith('opencode/'):
+        mid = mid.split('/', 1)[1]
+    if not mid:
+        return
+    with _dynamic_alias_lock:
+        if _dynamic_alias_target != mid:
+            logger.info(f'[alias] dynamic target bound → {mid}')
+        _dynamic_alias_target = mid
 
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 ANTI_SILENCE = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
@@ -157,28 +185,30 @@ async def get_session():
 def _zen_family(model: str) -> str:
     """Map model id → Zen endpoint family per https://opencode.ai/docs/zen/"""
     m = (model or '').lower().strip()
-    # strip opencode/ prefix if client sends it
     if m.startswith('opencode/'):
         m = m[len('opencode/'):]
+    # Aliases route by the bound concrete target, never by a hardcoded map
+    if is_alias_name(m):
+        tgt = get_dynamic_alias_target()
+        if not tgt:
+            return 'chat'
+        m = tgt.lower().strip()
     if m.startswith('gpt-') or m in ('gpt-5',):
         return 'responses'
-    if m.startswith('claude-') or m in ('sonnet', 'opus', 'haiku'):
+    if m.startswith('claude-'):
         return 'messages'
     if m.startswith('gemini-'):
         return 'google'
-    # grok, deepseek, minimax, glm, kimi, qwen (some qwen on messages — see docs), free models, etc.
     if m.startswith('qwen3.') or m.startswith('qwen3-') or m.startswith('qwen3'):
-        # Zen serves Qwen3.x via Anthropic messages endpoint
         return 'messages'
     return 'chat'
 
-def _normalize_model(model: str) -> str:
-    """Transparent model pass-through.
 
-    - Does NOT inject DEFAULT_MODEL / DEFAULT_FREE_MODEL.
-    - Strips optional `opencode/` prefix only.
-    - Optional short aliases (sonnet/opus/haiku) if configured.
-    - FREE_ONLY never rewrites the client's choice.
+def _normalize_model(model: str) -> str:
+    """Transparent pass-through + dynamic aliases (no hardcoded targets).
+
+    Concrete id (minimaxai/minimax-m3, z-ai/glm-5.2, ...) passes through and
+    binds all aliases. Alias names resolve to the current bound target only.
     """
     if model is None:
         return ""
@@ -187,14 +217,12 @@ def _normalize_model(model: str) -> str:
         return ""
     if m.lower().startswith('opencode/'):
         m = m.split('/', 1)[1]
-    aliases = {
-        'sonnet': os.environ.get('ALIAS_SONNET', 'claude-sonnet-4-6'),
-        'opus': os.environ.get('ALIAS_OPUS', 'claude-opus-4-6'),
-        'haiku': os.environ.get('ALIAS_HAIKU', 'claude-haiku-4-5'),
-        'claude-sonnet-4-20250514': 'claude-sonnet-4-6',
-        'claude-opus-4-20250514': 'claude-opus-4-6',
-    }
-    return aliases.get(m.lower(), m)
+    if is_alias_name(m):
+        tgt = get_dynamic_alias_target()
+        return tgt if tgt else m
+    set_dynamic_alias_target(m)
+    return m
+
 
 def _normalize_upstream_error(status: int, text_or_data) -> dict:
     """Single OpenAI-shaped error; unwrap nested JSON string messages."""
@@ -517,7 +545,10 @@ async def lifespan(app: FastAPI):
     global _session
     pool.load_from_env()
     start_env_watcher()
-    logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE}")
+    seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
+    if seed:
+        set_dynamic_alias_target(seed)
+    logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE} alias_target={get_dynamic_alias_target() or 'none'}")
     yield
     if _session is not None and not _session.closed:
         await _session.close()
@@ -536,7 +567,7 @@ def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "base": OPENCODE_BASE}
+    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE}
 
 @app.get("/v1/models")
 async def models(request: Request):
@@ -573,12 +604,17 @@ async def models(request: Request):
             return fallback
         # inject aliases (respect FREE_ONLY)
         ids = {m.get('id') for m in (data.get('data') or [])}
+        tgt = get_dynamic_alias_target()
         for a in ("sonnet", "opus", "haiku"):
             if a not in ids and model_allowed(a):
-                (data.setdefault('data', [])).append({"id": a, "object": "model", "owned_by": "alias"})
+                entry = {"id": a, "object": "model", "owned_by": "alias", "dynamic_alias": True}
+                if tgt:
+                    entry["rooted_model"] = tgt
+                (data.setdefault('data', [])).append(entry)
         if free_only_enabled():
             data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
         data['free_only'] = free_only_enabled()
+        data['dynamic_alias_target'] = tgt or None
         return data
     except Exception as e:
         pool.release(key)

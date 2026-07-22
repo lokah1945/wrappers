@@ -248,28 +248,19 @@ DEPRECATED_MODEL_REDIRECTS = {
     'nvidia/llama-3.3-nemotron-super-49b-v1': 'nvidia/llama-3.3-nemotron-super-49b-v1.5',
 }
 
-ALIAS_TO_NIM = {}
-DISCOVERY_TO_NIM = {}
-DISCOVERY_PREFIX = 'claude-'
-_unavailable_models: set = set()
-_retired_models: set = set()
-_sse_clients: set = set()
-_in_flight = 0
 
 DEFAULT_PARAMS = {}
 PROACTIVE_DROP = set()
-_WRAPPER_PARAMS = (os.environ.get('WRAPPER_PARAMS', 'temperature,top_p').split(',') if os.environ.get('WRAPPER_PARAMS') else ['temperature', 'top_p'])
-for _p in _WRAPPER_PARAMS:
+for _p in (os.environ.get('WRAPPER_PARAMS') or '').split(','):
     _p = _p.strip()
-    if _p:
-        _dv = os.environ.get(f'DEFAULT_{_p.upper()}')
-        if _dv:
-            DEFAULT_PARAMS[_p] = _dv
+    if not _p:
+        continue
+    _dv = os.environ.get(f'DEFAULT_{_p.upper()}')
+    if _dv is not None:
+        DEFAULT_PARAMS[_p] = _dv
 PROACTIVE_DROP = set((os.environ.get('DROP_PARAMS', 'think').split(',') if os.environ.get('DROP_PARAMS') else ['think']))
 PROACTIVE_DROP.update(['context_length', 'context_window', 'context_len', 'max_position_embeddings', 'max_context_length', 'max_input_tokens', 'max_output_tokens', 'token_limit'])
-
 PROTECTED_PARAMS = {'messages', 'model', 'stream', 'tools', 'tool_choice', 'system'}
-
 
 def find_reasoning_config(model_id: str) -> Optional[dict]:
     m = (model_id or '').lower()
@@ -398,6 +389,29 @@ def _strip_context_suffix(model_id: str) -> str:
         return model_id
     return re_module.sub(r'\[[0-9]+[mk]?\]$', '', model_id).strip()
 
+ALIAS_TO_NIM = {}  # kept for metrics/debug: maps alias -> last dynamic target (informational)
+DISCOVERY_TO_NIM = {}
+DISCOVERY_PREFIX = 'claude-'
+
+# Canonical Claude Code / Anthropic short names — NEVER hardcode a backing model.
+# They resolve at request-time to the last concrete model the client called
+# (e.g. minimaxai/minimax-m3 or z-ai/glm-5.2). Fully dynamic.
+_ALIAS_NAME_SET = {
+    'haiku', 'sonnet', 'opus',
+    'claude-haiku', 'claude-sonnet', 'claude-opus',
+    'claude-3-5-haiku', 'claude-3-5-sonnet', 'claude-3-opus',
+    'claude-3-haiku', 'claude-3-sonnet',
+    'claude-3-5-haiku-latest', 'claude-3-5-sonnet-latest',
+    'claude-3-5-haiku-20241022', 'claude-3-5-sonnet-20241022',
+    'claude-haiku-4-5', 'claude-sonnet-4-5', 'claude-opus-4-5',
+    'claude-haiku-4-5-latest', 'claude-sonnet-4-5-latest', 'claude-opus-4-5-latest',
+    'claude-sonnet-4', 'claude-opus-4', 'claude-haiku-4',
+    'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-1', 'claude-opus-4-8',
+    'claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-4-20250514',
+}
+_dynamic_alias_target: str = ''  # last concrete model id seen from any client request
+_dynamic_alias_lock = threading.Lock()
+
 
 def _norm_alias_key(s: str) -> str:
     return (s or '').lower().strip()
@@ -412,113 +426,66 @@ def _is_valid_nim_alias_target(id: str) -> bool:
     return bool(re_module.match(r'^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$', s))
 
 
-def _pick_alias_target(env_keys: list, fallback: str, family: str, pool: 'KeyPool' = None) -> str:
-    """Resolve Claude Code alias target.
+def is_alias_name(model_id: str) -> bool:
+    """True if model_id is a virtual alias (sonnet/haiku/claude-*), not a concrete provider id."""
+    if not model_id or not isinstance(model_id, str):
+        return False
+    key = _norm_alias_key(_strip_context_suffix(model_id) or model_id)
+    if key in _ALIAS_NAME_SET:
+        return True
+    # discovery form claude-<org>-<name> is handled separately
+    if key.startswith('claude-') and '/' not in key:
+        # bare claude-* without slash is treated as alias unless it is a discovery reverse map hit
+        return True
+    return False
 
-    Prefer explicit env override, else fallback if present in catalog, else a
-    small known-good instruct model so aliases never hang on huge/retired ids.
-    """
-    for k in env_keys:
-        v = os.environ.get(k)
-        if not v:
-            continue
-        if _is_valid_nim_alias_target(v):
-            return v.strip()
-        logger.warning(f'[alias] Ignoring invalid {family} alias from {k}="{v}". Using default {fallback}')
 
-    cached = []
-    try:
-        if pool is not None:
-            cached = list(getattr(pool, 'models_cached', None) or [])
-    except Exception:
-        cached = []
-    cached_l = {str(x).lower() for x in cached}
+def get_dynamic_alias_target() -> str:
+    with _dynamic_alias_lock:
+        return _dynamic_alias_target or ''
 
-    def _available(mid: str) -> bool:
-        if not mid:
-            return False
-        if not cached_l:
-            return True  # catalog not warm yet — accept fallback
-        return mid.lower() in cached_l
 
-    if _available(fallback):
-        return fallback
-
-    # Family-oriented safe candidates (fast → larger)
-    candidates = {
-        'haiku': [
-            'meta/llama-3.1-8b-instruct',
-            'meta/llama-3.2-3b-instruct',
-            'google/gemma-2-9b-it',
-            'mistralai/mistral-7b-instruct-v0.3',
-        ],
-        'sonnet': [
-            'meta/llama-3.3-70b-instruct',
-            'meta/llama-3.1-70b-instruct',
-            'meta/llama-3.1-8b-instruct',
-            'mistralai/mistral-nemotron',
-        ],
-        'opus': [
-            'meta/llama-3.1-405b-instruct',
-            'meta/llama-3.3-70b-instruct',
-            'meta/llama-3.1-70b-instruct',
-            'meta/llama-3.1-8b-instruct',
-        ],
-    }.get(family, ['meta/llama-3.1-8b-instruct'])
-
-    for c in candidates:
-        if _available(c):
-            logger.info(f'[alias] {family}: fallback {fallback} unavailable; using {c}')
-            return c
-    # Last resort: first chat-looking cached model
-    for mid in cached:
-        s = str(mid)
-        if _is_valid_nim_alias_target(s) and 'embed' not in s.lower() and 'image' not in s.lower():
-            logger.info(f'[alias] {family}: using catalog model {s}')
-            return s
-    return fallback or 'meta/llama-3.1-8b-instruct'
+def set_dynamic_alias_target(model_id: str) -> None:
+    """Bind all aliases to this concrete model (called when client uses a real model id)."""
+    global _dynamic_alias_target, ALIAS_TO_NIM
+    if not model_id or is_alias_name(model_id):
+        return
+    mid = str(model_id).strip()
+    if not mid:
+        return
+    with _dynamic_alias_lock:
+        if _dynamic_alias_target != mid:
+            logger.info(f'[alias] dynamic target bound → {mid} (all aliases now resolve here)')
+        _dynamic_alias_target = mid
+        # refresh informational map for metrics/debug
+        ALIAS_TO_NIM = {a: mid for a in _ALIAS_NAME_SET}
 
 
 def load_alias_config(pool: KeyPool = None):
-    global ALIAS_TO_NIM, DISCOVERY_TO_NIM
-    haiku = _pick_alias_target(['CLAUDE_CODE_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], 'meta/llama-3.1-8b-instruct', 'haiku', pool)
-    # Small default targets keep Claude Code aliases responsive; override via env if desired.
-    sonnet = _pick_alias_target(['CLAUDE_CODE_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL'], 'meta/llama-3.1-8b-instruct', 'sonnet', pool)
-    opus = _pick_alias_target(['CLAUDE_CODE_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'], 'meta/llama-3.1-8b-instruct', 'opus', pool)
+    """No hardcoded alias→model map.
 
-    mapping = {
-        'haiku': haiku, 'sonnet': sonnet, 'opus': opus,
-        'claude-haiku': haiku, 'claude-sonnet': sonnet, 'claude-opus': opus,
-        'claude-3-5-haiku': haiku, 'claude-3-5-sonnet': sonnet, 'claude-3-opus': opus,
-        'claude-3-haiku': haiku, 'claude-3-sonnet': sonnet,
-        'claude-3-5-haiku-latest': haiku, 'claude-3-5-sonnet-latest': sonnet,
-        'claude-3-5-haiku-20241022': haiku, 'claude-3-5-sonnet-20241022': sonnet,
-        'claude-haiku-4-5': haiku, 'claude-sonnet-4-5': sonnet, 'claude-opus-4-5': opus,
-        'claude-haiku-4-5-latest': haiku, 'claude-sonnet-4-5-latest': sonnet, 'claude-opus-4-5-latest': opus,
-        'claude-sonnet-4': sonnet, 'claude-opus-4': opus, 'claude-haiku-4': haiku,
-    }
-
-    extra = os.environ.get('ANTHROPIC_ALIAS_MAP')
-    if extra:
-        try:
-            parsed = json.loads(extra)
-            for k, v in parsed.items():
-                if k and v:
-                    mapping[_norm_alias_key(k)] = v
-        except (json.JSONDecodeError, ValueError) as e:
-            logger.warning(f'[alias] Failed to parse ANTHROPIC_ALIAS_MAP: {e}')
-
-    ALIAS_TO_NIM = mapping
+    Optional env seed only (operator choice, not code hardcode):
+      DYNAMIC_ALIAS_TARGET=minimaxai/minimax-m3
+    Discovery reverse-map still built from catalog (claude-org-name → org/name).
+    """
+    global DISCOVERY_TO_NIM, ALIAS_TO_NIM
+    seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or os.environ.get('ALIAS_DYNAMIC_TARGET') or '').strip()
+    if seed and not is_alias_name(seed):
+        set_dynamic_alias_target(seed)
+    else:
+        # Keep map empty or pointing at current dynamic target
+        tgt = get_dynamic_alias_target()
+        ALIAS_TO_NIM = {a: tgt for a in _ALIAS_NAME_SET} if tgt else {}
 
     all_ids = set((pool.models_cached if pool else []) or [])
     for c in CURATED_GENAI:
         all_ids.add(c)
     discovery_map = {}
     for id_val in all_ids:
-        if id_val:
-            discovery_map[discovery_alias(id_val)] = id_val
+        if id_val and not is_alias_name(str(id_val)):
+            discovery_map[discovery_alias(str(id_val))] = str(id_val)
     DISCOVERY_TO_NIM = discovery_map
-    logger.info(f'[alias] haiku={haiku} sonnet={sonnet} opus={opus}')
+    logger.info(f'[alias] dynamic mode on | target={get_dynamic_alias_target() or "(none yet — aliases pass through until a concrete model is called)"} | discovery={len(DISCOVERY_TO_NIM)}')
 
 
 def discovery_alias(nim_id: str) -> str:
@@ -526,17 +493,39 @@ def discovery_alias(nim_id: str) -> str:
 
 
 def resolve_target_model(requested_model: str) -> str:
+    """Transparent resolve with dynamic aliases.
+
+    - Concrete id (minimaxai/minimax-m3, z-ai/glm-5.2, ...) → pass through AND bind aliases to it.
+    - Alias (sonnet/haiku/opus/claude-*) → resolve to current dynamic target if bound; else pass through unchanged.
+    - No hardcoded default model under any alias.
+    """
     m = _strip_context_suffix(requested_model)
     if not m:
-        return requested_model
+        return requested_model or ''
     lower = m.lower()
+
+    # Discovery reverse: claude-meta-llama-3.1-8b-instruct → meta/llama-3.1-8b-instruct
     if m.startswith(DISCOVERY_PREFIX) and DISCOVERY_TO_NIM.get(m):
-        return DISCOVERY_TO_NIM[m]
-    if lower in ALIAS_TO_NIM:
-        return ALIAS_TO_NIM[lower]
+        concrete = DISCOVERY_TO_NIM[m]
+        set_dynamic_alias_target(concrete)
+        return concrete
+
+    # Deprecated catalog renames (provider-level, not alias hardcode)
     redirect = resolve_deprecated_redirect(m)
     if redirect:
+        set_dynamic_alias_target(redirect)
         return redirect
+
+    # Virtual alias names → dynamic target
+    if is_alias_name(m) or lower in _ALIAS_NAME_SET:
+        tgt = get_dynamic_alias_target()
+        if tgt:
+            return tgt
+        # No concrete model bound yet — do not invent one; pass alias through
+        return m
+
+    # Concrete provider model id
+    set_dynamic_alias_target(m)
     return m
 
 
@@ -923,7 +912,17 @@ class Server:
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = await self.metrics.get_model_status()
             enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
-            return {'object': 'list', 'data': enriched}
+            # Dynamic aliases: expose short names bound to current concrete target (if any)
+            tgt = get_dynamic_alias_target()
+            if tgt:
+                seen = {e.get('id') for e in enriched}
+                for alias in ('haiku', 'sonnet', 'opus'):
+                    if alias not in seen:
+                        enriched.append({
+                            'id': alias, 'object': 'model', 'owned_by': 'alias',
+                            'rooted_model': tgt, 'dynamic_alias': True,
+                        })
+            return {'object': 'list', 'data': enriched, 'dynamic_alias_target': tgt or None}
 
         @app.get('/v1/models/{model_id:path}')
         async def model_info(model_id: str, request: Request):

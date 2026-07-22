@@ -24,6 +24,7 @@ import json
 import time
 import random
 import asyncio
+import threading
 import logging
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from contextlib import asynccontextmanager
@@ -59,7 +60,7 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.4-production"
+VERSION = "2.0.5-dynamic-alias"
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only expose/allow models whose id contains 'free'."""
@@ -91,7 +92,7 @@ def model_allowed(model_id: str) -> bool:
     if not model_id:
         return False
     # Alias key itself or resolved target must contain 'free'
-    resolved = MODEL_ALIASES.get(str(model_id).lower(), model_id)
+    resolved = resolve_model(model_id) if model_id else model_id
     return is_free_model(model_id) or is_free_model(resolved)
 
 def free_only_error(model_id: str) -> dict:
@@ -121,44 +122,83 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s")
 logger = logging.getLogger("wrapper-nous")
 
 # --------------------------------------------------------------------------
-# MODEL ALIASES + METADATA (rich for 100/100 + Claude Code)
+# DYNAMIC ALIASES — no hardcoded model targets
 # --------------------------------------------------------------------------
-MODEL_ALIASES = {
-    "claude-sonnet-4-20250514": REASONING_MODEL,
-    "claude-opus-4-20250514": REASONING_MODEL,
-    "claude-haiku-4-20250514": DEFAULT_MODEL,
-    "claude-sonnet-4-6": REASONING_MODEL,
-    "claude-opus-4-8": REASONING_MODEL,
-    "claude-haiku-4-5": DEFAULT_MODEL,
-    "sonnet": REASONING_MODEL,
-    "opus": REASONING_MODEL,
-    "haiku": DEFAULT_MODEL,
-    "claude-3-5-sonnet-20241022": REASONING_MODEL,
+# Virtual Claude Code / Anthropic short names. They NEVER point to a fixed model.
+# When the client calls a concrete model (e.g. tencent/hy3:free, poolside/...),
+# all aliases below bind dynamically to that concrete id for subsequent requests.
+_ALIAS_NAME_SET = {
+    "sonnet", "opus", "haiku",
+    "claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514",
+    "claude-sonnet-4-6", "claude-opus-4-8", "claude-haiku-4-5",
+    "claude-3-5-sonnet-20241022", "claude-3-5-haiku-20241022",
+    "claude-sonnet-4", "claude-opus-4", "claude-haiku-4",
+    "claude-sonnet", "claude-opus", "claude-haiku",
 }
+_dynamic_alias_target: str = ""
+_dynamic_alias_lock = threading.Lock()
 
+# Optional static metadata for known upstream free models (display only)
 MODEL_METADATA = {
     "tencent/hy3:free": {"context_window": 128000, "max_tokens": 4096, "supports_vision": False, "supports_tools": True, "reasoning": True},
     "poolside/laguna-s-2.1:free": {"context_window": 1048576, "max_tokens": 131072, "supports_vision": False, "supports_tools": True, "reasoning": True},
 }
 
-def resolve_model(m: str) -> str:
-    """Transparent model pass-through.
+def is_alias_name(model_id: str) -> bool:
+    if not model_id:
+        return False
+    return str(model_id).lower().strip() in _ALIAS_NAME_SET
 
-    - Empty/missing → returned as-is (no DEFAULT_MODEL injection).
-    - Known aliases (sonnet/haiku/...) → mapped; everything else unchanged.
-    - FREE_ONLY never rewrites the client's model choice.
+def get_dynamic_alias_target() -> str:
+    with _dynamic_alias_lock:
+        return _dynamic_alias_target or ""
+
+def set_dynamic_alias_target(model_id: str) -> None:
+    global _dynamic_alias_target
+    if not model_id or is_alias_name(model_id):
+        return
+    mid = str(model_id).strip()
+    if not mid:
+        return
+    with _dynamic_alias_lock:
+        if _dynamic_alias_target != mid:
+            logger.info(f"[alias] dynamic target bound → {mid}")
+        _dynamic_alias_target = mid
+
+def resolve_model(m: str) -> str:
+    """Transparent pass-through + dynamic aliases.
+
+    - Concrete id → pass through AND bind all aliases to it.
+    - Alias (sonnet/haiku/...) → current dynamic target if bound; else pass through unchanged.
+    - Never inject DEFAULT_MODEL / REASONING_MODEL as a hidden default.
     """
     if not m:
         return m or ""
-    return MODEL_ALIASES.get(str(m).lower(), m)
+    key = str(m).lower().strip()
+    if is_alias_name(key):
+        tgt = get_dynamic_alias_target()
+        return tgt if tgt else m
+    # concrete
+    set_dynamic_alias_target(m)
+    return m
 
 def get_model_meta(mid: str) -> dict:
-    m = resolve_model(mid)
-    base = {"id": m, "object": "model", "created": 0, "owned_by": "nous", "context_window": 128000, "max_tokens": 4096}
-    if m in MODEL_METADATA:
-        base.update(MODEL_METADATA[m])
-    if m == REASONING_MODEL:
-        base["aliases"] = ["claude-sonnet-4-6", "sonnet", "opus"]
+    # Preserve requested id in listing; rooted_model shows dynamic bind if alias
+    rooted = resolve_model(mid) if mid else mid
+    base = {
+        "id": mid,
+        "object": "model",
+        "created": 0,
+        "owned_by": "alias" if is_alias_name(mid) else "nous",
+        "context_window": 128000,
+        "max_tokens": 4096,
+    }
+    concrete = rooted if not is_alias_name(rooted) else get_dynamic_alias_target()
+    if concrete and concrete in MODEL_METADATA:
+        base.update(MODEL_METADATA[concrete])
+    if is_alias_name(mid) and concrete:
+        base["rooted_model"] = concrete
+        base["dynamic_alias"] = True
     return base
 
 # --------------------------------------------------------------------------
@@ -700,6 +740,9 @@ def check_rate_limit(ip: str):
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    seed = (os.environ.get("DYNAMIC_ALIAS_TARGET") or "").strip()
+    if seed:
+        set_dynamic_alias_target(seed)
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
     yield
     if _session and not _session.closed:
@@ -724,7 +767,7 @@ async def health():
         upstream = code == 200
     except:
         upstream = False
-    return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "metrics": metrics.snapshot()}
+    return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "metrics": metrics.snapshot()}
 
 @app.get("/version")
 async def version(): return {"version": VERSION}
@@ -740,12 +783,18 @@ async def models():
         data = {"data": []}
 
     models_list = data.get("data", []) if isinstance(data, dict) else []
-    for alias, real in MODEL_ALIASES.items():
-        # Under FREE_ONLY only inject aliases that resolve to a free model
-        if free_only_enabled() and not (is_free_model(alias) or is_free_model(real)):
-            continue
+    # Inject dynamic aliases (bound to last concrete model if any)
+    tgt = get_dynamic_alias_target()
+    for alias in sorted(_ALIAS_NAME_SET):
+        if free_only_enabled():
+            # only show alias if current dynamic target is free (or target unset → skip under FREE_ONLY)
+            if not tgt or not (is_free_model(alias) or is_free_model(tgt)):
+                continue
         if not any(m.get("id") == alias for m in models_list):
-            models_list.append({"id": alias, "object": "model", "created": 0, "owned_by": "anthropic"})
+            entry = {"id": alias, "object": "model", "created": 0, "owned_by": "alias", "dynamic_alias": True}
+            if tgt:
+                entry["rooted_model"] = tgt
+            models_list.append(entry)
     if free_only_enabled():
         models_list = [m for m in models_list if model_allowed(m.get("id", ""))]
     # Deduplicate by id (upstream + aliases can repeat free models)
@@ -762,7 +811,7 @@ async def models():
     for i, m in enumerate(deduped):
         if isinstance(enriched[i], dict):
             enriched[i]["id"] = m.get("id")
-    return {"object": "list", "data": enriched, "free_only": free_only_enabled()}
+    return {"object": "list", "data": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None}
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):
