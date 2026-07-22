@@ -54,6 +54,20 @@ nvidia/.env.bkp
 nvidia/.env.bos-audit-*.bak
 nvidia/.env.pre-stable-*.bak
 
+# Python caches (global)
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+dist/
+build/
+
 # DB files
 netrics.db
 netrics.db-*

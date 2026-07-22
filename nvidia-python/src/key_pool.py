@@ -450,7 +450,7 @@ class KeyPool:
 
         # Load shedding check (safe outside lock)
         load_shedding_enabled = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
-        inflight_soft_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '50'))
+        inflight_soft_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
         if load_shedding_enabled:
             total_in_flight = sum(k.in_flight for k in self.keys)
             if total_in_flight >= inflight_soft_cap:

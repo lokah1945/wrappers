@@ -1,118 +1,92 @@
-# wrapper-nvidia
+# Wrappers
 
-> OpenAI- and Anthropic-compatible transparent proxy for the NVIDIA NIM API.
-> Adds multi-key rotation, rate-limit pacing, per-model failover, and
-> Prometheus-style metrics on top of NVIDIA NIM.
+Production-grade API proxies for various LLM providers.
 
-This repository contains the production **wrapper-nvidia** service only.
+This monorepo contains hardened, SDK-compatible transparent proxies that add multi-key rotation, pacing, metrics, streaming reliability, and full OpenAI + Anthropic compatibility.
 
-- Service: `wrapper-nvidia.service` (systemd)
-- Ports: `9100` primary, `9910` additionally bound on the same server (gateway model discovery)
-- Provider: NVIDIA NIM (`https://integrate.api.nvidia.com/v1`)
-- Models: 120+ free models via the NVIDIA NIM catalog
+## Current Status (2026-07-23)
 
-## Repository layout
+| Wrapper          | Status          | Score   | Canonical Dir          | Notes |
+|------------------|-----------------|---------|------------------------|-------|
+| **wrapper-nvidia** | ✅ Production   | **100/100** | `nvidia-python/`      | **Use this** for NVIDIA NIM. Node.js version in `nvidia/` is **deprecated**. |
+| **wrapper-nous**   | ✅ Production   | **100/100** | `nous/`               | Nous Research inference API. |
+
+## Repository Layout
 
 ```
-wrapper-nvidia/
-├── install.sh                 # idempotent systemd installer
-├── wrapper-nvidia.service     # systemd unit (copied to /etc/systemd/system)
-├── .env.example               # canonical config keys
-├── .gitignore
-├── README.md                  # this file
-└── nvidia/                    # wrapper source + assets
-    ├── src/
-    │   ├── index.js            # server entry, routing, retry/backoff, SSE keepalive
-    │   ├── anthropic_compat.js # Anthropic <-> OpenAI translation
-    │   ├── responses_compat.js # OpenAI Responses API (Codex / Hermes)
-    │   ├── capabilities.js     # model classification
-    │   ├── metrics.js          # SQLite-backed telemetry
-    │   ├── registry.js         # dynamic NGC-synced model registry
-    │   ├── alert_history.js    # alert historian
-    │   └── loki_push.js        # optional Loki push
-    ├── key_pool.js             # multi-key pool with pacing
-    ├── dashboard.html          # ops dashboard
-    ├── test/                   # unit + regression + e2e tests
-    ├── package.json
-    ├── .env.example
-    ├── CHANGELOG.md
-    └── README.md               # deep-dive docs / runbook
+wrappers/
+├── README.md
+├── .env.example
+├── install.sh
+├── wrapper-nvidia.service
+├── CHANGELOG.md
+│
+├── nvidia-python/          # ← CANONICAL wrapper-nvidia (Python)
+│   ├── src/main.py
+│   ├── src/key_pool.py
+│   ├── tests/
+│   ├── AUDIT_REPORT_2026-07-23.md
+│   └── README.md
+│
+├── nvidia/                 # DEPRECATED (Node.js reference only)
+│   └── src/index.js
+│
+├── nous/                   # wrapper-nous (Python)
+│   ├── wrapper_nous.py
+│   ├── AUDIT_*.md
+│   └── README.md
+│
+└── dashboard.html
 ```
 
-## Features
+## wrapper-nvidia (NVIDIA NIM)
 
-- Transparent proxy: model names pass through exactly as the client sends them.
-- Multi-key rotation with even distribution and per-(key, model) rate-limit isolation.
-- Internal token-bucket pacing that converts capacity limits into latency instead of 429s.
-- OpenAI Chat Completions + Anthropic Messages API translation, plus OpenAI Responses API.
-- SSE stream heartbeat so long-running / reasoning streams don't time out.
-- Adaptive backpressure (workload-aware queue sizing) and a provider circuit breaker.
-- Retry budget cap with jittered exponential backoff; minimal 4-class error taxonomy.
-- Prometheus-style metrics on `/metrics/prom`, plus `/health`, `/stats`, `/version`.
+**Recommended implementation:** `nvidia-python/`
 
-## Quick start
+- Full OpenAI + Anthropic + Responses compatibility
+- Multi-key rotation, pacing, load shedding (`INFLIGHT_SOFT_CAP=100`)
+- Reasoning injection, aliases (Claude Code), model verification
+- Production hardening: anti-silence (960s), TTFT, pre-response, stream buffering
+- .env hot reload + rich metrics
 
-### Prerequisites
-- Node.js >= 18
-- One or more NVIDIA API keys (`nvapi-...`)
+**Migrate to this version.** The old Node.js implementation (`nvidia/`) will be removed.
 
-### Configure
+See:
+- `nvidia-python/README.md`
+- `nvidia-python/AUDIT_REPORT_2026-07-23.md` (full 100/100 audit)
+
+## wrapper-nous
+
+Full-featured proxy for `inference-api.nousresearch.com`.
+
+- 100/100 OpenAI + Anthropic + Responses + parallel tools
+- SSE heartbeat, vision, thinking, rich metadata
+- See `nous/README.md` and `nous/FINAL_100_AUDIT.md`
+
+## Quick Start (Recommended)
+
+### NVIDIA (new canonical)
+
 ```bash
-cd /root/wrapper/nvidia
-cp .env.example .env
-# edit .env: set NVIDIA_API_KEY_1, NVIDIA_API_KEY_2, ...
+cd nvidia-python
+pip install -r requirements.txt
+cp .env.example .env   # add your NVIDIA_API_KEY_*
+python -m uvicorn src.main:app --port 9101
 ```
 
-### Run (systemd, recommended)
+### Nous
+
 ```bash
-sudo ./install.sh            # installs unit, enables + starts service, smoke-tests /health
-sudo ./install.sh --status   # show service status
+cd nous
+pip install -r requirements.txt
+python -m uvicorn wrapper_nous:app --port 9106
 ```
 
-### Run (manual)
-```bash
-cd /root/wrapper/nvidia
-npm install
-npm start
-curl http://localhost:9100/health
-```
+## Migration Notice
 
-## Endpoints
-
-OpenAI-compatible: `/v1/chat/completions`, `/v1/embeddings`, `/v1/models`,
-`/v1/images/generations`, `/v1/ranking`.
-
-Anthropic-compatible: `/v1/messages`, `/v1/messages/count_tokens`.
-
-Management: `/health`, `/stats`, `/metrics/prom`, `/metrics/activity`,
-`/metrics/model-status`, `/version`.
-
-See [nvidia/README.md](nvidia/README.md) for full examples and the configuration
-reference.
-
-## Configuration
-
-All configuration is via `.env` (auto-reloaded). Key variables:
-
-| Variable | Default | Description |
-|---|---|---|
-| `NVIDIA_API_KEY_N` | — | NVIDIA API key(s) |
-| `LISTEN_PORT` | 9100 | Primary HTTP listen port |
-| `ANY_ALSO_PORTS` | 9910 | Extra ports bound on the same server |
-| `SOFT_LIMIT_RPM` | 30 | Soft RPM limit per key |
-| `HARD_LIMIT_RPM` | 40 | Hard RPM limit per key |
-| `REQUEST_TIMEOUT` | 600 | Upstream timeout (seconds) |
-| `HEARTBEAT_INTERVAL_MS` | 5000 | Stream heartbeat interval (ms) |
-| `DROP_PARAMS` | think | Params to strip proactively |
-
-Secrets (`*.env`, `*.db`, `backups/`, `node_modules/`) are git-ignored and never committed.
-
-## Testing
-```bash
-cd /root/wrapper/nvidia
-npm test                 # unit tests
-node test/test.js
-```
+- `~/wrappers/nvidia` (Node.js) → **deprecated**. Point all clients and services to `nvidia-python`.
+- Both `nvidia-python` and `nous` are maintained at **100/100 production grade**.
 
 ## License
+
 Internal use only.

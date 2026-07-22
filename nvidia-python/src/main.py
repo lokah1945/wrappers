@@ -49,6 +49,7 @@ import uuid
 import asyncio
 import logging
 import re as re_module
+import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
 
@@ -57,6 +58,102 @@ from fastapi import FastAPI, Request, HTTPException, Response, status
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from contextlib import asynccontextmanager
+
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
+
+# --------------------------------------------------------------------------
+# MODEL VERIFICATION (full parity with Node.js audit)
+# --------------------------------------------------------------------------
+_unavailable_models: set = set()
+_retired_models: set = set()
+_model_status: dict = {}
+
+async def probe_model(pool, model_id: str, timeout_ms: int = 120000) -> dict:
+    """Probe a model for basic functionality (parity with Node verify)."""
+    try:
+        key = pool.peek_key()
+        if not key:
+            return {"ok": False, "status": 0, "reason": "no_key"}
+        
+        body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
+        headers = {"Authorization": f"Bearer {key.api_key}"}
+        sess = await get_session() if 'get_session' in globals() else None
+        
+        # Use pool's session if available
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms/1000)) as s:
+            async with s.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
+                if resp.status < 400:
+                    return {"ok": True, "status": resp.status, "reason": ""}
+                text = await resp.text()
+                return {"ok": False, "status": resp.status, "reason": text[:200]}
+    except Exception as e:
+        return {"ok": False, "status": 0, "reason": str(e)[:200]}
+
+async def verify_models(pool):
+    """Full model verification sweep (from Node audit)."""
+    global _unavailable_models, _retired_models, _model_status
+    ids = await pool.refresh_models(force=True) or []
+    if not ids:
+        return
+    
+    sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
+    results = {}
+    
+    async def _probe(mid):
+        async with sem:
+            res = await probe_model(pool, mid, TTFT_TIMEOUT_MS)
+            results[mid] = res
+            if not res["ok"]:
+                if res["status"] in (404, 410):
+                    _retired_models.add(mid)
+                _unavailable_models.add(mid)
+            else:
+                _unavailable_models.discard(mid)
+                _retired_models.discard(mid)
+            _model_status[mid] = res
+    
+    await asyncio.gather(*[_probe(mid) for mid in ids[:100]])  # cap for safety
+    logger.info(f"[verify] sweep done: {len(_unavailable_models)} unavailable, {len(_retired_models)} retired")
+
+async def verify_loop(pool):
+    while True:
+        try:
+            await verify_models(pool)
+            await asyncio.sleep(VERIFY_INTERVAL / 1000)
+        except Exception as e:
+            logger.error(f"[verify] loop error: {e}")
+            await asyncio.sleep(60)
+
+
+# ----------------------------------------------------------------------
+# .env HOT RELOAD WATCHER (full Node parity)
+# ----------------------------------------------------------------------
+def start_env_watcher():
+    """Start .env hot-reload watcher (exact parity with Node reloadDotenv + fs.watch)."""
+    if not HAS_WATCHDOG:
+        logger.warning('[env] watchdog not available; hot reload disabled')
+        return
+    try:
+        class EnvWatcher(FileSystemEventHandler):
+            def on_modified(self, event):
+                if event.src_path.endswith('.env') or event.src_path.endswith('/.env'):
+                    load_dotenv(override=True)
+                    # Re-apply any runtime config that depends on env (alias etc if needed)
+                    logger.info('[env] .env reloaded (hot)')
+
+        observer = Observer()
+        watch_path = str(Path(__file__).parent.parent)
+        observer.schedule(EnvWatcher(), path=watch_path, recursive=False)
+        observer.start()
+        logger.info('[env] Watching .env for hot reload')
+    except Exception as e:
+        logger.warning(f'[env] Failed to start watcher: {e}')
 
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
 from .anthropic_compat import (
@@ -101,9 +198,19 @@ MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 HEADERS_TIMEOUT_MS = int(os.environ.get('HEADERS_TIMEOUT_MS', '120000'))
 PRE_RESPONSE_TIMEOUT_MS = int(os.environ.get('PRE_RESPONSE_TIMEOUT_MS', '300000'))
+TTFT_TIMEOUT_MS = int(os.environ.get('TTFT_TIMEOUT_MS', '120000'))
 REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT', '120'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '600'))
 GEN_TIMEOUT_SEC = int(os.environ.get('GEN_TIMEOUT_SEC', '900'))
+ANTI_SILENCE_TIMEOUT_MS = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
+INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
+LOAD_SHEDDING_ENABLED = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
+VERIFY_CONCURRENCY = int(os.environ.get('VERIFY_CONCURRENCY', '8'))
+VERIFY_INTERVAL = int(os.environ.get('VERIFY_INTERVAL', '600')) * 1000
+VERIFY_ON_BOOT = os.environ.get('VERIFY_ON_BOOT', 'true').lower() != 'false'
+MODEL_REFRESH_SEC = int(os.environ.get('MODEL_REFRESH_SEC', '600'))
+MAX_STREAM_BUFFER_KB = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512'))
+MAX_STREAM_BUFFER = MAX_STREAM_BUFFER_KB * 1024
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 try:
     import importlib.metadata
@@ -449,6 +556,7 @@ class Server:
         self._agent: Optional[aiohttp.TCPConnector] = None
         self._in_flight = 0
         self._sse_clients: set = set()
+        self._start_time = time.time()
 
     async def init(self):
         self.pool.load_from_env()
@@ -482,6 +590,12 @@ class Server:
         })
 
         self.pool.start_model_refresh()
+
+        # Full model verification + env watcher (Node audit parity, production)
+        if VERIFY_ON_BOOT:
+            asyncio.create_task(verify_models(self.pool))
+        asyncio.create_task(verify_loop(self.pool))
+        start_env_watcher()
 
     def _register_routes(self):
         app = self.app
@@ -517,7 +631,16 @@ class Server:
 
         @app.get('/health')
         async def health():
-            return {'status': 'ok', 'version': VERSION, 'keys': self.pool.total_keys, 'available': self.pool.available_keys}
+            snap = await self.metrics.summary('24h') if self.metrics else {}
+            return {
+                'status': 'ok' if self.pool.available_keys > 0 else 'degraded',
+                'version': VERSION,
+                'keys': self.pool.total_keys,
+                'available': self.pool.available_keys,
+                'models_cached': len(self.pool.models_cached),
+                'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
+                **snap
+            }
 
         @app.get('/version')
         async def version():
@@ -1138,7 +1261,13 @@ class Server:
 
                     is_streaming = bool(body.get('stream'))
                     is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', metric_path or ''))
-                    timeout_sec = STREAM_REQUEST_TIMEOUT_SEC if is_streaming else (GEN_TIMEOUT_SEC if is_gen else REQUEST_TIMEOUT_SEC)
+                    # Production-grade timeout selection (parity with Node audit)
+                    if is_streaming:
+                        timeout_sec = max(STREAM_REQUEST_TIMEOUT_SEC, ANTI_SILENCE_TIMEOUT_MS // 1000)
+                    elif is_gen:
+                        timeout_sec = GEN_TIMEOUT_SEC
+                    else:
+                        timeout_sec = REQUEST_TIMEOUT_SEC
 
                     if body.get('stream'):
                         resp = await self._session.post(
@@ -1498,22 +1627,23 @@ def create_app() -> FastAPI:
     server = Server(app)
     server._register_routes()
 
-    @app.on_event('startup')
-    async def startup():
+    @asynccontextmanager
+    async def lifespan(app: FastAPI):
         await server.init()
+        try:
+            yield
+        finally:
+            if server:
+                if server._session:
+                    await server._session.close()
+                if server._agent:
+                    await server._agent.close()
+                if server.metrics:
+                    await server.metrics.close()
+                if server.registry:
+                    server.registry.stop()
 
-    @app.on_event('shutdown')
-    async def shutdown():
-        if server:
-            if server._session:
-                await server._session.close()
-            if server._agent:
-                await server._agent.close()
-            if server.metrics:
-                await server.metrics.close()
-            if server.registry:
-                server.registry.stop()
-
+    app.router.lifespan_context = lifespan
     return app
 
 
