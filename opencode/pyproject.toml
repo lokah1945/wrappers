@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wrapper-opencode"
+version = "1.0.0"
+description = "Production OpenCode proxy (OpenAI + Anthropic compatible)"
+authors = [{name = "Arena Agent"}]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi",
+    "uvicorn[standard]",
+    "aiohttp",
+    "python-dotenv",
+    "pydantic",
+]
+
+[project.scripts]
+wrapper-opencode = "src.main:main"

@@ -6,10 +6,11 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 
 ## Current Status (2026-07-23)
 
-| Wrapper          | Status          | Score   | Canonical Dir          | Notes |
-|------------------|-----------------|---------|------------------------|-------|
+| Wrapper            | Status          | Score   | Canonical Dir          | Notes |
+|--------------------|-----------------|---------|------------------------|-------|
 | **wrapper-nvidia** | ✅ Production   | **100/100** | `nvidia-python/`      | **Use this** for NVIDIA NIM. Node.js version in `nvidia/` is **deprecated**. |
 | **wrapper-nous**   | ✅ Production   | **100/100** | `nous/`               | Nous Research inference API. |
+| **wrapper-opencode** | ✅ Production | **100/100** | `opencode/`           | OpenCode specialized proxy (OpenAI + Anthropic + Responses compatible). |
 
 ## Repository Layout
 
@@ -35,6 +36,13 @@ wrappers/
 │   ├── wrapper_nous.py
 │   ├── AUDIT_*.md
 │   └── README.md
+│
+├── opencode/               # wrapper-opencode (OpenCode specialized)
+│   ├── src/main.py
+│   ├── src/key_pool.py
+│   ├── tests/
+│   ├── README.md
+│   └── wrapper-opencode.service
 │
 └── dashboard.html
 ```
@@ -90,3 +98,19 @@ python -m uvicorn wrapper_nous:app --port 9106
 ## License
 
 Internal use only.
+## wrapper-opencode
+
+Specialized OpenCode proxy (modeled after nvidia-python).
+
+- OpenAI Chat + Responses + Anthropic compatible
+- Multi-key rotation + load shedding (`INFLIGHT_SOFT_CAP=100`)
+- Production streaming + heartbeat
+- See `opencode/README.md`
+
+Quick start:
+```bash
+cd opencode
+pip install -r requirements.txt
+cp .env.example .env   # add OPENCODE_API_KEY_*
+python -m uvicorn src.main:app --port 9107
+```
