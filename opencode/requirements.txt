@@ -3,3 +3,4 @@ uvicorn[standard]
 aiohttp
 python-dotenv
 pydantic
+watchdog>=4.0.0

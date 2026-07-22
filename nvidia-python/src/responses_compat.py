@@ -108,17 +108,42 @@ def input_to_messages(input_val: Any, instructions: Optional[str] = None) -> Lis
 
 
 def convert_tools(tools: Optional[list]) -> Optional[list]:
+    """Convert Responses/OpenAI tools → chat tools.
+
+    Drops tools with missing/null/empty names (Codex/Hermes sometimes send
+    placeholder tools with name:null which break upstream validators).
+    Also accepts bare function-shaped tools without the outer {type,function} wrap.
+    """
     if not tools or not isinstance(tools, list):
         return None
     out = []
     for t in tools:
-        if t and t.get('type') == 'function' and t.get('function'):
+        if not t or not isinstance(t, dict):
+            continue
+        # Responses / OpenAI chat shape: {type:"function", function:{name,...}}
+        if t.get('type') == 'function' and isinstance(t.get('function'), dict):
+            fn = t['function']
+            name = fn.get('name')
+            if not name:
+                continue  # Codex/Hermes name:null filter
             out.append({
                 'type': 'function',
                 'function': {
-                    'name': t['function'].get('name', ''),
-                    'description': t['function'].get('description', ''),
-                    'parameters': t['function'].get('parameters', {}),
+                    'name': name,
+                    'description': fn.get('description', '') or '',
+                    'parameters': fn.get('parameters', {}) or {},
+                },
+            })
+            continue
+        # Bare function shape: {name, description, parameters} (some SDKs)
+        name = t.get('name')
+        if name and t.get('type') in (None, 'function'):
+            out.append({
+                'type': 'function',
+                'function': {
+                    'name': name,
+                    'description': t.get('description', '') or '',
+                    'parameters': t.get('parameters') or t.get('input_schema') or {},
                 },
             })
     return out if out else None
@@ -258,9 +283,23 @@ class ResponsesHandler:
         self.guard_stream_unsupported = deps.get('guard_stream_unsupported')
 
     def is_nvidia_model(self, model_id: str) -> bool:
-        cached = getattr(self.pool, 'models_cached', None)
-        if isinstance(cached, list):
-            return model_id in cached or model_id in self.curated_genai
+        """Return True if model looks like a NIM target.
+
+        When the models cache is still empty (boot / offline), allow the request
+        through so aliases and first-hit models are not falsely rejected.
+        """
+        if not model_id:
+            return False
+        cached = getattr(self.pool, 'models_cached', None) or []
+        curated = self.curated_genai or []
+        if model_id in cached or model_id in curated:
+            return True
+        # Cache not warm yet — allow through (upstream will 404 if invalid)
+        if not cached:
+            return True
+        # Heuristic: org/name NIM ids
+        if '/' in model_id and ':' not in model_id:
+            return True
         return False
 
     async def translate_to_nim(

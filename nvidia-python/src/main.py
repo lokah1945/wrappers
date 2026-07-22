@@ -1162,7 +1162,15 @@ class Server:
             async def anthropic_stream():
                 async for chunk in stream_openai_to_anthropic(result['stream'], model_id, {}, start_ms=result.get('start_ms', time.time() * 1000)):
                     yield chunk
-            return StreamingResponse(anthropic_stream(), media_type='application/json', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
+            return StreamingResponse(
+                anthropic_stream(),
+                media_type='text/event-stream',
+                headers={
+                    'Cache-Control': 'no-cache',
+                    'Connection': 'keep-alive',
+                    'X-Accel-Buffering': 'no',
+                },
+            )
 
         status_code = result.get('status', 200)
         data = result.get('data', {})
@@ -1293,15 +1301,16 @@ class Server:
                                 continue
                             return {'status': resp.status, 'data': resp_body}
 
-                        key.decrement_in_flight()
-                        self._in_flight = max(0, self._in_flight - 1)
-
+                        # Keep in-flight until stream consumer finishes (_stream_chat / anthropic finally).
                         async def stream_wrapper():
                             try:
                                 async for chunk, _ in resp.content.iter_chunks():
                                     yield chunk
                             finally:
-                                await resp.release()
+                                try:
+                                    await resp.release()
+                                except Exception:
+                                    pass
 
                         return {'stream': stream_wrapper(), 'key': key, 'start_ms': start_ms, 'status': 200}
                     else:
@@ -1331,7 +1340,6 @@ class Server:
                                 continue
                             return {'status': resp.status, 'data': resp_data}
 
-                        key.decrement_in_flight()
                         if self.metrics:
                             await self.metrics.record_request(
                                 model=model_id, key_label=key.label,
@@ -1436,7 +1444,6 @@ class Server:
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     return JSONResponse(status_code=resp.status, content=err_data)
 
-                key.decrement_in_flight()
                 if self.metrics:
                     await self.metrics.record_request(
                         model=model_id, key_label=key.label,
@@ -1559,7 +1566,6 @@ class Server:
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     return JSONResponse(status_code=resp.status, content=err_data)
 
-                key.decrement_in_flight()
                 if self.metrics:
                     await self.metrics.record_request(
                         model=model_id, key_label=key.label,

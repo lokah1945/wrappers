@@ -276,3 +276,22 @@ class TestHttpStatusFromError:
         assert http_status_from_error({'type': 'unknown'}) == 500
         assert http_status_from_error({}) == 500
         assert http_status_from_error(None) == 500
+
+
+class TestConvertToolsNullName:
+    def test_null_name_filtered(self):
+        tools = [
+            {'type': 'function', 'function': {'name': None, 'parameters': {}}},
+            {'type': 'function', 'function': {'name': '', 'parameters': {}}},
+            {'type': 'function', 'function': {'name': 'ok_tool', 'description': 'd', 'parameters': {'type': 'object'}}},
+        ]
+        result = convert_tools(tools)
+        assert result is not None
+        assert len(result) == 1
+        assert result[0]['function']['name'] == 'ok_tool'
+
+    def test_bare_function_shape(self):
+        tools = [{'name': 'search', 'description': 's', 'parameters': {'type': 'object'}}]
+        result = convert_tools(tools)
+        assert result is not None
+        assert result[0]['function']['name'] == 'search'

@@ -68,15 +68,15 @@ def extract_internal_reasoning(msg: dict) -> dict:
         trimmed = (content or '').strip()
         end = -1
         start = -1
-        if trimmed.startswith(''):
+        if trimmed.startswith('<think>'):
             start = 7
-            end = trimmed.find('')
+            end = trimmed.find('</think>')
         elif trimmed.startswith('<thinking>'):
             start = 10
             end = trimmed.find('</thinking>')
         if end != -1 and start != -1:
             reasoning = trimmed[start:end].strip()
-            tag_len = 8 if trimmed.startswith('') else 11
+            tag_len = 11 if trimmed.startswith('<thinking>') else 8
             content = trimmed[end + tag_len:].strip()
 
     return {'reasoning': reasoning or '', 'content': content}
@@ -490,10 +490,15 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     }
 
 
-async def stream_openai_to_anthropic(stream, model: str, capture: dict,
+async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                                      input_tokens: int = 0, request_id: str = None,
-                                     expect_thinking: bool = False) -> AsyncGenerator[str, None]:
+                                     expect_thinking: bool = False,
+                                     start_ms: float = None, **kwargs) -> AsyncGenerator[str, None]:
     """Async generator: consume OpenAI SSE stream, emit Anthropic event stream."""
+    if capture is None:
+        capture = {}
+    if start_ms is not None:
+        capture['_startMs'] = int(start_ms)
     msg_id = f'msg_{request_id}' if request_id else f'msg_{int(time.time() * 1000)}'
     text_index = None
     thinking_index = None
@@ -533,7 +538,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
             open_idx = None
 
     async def emit_text(text):
-        nonlocal completed_thinking, text_index, open_idx, sent_content_block_start, sent_text_or_tool_block
+        nonlocal completed_thinking, text_index, open_idx, sent_content_block_start, sent_text_or_tool_block, next_index
         completed_thinking = True
         if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
             async for chunk in emit_synthetic_thinking():
@@ -543,6 +548,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
                 yield chunk
             text_index = next_index
             open_idx = text_index
+            next_index += 1
             sent_content_block_start = True
             sent_text_or_tool_block = True
             yield _sse('content_block_start', {
@@ -555,12 +561,13 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
         })
 
     async def emit_thinking_start():
-        nonlocal thinking_index, open_idx, real_thinking_emitted, sent_content_block_start
+        nonlocal thinking_index, open_idx, real_thinking_emitted, sent_content_block_start, next_index
         if thinking_index is None:
             async for chunk in stop_open():
                 yield chunk
             thinking_index = next_index
             open_idx = thinking_index
+            next_index += 1
             real_thinking_emitted = True
             sent_content_block_start = True
             yield _sse('content_block_start', {
@@ -569,7 +576,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
             })
 
     async def emit_synthetic_thinking():
-        nonlocal synthetic_thinking_emitted, thinking_index, open_idx, completed_thinking
+        nonlocal synthetic_thinking_emitted, thinking_index, open_idx, completed_thinking, next_index
         if synthetic_thinking_emitted or real_thinking_emitted:
             return
         synthetic_thinking_emitted = True
@@ -577,6 +584,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
             yield chunk
         thinking_index = next_index
         open_idx = thinking_index
+        next_index += 1
         yield _sse('content_block_start', {
             'type': 'content_block_start', 'index': thinking_index,
             'content_block': {'type': 'thinking', 'thinking': ''},
@@ -736,7 +744,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
         if in_think_tag:
             end_idx = -1
             tag_len = 0
-            end1 = chunk.find('')
+            end1 = chunk.find('</think>')
             end2 = chunk.find('</thinking>')
             end3 = chunk.find('<|DSML|tool_calls>')
             if end3 == -1:
@@ -785,7 +793,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
 
             start_idx = -1
             tag_len = 0
-            start1 = chunk.find('')
+            start1 = chunk.find('<think>')
             start2 = chunk.find('<thinking>')
             if start1 != -1:
                 start_idx = start1
@@ -819,29 +827,49 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
         },
     })
 
-    reader = stream.get_reader()
-    decoder = ''
+    # Consume either an async iterator of bytes/str OR an object with .content.iter_any()
     buffer = ''
     last_usage_chunk = ''
     is_first_read = True
+    capture = capture if isinstance(capture, dict) else {}
+    if 'start_ms' in (capture or {}) or capture.get('_startMs'):
+        pass
+    else:
+        capture.setdefault('_startMs', int(time.time() * 1000))
+
+    async def _iter_upstream():
+        """Normalize various stream shapes into async chunks of str/bytes."""
+        if stream is None:
+            return
+        # aiohttp-like response
+        if hasattr(stream, 'content') and hasattr(stream.content, 'iter_any'):
+            async for chunk in stream.content.iter_any():
+                yield chunk
+            return
+        # async iterator / generator
+        if hasattr(stream, '__aiter__'):
+            async for chunk in stream:
+                yield chunk
+            return
+        # sync iterable fallback
+        if hasattr(stream, '__iter__') and not isinstance(stream, (str, bytes)):
+            for chunk in stream:
+                yield chunk
+            return
 
     try:
-        while True:
-            try:
-                done, value = await reader.read()
-            except Exception:
-                break
-            if done:
-                break
+        async for value in _iter_upstream():
             if is_first_read:
-                capture['ttftMs'] = capture.get('_startMs', 0) and (int(time.time() * 1000) - capture['_startMs']) or 0
+                start_ms = capture.get('_startMs') or capture.get('start_ms') or 0
+                if start_ms:
+                    capture['ttftMs'] = int(time.time() * 1000) - int(start_ms)
                 is_first_read = False
-            chunk_text = value.decode('utf-8', errors='replace') if isinstance(value, bytes) else value
+            chunk_text = value.decode('utf-8', errors='replace') if isinstance(value, (bytes, bytearray)) else str(value)
             buffer += chunk_text
             if '"usage"' in chunk_text:
                 last_usage_chunk = chunk_text
             lines = buffer.split('\n')
-            buffer = lines.pop() or ''
+            buffer = lines.pop() if lines else ''
 
             for line in lines:
                 trimmed = line.strip()
@@ -893,6 +921,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
                             'type': 'content_block_start', 'index': ai,
                             'content_block': {'type': 'tool_use', 'id': tool_call_id, 'name': fn.get('name', ''), 'input': {}},
                         })
+                        next_index += 1
                     ai = tool_map[oi]
                     if fn.get('arguments'):
                         generated_chars += len(fn['arguments'])
@@ -907,8 +936,10 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict,
         errored = True
         error_message = str(e) if e else 'upstream connection error'
     finally:
+        # Best-effort release for aiohttp responses
         try:
-            await reader.release()
+            if hasattr(stream, 'release'):
+                await stream.release()
         except Exception:
             pass
         if open_idx is not None:

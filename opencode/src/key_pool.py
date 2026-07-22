@@ -98,14 +98,22 @@ class KeyPool:
     def load_from_env(self):
         self.keys = []
         env_keys = []
+        seen = set()
         for key_name, value in sorted(os.environ.items()):
-            if key_name.startswith('OPENCODE_API_KEY_') and value and len(value) > 10:
-                env_keys.append(value.strip())
+            if not value or len(value.strip()) < 10:
+                continue
+            # OPENCODE_API_KEY, OPENCODE_API_KEY_1, OPENCODE_API_KEY_2, ...
+            if key_name == 'OPENCODE_API_KEY' or key_name.startswith('OPENCODE_API_KEY_'):
+                v = value.strip()
+                if v in seen:
+                    continue
+                seen.add(v)
+                env_keys.append(v)
 
         if env_keys:
             self.keys = [KeyEntry(f'key{i+1}', k) for i, k in enumerate(env_keys)]
         else:
-            logger.warning('[opencode] No OPENCODE_API_KEY_* found')
+            logger.warning('[opencode] No OPENCODE_API_KEY* found')
 
         self.soft_limit = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
         self.hard_limit = int(os.environ.get('HARD_LIMIT_RPM', '40'))

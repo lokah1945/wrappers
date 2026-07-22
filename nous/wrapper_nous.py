@@ -59,7 +59,7 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.1-production-hermes-fixed"
+VERSION = "2.0.2-production-hermes-fixed"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s")
 logger = logging.getLogger("wrapper-nous")
@@ -350,9 +350,15 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                             yield "data: [DONE]\n\n"
                             if state and hasattr(state, "done"):
                                 try:
-                                    for ev in state.done():
-                                        yield serialize_fn(ev) if callable(serialize_fn) else ev
-                                except:
+                                    done_evs = state.done()
+                                    if isinstance(done_evs, str):
+                                        done_evs = [done_evs]
+                                    for ev in (done_evs or []):
+                                        if isinstance(ev, str):
+                                            yield ev
+                                        else:
+                                            yield serialize_fn(ev) if callable(serialize_fn) else ev
+                                except Exception:
                                     pass
                             return
                         try:
@@ -360,7 +366,11 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                             if state and hasattr(state, "translate_chunk"):
                                 events = state.translate_chunk(parsed)
                                 for ev in events:
-                                    yield serialize_fn(ev)
+                                    # ResponsesStreamState emits pre-formatted SSE strings
+                                    if isinstance(ev, str):
+                                        yield ev
+                                    else:
+                                        yield serialize_fn(ev)
                             else:
                                 yield f"data: {data.decode()}\n\n"
                         except:
@@ -393,34 +403,44 @@ class AnthropicStreamState:
         ch = chunk["choices"][0]
         delta = ch.get("delta", {})
 
+        # reasoning / thinking delta
+        reason = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reason, str) and reason:
+            if self.current_block != "thinking":
+                if self.current_block: events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                self.index += 1
+                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "thinking", "thinking": ""}}})
+                self.current_block = "thinking"
+            events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": self.index, "delta": {"type": "thinking_delta", "thinking": reason}}})
+
         if delta.get("content"):
             if self.current_block != "text":
-                if self.current_block: events.append({"type": "content_block_stop", "data": {"index": self.index}})
+                if self.current_block: events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
-                events.append({"type": "content_block_start", "data": {"index": self.index, "content_block": {"type": "text", "text": ""}}})
+                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "text", "text": ""}}})
                 self.current_block = "text"
-            events.append({"type": "content_block_delta", "data": {"index": self.index, "delta": {"type": "text_delta", "text": delta["content"]}}})
+            events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": self.index, "delta": {"type": "text_delta", "text": delta["content"]}}})
 
         for tc in delta.get("tool_calls", []):
             idx = tc.get("index", 0)
             if idx not in self.tool_map:
                 if self.current_block: 
-                    events.append({"type": "content_block_stop", "data": {"index": self.index}})
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 self.tool_map[idx] = self.index
                 fn = tc.get("function", {})
-                events.append({"type": "content_block_start", "data": {"index": self.index, "content_block": {"type": "tool_use", "id": tc.get("id"), "name": fn.get("name", "")}}})
+                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "tool_use", "id": tc.get("id"), "name": fn.get("name", ""), "input": {}}}})
                 self.current_block = "tool_use"
             tidx = self.tool_map[idx]
             if fn := tc.get("function", {}):
                 if "arguments" in fn:
-                    events.append({"type": "content_block_delta", "data": {"index": tidx, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}})
+                    events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": tidx, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}})
 
         if ch.get("finish_reason"):
             if self.current_block:
-                events.append({"type": "content_block_stop", "data": {"index": self.index}})
-            events.append({"type": "message_delta", "data": {"delta": {"stop_reason": "end_turn"}, "usage": chunk.get("usage", {})}})
-            events.append({"type": "message_stop", "data": {}})
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            events.append({"type": "message_delta", "data": {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": chunk.get("usage", {})}})
+            events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.current_block = None
         return events
 
@@ -462,7 +482,8 @@ class ResponsesStreamState:
         return self.emit("response.function_call.delta", {"item_id": call_id, "output_index": 1, "delta": args})
 
     def done(self, usage=None):
-        return self.emit("response.completed", {"response": {"id": self.rid, "status": "completed", "usage": usage or {}}})
+        # MUST return a list — stream_with_heartbeat iterates this
+        return [self.emit("response.completed", {"response": {"id": self.rid, "status": "completed", "usage": usage or {}}})]
 
     def translate_chunk(self, chunk):
         """Convert OpenAI chat chunk → Responses events"""
@@ -491,7 +512,7 @@ class ResponsesStreamState:
 
         if ch.get("finish_reason"):
             usage = chunk.get("usage")
-            events.append(self.done(usage))
+            events.extend(self.done(usage))
         return events
 
 # --------------------------------------------------------------------------
@@ -623,7 +644,7 @@ async def chat_completions(request: Request):
         async def gen():
             async for line in stream_with_heartbeat(result, lambda x: f"data: {json.dumps(x)}\n\n"):
                 yield line
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     return JSONResponse(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---
@@ -645,9 +666,10 @@ async def responses(request: Request):
         async def gen():
             for ev in state.start():
                 yield ev
-            async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else f"event: {x.get('type','response.delta')}\ndata: {json.dumps(x.get('data', x))}\n\n" if isinstance(x, dict) else str(x), state=state):
+            # serialize_fn only used for non-str events; ResponsesStreamState yields SSE strings
+            async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state):
                 yield line
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)
     await store_conversation(resp["id"], chat_body.get("messages", []))
@@ -669,9 +691,9 @@ async def messages(request: Request):
     if is_stream:
         state = AnthropicStreamState(chat_body["model"])
         async def gen():
-            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps(x.get('data', {}))}\n\n", state=state):
+            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state):
                 yield line
-        return StreamingResponse(gen(), media_type="text/event-stream")
+        return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     return openai_to_anthropic(chat_body["model"], result)
 
@@ -695,7 +717,7 @@ async def healthz(): return await health()
 # catch-all
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
-    return JSONResponse(404, {"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
+    return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
 
 if __name__ == "__main__":
     import uvicorn

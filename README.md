@@ -10,7 +10,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 |--------------------|-----------------|---------|------------------------|-------|
 | **wrapper-nvidia** | ✅ Production   | **100/100** | `nvidia-python/`      | **Use this** for NVIDIA NIM. Node.js version in `nvidia/` is **deprecated**. |
 | **wrapper-nous**   | ✅ Production   | **100/100** | `nous/`               | Nous Research inference API. |
-| **wrapper-opencode** | ✅ Production | **100/100** | `opencode/`           | OpenCode specialized proxy (OpenAI + Anthropic + Responses compatible). |
+| **wrapper-opencode** | ✅ Production | **100/100** | `opencode/`           | OpenCode **Zen** gateway (`https://opencode.ai/zen/v1`) — multi-protocol. |
 
 ## Repository Layout
 
