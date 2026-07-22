@@ -11,6 +11,7 @@ Three translators:
 
 import re
 import json
+import time
 import asyncio
 from typing import Dict, List, Optional, Any, AsyncGenerator
 

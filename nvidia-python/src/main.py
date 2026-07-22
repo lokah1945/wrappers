@@ -412,7 +412,12 @@ def _is_valid_nim_alias_target(id: str) -> bool:
     return bool(re_module.match(r'^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)+$', s))
 
 
-def _pick_alias_target(env_keys: list, fallback: str, family: str) -> str:
+def _pick_alias_target(env_keys: list, fallback: str, family: str, pool: 'KeyPool' = None) -> str:
+    """Resolve Claude Code alias target.
+
+    Prefer explicit env override, else fallback if present in catalog, else a
+    small known-good instruct model so aliases never hang on huge/retired ids.
+    """
     for k in env_keys:
         v = os.environ.get(k)
         if not v:
@@ -420,14 +425,66 @@ def _pick_alias_target(env_keys: list, fallback: str, family: str) -> str:
         if _is_valid_nim_alias_target(v):
             return v.strip()
         logger.warning(f'[alias] Ignoring invalid {family} alias from {k}="{v}". Using default {fallback}')
-    return fallback
+
+    cached = []
+    try:
+        if pool is not None:
+            cached = list(getattr(pool, 'models_cached', None) or [])
+    except Exception:
+        cached = []
+    cached_l = {str(x).lower() for x in cached}
+
+    def _available(mid: str) -> bool:
+        if not mid:
+            return False
+        if not cached_l:
+            return True  # catalog not warm yet — accept fallback
+        return mid.lower() in cached_l
+
+    if _available(fallback):
+        return fallback
+
+    # Family-oriented safe candidates (fast → larger)
+    candidates = {
+        'haiku': [
+            'meta/llama-3.1-8b-instruct',
+            'meta/llama-3.2-3b-instruct',
+            'google/gemma-2-9b-it',
+            'mistralai/mistral-7b-instruct-v0.3',
+        ],
+        'sonnet': [
+            'meta/llama-3.3-70b-instruct',
+            'meta/llama-3.1-70b-instruct',
+            'meta/llama-3.1-8b-instruct',
+            'mistralai/mistral-nemotron',
+        ],
+        'opus': [
+            'meta/llama-3.1-405b-instruct',
+            'meta/llama-3.3-70b-instruct',
+            'meta/llama-3.1-70b-instruct',
+            'meta/llama-3.1-8b-instruct',
+        ],
+    }.get(family, ['meta/llama-3.1-8b-instruct'])
+
+    for c in candidates:
+        if _available(c):
+            logger.info(f'[alias] {family}: fallback {fallback} unavailable; using {c}')
+            return c
+    # Last resort: first chat-looking cached model
+    for mid in cached:
+        s = str(mid)
+        if _is_valid_nim_alias_target(s) and 'embed' not in s.lower() and 'image' not in s.lower():
+            logger.info(f'[alias] {family}: using catalog model {s}')
+            return s
+    return fallback or 'meta/llama-3.1-8b-instruct'
 
 
 def load_alias_config(pool: KeyPool = None):
     global ALIAS_TO_NIM, DISCOVERY_TO_NIM
-    haiku = _pick_alias_target(['CLAUDE_CODE_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], 'meta/llama-3.1-8b-instruct', 'haiku')
-    sonnet = _pick_alias_target(['CLAUDE_CODE_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL'], 'deepseek-ai/deepseek-v4-pro', 'sonnet')
-    opus = _pick_alias_target(['CLAUDE_CODE_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'], 'nvidia/nemotron-3-ultra-550b-a55b', 'opus')
+    haiku = _pick_alias_target(['CLAUDE_CODE_DEFAULT_HAIKU_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL'], 'meta/llama-3.1-8b-instruct', 'haiku', pool)
+    # Small default targets keep Claude Code aliases responsive; override via env if desired.
+    sonnet = _pick_alias_target(['CLAUDE_CODE_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL'], 'meta/llama-3.1-8b-instruct', 'sonnet', pool)
+    opus = _pick_alias_target(['CLAUDE_CODE_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_OPUS_MODEL'], 'meta/llama-3.1-8b-instruct', 'opus', pool)
 
     mapping = {
         'haiku': haiku, 'sonnet': sonnet, 'opus': opus,
@@ -545,6 +602,21 @@ def pre_response_timeout_ms_for(model_id: str) -> int:
     return PRE_RESPONSE_TIMEOUT_MS
 
 
+
+async def _safe_response_body(resp) -> dict:
+    """Parse upstream body as JSON; fall back to text envelope (NIM sometimes returns text/plain errors)."""
+    try:
+        data = await resp.json(content_type=None)
+        if isinstance(data, dict):
+            return data
+        return {'error': {'message': str(data)[:2000], 'type': 'api_error'}}
+    except Exception:
+        try:
+            text = await resp.text()
+        except Exception as e:
+            text = str(e)
+        return {'error': {'message': (text or f'HTTP {resp.status}')[:2000], 'type': 'api_error', 'code': resp.status}}
+
 class Server:
     def __init__(self, app: FastAPI = None):
         self.app = app or FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
@@ -571,6 +643,12 @@ class Server:
         self.registry.set_external_agent(self._session)
         await self.registry.refresh(force=True)
         self.registry.start()
+
+        # Warm NIM model catalog before resolving Claude Code aliases
+        try:
+            await self.pool.refresh_models(force=True)
+        except Exception as e:
+            logger.warning(f'[init] model catalog warm failed: {e}')
 
         load_alias_config(self.pool)
 
@@ -1293,7 +1371,7 @@ class Server:
                             attempt += 1
                             continue
                         if resp.status >= 400:
-                            resp_body = await resp.json()
+                            resp_body = await _safe_response_body(resp)
                             self._in_flight = max(0, self._in_flight - 1)
                             key.decrement_in_flight()
                             if attempt < max_attempts - 1:
@@ -1330,7 +1408,7 @@ class Server:
                             attempt += 1
                             continue
 
-                        resp_data = await resp.json()
+                        resp_data = await _safe_response_body(resp)
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
 
@@ -1382,7 +1460,28 @@ class Server:
                 continue
             if wants_reasoning and not is_reasoning_model(mid):
                 continue
+            # Skip retired/unavailable
+            if is_model_unavailable(mid):
+                continue
             cands.append(mid)
+        # Prefer smaller/faster instruct models first (avoid multi-minute fallbacks)
+        def _rank(mid: str) -> tuple:
+            s = str(mid).lower()
+            score = 50
+            if '8b' in s or '7b' in s or '3b' in s or 'mini' in s or 'nano' in s:
+                score = 0
+            elif '9b' in s or '12b' in s or '13b' in s:
+                score = 1
+            elif '27b' in s or '30b' in s or '32b' in s or '34b' in s:
+                score = 2
+            elif '70b' in s:
+                score = 3
+            elif '405b' in s or 'ultra' in s or '550b' in s:
+                score = 9
+            if 'instruct' in s:
+                score -= 1
+            return (score, len(s))
+        cands.sort(key=_rank)
         return cands[:int(os.environ.get('MODEL_FALLBACK_MAX_HOPS', '2'))]
 
     def _resolve_base(self, model_id: str) -> str:

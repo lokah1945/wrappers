@@ -89,3 +89,16 @@ cd opencode && PYTHONPATH=. python -c "from src.main import OPENCODE_BASE, _zen_
 ## Status
 
 ✅ **PRODUCTION READY — 100/100** (surgical patch pass, 2026-07-23)
+
+## Live deep matrix (2026-07-23 evening)
+
+Real keys exercised against upstreams (keys not stored in repo):
+
+| Wrapper | Live matrix | Notes |
+|---------|-------------|-------|
+| nvidia-python | **PASS** OpenAI chat/stream, Responses stream, Anthropic stream (index 0), Claude aliases haiku/sonnet/opus, tools name:null, count_tokens, thinking flag | Fixed missing `import time` (empty Anthropic SSE), safe non-JSON error decode, safer alias defaults + catalog-warm before alias load, ranked fallbacks |
+| nous | **PASS** chat/stream, responses/stream, anthropic+thinking stream, aliases, name:null tools, FREE_ONLY filter | FREE_ONLY only |
+| opencode | **PASS** Zen free chat/stream/responses/anthropic+thinking; GPT paid returns clean auth error | FREE_ONLY only; Zen billing required for paid GPT/Claude |
+
+**FREE_ONLY:** only `nous` + `opencode`. **Not used by nvidia-python** (NIM catalog already free-accessible).
+
