@@ -1367,6 +1367,8 @@ async function verifyModels() {
 }
 
 let serverInstance = null;
+// Extra http.Server instances for ANY_ALSO_PORTS (one server per port).
+const extraServers = [];
 
 async function verifyLoop() {
   await new Promise(resolve => setTimeout(resolve, 30000));
@@ -4652,13 +4654,16 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
   serverInstance.maxHeadersCount = 100;
   serverInstance.headersTimeout = parseInt(process.env.SERVER_HEADERS_TIMEOUT_MS || '15000', 10);
 
-  serverInstance.listen(LISTEN_PORT, BIND_HOST, () => {
+  // Skip listening in test_integration mode (listen neutralized by harness)
+  if (process.env.NODE_ENV !== 'test_integration') {
+    serverInstance.listen(LISTEN_PORT, BIND_HOST, () => {
     console.log(`[wrapper-nvidia] v${VERSION} listening on ${BIND_HOST}:${LISTEN_PORT}`);
     console.log(`[wrapper-nvidia] Keys: ${pool.totalKeys} total, ${pool.availableKeys} available`);
     console.log(`[wrapper-nvidia] Models cached: ${pool.modelsCached.length}`);
     console.log(`[wrapper-nvidia] Upstream: LLM=${BASE_LLM}`);
     console.log(`[wrapper-nvidia] Metrics DB: ${dbPath}`);
   });
+  }
 
   // FIX P0: multi-port bind so every client config is satisfied without
   // editing client configs (which live outside this repo):
@@ -4668,19 +4673,35 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
   //     and CLADUE_CODE_GATEWAY_MODEL_DISCOVERY_URL = http://localhost:9910/v1/models
   // Previously this wrapper bound only LISTEN_PORT (9910 via .env + service), so
   // every 9100-targeting client got ECONNREFUSED. We keep LISTEN_PORT as the
-  // primary and additionally bind ANY_ALSO_PORTS (comma-separated) on the SAME
-  // http.Server/handler, so one OS process serves all expected addresses.
+  // primary and additionally bind ANY_ALSO_PORTS (comma-separated).
+  //
+  // CRITICAL FIX: A single http.Server CANNOT listen on multiple ports.
+  // Calling .listen() a second time on the same server REPLACES the first
+  // socket, so only the last port ends up bound. Each port needs its OWN
+  // http.Server instance sharing the same handleRequest handler.
   const extraPorts = (process.env.ANY_ALSO_PORTS || '')
     .split(',').map(x => parseInt((x || '').trim(), 10))
     .filter(p => Number.isInteger(p) && p > 0 && p !== LISTEN_PORT)
     // de-dup
     .filter((p, i, arr) => arr.indexOf(p) === i);
-  for (const p of extraPorts) {
-    // A single http.Server can call .listen() multiple times; Node adds an
-    // extra handle per call while reusing the same request handler.
-    serverInstance.listen(p, BIND_HOST, () => {
-      console.log(`[wrapper-nvidia] also listening on ${BIND_HOST}:${p}`);
-    });
+  if (process.env.NODE_ENV !== 'test_integration') {
+    for (const p of extraPorts) {
+      const extraServer = http.createServer(handleRequest);
+      extraServer.on('error', (err) => {
+        // Any listen failure must terminate loudly instead of hanging silently.
+        console.error(`[FATAL] listen() error on ${BIND_HOST}:${p}: ${err.code || err.message}`);
+        console.error(err.stack || err);
+        process.exit(1);
+      });
+      extraServer.timeout = antiSilence;
+      extraServer.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_MS || '65000', 10);
+      extraServer.maxHeadersCount = 100;
+      extraServer.headersTimeout = parseInt(process.env.SERVER_HEADERS_TIMEOUT_MS || '15000', 10);
+      extraServer.listen(p, BIND_HOST, () => {
+        console.log(`[wrapper-nvidia] also listening on ${BIND_HOST}:${p}`);
+      });
+      extraServers.push(extraServer);
+    }
   }
 
   pool.startModelRefresh();
@@ -4698,9 +4719,12 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
 
   const shutdown = () => {
     console.log('[wrapper-nvidia] Shutting down...');
-    // Stop accepting new connections
-    serverInstance.close(() => {
-      console.log('[wrapper-nvidia] Server closed, draining remaining requests...');
+    // Stop accepting new connections on ALL servers (primary + ANY_ALSO_PORTS)
+    const allServers = [serverInstance, ...extraServers];
+    let pending = allServers.length;
+    const onAllClosed = () => {
+      if (--pending > 0) return;
+      console.log('[wrapper-nvidia] All servers closed, draining remaining requests...');
       // Give in-flight requests a chance to complete
       let drainAttempts = 0;
       const drainInterval = setInterval(() => {
@@ -4713,7 +4737,10 @@ serverInstance.keepAliveTimeout = parseInt(process.env.SERVER_KEEPALIVE_TIMEOUT_
         console.log(`[wrapper-nvidia] Draining: ${remaining} in-flight requests...`);
         drainAttempts++;
       }, 1000);
-    });
+    };
+    for (const s of allServers) {
+      s.close(onAllClosed);
+    }
     // Force shutdown after timeout
     setTimeout(() => {
       console.log('[wrapper-nvidia] Force shutdown after timeout');

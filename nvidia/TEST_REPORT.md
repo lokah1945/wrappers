@@ -1,20 +1,20 @@
 # TEST REPORT - E2E Integration Testing
 
-Date: 2026-07-11T04:57:31.140Z
+Date: 2026-07-21T08:04:41.612Z
 
 ## Test Results
 
 | Test Case | Status | Details |
 | --- | --- | --- |
-| Health Check | ✅ PASS |  |
-| Models List & Context Window Heuristic | ✅ PASS | Llama 3.1 8B context window: 128000 |
-| OpenAI Chat Completion Non-Stream | ✅ PASS | Response: SUCCESS |
-| OpenAI Chat Completion Stream | ✅ PASS |  |
-| Anthropic Messages Non-Stream | ✅ PASS | Response: SUCCESS |
-| Anthropic Messages Stream | ✅ PASS |  |
-| Embeddings | ✅ PASS | Vector size: 4096 |
+| Health Check | ❌ FAIL | fetch failed |
+| Models List & Context Window Heuristic | ❌ FAIL | fetch failed |
+| OpenAI Chat Completion Non-Stream | ❌ FAIL | fetch failed |
+| OpenAI Chat Completion Stream | ❌ FAIL | fetch failed |
+| Anthropic Messages Non-Stream | ❌ FAIL | fetch failed |
+| Anthropic Messages Stream | ❌ FAIL | fetch failed |
+| Embeddings | ❌ FAIL | fetch failed |
 
 
 ## Conclusion
 
-All integration tests passed successfully. The wrapper proxy is functioning as a robust, fully compatible transparent proxy for NVIDIA NIM.
+Some integration tests failed. Please check the logs above to identify and resolve issues.

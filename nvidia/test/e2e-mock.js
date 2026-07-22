@@ -33,8 +33,8 @@ const path = require('path');
 const fs = require('fs');
 
 const ROOT = path.resolve(__dirname, '..');
-const WRAPPER_PORT = 9941;
-const MOCK_PORT = 9942;
+const WRAPPER_PORT = 19941;
+const MOCK_PORT = 19942; MOCK_HOST = "127.0.0.1";
 const TOKEN = 'e2e-token';
 
 // ── Mock NVIDIA upstream ────────────────────────────────────────────────────
@@ -157,7 +157,7 @@ function startMock() {
         res.end(JSON.stringify({ error: { message: 'Model not found', type: 'not_found_error' } }));
       });
     });
-    srv.listen(MOCK_PORT, () => resolve(srv));
+    srv.listen(MOCK_PORT, "127.0.0.1", () => resolve(srv));
   });
 }
 
