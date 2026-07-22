@@ -32,10 +32,11 @@ Environment=METRICS_DB=/root/wrapper/nvidia/metrics.db
 # silently 504'd healthy large-reasoning-model streams, the exact premature-kill
 # risk called out for model (b). We therefore DO NOT override it: the documented
 # 960000ms default in .env.example (>= STREAM_REQUEST_TIMEOUT_SEC + 60s) applies.
-# If a tighter ceiling is ever required, set it >= 960000, never below.
+# SERVER_KEEPALIVE_TIMEOUT_MS=65000 provides reasonable connection reuse while
+# allowing long reasoning sessions to complete.
 Environment=SERVER_REQUEST_TIMEOUT_MS=60000
-Environment=SERVER_KEEPALIVE_TIMEOUT_MS=10000
-Environment=SERVER_HEADERS_TIMEOUT_MS=15000
+Environment=SERVER_KEEPALIVE_TIMEOUT_MS=65000
+Environment=SERVER_HEADERS_TIMEOUT_MS=35000
 TimeoutStopSec=15
 # Resource limits — cap memory so a runaway upstream response can't OOM
 # the host. Conservative; tune up if needed.
