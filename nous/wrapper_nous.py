@@ -59,7 +59,64 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.2-production-hermes-fixed"
+VERSION = "2.0.3-production-free-only"
+
+def free_only_enabled() -> bool:
+    """FREE_ONLY=yes|true|1 → only expose/allow models whose id contains 'free'."""
+    v = (os.environ.get("FREE_ONLY") or "no").strip().lower()
+    return v in ("yes", "true", "1", "on", "y")
+
+def is_free_model(model_id: str) -> bool:
+    """True if model name/id contains 'free' (case-insensitive).
+
+    Optional FREE_MODEL_ALLOWLIST=comma,separated,ids for free models whose
+    ids do not contain the substring (e.g. niche upstream names).
+    """
+    if not model_id:
+        return False
+    mid = str(model_id).lower().strip()
+    if "free" in mid:
+        return True
+    allow = (os.environ.get("FREE_MODEL_ALLOWLIST") or "").strip()
+    if not allow:
+        return False
+    extras = {x.strip().lower() for x in allow.split(",") if x.strip()}
+    bare = mid.split("/", 1)[-1] if "/" in mid else mid
+    return mid in extras or bare in extras
+
+def model_allowed(model_id: str) -> bool:
+    """When FREE_ONLY, allow only free models (and aliases that resolve to free)."""
+    if not free_only_enabled():
+        return True
+    if not model_id:
+        return False
+    # Alias key itself or resolved target must contain 'free'
+    resolved = MODEL_ALIASES.get(str(model_id).lower(), model_id)
+    return is_free_model(model_id) or is_free_model(resolved)
+
+def free_only_error(model_id: str) -> dict:
+    return {
+        "error": {
+            "type": "invalid_request_error",
+            "message": (
+                f'Model "{model_id}" is not available while FREE_ONLY=yes. '
+                'Only models with "free" in the model name are allowed. '
+                'Set FREE_ONLY=no to use paid models, or pick a free model '
+                '(e.g. tencent/hy3:free, poolside/laguna-s-2.1:free).'
+            ),
+            "code": "free_only_restricted",
+            "param": "model",
+        }
+    }
+
+def free_only_anthropic_error(model_id: str) -> dict:
+    return {
+        "type": "error",
+        "error": {
+            "type": "invalid_request_error",
+            "message": free_only_error(model_id)["error"]["message"],
+        },
+    }
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s")
 logger = logging.getLogger("wrapper-nous")
@@ -86,8 +143,15 @@ MODEL_METADATA = {
 }
 
 def resolve_model(m: str) -> str:
-    if not m: return DEFAULT_MODEL
-    return MODEL_ALIASES.get(m.lower(), m)
+    if not m:
+        # Prefer a free default when FREE_ONLY is on
+        if free_only_enabled() and not is_free_model(DEFAULT_MODEL):
+            for mid in MODEL_METADATA:
+                if is_free_model(mid):
+                    return mid
+        return DEFAULT_MODEL
+    resolved = MODEL_ALIASES.get(m.lower(), m)
+    return resolved
 
 def get_model_meta(mid: str) -> dict:
     m = resolve_model(mid)
@@ -124,7 +188,23 @@ _session: Optional[aiohttp.ClientSession] = None
 
 async def get_session() -> aiohttp.ClientSession:
     global _session
-    if _session is None or _session.closed:
+    # Recreate when missing, closed, or bound to a dead event loop (TestClient / reload)
+    need_new = _session is None or _session.closed
+    if not need_new:
+        try:
+            loop = asyncio.get_running_loop()
+            # aiohttp session tied to a different/closed loop → rebuild
+            sess_loop = getattr(_session, '_loop', None)
+            if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
+                need_new = True
+        except Exception:
+            need_new = True
+    if need_new:
+        if _session is not None and not _session.closed:
+            try:
+                await _session.close()
+            except Exception:
+                pass
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=300),
             connector=aiohttp.TCPConnector(limit=100, limit_per_host=50)
@@ -588,7 +668,7 @@ async def health():
         upstream = code == 200
     except:
         upstream = False
-    return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "metrics": metrics.snapshot()}
+    return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "metrics": metrics.snapshot()}
 
 @app.get("/version")
 async def version(): return {"version": VERSION}
@@ -605,10 +685,15 @@ async def models():
 
     models_list = data.get("data", []) if isinstance(data, dict) else []
     for alias, real in MODEL_ALIASES.items():
+        # Under FREE_ONLY only inject aliases that resolve to a free model
+        if free_only_enabled() and not (is_free_model(alias) or is_free_model(real)):
+            continue
         if not any(m.get("id") == alias for m in models_list):
             models_list.append({"id": alias, "object": "model", "created": 0, "owned_by": "anthropic"})
+    if free_only_enabled():
+        models_list = [m for m in models_list if model_allowed(m.get("id", ""))]
     enriched = [get_model_meta(m.get("id", "")) for m in models_list]
-    return {"object": "list", "data": enriched}
+    return {"object": "list", "data": enriched, "free_only": free_only_enabled()}
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):
@@ -625,8 +710,13 @@ async def chat_completions(request: Request):
     if not check_rate_limit(client_ip):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
-    model = resolve_model(body.get("model"))
+    requested = body.get("model")
+    model = resolve_model(requested)
     body["model"] = model
+    if free_only_enabled() and not (model_allowed(requested or "") or model_allowed(model)):
+        return JSONResponse(status_code=400, content=free_only_error(requested or model))
+    if free_only_enabled() and not model_allowed(model):
+        return JSONResponse(status_code=400, content=free_only_error(requested or model))
     for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
         body.pop(bad, None)
 
@@ -652,7 +742,14 @@ async def chat_completions(request: Request):
 async def responses(request: Request):
     await _auth_check(request)
     body = await request.json()
+    requested = body.get("model")
+    if free_only_enabled():
+        resolved = resolve_model(requested)
+        if not (model_allowed(requested or "") or model_allowed(resolved)):
+            return JSONResponse(status_code=400, content=free_only_error(requested or resolved))
     chat_body = responses_to_chat(body)
+    if free_only_enabled() and not model_allowed(chat_body.get("model", "")):
+        return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
     is_stream = body.get("stream", False)
 
@@ -680,7 +777,15 @@ async def responses(request: Request):
 async def messages(request: Request):
     await _auth_check(request)
     body = await request.json()
+    requested = body.get("model")
+    if free_only_enabled():
+        resolved = resolve_model(requested)
+        # thinking may force REASONING_MODEL — still must be free
+        if not (model_allowed(requested or "") or model_allowed(resolved)):
+            return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or resolved))
     chat_body = anthropic_to_openai(body)
+    if free_only_enabled() and not model_allowed(chat_body.get("model", "")):
+        return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
     is_stream = body.get("stream", False)
 

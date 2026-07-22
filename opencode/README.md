@@ -56,3 +56,15 @@ export OPENAI_API_KEY=wrapper-local-key
 - `name:null` tools filter (Codex/Hermes)
 - Claude Code aliases (`sonnet`/`opus`/`haiku`)
 - `.env` hot reload, metrics, bearer auth
+
+## FREE_ONLY mode
+
+```bash
+FREE_ONLY=yes
+FREE_MODEL_ALLOWLIST=big-pickle   # Zen free model without "free" in the id
+DEFAULT_FREE_MODEL=mimo-v2.5-free
+```
+
+Filters `GET /v1/models` and rejects paid models on Chat / Responses / Messages
+with OpenAI/Anthropic-compatible 400 error envelopes so SDKs surface a clean error.
+

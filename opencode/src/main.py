@@ -45,7 +45,81 @@ BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
-VERSION = '1.0.1-opencode-zen-py'
+VERSION = '1.0.2-opencode-zen-free-only'
+
+def free_only_enabled() -> bool:
+    """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""
+    v = (os.environ.get('FREE_ONLY') or 'no').strip().lower()
+    return v in ('yes', 'true', '1', 'on', 'y')
+
+def is_free_model(model_id: str) -> bool:
+    """True if model id contains 'free', or is listed in FREE_MODEL_ALLOWLIST.
+
+    OpenCode Zen free catalog mostly uses *-free ids; `big-pickle` is free but
+    has no 'free' substring — add it via FREE_MODEL_ALLOWLIST=big-pickle if needed.
+    """
+    if not model_id:
+        return False
+    mid = str(model_id).lower().strip()
+    if mid.startswith('opencode/'):
+        mid = mid.split('/', 1)[1]
+    if 'free' in mid:
+        return True
+    allow = (os.environ.get('FREE_MODEL_ALLOWLIST') or '').strip()
+    if not allow:
+        return False
+    extras = {x.strip().lower() for x in allow.split(',') if x.strip()}
+    bare = mid.split('/')[-1] if '/' in mid else mid
+    return mid in extras or bare in extras
+
+def model_allowed(model_id: str) -> bool:
+    if not free_only_enabled():
+        return True
+    if not model_id:
+        return False
+    # Check raw id and alias-normalized form
+    raw = str(model_id)
+    if is_free_model(raw):
+        return True
+    # strip opencode/ prefix
+    if raw.lower().startswith('opencode/'):
+        raw = raw.split('/', 1)[1]
+    if is_free_model(raw):
+        return True
+    # known aliases map
+    aliases = {
+        'sonnet': os.environ.get('ALIAS_SONNET', 'claude-sonnet-4-6'),
+        'opus': os.environ.get('ALIAS_OPUS', 'claude-opus-4-6'),
+        'haiku': os.environ.get('ALIAS_HAIKU', 'claude-haiku-4-5'),
+    }
+    target = aliases.get(raw.lower(), raw)
+    return is_free_model(target)
+
+def free_only_error(model_id: str) -> dict:
+    return {
+        'error': {
+            'type': 'invalid_request_error',
+            'message': (
+                f'Model "{model_id}" is not available while FREE_ONLY=yes. '
+                'Only models with "free" in the model name are allowed '
+                '(e.g. big-pickle, mimo-v2.5-free, laguna-s-2.1-free, '
+                'nemotron-3-ultra-free, deepseek-v4-flash-free). '
+                'Set FREE_ONLY=no to use paid models.'
+            ),
+            'code': 'free_only_restricted',
+            'param': 'model',
+        }
+    }
+
+def free_only_anthropic_error(model_id: str) -> dict:
+    return {
+        'type': 'error',
+        'error': {
+            'type': 'invalid_request_error',
+            'message': free_only_error(model_id)['error']['message'],
+        },
+    }
+
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 ANTI_SILENCE = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
 INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
@@ -59,7 +133,21 @@ async def get_session():
     """Reuse one aiohttp session (fix per-request ClientSession leak)."""
     global _session
     import aiohttp
-    if _session is None or _session.closed:
+    need_new = _session is None or _session.closed
+    if not need_new:
+        try:
+            loop = asyncio.get_running_loop()
+            sess_loop = getattr(_session, '_loop', None)
+            if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
+                need_new = True
+        except Exception:
+            need_new = True
+    if need_new:
+        if _session is not None and not _session.closed:
+            try:
+                await _session.close()
+            except Exception:
+                pass
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=900, sock_connect=30),
             connector=aiohttp.TCPConnector(limit=100, limit_per_host=50),
@@ -95,7 +183,18 @@ def _normalize_model(model: str) -> str:
         'claude-sonnet-4-20250514': 'claude-sonnet-4-6',
         'claude-opus-4-20250514': 'claude-opus-4-6',
     }
-    return aliases.get(m.lower(), m)
+    resolved = aliases.get(m.lower(), m)
+    # When FREE_ONLY and empty/default is paid, prefer a known free Zen model
+    if free_only_enabled() and not is_free_model(resolved):
+        if not model:  # only auto-switch when client omitted model
+            for cand in (
+                os.environ.get('DEFAULT_FREE_MODEL', 'mimo-v2.5-free'),
+                'mimo-v2.5-free', 'laguna-s-2.1-free', 'nemotron-3-ultra-free',
+                'deepseek-v4-flash-free', 'north-mini-code-free', 'big-pickle',
+            ):
+                if cand and is_free_model(cand):
+                    return cand
+    return resolved
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
     import aiohttp
@@ -366,7 +465,7 @@ def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys}
+    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "base": OPENCODE_BASE}
 
 @app.get("/v1/models")
 async def models(request: Request):
@@ -374,16 +473,24 @@ async def models(request: Request):
     _auth_check(request)
     key_result = await pool.acquire()
     # Even without keys, return curated aliases so Claude Code discovery works
-    fallback = {"object": "list", "data": [
+    fallback_all = [
         {"id": "gpt-5.4-mini", "object": "model", "owned_by": "opencode-zen"},
         {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "opencode-zen"},
         {"id": "claude-haiku-4-5", "object": "model", "owned_by": "opencode-zen"},
         {"id": "claude-opus-4-6", "object": "model", "owned_by": "opencode-zen"},
         {"id": "big-pickle", "object": "model", "owned_by": "opencode-zen"},
+        {"id": "mimo-v2.5-free", "object": "model", "owned_by": "opencode-zen"},
+        {"id": "laguna-s-2.1-free", "object": "model", "owned_by": "opencode-zen"},
+        {"id": "nemotron-3-ultra-free", "object": "model", "owned_by": "opencode-zen"},
+        {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode-zen"},
+        {"id": "north-mini-code-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "sonnet", "object": "model", "owned_by": "alias"},
         {"id": "opus", "object": "model", "owned_by": "alias"},
         {"id": "haiku", "object": "model", "owned_by": "alias"},
-    ]}
+    ]
+    if free_only_enabled():
+        fallback_all = [m for m in fallback_all if model_allowed(m.get("id", ""))]
+    fallback = {"object": "list", "data": fallback_all, "free_only": free_only_enabled()}
     if not key_result:
         return fallback
     key = key_result['key']
@@ -393,11 +500,14 @@ async def models(request: Request):
         pool.release(key)
         if status != 200 or not isinstance(data, dict):
             return fallback
-        # inject aliases
+        # inject aliases (respect FREE_ONLY)
         ids = {m.get('id') for m in (data.get('data') or [])}
         for a in ("sonnet", "opus", "haiku"):
-            if a not in ids:
+            if a not in ids and model_allowed(a):
                 (data.setdefault('data', [])).append({"id": a, "object": "model", "owned_by": "alias"})
+        if free_only_enabled():
+            data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
+        data['free_only'] = free_only_enabled()
         return data
     except Exception as e:
         pool.release(key)
@@ -415,7 +525,12 @@ async def chat_completions(request: Request):
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
     body = await request.json()
-    body["model"] = _normalize_model(body.get("model") or DEFAULT_MODEL)
+    requested = body.get("model") or DEFAULT_MODEL
+    body["model"] = _normalize_model(requested)
+    if free_only_enabled() and not (model_allowed(requested) or model_allowed(body["model"])):
+        return _jr(400, free_only_error(requested))
+    if free_only_enabled() and not model_allowed(body["model"]):
+        return _jr(400, free_only_error(requested))
     is_stream = bool(body.get("stream", False))
 
     key_result = await pool.acquire()
@@ -462,8 +577,13 @@ async def responses(request: Request):
     """
     _auth_check(request)
     body = await request.json()
-    model = _normalize_model(body.get("model") or DEFAULT_MODEL)
+    requested = body.get("model") or DEFAULT_MODEL
+    model = _normalize_model(requested)
     body["model"] = model
+    if free_only_enabled() and not (model_allowed(requested) or model_allowed(model)):
+        return _jr(400, free_only_error(requested))
+    if free_only_enabled() and not model_allowed(model):
+        return _jr(400, free_only_error(requested))
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 
@@ -557,8 +677,13 @@ async def anthropic_messages(request: Request):
     """
     _auth_check(request)
     body = await request.json()
-    model = _normalize_model(body.get("model") or DEFAULT_MODEL)
+    requested = body.get("model") or DEFAULT_MODEL
+    model = _normalize_model(requested)
     body["model"] = model
+    if free_only_enabled() and not (model_allowed(requested) or model_allowed(model)):
+        return _jr(400, free_only_anthropic_error(requested))
+    if free_only_enabled() and not model_allowed(model):
+        return _jr(400, free_only_anthropic_error(requested))
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 

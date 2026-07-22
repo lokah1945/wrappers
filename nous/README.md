@@ -143,3 +143,18 @@ See `FINAL_100_AUDIT.md` for the complete 100/100 compatibility matrix and proof
 **Related projects:**
 - NVIDIA NIM wrapper (canonical): `../nvidia-python/`
 - Root wrappers overview: `../README.md`
+
+## FREE_ONLY mode
+
+```bash
+# .env
+FREE_ONLY=yes   # only models with "free" in the name are listed & accepted
+FREE_ONLY=no    # default — all models
+# FREE_MODEL_ALLOWLIST=   # optional ids without substring "free"
+```
+
+When `FREE_ONLY=yes`:
+- `GET /v1/models` returns only free models (+ free-resolving aliases)
+- `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages` return **400**
+  `invalid_request_error` / `free_only_restricted` for paid model ids
+
