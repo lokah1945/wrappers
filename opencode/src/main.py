@@ -45,7 +45,7 @@ BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
-VERSION = '1.0.2-opencode-zen-free-only'
+VERSION = '1.0.3-opencode-zen'
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""
@@ -196,6 +196,50 @@ def _normalize_model(model: str) -> str:
     }
     return aliases.get(m.lower(), m)
 
+def _normalize_upstream_error(status: int, text_or_data) -> dict:
+    """Single OpenAI-shaped error; unwrap nested JSON string messages."""
+    msg = text_or_data
+    etype = "api_error"
+    if isinstance(text_or_data, dict):
+        if isinstance(text_or_data.get("error"), dict):
+            err = text_or_data["error"]
+            msg = err.get("message") or err.get("msg") or str(err)
+            etype = err.get("type") or etype
+        elif text_or_data.get("message"):
+            msg = text_or_data.get("message")
+            etype = text_or_data.get("type") or etype
+        else:
+            msg = json.dumps(text_or_data)[:2000]
+    else:
+        msg = str(text_or_data or "")
+        try:
+            parsed = json.loads(msg)
+            return _normalize_upstream_error(status, parsed)
+        except Exception:
+            pass
+    if isinstance(msg, str):
+        try:
+            inner = json.loads(msg)
+            if isinstance(inner, dict):
+                if isinstance(inner.get("error"), dict):
+                    msg = inner["error"].get("message") or msg
+                    etype = inner["error"].get("type") or etype
+                elif inner.get("message"):
+                    msg = inner.get("message")
+        except Exception:
+            pass
+    if status == 429:
+        etype = "rate_limit_error"
+    elif status in (401, 403):
+        etype = "authentication_error"
+    elif status == 402 or (isinstance(etype, str) and "credit" in etype.lower()):
+        etype = "authentication_error"
+    elif status == 404:
+        etype = "not_found_error"
+    elif status >= 500:
+        etype = "server_error"
+    return {"error": {"message": str(msg)[:2000], "type": etype, "code": status}}
+
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
     import aiohttp
     sess = await get_session()
@@ -213,8 +257,8 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                 try:
                     data = json.loads(text)
                 except Exception:
-                    data = {"error": {"message": text[:2000], "type": "api_error"}}
-                return resp.status, data
+                    data = text
+                return resp.status, _normalize_upstream_error(resp.status, data)
             return 200, resp
         async with sess.request(
             method, url, json=json_body, headers=headers,
@@ -224,10 +268,35 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             try:
                 data = json.loads(text) if text else {}
             except Exception:
-                data = {"error": {"message": text[:2000], "type": "api_error"}}
+                data = text
+            if resp.status >= 400:
+                return resp.status, _normalize_upstream_error(resp.status, data)
+            if not isinstance(data, dict):
+                data = {"error": {"message": str(data)[:2000], "type": "api_error"}}
             return resp.status, data
     except Exception as e:
         return 502, {"error": {"message": str(e), "type": "api_error"}}
+
+
+def _ensure_chat_message(data: dict) -> dict:
+    """Normalize chat completion message for strict OpenAI clients."""
+    if not isinstance(data, dict):
+        return data
+    try:
+        choices = data.get("choices") or []
+        if not choices:
+            return data
+        ch0 = choices[0] or {}
+        msg = ch0.get("message") or {}
+        if msg.get("content") is None:
+            msg["content"] = ""
+        # Keep reasoning_content if present; do not move it into content (transparent)
+        ch0["message"] = msg
+        choices[0] = ch0
+        data["choices"] = choices
+    except Exception:
+        pass
+    return data
 
 def _jr(status: int, content: dict):
     """JSONResponse with correct kw-only args (Starlette)."""
@@ -307,9 +376,11 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     content = []
     if reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
-    if text:
-        content.append({"type": "text", "text": text})
-    for tc in msg.get('tool_calls') or []:
+    # Always emit a text block when no tools (Anthropic clients expect content blocks)
+    tool_calls = msg.get('tool_calls') or []
+    if text or not tool_calls:
+        content.append({"type": "text", "text": text or ""})
+    for tc in tool_calls:
         fn = tc.get('function') or {}
         try:
             inp = json.loads(fn.get('arguments') or '{}')
@@ -566,7 +637,7 @@ async def chat_completions(request: Request):
         await metrics.record_request(model=body.get("model"), path="/v1/chat/completions",
                                      prompt_tokens=(data.get("usage") or {}).get("prompt_tokens", 0),
                                      completion_tokens=(data.get("usage") or {}).get("completion_tokens", 0))
-        return JSONResponse(data)
+        return JSONResponse(_ensure_chat_message(data))
     except Exception as e:
         pool.release(key)
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})

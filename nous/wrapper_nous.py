@@ -59,7 +59,7 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.3-production-free-only"
+VERSION = "2.0.4-production"
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only expose/allow models whose id contains 'free'."""
@@ -210,6 +210,45 @@ async def get_session() -> aiohttp.ClientSession:
         )
     return _session
 
+
+def _normalize_upstream_error(status: int, text: str) -> dict:
+    """Parse upstream error body into a single OpenAI-shaped error (no double-encode)."""
+    msg = (text or "").strip()
+    etype = "api_error"
+    parsed = None
+    try:
+        parsed = json.loads(msg) if msg else None
+    except Exception:
+        parsed = None
+    if isinstance(parsed, dict):
+        if isinstance(parsed.get("error"), dict):
+            err = parsed["error"]
+            msg = err.get("message") or err.get("msg") or msg
+            etype = err.get("type") or etype
+            if isinstance(msg, str):
+                try:
+                    inner = json.loads(msg)
+                    if isinstance(inner, dict):
+                        if isinstance(inner.get("error"), dict):
+                            msg = inner["error"].get("message", msg)
+                            etype = inner["error"].get("type") or etype
+                        elif inner.get("message"):
+                            msg = inner.get("message")
+                except Exception:
+                    pass
+        elif parsed.get("message"):
+            msg = parsed.get("message")
+            etype = parsed.get("type") or etype
+    if status == 429:
+        etype = "rate_limit_error"
+    elif status in (401, 403):
+        etype = "authentication_error"
+    elif status == 404:
+        etype = "not_found_error"
+    elif status >= 500:
+        etype = "server_error"
+    return {"error": {"message": str(msg)[:2000], "type": etype, "code": status}}
+
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
     url = f"{NOUS_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
@@ -226,14 +265,17 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
         if resp.status != 200:
             text = await resp.text()
             await resp.release()
-            return resp.status, {"error": {"message": text, "type": "api_error"}}
+            return resp.status, _normalize_upstream_error(resp.status, text)
         return 200, resp
     else:
         async with sess.post(url, json=payload, headers=headers) as resp:
+            text = await resp.text()
             if resp.status != 200:
-                text = await resp.text()
-                return resp.status, {"error": {"message": text, "type": "api_error"}}
-            data = await resp.json()
+                return resp.status, _normalize_upstream_error(resp.status, text)
+            try:
+                data = json.loads(text) if text else {}
+            except Exception:
+                data = {"error": {"message": text[:2000], "type": "api_error"}}
             return resp.status, data
 
 # --------------------------------------------------------------------------
@@ -313,6 +355,21 @@ _STORE_LOCK = asyncio.Lock()
 async def store_conversation(rid: str, msgs: list):
     async with _STORE_LOCK:
         _RESPONSE_STORE[rid] = (time.time(), msgs)
+
+
+def _ensure_chat_content(data: dict) -> dict:
+    """Normalize chat completion message for strict OpenAI clients."""
+    try:
+        choices = data.get("choices") or []
+        if not choices:
+            return data
+        msg = choices[0].get("message") or {}
+        if msg.get("content") is None:
+            msg["content"] = ""
+            choices[0]["message"] = msg
+    except Exception:
+        pass
+    return data
 
 def chat_to_responses(model: str, chat: dict) -> dict:
     msg = (chat.get("choices") or [{}])[0].get("message", {})
@@ -467,7 +524,7 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
 class AnthropicStreamState:
     def __init__(self, model): 
         self.model = model
-        self.index = 0
+        self.index = -1  # first content block must be index 0 (Anthropic SDK)
         self.message_started = False
         self.current_block = None
         self.tool_map = {}
@@ -691,7 +748,20 @@ async def models():
             models_list.append({"id": alias, "object": "model", "created": 0, "owned_by": "anthropic"})
     if free_only_enabled():
         models_list = [m for m in models_list if model_allowed(m.get("id", ""))]
-    enriched = [get_model_meta(m.get("id", "")) for m in models_list]
+    # Deduplicate by id (upstream + aliases can repeat free models)
+    seen = set()
+    deduped = []
+    for m in models_list:
+        mid = m.get("id") if isinstance(m, dict) else None
+        if not mid or mid in seen:
+            continue
+        seen.add(mid)
+        deduped.append(m)
+    enriched = [get_model_meta(m.get("id", "")) for m in deduped]
+    # Preserve original id on meta
+    for i, m in enumerate(deduped):
+        if isinstance(enriched[i], dict):
+            enriched[i]["id"] = m.get("id")
     return {"object": "list", "data": enriched, "free_only": free_only_enabled()}
 
 @app.post("/v1/messages/count_tokens")
@@ -720,6 +790,21 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400, content=free_only_error(requested or model))
     for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
         body.pop(bad, None)
+    # Drop name:null tools (Codex/Hermes) before upstream
+    if isinstance(body.get("tools"), list):
+        cleaned = []
+        for tool in body["tools"]:
+            if not isinstance(tool, dict):
+                continue
+            fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+            name = fn.get("name") if isinstance(fn, dict) else None
+            if not name:
+                continue
+            cleaned.append(tool)
+        if cleaned:
+            body["tools"] = cleaned
+        else:
+            body.pop("tools", None)
 
     tok = await get_token()
     is_stream = body.get("stream", False)
@@ -736,6 +821,8 @@ async def chat_completions(request: Request):
             async for line in stream_with_heartbeat(result, lambda x: f"data: {json.dumps(x)}\n\n"):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+    if isinstance(result, dict):
+        _ensure_chat_content(result)
     return JSONResponse(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---
