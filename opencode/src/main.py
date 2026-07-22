@@ -100,11 +100,11 @@ def free_only_error(model_id: str) -> dict:
         'error': {
             'type': 'invalid_request_error',
             'message': (
-                f'Model "{model_id}" is not available while FREE_ONLY=yes. '
-                'Only models with "free" in the model name are allowed '
-                '(e.g. big-pickle, mimo-v2.5-free, laguna-s-2.1-free, '
-                'nemotron-3-ultra-free, deepseek-v4-flash-free). '
-                'Set FREE_ONLY=no to use paid models.'
+                f'Model "{model_id}" is blocked by FREE_ONLY=yes. '
+                'Only model ids containing "free" are allowed '
+                '(plus any ids in FREE_MODEL_ALLOWLIST). '
+                'Set FREE_ONLY=no to allow paid models. '
+                'This wrapper does not substitute models — send a free model id from the client.'
             ),
             'code': 'free_only_restricted',
             'param': 'model',
@@ -173,7 +173,18 @@ def _zen_family(model: str) -> str:
     return 'chat'
 
 def _normalize_model(model: str) -> str:
-    m = (model or DEFAULT_MODEL).strip()
+    """Transparent model pass-through.
+
+    - Does NOT inject DEFAULT_MODEL / DEFAULT_FREE_MODEL.
+    - Strips optional `opencode/` prefix only.
+    - Optional short aliases (sonnet/opus/haiku) if configured.
+    - FREE_ONLY never rewrites the client's choice.
+    """
+    if model is None:
+        return ""
+    m = str(model).strip()
+    if not m:
+        return ""
     if m.lower().startswith('opencode/'):
         m = m.split('/', 1)[1]
     aliases = {
@@ -183,18 +194,7 @@ def _normalize_model(model: str) -> str:
         'claude-sonnet-4-20250514': 'claude-sonnet-4-6',
         'claude-opus-4-20250514': 'claude-opus-4-6',
     }
-    resolved = aliases.get(m.lower(), m)
-    # When FREE_ONLY and empty/default is paid, prefer a known free Zen model
-    if free_only_enabled() and not is_free_model(resolved):
-        if not model:  # only auto-switch when client omitted model
-            for cand in (
-                os.environ.get('DEFAULT_FREE_MODEL', 'mimo-v2.5-free'),
-                'mimo-v2.5-free', 'laguna-s-2.1-free', 'nemotron-3-ultra-free',
-                'deepseek-v4-flash-free', 'north-mini-code-free', 'big-pickle',
-            ):
-                if cand and is_free_model(cand):
-                    return cand
-    return resolved
+    return aliases.get(m.lower(), m)
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
     import aiohttp
@@ -254,7 +254,7 @@ def _strip_cache(obj):
 
 def anthropic_to_openai(body: dict) -> dict:
     _strip_cache(body)
-    model = _normalize_model(body.get('model') or DEFAULT_MODEL)
+    model = _normalize_model(body.get('model') or '')
     msgs = []
     sys = body.get('system')
     if isinstance(sys, str) and sys:
@@ -328,7 +328,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
                       "output_tokens": u.get('completion_tokens', 0) or 0}}
 
 def responses_to_chat(body: dict) -> dict:
-    model = _normalize_model(body.get('model') or DEFAULT_MODEL)
+    model = _normalize_model(body.get('model') or '')
     msgs = []
     raw = body.get('input')
     if isinstance(raw, str):
@@ -525,12 +525,13 @@ async def chat_completions(request: Request):
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
     body = await request.json()
-    requested = body.get("model") or DEFAULT_MODEL
-    body["model"] = _normalize_model(requested)
-    if free_only_enabled() and not (model_allowed(requested) or model_allowed(body["model"])):
+    requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
+    if requested is not None:
+        body["model"] = _normalize_model(requested)
+    if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(body.get("model") or ""):
         return _jr(400, free_only_error(requested))
-    if free_only_enabled() and not model_allowed(body["model"]):
-        return _jr(400, free_only_error(requested))
+    if free_only_enabled() and body.get("model") and not model_allowed(body["model"]):
+        return _jr(400, free_only_error(requested or body["model"]))
     is_stream = bool(body.get("stream", False))
 
     key_result = await pool.acquire()
@@ -540,9 +541,9 @@ async def chat_completions(request: Request):
     headers = _auth_headers(key.api_key, request)
 
     # Prefer chat/completions; if model is responses/messages-native, still accept chat shape via conversion path upstream may reject — try chat first for openai-compatible clients
-    family = _zen_family(body["model"])
+    family = _zen_family(body.get("model") or "")
     if family == "chat" or family == "google":
-        url = f"{OPENCODE_BASE}/chat/completions" if family == "chat" else f"{OPENCODE_BASE}/models/{body['model']}"
+        url = f"{OPENCODE_BASE}/chat/completions" if family == "chat" else f"{OPENCODE_BASE}/models/{body.get('model') or ''}"
     else:
         # For GPT/Claude models Zen's native surface differs; still expose chat by converting through chat endpoint when available, else fall through
         url = f"{OPENCODE_BASE}/chat/completions"
@@ -577,13 +578,14 @@ async def responses(request: Request):
     """
     _auth_check(request)
     body = await request.json()
-    requested = body.get("model") or DEFAULT_MODEL
-    model = _normalize_model(requested)
-    body["model"] = model
-    if free_only_enabled() and not (model_allowed(requested) or model_allowed(model)):
+    requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
+    model = _normalize_model(requested) if requested else ""
+    if requested is not None:
+        body["model"] = model
+    if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(model):
         return _jr(400, free_only_error(requested))
-    if free_only_enabled() and not model_allowed(model):
-        return _jr(400, free_only_error(requested))
+    if free_only_enabled() and model and not model_allowed(model):
+        return _jr(400, free_only_error(requested or model))
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 
@@ -677,13 +679,14 @@ async def anthropic_messages(request: Request):
     """
     _auth_check(request)
     body = await request.json()
-    requested = body.get("model") or DEFAULT_MODEL
-    model = _normalize_model(requested)
-    body["model"] = model
-    if free_only_enabled() and not (model_allowed(requested) or model_allowed(model)):
+    requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
+    model = _normalize_model(requested) if requested else ""
+    if requested is not None:
+        body["model"] = model
+    if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(model):
         return _jr(400, free_only_anthropic_error(requested))
-    if free_only_enabled() and not model_allowed(model):
-        return _jr(400, free_only_anthropic_error(requested))
+    if free_only_enabled() and model and not model_allowed(model):
+        return _jr(400, free_only_anthropic_error(requested or model))
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 

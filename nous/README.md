@@ -153,8 +153,9 @@ FREE_ONLY=no    # default — all models
 # FREE_MODEL_ALLOWLIST=   # optional ids without substring "free"
 ```
 
+Transparent proxy: the client always chooses the model. FREE_ONLY only filters.
+
 When `FREE_ONLY=yes`:
 - `GET /v1/models` returns only free models (+ free-resolving aliases)
 - `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages` return **400**
   `invalid_request_error` / `free_only_restricted` for paid model ids
-

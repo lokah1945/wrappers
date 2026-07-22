@@ -99,10 +99,9 @@ def free_only_error(model_id: str) -> dict:
         "error": {
             "type": "invalid_request_error",
             "message": (
-                f'Model "{model_id}" is not available while FREE_ONLY=yes. '
-                'Only models with "free" in the model name are allowed. '
-                'Set FREE_ONLY=no to use paid models, or pick a free model '
-                '(e.g. tencent/hy3:free, poolside/laguna-s-2.1:free).'
+                f'Model "{model_id}" is blocked by FREE_ONLY=yes. '
+                'Only model ids containing "free" are allowed. '
+                'Set FREE_ONLY=no to allow paid models, or request a free model id.'
             ),
             "code": "free_only_restricted",
             "param": "model",
@@ -143,15 +142,15 @@ MODEL_METADATA = {
 }
 
 def resolve_model(m: str) -> str:
+    """Transparent model pass-through.
+
+    - Empty/missing → returned as-is (no DEFAULT_MODEL injection).
+    - Known aliases (sonnet/haiku/...) → mapped; everything else unchanged.
+    - FREE_ONLY never rewrites the client's model choice.
+    """
     if not m:
-        # Prefer a free default when FREE_ONLY is on
-        if free_only_enabled() and not is_free_model(DEFAULT_MODEL):
-            for mid in MODEL_METADATA:
-                if is_free_model(mid):
-                    return mid
-        return DEFAULT_MODEL
-    resolved = MODEL_ALIASES.get(m.lower(), m)
-    return resolved
+        return m or ""
+    return MODEL_ALIASES.get(str(m).lower(), m)
 
 def get_model_meta(mid: str) -> dict:
     m = resolve_model(mid)
@@ -335,8 +334,8 @@ def chat_to_responses(model: str, chat: dict) -> dict:
 def anthropic_to_openai(req: dict) -> dict:
     strip_cache_control(req)
     model = resolve_model(req.get("model"))
-    if (req.get("thinking") or {}).get("type") == "enabled":
-        model = REASONING_MODEL
+    # Transparent: do NOT force REASONING_MODEL when thinking is enabled.
+    # Client/agent chooses the model; thinking flags are passed through upstream.
 
     msgs = []
     sys = req.get("system")
@@ -711,11 +710,13 @@ async def chat_completions(request: Request):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
     requested = body.get("model")
-    model = resolve_model(requested)
-    body["model"] = model
-    if free_only_enabled() and not (model_allowed(requested or "") or model_allowed(model)):
-        return JSONResponse(status_code=400, content=free_only_error(requested or model))
-    if free_only_enabled() and not model_allowed(model):
+    # Transparent: only alias-map; do not inject DEFAULT_MODEL
+    model = resolve_model(requested) if requested else requested
+    if requested:
+        body["model"] = model
+    if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(model or ""):
+        return JSONResponse(status_code=400, content=free_only_error(requested))
+    if free_only_enabled() and model and not model_allowed(model):
         return JSONResponse(status_code=400, content=free_only_error(requested or model))
     for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
         body.pop(bad, None)
@@ -743,12 +744,12 @@ async def responses(request: Request):
     await _auth_check(request)
     body = await request.json()
     requested = body.get("model")
-    if free_only_enabled():
+    if free_only_enabled() and requested:
         resolved = resolve_model(requested)
-        if not (model_allowed(requested or "") or model_allowed(resolved)):
-            return JSONResponse(status_code=400, content=free_only_error(requested or resolved))
+        if not model_allowed(requested) and not model_allowed(resolved):
+            return JSONResponse(status_code=400, content=free_only_error(requested))
     chat_body = responses_to_chat(body)
-    if free_only_enabled() and not model_allowed(chat_body.get("model", "")):
+    if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
     is_stream = body.get("stream", False)
@@ -778,13 +779,14 @@ async def messages(request: Request):
     await _auth_check(request)
     body = await request.json()
     requested = body.get("model")
-    if free_only_enabled():
+    if free_only_enabled() and requested:
         resolved = resolve_model(requested)
-        # thinking may force REASONING_MODEL — still must be free
-        if not (model_allowed(requested or "") or model_allowed(resolved)):
-            return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or resolved))
+        if not model_allowed(requested) and not model_allowed(resolved):
+            return JSONResponse(status_code=400, content=free_only_anthropic_error(requested))
     chat_body = anthropic_to_openai(body)
-    if free_only_enabled() and not model_allowed(chat_body.get("model", "")):
+    # Note: anthropic_to_openai may map thinking→REASONING_MODEL (pre-existing);
+    # FREE_ONLY still enforces the *outgoing* model is free when enabled.
+    if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
     is_stream = body.get("stream", False)
