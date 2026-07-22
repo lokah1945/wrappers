@@ -142,15 +142,22 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
 
     sess = await get_session()
     try:
-        async with sess.post(url, json=payload, headers=headers) as resp:
-            if stream:
-                if resp.status != 200:
-                    text = await resp.text()
-                    return resp.status, {"error": {"message": text, "type": "api_error"}}
-                return 200, resp
-            else:
-                data = await resp.json()
+        resp = await sess.post(url, json=payload, headers=headers)
+        if stream:
+            if resp.status != 200:
+                text = await resp.text()
+                await resp.release()
+                return resp.status, {"error": {"message": text, "type": "api_error"}}
+            return 200, resp
+        async with resp:
+            if resp.status != 200:
+                try:
+                    data = await resp.json()
+                except Exception:
+                    data = {"error": {"message": await resp.text(), "type": "api_error"}}
                 return resp.status, data
+            data = await resp.json()
+            return resp.status, data
     except Exception as e:
         return 502, {"error": {"message": str(e), "type": "api_error"}}
 
@@ -337,6 +344,8 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                     if line.startswith(b"data:"):
                         data = line[5:].strip()
                         if data in (b"[DONE]", b"", b'"[DONE]"'):
+                            if state and hasattr(state, "done"):
+                                yield state.done()
                             yield "data: [DONE]\n\n"
                             return
                         try:
@@ -445,6 +454,30 @@ class ResponsesStreamState:
 
     def done(self, usage=None):
         return self.emit("response.completed", {"response": {"id": self.rid, "status": "completed", "usage": usage or {}}})
+
+    def translate_chunk(self, chunk):
+        """Convert an upstream OpenAI chat.completion.chunk into Responses
+        SSE events. Called by stream_with_heartbeat when state is provided."""
+        events = []
+        if not self.reasoning_started:
+            events.extend(self.start())
+            self.reasoning_started = True
+        ch = (chunk.get("choices") or [{}])[0]
+        delta = ch.get("delta", {}) or {}
+        if delta.get("content"):
+            events.append(self.delta(delta["content"]))
+        # tool_calls in upstream chat stream -> function_call events
+        for tc in delta.get("tool_calls", []) or []:
+            cid = tc.get("id") or f"call-{self.seq}"
+            fn = tc.get("function", {}) or {}
+            events.append(self.tool_delta(cid, fn.get("name", ""), fn.get("arguments", "") or ""))
+        if ch.get("finish_reason"):
+            usage = chunk.get("usage") or {}
+            events.append(self.done(usage=usage))
+        elif not delta and not ch.get("finish_reason"):
+            # keepalive / empty delta, ignore
+            pass
+        return events
 
 # --------------------------------------------------------------------------
 # METRICS (100/100 requirement)
@@ -595,8 +628,10 @@ async def responses(request: Request):
         return JSONResponse(status_code=status, content=result)
 
     if is_stream:
+        rid = f"resp-{int(time.time()*1000)}"
+        state = ResponsesStreamState(rid, chat_body["model"])
         async def gen():
-            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps(x.get('data', {}))}\n\n"):
+            async for line in stream_with_heartbeat(result, lambda x: x, state=state):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream")
 
