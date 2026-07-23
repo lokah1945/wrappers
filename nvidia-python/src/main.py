@@ -984,20 +984,36 @@ class Server:
         async def favicon():
             return Response(status_code=204)
 
+        def _serve_dashboard_html() -> HTMLResponse:
+            """Serve dashboard.html, injecting the bearer token as a <meta> tag
+            when auth is enabled (Node.js parity: index.js dashboard handler,
+            lines ~3111-3113). The browser reads this meta tag via
+            getAuthHeaders() and sends it on every /metrics API call, so the
+            dashboard works behind auth WITHOUT a manual token entry.
+
+            Without this injection the dashboard loads (it's in public_paths)
+            but every /metrics* fetch returns 401 and all cards render '–'.
+            """
+            dashboard_path = Path(__file__).parent.parent / 'dashboard.html'
+            if not dashboard_path.exists():
+                return HTMLResponse(content='<html><body><h1>wrapper-nvidia</h1>'
+                                            '<p>See /metrics, /metrics/prom, /v1/models</p></body></html>')
+            html = dashboard_path.read_text()
+            token = (BEARER_TOKEN or '').strip()
+            if token:
+                meta_tag = '<meta name="wrapper-bearer-token" content="' \
+                    + token.replace('"', '&quot;') + '">'
+                # Inject after the first <head> only (matches Node html.replace).
+                html = html.replace('<head>', '<head>\n' + meta_tag, 1)
+            return HTMLResponse(content=html)
+
         @app.get('/dashboard')
         async def dashboard():
-            dashboard_path = Path(__file__).parent.parent / 'dashboard.html'
-            if dashboard_path.exists():
-                return HTMLResponse(content=dashboard_path.read_text())
-            return HTMLResponse(content='<html><body><h1>wrapper-nvidia</h1><p>See /metrics, /metrics/prom, /v1/models</p></body></html>')
+            return _serve_dashboard_html()
 
         @app.get('/dashboard.html')
         async def dashboard_html():
-            dashboard_path = Path(__file__).parent.parent / 'dashboard.html'
-            if dashboard_path.exists():
-                return HTMLResponse(content=dashboard_path.read_text())
-            return HTMLResponse(content='<html><body><h1>wrapper-nvidia</h1><p>See /metrics, /metrics/prom, /v1/models</p></body></html>')
-
+            return _serve_dashboard_html()
         @app.post('/v1/chat/completions')
         async def chat_completions(request: Request):
             raw = await request.body()
