@@ -5,9 +5,9 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/root/wrappers/opencode
-Environment=PYTHONPATH=/root/wrappers/opencode
-EnvironmentFile=/root/wrappers/opencode/.env
+WorkingDirectory=/root/wrapper/opencode
+Environment=PYTHONPATH=/root/wrapper/opencode
+EnvironmentFile=/root/wrapper/opencode/.env
 ExecStart=/usr/local/bin/python -m uvicorn src.main:app --host 0.0.0.0 --port 9107
 Restart=always
 RestartSec=5

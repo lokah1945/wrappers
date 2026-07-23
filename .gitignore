@@ -75,3 +75,40 @@ netrics.db-*
 # Local backup directories — never push to GitHub
 nvidia_backup_*/
 nvidia.backup.*/
+
+# Artifacts and archives
+artifacts/
+*.tar.gz
+*.log
+
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Database
+*.db*
+
+# Metrics
+metrics.db*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test coverage
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Environment
+.env
+.env.local
+.env.*.local

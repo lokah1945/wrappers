@@ -875,17 +875,35 @@ async def health():
 @app.get("/version")
 async def version(): return {"version": VERSION}
 
+# Curated fallback models for Codex/Claude Code discovery (when upstream unavailable)
+CURATED_FREE_MODELS = [
+    {"id": "tencent/hy3:free", "object": "model", "owned_by": "nous", "context_window": 128000, "max_tokens": 4096, "supports_tools": True},
+    {"id": "poolside/laguna-s-2.1:free", "object": "model", "owned_by": "nous", "context_window": 1048576, "max_tokens": 131072, "supports_tools": True},
+    {"id": "big-pickle", "object": "model", "owned_by": "nous", "context_window": 128000, "max_tokens": 32768, "supports_tools": True},
+]
+
 @app.get("/v1/models")
 async def models():
     tok = await get_token()
     sess = await get_session()
+    upstream_models = []
     try:
         async with sess.get(f"{NOUS_BASE}/v1/models", headers={"Authorization": f"Bearer {tok}"}) as r:
-            data = await r.json() if r.status == 200 else {"data": []}
+            if r.status == 200:
+                data = await r.json()
+                upstream_models = data.get("data", []) if isinstance(data, dict) else []
     except:
-        data = {"data": []}
+        pass  # Will use curated fallback
 
-    models_list = data.get("data", []) if isinstance(data, dict) else []
+    models_list = list(upstream_models)
+
+    # FIX: Add curated fallback models for Codex model discovery when upstream is unavailable
+    # Codex CLI needs to discover models before making chat requests
+    if not upstream_models or len(upstream_models) == 0:
+        for m in CURATED_FREE_MODELS:
+            if model_allowed(m.get("id", "")):
+                models_list.append(m)
+
     # Inject dynamic aliases (bound to last concrete model if any)
     tgt = get_dynamic_alias_target()
     for alias in sorted(_ALIAS_NAME_SET):
@@ -898,6 +916,14 @@ async def models():
             if tgt:
                 entry["rooted_model"] = tgt
             models_list.append(entry)
+
+    # Always inject sonnet/haiku/opus aliases if we have a dynamic target (for Claude Code compatibility)
+    if tgt:
+        for alias in ("sonnet", "opus", "haiku"):
+            if not any(m.get("id") == alias for m in models_list):
+                entry = {"id": alias, "object": "model", "created": 0, "owned_by": "alias", "dynamic_alias": True, "rooted_model": tgt}
+                models_list.append(entry)
+
     if free_only_enabled():
         models_list = [m for m in models_list if model_allowed(m.get("id", ""))]
     # Deduplicate by id (upstream + aliases can repeat free models)
@@ -1007,11 +1033,15 @@ async def responses(request: Request):
         rid = f"resp-{int(time.time()*1000)}"
         state = ResponsesStreamState(rid, chat_body["model"])
         async def gen():
+            # FIX: Codex v0.145 requires output_item.added BEFORE first delta
             for ev in state.start():
                 yield ev
             # serialize_fn only used for non-str events; ResponsesStreamState yields SSE strings
             async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state):
                 yield line
+            # FIX: Ensure response.completed is emitted for Codex
+            for ev in state.done():
+                yield ev
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)
@@ -1049,7 +1079,11 @@ async def messages(request: Request):
 
     status, result = await post_nous(chat_body, tok, stream=is_stream)
     if status != 200:
-        return JSONResponse(status_code=status, content={"type": "error", "error": {"type": "api_error", "message": str(result)}})
+        # FIX: Proper Anthropic error format for Claude Code
+        err_data = result if isinstance(result, dict) else {"message": str(result)}
+        err_msg = err_data.get("error", {}).get("message") if isinstance(err_data.get("error"), dict) else err_data.get("message", str(err_data))
+        err_type = err_data.get("error", {}).get("type") if isinstance(err_data.get("error"), dict) else "api_error"
+        return JSONResponse(status_code=status, content={"type": "error", "error": {"type": err_type, "message": err_msg}})
 
     if is_stream:
         state = AnthropicStreamState(chat_body["model"])

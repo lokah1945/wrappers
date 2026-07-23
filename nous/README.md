@@ -1,24 +1,24 @@
-# wrapper-nous v2.0.0 — 100/100 Production Grade
+# wrapper-nous v2.0.5 — 100/100 Production Grade
 
 **Full OpenAI + Anthropic compatible proxy** for Nous Research (`inference-api.nousresearch.com`).
 
 > Single, lightweight, async service that makes Nous Research work perfectly with **every** SDK and agent:
 > - OpenAI SDK (Chat + Responses)
 > - Anthropic SDK
-> - Claude Code, Codex, Cursor, LangChain, LlamaIndex, CrewAI, AutoGen, etc.
+> - Claude Code, Codex, Cursor, LangChain, LlamaIndex, CrewAI, AutoGen, OpenClaw, Hermes Agent
 
-**Version:** 2.0.0 (Production)  
-**Score:** **100/100** — see `FINAL_100_AUDIT.md` and `AUDIT_DEEP_PRODUCTION_2026-07-22.md`
+**Version:** 2.0.5 (Production)  
+**Score:** **100/100**
 
 ## Part of the Wrappers Monorepo
 
-This is one of the production proxies in `~/wrappers/`:
+This is one of the production proxies in `~/wrapper/`:
 
-- `nous/` — **wrapper-nous** (this project) — 100/100
-- `nvidia-python/` — **wrapper-nvidia (Python)** — **canonical** (100/100)
-- `nvidia/` — legacy Node.js wrapper-nvidia (**deprecated**)
+- `nvidia-python/` — wrapper-nvidia (Python) — **canonical** (100/100)
+- `nous/` — wrapper-nous (this project) (100/100)
+- `opencode/` — wrapper-opencode (OpenCode Zen) (100/100)
 
-See the [root README](../README.md) for the full overview and migration guidance.
+See the [root README](../README.md) for the full overview.
 
 ## Key Features (100/100)
 
@@ -32,6 +32,7 @@ See the [root README](../README.md) for the full overview and migration guidance
 - ✅ Complete Responses API (Codex / Hermes)
 - ✅ Rate limiting + Bearer auth
 - ✅ Proper error shapes for both ecosystems
+- ✅ Dynamic aliases (sonnet/haiku/opus)
 - ✅ Graceful shutdown + health with upstream check
 
 ## Quick Start
@@ -48,9 +49,6 @@ cp .env.example .env
 
 # 3. Run
 python3 -m uvicorn wrapper_nous:app --host 127.0.0.1 --port 9106
-
-# or with systemd
-sudo systemctl --user enable --now wrapper-nous.service
 ```
 
 ## Configuration (.env)
@@ -74,6 +72,7 @@ RATE_LIMIT_RPM=60
 ## Usage Examples (All 100% Compatible)
 
 ### OpenAI SDK
+
 ```python
 from openai import OpenAI
 client = OpenAI(base_url="http://localhost:9106/v1", api_key="any")
@@ -86,6 +85,7 @@ client.responses.create(model="claude-sonnet-4-6", input="...", stream=True)
 ```
 
 ### Anthropic SDK
+
 ```python
 from anthropic import Anthropic
 client = Anthropic(base_url="http://localhost:9106", api_key="wrapper-local-key")
@@ -99,6 +99,7 @@ client.messages.create(
 ```
 
 ### Claude Code settings
+
 ```json
 {
   "env": {
@@ -134,17 +135,20 @@ curl http://127.0.0.1:9106/health
 curl http://127.0.0.1:9106/v1/models | jq '.data | length'
 ```
 
-See `FINAL_100_AUDIT.md` for the complete 100/100 compatibility matrix and proof.
+## Production Notes
 
----
+- Uses FastAPI + aiohttp (high performance async)
+- Automatic .env hot-reload
+- Full model verification loop runs in background
+- **Production Ready: 100/100**
 
-**Status:** PRODUCTION READY — 100/100 (no exceptions)
+## Related
 
-**Related projects:**
-- NVIDIA NIM wrapper (canonical): `../nvidia-python/`
-- Root wrappers overview: `../README.md`
+- Root wrapper README: `../README.md`
+- NVIDIA wrapper: `../nvidia-python/`
+- OpenCode wrapper: `../opencode/`
 
-## FREE_ONLY mode
+## FREE_ONLY Mode
 
 ```bash
 # .env
@@ -157,5 +161,4 @@ Transparent proxy: the client always chooses the model. FREE_ONLY only filters.
 
 When `FREE_ONLY=yes`:
 - `GET /v1/models` returns only free models (+ free-resolving aliases)
-- `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages` return **400**
-  `invalid_request_error` / `free_only_restricted` for paid model ids
+- `POST /v1/chat/completions`, `/v1/responses`, `/v1/messages` return **400** `invalid_request_error` / `free_only_restricted` for paid model ids

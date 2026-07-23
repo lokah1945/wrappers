@@ -47,8 +47,6 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [opencode] %(message
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9107'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
-import sys as _sys
-print(f"DEBUG_OPENCODE_BASE_LINE46={OPENCODE_BASE!r} env={os.environ.get('OPENCODE_BASE_URL')!r}", file=_sys.stderr, flush=True)
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
 VERSION = '1.0.4-dynamic-alias'
@@ -206,8 +204,12 @@ def _zen_family(model: str) -> str:
         return 'google'
     if m.startswith('qwen3.') or m.startswith('qwen3-') or m.startswith('qwen3'):
         return 'messages'
-    # Zen OpenAI-compatible Responses API supports all non-Anthropic/non-Gemini models
-    return 'responses'
+    # Free models (OpenAI-compatible per Zen docs) → chat/completions
+    if is_free_model(m):
+        return 'chat'
+    # Zen OpenAI-compatible models (Grok, DeepSeek, MiniMax, GLM, Kimi, etc.)
+    # → chat/completions (the Responses API translate branch handles them).
+    return 'chat'
 
 
 def _normalize_model(model: str) -> str:
@@ -432,9 +434,16 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
             "usage": {"input_tokens": u.get('prompt_tokens', 0) or 0,
                       "output_tokens": u.get('completion_tokens', 0) or 0}}
 
+# G11 fix: previous_response_id store for codex multi-turn server-side history
+_RESPONSE_STORE: dict = {}
+
 def responses_to_chat(body: dict) -> dict:
     model = _normalize_model(body.get('model') or '')
     msgs = []
+    # G11: if previous_response_id references a stored conversation, prepend it
+    prev = body.get('previous_response_id')
+    if prev and prev in _RESPONSE_STORE:
+        msgs.extend(_RESPONSE_STORE[prev])
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({"role": "user", "content": raw})
@@ -570,11 +579,16 @@ app = FastAPI(title="wrapper-opencode", version=VERSION, lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
 def _auth_check(request: Request):
+    # G10 fix: if BEARER_TOKEN is set, auth is mandatory and must match.
+    # If client sends a token (even wrong) we MUST reject on mismatch.
+    # If BEARER_TOKEN empty, remain open (backwards-compatible, logged).
     if not BEARER_TOKEN:
+        if request.headers.get("authorization") or request.headers.get("x-api-key"):
+            logger.warning("[auth] BEARER_TOKEN unset but client sent credentials — accepting open (insecure)")
         return
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     token = auth.replace("Bearer ", "", 1).strip()
-    if token != BEARER_TOKEN:
+    if not token or token != BEARER_TOKEN:
         raise HTTPException(401, {"error": {"type": "authentication_error", "message": "Unauthorized"}})
 
 @app.get("/health")
@@ -589,6 +603,7 @@ async def models(request: Request):
     _auth_check(request)
     key_result = await pool.acquire()
     # Even without keys, return curated aliases so Claude Code discovery works
+    tgt = get_dynamic_alias_target()
     fallback_all = [
         {"id": "gpt-5.4-mini", "object": "model", "owned_by": "opencode-zen"},
         {"id": "claude-sonnet-4-6", "object": "model", "owned_by": "opencode-zen"},
@@ -600,13 +615,15 @@ async def models(request: Request):
         {"id": "nemotron-3-ultra-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "north-mini-code-free", "object": "model", "owned_by": "opencode-zen"},
-        {"id": "sonnet", "object": "model", "owned_by": "alias"},
-        {"id": "opus", "object": "model", "owned_by": "alias"},
-        {"id": "haiku", "object": "model", "owned_by": "alias"},
     ]
+    # Add aliases (sonnet/haiku/opus) with dynamic_alias flag
+    for alias in ("sonnet", "opus", "haiku"):
+        if free_only_enabled() and not model_allowed(alias):
+            continue
+        fallback_all.append({"id": alias, "object": "model", "owned_by": "alias", "dynamic_alias": True, "rooted_model": tgt if tgt else None})
     if free_only_enabled():
         fallback_all = [m for m in fallback_all if model_allowed(m.get("id", ""))]
-    fallback = {"object": "list", "data": fallback_all, "free_only": free_only_enabled()}
+    fallback = {"object": "list", "data": fallback_all, "free_only": free_only_enabled(), "dynamic_alias_target": tgt or None}
     if not key_result:
         return fallback
     key = key_result['key']
@@ -619,12 +636,18 @@ async def models(request: Request):
         # inject aliases (respect FREE_ONLY)
         ids = {m.get('id') for m in (data.get('data') or [])}
         tgt = get_dynamic_alias_target()
+        # Add aliases after FREE_ONLY check to ensure correct filtering
+        aliases_to_add = []
         for a in ("sonnet", "opus", "haiku"):
-            if a not in ids and model_allowed(a):
+            if a not in ids:
+                # Check FREE_ONLY compatibility before adding
+                if free_only_enabled() and not model_allowed(a):
+                    continue
                 entry = {"id": a, "object": "model", "owned_by": "alias", "dynamic_alias": True}
                 if tgt:
                     entry["rooted_model"] = tgt
-                (data.setdefault('data', [])).append(entry)
+                aliases_to_add.append(entry)
+        (data.setdefault('data', [])).extend(aliases_to_add)
         if free_only_enabled():
             data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
         data['free_only'] = free_only_enabled()
@@ -761,6 +784,9 @@ async def responses(request: Request):
                     nonlocal seq
                     seq += 1
                     return f"event: {etype}\ndata: {json.dumps({'type': etype, 'sequence_number': seq, **payload})}\n\n"
+                item_added = False
+                acc_text = ""  # FIX: Track accumulated text for Codex
+                acc_usage = None
                 try:
                     yield emit("response.created", {"response": {"id": rid, "model": model, "status": "in_progress"}})
                     yield emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}})
@@ -779,10 +805,42 @@ async def responses(request: Request):
                                 c = json.loads(payload)
                             except Exception:
                                 continue
+                            if c.get("usage"):
+                                u = c["usage"]
+                                acc_usage = {"input_tokens": u.get("prompt_tokens", 0) or 0,
+                                             "output_tokens": u.get("completion_tokens", 0) or 0,
+                                             "total_tokens": u.get("total_tokens", 0) or 0}
                             d = ((c.get("choices") or [{}])[0].get("delta") or {})
                             if d.get("content"):
-                                yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "delta": d["content"]})
-                    yield emit("response.completed", {"response": {"id": rid, "model": model, "status": "completed"}})
+                                content = d["content"]
+                                acc_text += content  # FIX: Accumulate text for Codex
+                                # G8 fix: Codex v0.145 requires output_item.added BEFORE first delta
+                                if not item_added:
+                                    item_added = True
+                                    yield emit("response.output_item.added", {
+                                        "output_index": 0,
+                                        "item": {"id": "msg-1", "type": "message", "status": "in_progress",
+                                                 "role": "assistant", "content": []}})
+                                    yield emit("response.content_part.added", {
+                                        "item_id": "msg-1", "output_index": 0, "content_index": 0,
+                                        "part": {"type": "output_text", "text": ""}})
+                                yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "delta": content})
+                    if item_added:
+                        yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
+                        yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0,
+                                                                  "part": {"type": "output_text", "text": acc_text, "annotations": []}})
+                        yield emit("response.output_item.done", {"output_index": 0,
+                                "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant",
+                                         "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}})
+                    # G9 fix: include usage in completed event
+                    completed = {"response": {"id": rid, "model": model, "status": "completed"}}
+                    # Always include usage object for OpenAI Responses SDK compatibility
+                    completed["response"]["usage"] = acc_usage if acc_usage else {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0
+                    }
+                    yield emit("response.completed", completed)
                 finally:
                     try:
                         await resp.release()
@@ -796,7 +854,18 @@ async def responses(request: Request):
         pool.release(key)
         if status != 200:
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
-        return JSONResponse(chat_to_responses(model, data))
+        resp_obj = chat_to_responses(model, data)
+        # G11: store conversation for previous_response_id multi-turn
+        rid_store = resp_obj.get("id")
+        if rid_store:
+            _RESPONSE_STORE[rid_store] = chat_body.get("messages", [])
+            # keep store bounded
+            if len(_RESPONSE_STORE) > 200:
+                _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
+        # G11 also store under the request's response id if provided
+        if body.get("previous_response_id") is None and body.get("id"):
+            _RESPONSE_STORE[body["id"]] = chat_body.get("messages", [])
+        return JSONResponse(resp_obj)
     except Exception as e:
         pool.release(key)
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})

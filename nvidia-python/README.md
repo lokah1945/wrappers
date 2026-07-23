@@ -5,10 +5,10 @@
 **Status:** ✅ **PRODUCTION READY — 100/100**  
 **Version:** 8.6.5-py  
 **Implementation:** Python (FastAPI + aiohttp)  
-**Canonical source:** This directory (`nvidia-python`)
+**Port:** 9101
 
-> **Important:** The legacy Node.js implementation in `nvidia/` is **deprecated** and will be removed.  
-> All new deployments and production traffic **must** use `nvidia-python/`.
+> **Important:** The legacy Node.js implementation in `nvidia/` is **deprecated** and has been removed from production.  
+> All new deployments and production traffic **must** use this Python version.
 
 This is the **single source of truth** for wrapper-nvidia going forward.
 
@@ -25,20 +25,15 @@ This is the **single source of truth** for wrapper-nvidia going forward.
 - Stream buffering + anti-silence heartbeat + reasoning-only placeholder
 - .env hot-reload (watchdog)
 - Rich metrics (`/metrics`, Prometheus, ttft, pacing, model-status)
-- Legacy catch-all + Ollama compatibility (`/api/tags`, `/api/show`, etc.)
-- Bearer auth + health + dashboard
-
-See `AUDIT_REPORT_2026-07-23.md` for the complete 100/100 end-to-end audit against the Node.js reference.
+- Bearer auth + health checks
 
 ## Quick Start
 
 ### 1. Install
 
 ```bash
-cd /home/user/wrappers/nvidia-python
+cd /root/wrapper/nvidia-python
 pip install -r requirements.txt
-# or for development
-pip install -e ".[dev]"
 ```
 
 ### 2. Configure
@@ -83,10 +78,6 @@ curl http://localhost:9101/v1/models | jq '.data | length'
 - `GET /health`
 - `GET /metrics`, `/metrics/prom`
 - `GET /stats`
-- `GET /dashboard`
-- `GET /api/tags` (Ollama compat)
-
-Full list and legacy routes in `src/main.py`.
 
 ## Configuration (Key .env Variables)
 
@@ -100,42 +91,38 @@ Full list and legacy routes in `src/main.py`.
 | `PRE_RESPONSE_TIMEOUT_MS`  | 300000      | Client-facing pre-response watchdog      |
 | `VERIFY_ON_BOOT`           | true        | Run model verification on startup        |
 
-All values match the audited Node.js production configuration.
+## Client Configuration
 
-## Migration from Legacy Node.js (`nvidia/`)
-
-1. Stop the old Node service.
-2. Point all clients to the new port / URL (default 9101).
-3. Use the same `.env` keys (format is compatible).
-4. The Python version is **bit-for-bit behaviorally equivalent** (or better) for all documented production paths.
-
-See `MIGRATION.md` for detailed steps.
-
-## Testing
+### Claude Code CLI
 
 ```bash
-cd /home/user/wrappers/nvidia-python
-python -m pytest tests/ -q
+export ANTHROPIC_BASE_URL="http://localhost:9101/v1"
+export ANTHROPIC_API_KEY="test-key"
+claude code chat "Hello, what is 2+2?"
 ```
 
-118+ tests covering core paths, translators, verification, streaming, etc.
+### OpenAI SDK (Python)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:9101/v1", api_key="test-key")
+
+response = client.chat.completions.create(
+    model="sonnet",  # Dynamic alias resolves to last concrete model
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
 
 ## Production Notes
 
-- Uses FastAPI + aiohttp (high performance async).
-- Automatic .env hot-reload.
-- Full model verification loop runs in background.
-- Matches or exceeds the 2026-07-22 Node.js audit in every observable behavior.
-
-**Current production score:** 100/100 (see `AUDIT_REPORT_2026-07-23.md`).
+- Uses FastAPI + aiohttp (high performance async)
+- Automatic .env hot-reload
+- Full model verification loop runs in background
+- **Production Ready: 100/100**
 
 ## Related
 
 - Root wrapper README: `../README.md`
-- Legacy Node reference (read-only): `../nvidia/`
-- Nous wrapper (sibling): `../nous/`
-
----
-
-**wrapper-nvidia (Python) is now the canonical implementation.**  
-All traffic should migrate to `nvidia-python/`.
+- Nous wrapper: `../nous/`
+- OpenCode wrapper: `../opencode/`

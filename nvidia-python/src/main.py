@@ -163,6 +163,7 @@ from .anthropic_compat import (
     estimate_input_tokens,
     anthropic_error,
     extract_internal_reasoning,
+    _sse,
 )
 from .capabilities import (
     classify,
@@ -1018,11 +1019,6 @@ class Server:
         async def chat_completions(request: Request):
             raw = await request.body()
             try:
-                _b = json.loads(raw)
-                logger.warning(f"[DBG chat] temp={_b.get('temperature')!r} model={_b.get('model')}")
-            except Exception:
-                pass
-            try:
                 body = json.loads(raw)
             except (json.JSONDecodeError, ValueError) as e:
                 logger.error(f'[JSON PARSE ERROR] completions: {e}')
@@ -1291,8 +1287,13 @@ class Server:
 
         if result.get('stream'):
             async def anthropic_stream():
-                async for chunk in stream_openai_to_anthropic(result['stream'], model_id, {}, start_ms=result.get('start_ms', time.time() * 1000)):
-                    yield chunk
+                try:
+                    async for chunk in stream_openai_to_anthropic(result['stream'], model_id, {}, start_ms=result.get('start_ms', time.time() * 1000)):
+                        yield chunk
+                except Exception as e:
+                    logger.error(f'[anthropic_stream] error: {e}')
+                    # Emit error event for Claude Code SDK compatibility
+                    yield _sse('message_stop', {'type': 'message_stop'})
             return StreamingResponse(
                 anthropic_stream(),
                 media_type='text/event-stream',
@@ -1781,6 +1782,8 @@ async def get_server() -> Server:
 def create_app() -> FastAPI:
     global server
     app = FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
+    # P3 CORS hardening (parity with nous/opencode) for codex-cli cross-origin if needed
+    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
     server = Server(app)
     server._register_routes()

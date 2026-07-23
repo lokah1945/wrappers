@@ -16,6 +16,9 @@ from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
 
 from .anthropic_compat import extract_internal_reasoning
 
+# P2: previous_response_id store for codex multi-turn server-side history
+_RESPONSE_STORE: Dict[str, list] = {}
+
 
 def _rand(suffix: str) -> str:
     chars = string.ascii_lowercase + string.digits
@@ -345,7 +348,18 @@ class ResponsesHandler:
 
         if not chat_body.get('stream'):
             data = result.get('data', {})
-            return respond_non_streaming(data, model), None
+            resp_obj = respond_non_streaming(data, model)
+            # P2: store conversation for previous_response_id multi-turn
+            rid_store = resp_obj.get('id')
+            if rid_store:
+                from .main import input_to_messages
+                try:
+                    _RESPONSE_STORE[rid_store] = input_to_messages(chat_body, model)
+                    if len(_RESPONSE_STORE) > 200:
+                        _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
+                except Exception:
+                    pass
+            return resp_obj, None
 
         # Streaming: return async generator
         async def stream_gen() -> AsyncGenerator[str, None]:
@@ -469,14 +483,40 @@ class ResponsesHandler:
                                     idx = tc.get('index') if isinstance(tc.get('index'), (int, float)) else len(tool_accs)
                                     acc = tool_accs[idx] if idx < len(tool_accs) else None
                                     if acc is None:
-                                        acc = {'name': '', 'args': '', 'id': _rand('fc'), 'call_id': _rand('call')}
+                                        acc = {'name': '', 'args': '', 'id': _rand('fc'), 'call_id': _rand('call'), 'added': False}
                                         while len(tool_accs) <= idx:
                                             tool_accs.append(None)
                                         tool_accs[idx] = acc
+                                    # P3: emit function_call.delta (Codex v0.145 expects this)
+                                    if not acc['added']:
+                                        acc['added'] = True
+                                        yield emit({
+                                            'type': 'response.output_item.added',
+                                            'sequence_number': next_seq(),
+                                            'output_index': MSG_INDEX + 1 + idx,
+                                            'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
+                                                     'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
+                                        })
                                     if tc.get('function', {}).get('name'):
                                         acc['name'] += tc['function']['name']
+                                        yield emit({
+                                            'type': 'response.function_call.delta',
+                                            'sequence_number': next_seq(),
+                                            'item_id': acc['call_id'],
+                                            'output_index': MSG_INDEX + 1 + idx,
+                                            'delta': tc['function']['name'],
+                                            'name': acc['name'],
+                                        })
                                     if tc.get('function', {}).get('arguments'):
-                                        acc['args'] += tc['function']['arguments']
+                                        chunk = tc['function']['arguments']
+                                        acc['args'] += chunk
+                                        yield emit({
+                                            'type': 'response.function_call.delta',
+                                            'sequence_number': next_seq(),
+                                            'item_id': acc['call_id'],
+                                            'output_index': MSG_INDEX + 1 + idx,
+                                            'delta': chunk,
+                                        })
                                     has_tool = True
             except Exception as e:
                 import logging
@@ -503,7 +543,7 @@ class ResponsesHandler:
             if has_tool and tool_accs:
                 tool_items = [
                     {
-                        'id': acc['id'],
+                        'id': acc['call_id'],
                         'type': 'function_call',
                         'status': 'completed',
                         'call_id': acc['call_id'],
@@ -512,6 +552,15 @@ class ResponsesHandler:
                     }
                     for acc in tool_accs if acc
                 ]
+                # P3: emit output_item.done for each tool (matching the added events)
+                for i, acc in enumerate([a for a in tool_accs if a]):
+                    yield emit({
+                        'type': 'response.output_item.done',
+                        'sequence_number': next_seq(),
+                        'output_index': MSG_INDEX + 1 + i,
+                        'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed',
+                                 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']},
+                    })
                 yield emit({
                     'type': 'response.output_text.done',
                     'sequence_number': next_seq(),
@@ -600,6 +649,16 @@ class ResponsesHandler:
             return {'error': {'message': 'Missing "model" in /v1/responses request', 'type': 'invalid_request_error'}}, None, None
 
         model = self.resolve_target_model(body['model'])
+
+        # P2: if previous_response_id references a stored conversation, inject it into input
+        prev = body.get('previous_response_id')
+        if prev and prev in _RESPONSE_STORE:
+            stored = _RESPONSE_STORE[prev]
+            cur = body.get('input')
+            if isinstance(cur, list):
+                body['input'] = stored + cur
+            elif isinstance(cur, str):
+                body['input'] = stored + [{'role': 'user', 'content': cur}]
 
         if self.get_deprecated_redirect_info:
             dep_r = self.get_deprecated_redirect_info(body['model'])

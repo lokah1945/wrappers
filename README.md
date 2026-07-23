@@ -1,79 +1,49 @@
 # Wrappers
 
-Production-grade API proxies for various LLM providers.
+Production-grade API proxies for Claude Code, OpenAI SDK, Anthropic SDK, and OpenClaw.
 
 This monorepo contains hardened, SDK-compatible transparent proxies that add multi-key rotation, pacing, metrics, streaming reliability, and full OpenAI + Anthropic compatibility.
 
-## Current Status (2026-07-23)
+## Current Status (2026-07-24)
 
-| Wrapper            | Status          | Score   | Canonical Dir          | Notes |
-|--------------------|-----------------|---------|------------------------|-------|
-| **wrapper-nvidia** | ✅ Production   | **100/100** | `nvidia-python/`      | **Use this** for NVIDIA NIM. Node.js version in `nvidia/` is **deprecated**. |
-| **wrapper-nous**   | ✅ Production   | **100/100** | `nous/`               | Nous Research inference API. |
-| **wrapper-opencode** | ✅ Production | **100/100** | `opencode/`           | OpenCode **Zen** gateway (`https://opencode.ai/zen/v1`) — multi-protocol. |
+| Wrapper            | Status          | Score   | Port   | Use Case |
+|--------------------|-----------------|---------|--------|----------|
+| **nvidia-python**  | ✅ Production   | **100/100** | 9101   | NVIDIA NIM API proxy |
+| **nous**           | ✅ Production   | **100/100** | 9106   | Nous Research inference API |
+| **opencode**       | ✅ Production   | **100/100** | 9107   | OpenCode Zen gateway |
 
 ## Repository Layout
 
 ```
-wrappers/
-├── README.md
-├── .env.example
-├── install.sh
-├── wrapper-nvidia.service
-├── CHANGELOG.md
+wrapper/
+├── README.md                    # This file
+├── .env.example                 # Environment configuration template
+├── install.sh                   # Installation script
+├── artifacts/                   # Archived reports and backups
+│   └── backup-nvidia-nodejs.tar.gz
 │
-├── nvidia-python/          # ← CANONICAL wrapper-nvidia (Python)
-│   ├── src/main.py
-│   ├── src/key_pool.py
-│   ├── tests/
-│   ├── AUDIT_REPORT_2026-07-23.md
+├── nvidia-python/               # ← NVIDIA NIM proxy (Python)
+│   ├── src/main.py             # FastAPI entry point
+│   ├── src/key_pool.py         # API key rotation
+│   ├── src/anthropic_compat.py # A↔O translation
+│   ├── src/responses_compat.py # Responses API streaming
+│   ├── .env.example            # NVIDIA-specific config
 │   └── README.md
 │
-├── nvidia/                 # DEPRECATED (Node.js reference only)
-│   └── src/index.js
-│
-├── nous/                   # wrapper-nous (Python)
-│   ├── wrapper_nous.py
-│   ├── AUDIT_*.md
+├── nous/                        # Nous Research proxy (Python)
+│   ├── wrapper_nous.py         # Main FastAPI application
+│   ├── .env.example            # Nous-specific config
 │   └── README.md
 │
-├── opencode/               # wrapper-opencode (OpenCode specialized)
-│   ├── src/main.py
-│   ├── src/key_pool.py
-│   ├── tests/
-│   ├── README.md
-│   └── wrapper-opencode.service
-│
-└── dashboard.html
+└── opencode/                    # OpenCode Zen proxy
+    ├── src/main.py             # FastAPI entry point
+    ├── .env.example            # OpenCode-specific config
+    └── README.md
 ```
 
-## wrapper-nvidia (NVIDIA NIM)
+## Quick Start
 
-**Recommended implementation:** `nvidia-python/`
-
-- Full OpenAI + Anthropic + Responses compatibility
-- Multi-key rotation, pacing, load shedding (`INFLIGHT_SOFT_CAP=100`)
-- Reasoning injection, aliases (Claude Code), model verification
-- Production hardening: anti-silence (960s), TTFT, pre-response, stream buffering
-- .env hot reload + rich metrics
-
-**Migrate to this version.** The old Node.js implementation (`nvidia/`) will be removed.
-
-See:
-- `nvidia-python/README.md`
-- `nvidia-python/AUDIT_REPORT_2026-07-23.md` (full 100/100 audit)
-
-## wrapper-nous
-
-Full-featured proxy for `inference-api.nousresearch.com`.
-
-- 100/100 OpenAI + Anthropic + Responses + parallel tools
-- SSE heartbeat, vision, thinking, rich metadata
-- See `nous/README.md` and `nous/FINAL_100_AUDIT.md`
-
-## Quick Start (Recommended)
-
-### NVIDIA (new canonical)
+### 1. NVIDIA NIM Proxy (Port 9101)
 
 ```bash
 cd nvidia-python
@@ -82,7 +52,7 @@ cp .env.example .env   # add your NVIDIA_API_KEY_*
 python -m uvicorn src.main:app --port 9101
 ```
 
-### Nous
+### 2. Nous Research Proxy (Port 9106)
 
 ```bash
 cd nous
@@ -90,27 +60,83 @@ pip install -r requirements.txt
 python -m uvicorn wrapper_nous:app --port 9106
 ```
 
-## Migration Notice
+### 3. OpenCode Zen Proxy (Port 9107)
 
-- `~/wrappers/nvidia` (Node.js) → **deprecated**. Point all clients and services to `nvidia-python`.
-- Both `nvidia-python` and `nous` are maintained at **100/100 production grade**.
+```bash
+cd opencode
+pip install -r requirements.txt
+cp .env.example .env   # add your API keys
+python -m uvicorn src.main:app --port 9107
+```
+
+## Client Configuration
+
+### Claude Code CLI
+
+```bash
+export ANTHROPIC_BASE_URL="http://localhost:9101/v1"  # or 9106/9107
+export ANTHROPIC_API_KEY="test-key"  # or your actual key
+
+# Test
+claude code chat "Hello, what is 2+2?"
+```
+
+### OpenAI SDK
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9101/v1",
+    api_key="test-key"
+)
+
+response = client.chat.completions.create(
+    model="sonnet",  # or "haiku", "opus", or concrete model id
+    messages=[{"role": "user", "content": "Hello!"}]
+)
+```
+
+### OpenAI Responses API (Codex)
+
+```python
+from openai import OpenAI
+
+client = OpenAI(
+    base_url="http://localhost:9101/v1",
+    api_key="test-key"
+)
+
+response = client.responses.create(
+    model="sonnet",
+    input="Hello!"
+)
+```
+
+## Features
+
+- ✅ **Dynamic Aliases**: sonnet/haiku/opus resolve to last concrete model called
+- ✅ **Streaming SSE**: Full event sequences with heartbeat
+- ✅ **Tool Calls**: OpenAI function_calling + Anthropic tool_use formats
+- ✅ **Multi-turn**: previous_response_id support
+- ✅ **FREE_ONLY Mode**: Filter for free models only
+- ✅ **Error Normalization**: SDK-compatible error messages
+- ✅ **Rate Limiting**: Per-key and per-IP limits
+- ✅ **Metrics**: Prometheus + JSON metrics endpoints
+
+## Production Readiness
+
+All wrappers achieved **100/100** production readiness score:
+
+| Feature | nvidia-python | nous | opencode |
+|---------|--------------|------|----------|
+| Claude Code alias | ✅ | ✅ | ✅ |
+| Streaming SSE | ✅ | ✅ | ✅ |
+| Tool calls | ✅ | ✅ | ✅ |
+| Multi-turn | ✅ | ✅ | ✅ |
+| FREE_ONLY | N/A | ✅ | ✅ |
+| Error format | ✅ | ✅ | ✅ |
 
 ## License
 
 Internal use only.
-## wrapper-opencode
-
-Specialized OpenCode proxy (modeled after nvidia-python).
-
-- OpenAI Chat + Responses + Anthropic compatible
-- Multi-key rotation + load shedding (`INFLIGHT_SOFT_CAP=100`)
-- Production streaming + heartbeat
-- See `opencode/README.md`
-
-Quick start:
-```bash
-cd opencode
-pip install -r requirements.txt
-cp .env.example .env   # add OPENCODE_API_KEY_*
-python -m uvicorn src.main:app --port 9107
-```
