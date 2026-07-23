@@ -48,7 +48,7 @@ LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9107'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
-DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
+# No DEFAULT_MODEL - all model selection is transparent (client chooses)
 VERSION = '1.0.4-dynamic-alias'
 
 def free_only_enabled() -> bool:

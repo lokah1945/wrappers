@@ -28,11 +28,70 @@ import threading
 import logging
 from typing import Optional, Dict, Any, List, AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiohttp
+from starlette.concurrency import run_in_threadpool
+
+
+# ============================================================================
+# KeyPool for multi-key rotation (parity with opencode/nvidia-python)
+# ============================================================================
+class KeyPool:
+    """Manages multiple Nous API keys with rotation and rate limiting."""
+
+    def __init__(self):
+        self.keys: List[str] = []
+        self._lock = threading.Lock()
+        self._current_idx = 0
+
+    def load_from_env(self):
+        """Load keys from NOUS_API_KEY or NOUS_API_KEY_1, NOUS_API_KEY_2, etc."""
+        env_keys = []
+        seen = set()
+
+        # Check for NOUS_API_KEY (singular)
+        key = os.environ.get("NOUS_API_KEY", "").strip()
+        if key and key not in seen:
+            env_keys.append(key)
+            seen.add(key)
+
+        # Check for NOUS_API_KEY_1, NOUS_API_KEY_2, etc.
+        for key_name, value in sorted(os.environ.items()):
+            if key_name.startswith("NOUS_API_KEY_") and key_name != "NOUS_API_KEY":
+                v = value.strip()
+                if v and v not in seen and len(v) > 10:
+                    env_keys.append(v)
+                    seen.add(v)
+
+        self.keys = env_keys
+        self._current_idx = 0
+        logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s)")
+        return self
+
+    def acquire(self) -> Optional[str]:
+        """Get next available key (simple round-robin)."""
+        with self._lock:
+            if not self.keys:
+                return None
+            key = self.keys[self._current_idx]
+            self._current_idx = (self._current_idx + 1) % len(self.keys)
+            return key
+
+    @property
+    def total_keys(self) -> int:
+        return len(self.keys)
+
+    @property
+    def available_keys(self) -> int:
+        return len(self.keys)
+
+
+# ============================================================================
 
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-import aiohttp
 from starlette.concurrency import run_in_threadpool
 
 # --------------------------------------------------------------------------
@@ -49,18 +108,41 @@ def load_dotenv():
 
 load_dotenv()
 
+# .env hot reload watcher (parity with opencode/nvidia-python)
+try:
+    from watchdog.observers import Observer
+    from watchdog.events import FileSystemEventHandler
+    HAS_WATCHDOG = True
+except ImportError:
+    HAS_WATCHDOG = False
+
+def start_env_watcher():
+    if not HAS_WATCHDOG:
+        return
+    try:
+        class EnvWatcher(FileSystemEventHandler):
+            def on_modified(self, event):
+                if '.env' in event.src_path:
+                    load_dotenv()
+                    logger.info('[env] .env reloaded (hot)')
+        obs = Observer()
+        obs.schedule(EnvWatcher(), path=str(Path(__file__).parent), recursive=False)
+        obs.start()
+        logger.info('[env] Watching .env for hot reload')
+    except Exception as e:
+        logger.warning(f'[env] watcher failed: {e}')
+
 NOUS_BASE = os.environ.get("NOUS_BASE_URL", "https://inference-api.nousresearch.com").rstrip("/")
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
-STATIC_KEY = os.environ.get("NOUS_API_KEY", "").strip()
+KEY_POOL = KeyPool()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
 LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9106"))
-DEFAULT_MODEL = os.environ.get("DEFAULT_MODEL", "tencent/hy3:free")
-REASONING_MODEL = os.environ.get("REASONING_MODEL", "tencent/hy3:free")
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
 VERSION = "2.0.5-dynamic-alias"
+# No DEFAULT_MODEL/REASONING_MODEL - all model selection is transparent (client chooses)
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only expose/allow models whose id contains 'free'."""
@@ -183,17 +265,58 @@ def resolve_model(m: str) -> str:
     set_dynamic_alias_target(m)
     return m
 
-def get_model_meta(mid: str) -> dict:
-    # Preserve requested id in listing; rooted_model shows dynamic bind if alias
-    rooted = resolve_model(mid) if mid else mid
+# Full Codex-compatible ModelInfo template (loaded from model_catalog_template.json)
+_CATALOG_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "model_catalog_template.json")
+_MODEL_INFO_TEMPLATE = {}
+
+def _load_model_info_template():
+    global _MODEL_INFO_TEMPLATE
+    if _MODEL_INFO_TEMPLATE:
+        return _MODEL_INFO_TEMPLATE
     base = {
-        "id": mid,
-        "object": "model",
-        "created": 0,
-        "owned_by": "alias" if is_alias_name(mid) else "nous",
-        "context_window": 128000,
-        "max_tokens": 4096,
+        "slug": "", "display_name": "", "description": "",
+        "default_reasoning_level": "medium",
+        "supported_reasoning_levels": [
+            {"effort": "low", "description": "Fast responses with lighter reasoning"},
+            {"effort": "medium", "description": "Balances speed and reasoning depth for everyday tasks"},
+            {"effort": "high", "description": "Greater reasoning depth for complex problems"},
+            {"effort": "xhigh", "description": "Extra high reasoning depth for complex problems"},
+        ],
+        "shell_type": "shell_command", "visibility": "list", "supported_in_api": True,
+        "priority": 7, "additional_speed_tiers": [], "service_tiers": [],
+        "supports_reasoning_summaries": True, "default_reasoning_summary": "none",
+        "support_verbosity": True, "default_verbosity": "low",
+        "apply_patch_tool_type": "freeform", "web_search_tool_type": "text_and_image",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": True, "supports_image_detail_original": True,
+        "max_context_window": 128000, "effective_context_window_percent": 95,
+        "experimental_supported_tools": [], "input_modalities": ["text", "image"],
+        "supports_search_tool": True, "use_responses_lite": False,
+        "supports_tools": True, "supports_vision": False,
+        "base_instructions": "", "model_messages": {"instructions_template": "", "instructions_variables": {}},
     }
+    try:
+        if os.path.exists(_CATALOG_PATH):
+            with open(_CATALOG_PATH) as f:
+                cat = json.load(f)
+            models = cat.get("models", []) if isinstance(cat, dict) else []
+            if models:
+                _MODEL_INFO_TEMPLATE = dict(models[0])
+                return _MODEL_INFO_TEMPLATE
+    except Exception:
+        pass
+    _MODEL_INFO_TEMPLATE = base
+    return _MODEL_INFO_TEMPLATE
+
+def get_model_meta(mid):
+    rooted = resolve_model(mid) if mid else mid
+    tpl = _load_model_info_template()
+    base = dict(tpl)
+    base.update({
+        "id": mid, "slug": mid, "object": "model", "created": 0,
+        "owned_by": "alias" if is_alias_name(mid) else "nous",
+        "display_name": mid, "description": f"{mid} via wrapper-nous (Nous Chat)",
+    })
     concrete = rooted if not is_alias_name(rooted) else get_dynamic_alias_target()
     if concrete and concrete in MODEL_METADATA:
         base.update(MODEL_METADATA[concrete])
@@ -202,54 +325,6 @@ def get_model_meta(mid: str) -> dict:
         base["dynamic_alias"] = True
     return base
 
-# --------------------------------------------------------------------------
-# AUTH & TOKEN
-# --------------------------------------------------------------------------
-async def get_token() -> str:
-    if STATIC_KEY:
-        return STATIC_KEY
-    try:
-        def _read():
-            with open(AUTH_PATH) as f:
-                d = json.load(f)
-            n = d.get("providers", {}).get("nous", {})
-            return n.get("access_token") or n.get("agent_key")
-        tok = await run_in_threadpool(_read)
-        if not tok:
-            raise RuntimeError("no token")
-        return tok
-    except Exception as e:
-        raise RuntimeError(f"Token error: {e}")
-
-# --------------------------------------------------------------------------
-# UPSTREAM ASYNC (aiohttp) — FIXED for streaming (no premature close)
-# --------------------------------------------------------------------------
-_session: Optional[aiohttp.ClientSession] = None
-
-async def get_session() -> aiohttp.ClientSession:
-    global _session
-    # Recreate when missing, closed, or bound to a dead event loop (TestClient / reload)
-    need_new = _session is None or _session.closed
-    if not need_new:
-        try:
-            loop = asyncio.get_running_loop()
-            # aiohttp session tied to a different/closed loop → rebuild
-            sess_loop = getattr(_session, '_loop', None)
-            if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
-                need_new = True
-        except Exception:
-            need_new = True
-    if need_new:
-        if _session is not None and not _session.closed:
-            try:
-                await _session.close()
-            except Exception:
-                pass
-        _session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=300),
-            connector=aiohttp.TCPConnector(limit=100, limit_per_host=50)
-        )
-    return _session
 
 
 def _normalize_upstream_error(status: int, text: str) -> dict:
@@ -581,8 +656,6 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
             yield "data: [DONE]\n\n"
         except Exception:
             pass
-        if _session and not _session.closed:
-            pass
         await upstream_resp.release()
 
 # Advanced streaming state machines
@@ -829,13 +902,15 @@ metrics = Metrics()
 # --------------------------------------------------------------------------
 from collections import defaultdict
 rate_limits = defaultdict(list)
+_rate_limit_lock = threading.Lock()
 
 def check_rate_limit(ip: str):
     now = time.time()
-    rate_limits[ip] = [t for t in rate_limits[ip] if now - t < 60]
-    if len(rate_limits[ip]) >= RATE_LIMIT_RPM:
-        return False
-    rate_limits[ip].append(now)
+    with _rate_limit_lock:
+        rate_limits[ip] = [t for t in rate_limits[ip] if now - t < 60]
+        if len(rate_limits[ip]) >= RATE_LIMIT_RPM:
+            return False
+        rate_limits[ip].append(now)
     return True
 
 # --------------------------------------------------------------------------
@@ -847,9 +922,17 @@ async def lifespan(app: FastAPI):
     if seed:
         set_dynamic_alias_target(seed)
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
+    start_env_watcher()
+    # Load API keys from environment
+    KEY_POOL.load_from_env()
     yield
-    if _session and not _session.closed:
-        await _session.close()
+    # Cleanup: close aiohttp session
+    global _SESSION
+    if _SESSION is not None and not _SESSION.closed:
+        try:
+            await _SESSION.close()
+        except Exception:
+            pass
     logger.info("Shutdown complete")
 
 app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)
@@ -866,8 +949,11 @@ async def _auth_check(request: Request):
 async def health():
     try:
         tok = await get_token()
-        code, _ = await post_nous({"model": DEFAULT_MODEL, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, tok)
-        upstream = code == 200
+        if tok and CURATED_FREE_MODELS:
+            code, _ = await post_nous({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, tok)
+            upstream = code == 200
+        else:
+            upstream = True  # No token configured - skip upstream check
     except:
         upstream = False
     return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "metrics": metrics.snapshot()}
@@ -881,6 +967,41 @@ CURATED_FREE_MODELS = [
     {"id": "poolside/laguna-s-2.1:free", "object": "model", "owned_by": "nous", "context_window": 1048576, "max_tokens": 131072, "supports_tools": True},
     {"id": "big-pickle", "object": "model", "owned_by": "nous", "context_window": 128000, "max_tokens": 32768, "supports_tools": True},
 ]
+
+_SESSION = None
+
+def _read_token_from_auth_path():
+    """Read OAuth access token from AUTH_PATH (Hermes profile format)."""
+    if not AUTH_PATH or not os.path.exists(AUTH_PATH):
+        return None
+    try:
+        with open(AUTH_PATH) as f:
+            data = json.load(f)
+        # Extract token from hermes profile format
+        token = data.get("providers", {}).get("nous", {}).get("access_token")
+        return token if token else None
+    except Exception as e:
+        logger.warning(f"[auth] Failed to read token from AUTH_PATH: {e}")
+        return None
+
+async def get_token():
+    """Get Nous API token: prefer AUTH_PATH (OAuth), fallback to KEY_POOL."""
+    # Priority 1: OAuth token from AUTH_PATH
+    token = _read_token_from_auth_path()
+    if token:
+        return token
+    # Priority 2: Use KeyPool (NOUS_API_KEY, NOUS_API_KEY_1, etc.)
+    key = KEY_POOL.acquire()
+    if key:
+        return key
+    logger.warning("[auth] No API key configured! Set NOUS_API_KEY* or AUTH_PATH.")
+    return ""
+
+async def get_session():
+    global _SESSION
+    if _SESSION is None or _SESSION.closed:
+        _SESSION = aiohttp.ClientSession()
+    return _SESSION
 
 @app.get("/v1/models")
 async def models():
@@ -940,7 +1061,7 @@ async def models():
     for i, m in enumerate(deduped):
         if isinstance(enriched[i], dict):
             enriched[i]["id"] = m.get("id")
-    return {"object": "list", "data": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None}
+    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None}
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):
@@ -1014,11 +1135,6 @@ async def responses(request: Request):
         if not model_allowed(requested) and not model_allowed(resolved):
             return JSONResponse(status_code=400, content=free_only_error(requested))
     chat_body = responses_to_chat(body)
-    # DEBUG: capture 2nd-turn tool-result payloads to find 400 cause
-    if body.get("previous_response_id") or any(isinstance(x, dict) and x.get("type") == "function_call_output" for x in (body.get("input") or [])):
-        logger.info(f"[DEBUG responses 2nd-turn] input_types={[x.get('type') for x in body.get('input',[]) if isinstance(x,dict)]} prev={body.get('previous_response_id')}")
-        logger.info(f"[DEBUG responses 2nd-turn CHAT] model={chat_body.get('model')} messages={json.dumps(chat_body.get('messages',[]), default=str)[:2500]}")
-        logger.info(f"[DEBUG responses 2nd-turn CHAT tools={json.dumps(chat_body.get('tools',[]), default=str)[:1000]}")
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
@@ -1026,7 +1142,6 @@ async def responses(request: Request):
 
     status, result = await post_nous(chat_body, tok, stream=is_stream)
     if status != 200:
-        logger.info(f"[DEBUG responses 2nd-turn FAIL] status={status} result={json.dumps(result, default=str)[:1000]}")
         return JSONResponse(status_code=status, content=result)
 
     if is_stream:

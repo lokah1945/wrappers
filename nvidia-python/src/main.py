@@ -697,8 +697,7 @@ class Server:
                 api_key_header = (request.headers.get('x-api-key') or '').strip()
                 token = auth_header.replace('Bearer ', '', 1) if auth_header.lower().startswith('bearer ') else auth_header or api_key_header
                 if token != BEARER_TOKEN:
-                    if path == '/v1/messages' or path.startswith('/v1/messages/'):
-                        return JSONResponse(status_code=401, content={'type': 'error', 'error': {'type': 'authentication_error', 'message': 'Unauthorized'}})
+                    # Consistent error format for all SDK clients
                     return JSONResponse(status_code=401, content={'error': {'message': 'Unauthorized', 'type': 'authentication_error'}})
 
             return await call_next(request)
