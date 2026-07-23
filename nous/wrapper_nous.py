@@ -118,7 +118,8 @@ def free_only_anthropic_error(model_id: str) -> dict:
         },
     }
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s",
+                    handlers=[logging.FileHandler("/root/wrapper/nous/wrapper_nous.log"), logging.StreamHandler()])
 logger = logging.getLogger("wrapper-nous")
 
 # --------------------------------------------------------------------------
@@ -357,7 +358,14 @@ def responses_to_chat(body: dict) -> dict:
             if t == "function_call_output":
                 msgs.append({"role": "tool", "tool_call_id": it.get("call_id"), "content": str(it.get("output", ""))})
             elif t == "function_call":
-                msgs.append({"role": "assistant", "content": None, "tool_calls": [{"id": it.get("call_id"), "type": "function", "function": {"name": it.get("name"), "arguments": json.dumps(it.get("arguments", {}))}}]})
+                raw_args = it.get("arguments", "")
+                # Codex sends arguments as a JSON STRING; json.dumps would
+                # double-encode it ("{...}" -> "\"{...}\"") which Nous rejects.
+                if isinstance(raw_args, str):
+                    args_out = raw_args
+                else:
+                    args_out = json.dumps(raw_args)
+                msgs.append({"role": "assistant", "content": None, "tool_calls": [{"id": it.get("call_id"), "type": "function", "function": {"name": it.get("name"), "arguments": args_out}}]})
             else:
                 role = it.get("role", "user")
                 c = it.get("content", "")
@@ -558,6 +566,23 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 yield ": heartbeat\n\n"
                 last_hb = now
     finally:
+        # Stream ended without [DONE] (Nous Responses API does not always send it).
+        # Emit completion exactly once so OpenAI Responses SDK / Codex can finalize.
+        try:
+            if state and hasattr(state, "done"):
+                done_evs = state.done()
+                if isinstance(done_evs, str):
+                    done_evs = [done_evs]
+                for ev in (done_evs or []):
+                    if isinstance(ev, str):
+                        yield ev
+                    else:
+                        yield serialize_fn(ev) if callable(serialize_fn) else ev
+            yield "data: [DONE]\n\n"
+        except Exception:
+            pass
+        if _session and not _session.closed:
+            pass
         await upstream_resp.release()
 
 # Advanced streaming state machines
@@ -630,6 +655,10 @@ class ResponsesStreamState:
         self.tool_acc = {}
         self.reasoning_started = False
         self.started = False
+        self._active_tool_id = None
+        self._completed = False
+        self._finished = False
+        self.accum_usage = {}
 
     def next_seq(self):
         self.seq += 1
@@ -643,29 +672,98 @@ class ResponsesStreamState:
         if self.started:
             return []
         self.started = True
+        rid = self.rid
+        # OpenAI Responses API requires the output item to be "added" (made active)
+        # BEFORE any output_text.delta is sent, otherwise clients like Codex v0.145
+        # emit "OutputTextDelta without active item" and hang.
         return [
-            self.emit("response.created", {"response": {"id": self.rid, "model": self.model, "status": "in_progress"}}),
-            self.emit("response.in_progress", {"response": {"id": self.rid, "status": "in_progress"}}),
+            self.emit("response.created", {"response": {"id": rid, "model": self.model, "status": "in_progress"}}),
+            self.emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}}),
+            self.emit("response.output_item.added", {
+                "output_index": 0,
+                "item": {"id": "msg-1", "type": "message", "status": "in_progress",
+                         "role": "assistant", "content": []},
+            }),
+            self.emit("response.content_part.added", {
+                "item_id": "msg-1", "output_index": 0, "content_index": 0,
+                "part": {"type": "output_text", "text": ""},
+            }),
         ]
 
     def delta(self, text):
-        return self.emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "delta": text})
+        self.final_text = getattr(self, "final_text", "") + text
+        return self.emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": text})
 
     def tool_delta(self, call_id, name, args):
+        events = []
         if call_id not in self.tool_acc:
             self.tool_acc[call_id] = {"name": name, "args": ""}
+            # Make the tool item "active" BEFORE sending its delta (Codex requires this).
+            events.append(self.emit("response.output_item.added", {
+                "output_index": 1,
+                "item": {
+                    "id": call_id, "type": "function_call", "status": "in_progress",
+                    "call_id": call_id, "name": name, "arguments": "",
+                },
+            }))
+        self.tool_acc[call_id]["name"] = self.tool_acc[call_id]["name"] or name
         self.tool_acc[call_id]["args"] += args
-        return self.emit("response.function_call.delta", {"item_id": call_id, "output_index": 1, "delta": args})
+        events.append(self.emit("response.function_call.delta", {
+            "item_id": call_id, "output_index": 1, "delta": args,
+        }))
+        return events
+
+    def _normalize_usage(self, u):
+        if not u:
+            u = self.accum_usage or {}
+        else:
+            self.accum_usage.update(u)
+        prompt = u.get("prompt_tokens") or u.get("input_tokens") or 0
+        completion = u.get("completion_tokens") or u.get("output_tokens") or 0
+        # OpenAI Responses API schema requires total_tokens alongside input/output.
+        return {
+            "input_tokens": int(prompt),
+            "output_tokens": int(completion),
+            "total_tokens": int(prompt) + int(completion),
+        }
 
     def done(self, usage=None):
-        # MUST return a list — stream_with_heartbeat iterates this
-        return [self.emit("response.completed", {"response": {"id": self.rid, "status": "completed", "usage": usage or {}}})]
+        # MUST return a list — stream_with_heartbeat iterates this.
+        # Idempotent: emit response.completed exactly once.
+        if self._completed:
+            return []
+        self._completed = True
+        norm = self._normalize_usage(usage)
+        rid = self.rid
+        text = getattr(self, "final_text", "")
+        events = [
+            self.emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": text}),
+            self.emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text}}),
+            self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
+        ]
+        # Close every tool item that was opened (Codex hangs if a function_call
+        # item is added but never marked done).
+        for call_id, info in self.tool_acc.items():
+            events.append(self.emit("response.output_item.done", {
+                "output_index": 1,
+                "item": {
+                    "id": call_id, "type": "function_call", "status": "completed",
+                    "call_id": call_id, "name": info.get("name", ""),
+                    "arguments": info.get("args", ""),
+                },
+            }))
+        events.append(self.emit("response.completed", {"response": {"id": rid, "status": "completed", "usage": norm}}))
+        return events
 
     def translate_chunk(self, chunk):
         """Convert OpenAI chat chunk → Responses events"""
         events = []
         if not self.started:
             events.extend(self.start())
+
+        # Accumulate usage from any chunk (Nous sends it separately from finish_reason)
+        if isinstance(chunk, dict) and chunk.get("usage"):
+            self.accum_usage.update(chunk["usage"])
 
         if "choices" not in chunk:
             return events
@@ -680,15 +778,20 @@ class ResponsesStreamState:
         # Tool calls (parallel support)
         for tc in delta.get("tool_calls", []):
             fn = tc.get("function", {})
-            call_id = tc.get("id") or f"call_{len(self.tool_acc)}"
+            raw_id = tc.get("id")
+            if raw_id:
+                self._active_tool_id = raw_id
+            call_id = self._active_tool_id or (tc.get("id") or f"call_{len(self.tool_acc)}")
             name = fn.get("name", "")
             args = fn.get("arguments", "")
             if name or args:
-                events.append(self.tool_delta(call_id, name, args))
+                events.extend(self.tool_delta(call_id, name, args))
 
+        # Completion event is emitted exactly once at [DONE] in stream_with_heartbeat.
+        # This avoids a double response.completed (one with empty usage) that breaks
+        # OpenAI Responses SDK / Codex parsing ("missing field input_tokens").
         if ch.get("finish_reason"):
-            usage = chunk.get("usage")
-            events.extend(self.done(usage))
+            self._finished = True
         return events
 
 # --------------------------------------------------------------------------
@@ -885,6 +988,11 @@ async def responses(request: Request):
         if not model_allowed(requested) and not model_allowed(resolved):
             return JSONResponse(status_code=400, content=free_only_error(requested))
     chat_body = responses_to_chat(body)
+    # DEBUG: capture 2nd-turn tool-result payloads to find 400 cause
+    if body.get("previous_response_id") or any(isinstance(x, dict) and x.get("type") == "function_call_output" for x in (body.get("input") or [])):
+        logger.info(f"[DEBUG responses 2nd-turn] input_types={[x.get('type') for x in body.get('input',[]) if isinstance(x,dict)]} prev={body.get('previous_response_id')}")
+        logger.info(f"[DEBUG responses 2nd-turn CHAT] model={chat_body.get('model')} messages={json.dumps(chat_body.get('messages',[]), default=str)[:2500]}")
+        logger.info(f"[DEBUG responses 2nd-turn CHAT tools={json.dumps(chat_body.get('tools',[]), default=str)[:1000]}")
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     tok = await get_token()
@@ -892,6 +1000,7 @@ async def responses(request: Request):
 
     status, result = await post_nous(chat_body, tok, stream=is_stream)
     if status != 200:
+        logger.info(f"[DEBUG responses 2nd-turn FAIL] status={status} result={json.dumps(result, default=str)[:1000]}")
         return JSONResponse(status_code=status, content=result)
 
     if is_stream:
@@ -906,7 +1015,18 @@ async def responses(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)
-    await store_conversation(resp["id"], chat_body.get("messages", []))
+    # Store the FULL conversation (user input + assistant reply incl. tool_calls)
+    # so that a later tool-result turn has the preceding assistant tool_calls —
+    # otherwise Nous rejects the orphaned role:tool with 400.
+    saved_msgs = list(chat_body.get("messages", []))
+    amsg = (result.get("choices") or [{}])[0].get("message", {})
+    if amsg:
+        saved_msgs.append({
+            "role": "assistant",
+            "content": amsg.get("content"),
+            "tool_calls": amsg.get("tool_calls") or None,
+        })
+    await store_conversation(resp["id"], saved_msgs)
     return resp
 
 # --- ANTHROPIC MESSAGES ---

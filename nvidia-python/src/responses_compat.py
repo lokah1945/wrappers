@@ -83,6 +83,18 @@ def input_to_messages(input_val: Any, instructions: Optional[str] = None) -> Lis
             messages.append({'role': normalized_role or 'user', 'content': content if content is not None else ''})
 
         elif item.get('type') == 'function_call':
+            raw_args = item.get('arguments')
+            # Normalize: if Codex sent a JSON string, parse it so we can
+            # re-serialize with correct types (ints stay ints, not "250").
+            if isinstance(raw_args, str):
+                try:
+                    raw_args = json.loads(raw_args)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+            if isinstance(raw_args, (dict, list, int, float, bool)) or raw_args is None:
+                arguments = json.dumps(raw_args) if raw_args is not None else ''
+            else:
+                arguments = str(raw_args)
             messages.append({
                 'role': 'assistant',
                 'content': None,
@@ -91,7 +103,7 @@ def input_to_messages(input_val: Any, instructions: Optional[str] = None) -> Lis
                     'type': 'function',
                     'function': {
                         'name': item.get('name', ''),
-                        'arguments': item.get('arguments') if isinstance(item.get('arguments'), str) else json.dumps(item.get('arguments') or {}),
+                        'arguments': arguments,
                     },
                 }],
             })
@@ -237,13 +249,25 @@ def build_chat_body(body: dict, model: str, translate_thinking_to_nim) -> dict:
     }
 
     if body.get('temperature') is not None:
-        chat_body['temperature'] = body['temperature']
+        try:
+            chat_body['temperature'] = float(body['temperature'])
+        except (TypeError, ValueError):
+            pass
     if body.get('top_p') is not None:
-        chat_body['top_p'] = body['top_p']
+        try:
+            chat_body['top_p'] = float(body['top_p'])
+        except (TypeError, ValueError):
+            pass
     if body.get('max_output_tokens') is not None:
-        chat_body['max_tokens'] = body['max_output_tokens']
+        try:
+            chat_body['max_tokens'] = int(body['max_output_tokens'])
+        except (TypeError, ValueError):
+            pass
     elif body.get('max_tokens') is not None:
-        chat_body['max_tokens'] = body['max_tokens']
+        try:
+            chat_body['max_tokens'] = int(body['max_tokens'])
+        except (TypeError, ValueError):
+            pass
 
     tools = convert_tools(body.get('tools'))
     if tools:

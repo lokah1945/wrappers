@@ -186,6 +186,7 @@ logger = logging.getLogger('wrapper-nvidia')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(message)s',
+    handlers=[logging.FileHandler("/root/wrapper/nvidia-python/nvidia_py.log"), logging.StreamHandler()],
 )
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9101'))
@@ -257,6 +258,11 @@ for _p in (os.environ.get('WRAPPER_PARAMS') or '').split(','):
         continue
     _dv = os.environ.get(f'DEFAULT_{_p.upper()}')
     if _dv is not None:
+        # Numeric defaults must be floats, not strings (NVIDIA rejects "0.7")
+        try:
+            _dv = float(_dv)
+        except (TypeError, ValueError):
+            pass
         DEFAULT_PARAMS[_p] = _dv
 PROACTIVE_DROP = set((os.environ.get('DROP_PARAMS', 'think').split(',') if os.environ.get('DROP_PARAMS') else ['think']))
 PROACTIVE_DROP.update(['context_length', 'context_window', 'context_len', 'max_position_embeddings', 'max_context_length', 'max_input_tokens', 'max_output_tokens', 'token_limit'])
@@ -996,6 +1002,11 @@ class Server:
         async def chat_completions(request: Request):
             raw = await request.body()
             try:
+                _b = json.loads(raw)
+                logger.warning(f"[DBG chat] temp={_b.get('temperature')!r} model={_b.get('model')}")
+            except Exception:
+                pass
+            try:
                 body = json.loads(raw)
             except (json.JSONDecodeError, ValueError) as e:
                 logger.error(f'[JSON PARSE ERROR] completions: {e}')
@@ -1024,6 +1035,25 @@ class Server:
         @app.post('/v1/responses')
         async def responses_api(request: Request):
             raw = await request.body()
+            import json as _json
+            try:
+                _b = _json.loads(raw)
+                _temp = _b.get('temperature')
+                # Deep scan for any string-valued temperature-like keys
+                _scan = []
+                def _walk(o, path=''):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            if k in ('temperature','top_p') and not isinstance(v, (int, float)):
+                                _scan.append(f'{path}/{k}={v!r}')
+                            _walk(v, f'{path}/{k}')
+                    elif isinstance(o, list):
+                        for i, v in enumerate(o):
+                            _walk(v, f'{path}[{i}]')
+                _walk(_b)
+                logger.warning(f"[DBG responses] top_temp={_temp!r} suspicious={_scan} model={_b.get('model')}")
+            except Exception as _e:
+                logger.warning(f"[DBG responses] parse fail {_e}")
             result, stream, status_code = await self.responses_handler.handle_responses_api(request, raw)
             if stream is not None:
                 return StreamingResponse(stream, media_type='text/event-stream', headers={
@@ -1138,6 +1168,14 @@ class Server:
         model_id = body.get('model', '')
         if is_model_unavailable(model_id):
             return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
+
+        # Cast numeric params that SDKs (Codex/OpenAI) may send as strings
+        for _k in ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty', 'min_p'):
+            if body.get(_k) is not None:
+                try:
+                    body[_k] = float(body[_k])
+                except (TypeError, ValueError):
+                    pass
 
         stream_guard = guard_stream_unsupported(body, model_id)
         if stream_guard:

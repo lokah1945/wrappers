@@ -36,7 +36,10 @@ except ImportError:
 from .key_pool import KeyPool
 from .metrics import Metrics
 
-load_dotenv()
+load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
+# Fallback: also try cwd-relative .env (for direct uvicorn launches)
+if not os.environ.get('OPENCODE_BASE_URL'):
+    load_dotenv()
 
 logger = logging.getLogger('wrapper-opencode')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [opencode] %(message)s')
@@ -44,6 +47,8 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [opencode] %(message
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9107'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
+import sys as _sys
+print(f"DEBUG_OPENCODE_BASE_LINE46={OPENCODE_BASE!r} env={os.environ.get('OPENCODE_BASE_URL')!r}", file=_sys.stderr, flush=True)
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 DEFAULT_MODEL = os.environ.get('DEFAULT_MODEL', 'gpt-5.4-mini')
 VERSION = '1.0.4-dynamic-alias'
@@ -201,7 +206,8 @@ def _zen_family(model: str) -> str:
         return 'google'
     if m.startswith('qwen3.') or m.startswith('qwen3-') or m.startswith('qwen3'):
         return 'messages'
-    return 'chat'
+    # Zen OpenAI-compatible Responses API supports all non-Anthropic/non-Gemini models
+    return 'responses'
 
 
 def _normalize_model(model: str) -> str:
@@ -331,7 +337,7 @@ def _jr(status: int, content: dict):
     return JSONResponse(status_code=status, content=content)
 
 def _auth_headers(api_key: str, request: Request = None) -> dict:
-    h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept-Encoding": "identity"}
     if request is not None:
         for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key"):
             v = request.headers.get(k)
@@ -470,7 +476,13 @@ def responses_to_chat(body: dict) -> dict:
         out['max_tokens'] = int(body['max_tokens'])
     for k in ('temperature', 'top_p', 'tool_choice'):
         if body.get(k) is not None:
-            out[k] = body[k]
+            v = body[k]
+            if k in ('temperature', 'top_p'):
+                try:
+                    v = float(v)
+                except (TypeError, ValueError):
+                    pass
+            out[k] = v
     if body.get('tools'):
         tools = []
         for t in body['tools']:
@@ -567,11 +579,13 @@ def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE}
+    return {"status": "ok", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE, "dbg_env_base": os.environ.get("OPENCODE_BASE_URL")}
 
 @app.get("/v1/models")
 async def models(request: Request):
     """Proxy Zen GET /models (https://opencode.ai/zen/v1/models)."""
+    import logging as _lg
+    _lg.getLogger('wrapper-opencode').warning(f"DBG models: OPENCODE_BASE={OPENCODE_BASE!r} free_only={free_only_enabled()}")
     _auth_check(request)
     key_result = await pool.acquire()
     # Even without keys, return curated aliases so Claude Code discovery works
@@ -716,10 +730,18 @@ async def responses(request: Request):
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                 )
-            status, data = await proxy_request("POST", url, body, headers)
+            try:
+                status, data = await proxy_request("POST", url, body, headers)
+            except Exception as e:
+                pool.release(key)
+                return _jr(502, {"error": {"message": f"Zen upstream error: {e}", "type": "api_error"}})
             pool.release(key)
             if status != 200:
-                return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
+                err_data = data if isinstance(data, dict) else {"error": {"message": str(data)}}
+                return _jr(status, err_data)
+            # Zen may return {"type":"error",...} even with 200 in some paths — normalize
+            if isinstance(data, dict) and data.get("type") == "error":
+                return _jr(400, data.get("error", {"message": "Zen error"}))
             return JSONResponse(data)
 
         # Translate via chat/completions for non-GPT Zen models
