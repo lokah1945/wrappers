@@ -696,8 +696,8 @@ DISCOVERY_TO_NIM = {}
 DISCOVERY_PREFIX = 'claude-'
 
 # Canonical Claude Code / Anthropic short names — NEVER hardcode a backing model.
-# They resolve at request-time to the last concrete model the client called
-# (e.g. minimaxai/minimax-m3 or z-ai/glm-5.2). Fully dynamic.
+# They resolve only from an explicit operator/scoped binding; concrete requests
+# never mutate alias state.
 _ALIAS_NAME_SET = {
     'haiku', 'sonnet', 'opus',
     'claude-haiku', 'claude-sonnet', 'claude-opus',
