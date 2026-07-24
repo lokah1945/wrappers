@@ -21,6 +21,7 @@ from .contracts import (
 from .errors import ErrorState, classify_upstream_error, error_text
 from .identity import AliasResolver, normalize_model_syntax
 from .registry import LocalModelRegistry
+from .sanitize import sanitize_error_detail
 
 __all__ = [
     "AliasBinding",
@@ -41,4 +42,5 @@ __all__ = [
     "classify_upstream_error",
     "error_text",
     "normalize_model_syntax",
+    "sanitize_error_detail",
 ]

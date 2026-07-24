@@ -12,6 +12,8 @@ from typing import Any
 
 import aiohttp
 
+from .sanitize import sanitize_error_detail
+
 
 class ModelRegistryClient:
     def __init__(self, base_url: str | None = None, token: str | None = None,
@@ -65,7 +67,7 @@ class ModelRegistryClient:
                 "state": state,
                 "http_status": status,
                 "reason_code": reason_code,
-                "reason_detail": str(reason_detail or "")[:4000],
+                "reason_detail": sanitize_error_detail(reason_detail),
                 "endpoint": endpoint,
             },
         )

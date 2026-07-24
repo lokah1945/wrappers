@@ -23,6 +23,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from .model.errors import classify_upstream_error, error_text
+from .model.sanitize import sanitize_error_detail
 
 SCHEMA_VERSION = 1
 
@@ -202,6 +203,7 @@ class ModelStateStore:
                       retry_after_sec: int = 0) -> dict[str, Any]:
         now = time.time()
         account_scope = account_scope or "unknown"
+        reason_detail = sanitize_error_detail(reason_detail)
         write_key = (account_scope, model_id, endpoint)
         cached_write = self._last_status_write.get(write_key)
         if cached_write:
@@ -323,7 +325,7 @@ class ModelStateStore:
     def record_error(self, model_id: str, account_credential: str | None,
                      status_code: int, payload: Any, endpoint: str = "") -> dict[str, Any]:
         classification = classify_upstream_error(status_code, payload)
-        detail = error_text(payload)
+        detail = sanitize_error_detail(payload)
         scope = credential_fingerprint(account_credential)
         return self.record_status(
             model_id=model_id,
