@@ -69,7 +69,7 @@ try:
         credential_fingerprint,
         error_text,
     )
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import (
@@ -78,7 +78,7 @@ except ImportError:
         credential_fingerprint,
         error_text,
     )
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 
 try:
     from watchdog.observers import Observer
@@ -1869,7 +1869,7 @@ class Server:
         client_surface = 'anthropic_messages' if metric_path == '/v1/messages' else 'openai_chat'
         try:
             call_plan = MODEL_REGISTRY.call_plan(model_id, client_surface)
-            if call_plan.model.provider_model_id != model_id:
+            if not same_provider_model_id('nvidia', call_plan.model.provider_model_id, model_id):
                 return {'status': 500, 'data': {'error': {'message': 'Model identity changed during call-plan resolution', 'type': 'server_error', 'code': 'MODEL_ID_MUTATION'}}}
         except ValueError as exc:
             return {'status': 400, 'data': {'error': {'message': str(exc), 'type': 'invalid_request_error', 'code': 'MODEL_CALL_PLAN_INVALID'}}}

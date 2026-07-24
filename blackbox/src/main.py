@@ -21,12 +21,12 @@ from contextlib import asynccontextmanager
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore, classify_upstream_error
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import ModelStateStore, classify_upstream_error
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException
@@ -315,7 +315,7 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             surface = 'anthropic_messages' if '/messages' in url else ('openai_responses' if '/responses' in url else 'openai_chat')
             try:
                 call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
-                if call_plan.model.provider_model_id != model_id:
+                if not same_provider_model_id('blackbox', call_plan.model.provider_model_id, model_id):
                     pool.release(key)
                     return 500, {'error': {'type': 'server_error', 'message': 'Model identity changed during call-plan resolution', 'code': 'MODEL_ID_MUTATION'}}, None
             except ValueError as exc:

@@ -23,6 +23,18 @@ def normalize_model_syntax(requested: str) -> str:
     return _CONTEXT_SUFFIX.sub("", value).strip()
 
 
+def same_provider_model_id(provider: str, left: str, right: str) -> bool:
+    """Compare raw provider IDs without confusing canonical namespace syntax."""
+    prefix = f"{provider}/"
+    left_value = str(left or "").strip()
+    right_value = str(right or "").strip()
+    if left_value.startswith(prefix):
+        left_value = left_value[len(prefix):]
+    if right_value.startswith(prefix):
+        right_value = right_value[len(prefix):]
+    return left_value == right_value
+
+
 class AliasResolutionError(ValueError):
     pass
 

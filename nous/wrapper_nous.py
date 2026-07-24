@@ -33,7 +33,7 @@ import sys
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry, ModelRegistryClient, classify_upstream_error
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id, classify_upstream_error
 except ImportError:
     # Audit/transparency tooling may load a temporary copy of this file; the
     # monorepo root is still the current working directory in that mode.
@@ -42,7 +42,7 @@ except ImportError:
             sys.path.insert(0, str(_root))
             break
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry, ModelRegistryClient, classify_upstream_error
+    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id, classify_upstream_error
 
 import aiohttp
 
@@ -565,7 +565,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     if model_id:
         try:
             call_plan = MODEL_REGISTRY.call_plan(model_id, client_surface)
-            if call_plan.model.provider_model_id != model_id:
+            if not same_provider_model_id('nous', call_plan.model.provider_model_id, model_id):
                 return 500, {"error": {"type": "server_error", "message": "Model identity changed during call-plan resolution", "code": "MODEL_ID_MUTATION"}}, None
         except ValueError as exc:
             return 400, {"error": {"type": "invalid_request_error", "message": str(exc), "code": "MODEL_CALL_PLAN_INVALID"}}, None

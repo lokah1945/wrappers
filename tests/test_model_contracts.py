@@ -11,6 +11,7 @@ from common.model import (
     ProtocolProfile,
     build_call_plan,
     classify_upstream_error,
+    same_provider_model_id,
 )
 
 
@@ -65,6 +66,11 @@ def test_invalid_profile_cannot_enable_substitution():
     ref = AliasResolver().resolve("provider/model-a", "nvidia")
     with pytest.raises(CallPlanError):
         build_call_plan(bad, ref, "openai_chat")
+
+
+def test_provider_namespace_comparison_is_representation_safe():
+    assert same_provider_model_id("nvidia", "provider/model-a", "nvidia/provider/model-a")
+    assert not same_provider_model_id("nvidia", "provider/model-a", "provider/model-b")
 
 
 def test_error_classifier_only_rotates_key_and_never_changes_model():
