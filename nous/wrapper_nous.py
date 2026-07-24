@@ -28,6 +28,19 @@ import logging
 from typing import Optional, Dict, List, AsyncGenerator, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
+import sys
+
+# Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
+try:
+    from common.model_state import ModelStateStore
+except ImportError:
+    # Audit/transparency tooling may load a temporary copy of this file; the
+    # monorepo root is still the current working directory in that mode.
+    for _root in (Path.cwd(), Path(__file__).resolve().parents[1], Path(__file__).resolve().parents[2]):
+        if (_root / 'common').is_dir():
+            sys.path.insert(0, str(_root))
+            break
+    from common.model_state import ModelStateStore
 
 import aiohttp
 
@@ -224,6 +237,11 @@ def start_env_watcher():
         logger.warning(f'[env] watcher failed: {e}')
 
 NOUS_BASE = os.environ.get("NOUS_BASE_URL", "https://inference-api.nousresearch.com").rstrip("/")
+MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().parent / "model-state.db"))
+MODEL_CATALOG_TTL_SEC = int(os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
+MODEL_CATALOG_REFRESH_SEC = int(os.environ.get("MODEL_CATALOG_REFRESH_SEC", "86400"))
+MODEL_STORE = ModelStateStore("nous", MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+_MODEL_REFRESH_TASK = None
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
 KEY_POOL = KeyPool()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
@@ -1348,6 +1366,26 @@ class Metrics:
 
 metrics = Metrics()
 
+
+def record_model_result(model_id: str, key_entry, status: int, payload, endpoint: str) -> None:
+    """Persist account-scoped upstream outcome without hard-blocking models."""
+    try:
+        credential = getattr(key_entry, "api_key", None)
+        if status == 200:
+            from common.model_state import credential_fingerprint
+            MODEL_STORE.record_status(
+                model_id=model_id or "unknown",
+                account_scope=credential_fingerprint(credential),
+                state="available",
+                status_code=status,
+                reason_code="OK",
+                endpoint=endpoint,
+            )
+        else:
+            MODEL_STORE.record_error(model_id or "unknown", credential, status, payload, endpoint)
+    except Exception as e:
+        logger.warning(f"[model-state] Nous result record failed: {e}")
+
 # --------------------------------------------------------------------------
 # RATE LIMIT
 # --------------------------------------------------------------------------
@@ -1364,19 +1402,46 @@ def check_rate_limit(ip: str):
         rate_limits[ip].append(now)
     return True
 
+
+async def refresh_model_catalog_once():
+    """Refresh the persistent Nous catalog without touching inference traffic."""
+    try:
+        status, data = await get_nous_json_with_retries("/v1/models")
+        models_data = data.get("data", []) if status == 200 and isinstance(data, dict) else []
+        if models_data:
+            MODEL_STORE.upsert_catalog(models_data, source="nous:/v1/models")
+            logger.info(f"[model-catalog] Nous refreshed {len(models_data)} models")
+    except Exception as e:
+        logger.warning(f"[model-catalog] Nous refresh failed: {e}")
+
+
+async def model_catalog_refresh_loop():
+    while True:
+        await asyncio.sleep(max(60, MODEL_CATALOG_REFRESH_SEC))
+        await refresh_model_catalog_once()
+
 # --------------------------------------------------------------------------
 # FASTAPI APP
 # --------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _MODEL_REFRESH_TASK
     seed = (os.environ.get("DYNAMIC_ALIAS_TARGET") or "").strip()
     if seed:
         set_dynamic_alias_target(seed, force=True)
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
     start_env_watcher()
-    # Load API keys from environment
+    # Load API keys from environment before the daily catalog task starts.
     KEY_POOL.load_from_env()
+    _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
+    if _MODEL_REFRESH_TASK:
+        _MODEL_REFRESH_TASK.cancel()
+        try:
+            await _MODEL_REFRESH_TASK
+        except asyncio.CancelledError:
+            pass
+        _MODEL_REFRESH_TASK = None
     # Cleanup: close aiohttp session
     global _SESSION
     if _SESSION is not None and not _SESSION.closed:
@@ -1491,13 +1556,20 @@ async def get_session():
 
 @app.get("/v1/models")
 async def models():
-    upstream_models = []
-    try:
-        status, data = await get_nous_json_with_retries("/v1/models")
-        if status == 200 and isinstance(data, dict):
-            upstream_models = data.get("data", [])
-    except Exception:
-        pass  # Will use curated fallback
+    # Use a persistent stale-while-revalidate catalog.  Discovery must not
+    # depend on a live upstream call on every client request.
+    upstream_models = MODEL_STORE.get_catalog(fresh_only=True)
+    if not upstream_models:
+        try:
+            status, data = await get_nous_json_with_retries("/v1/models")
+            if status == 200 and isinstance(data, dict):
+                upstream_models = data.get("data", [])
+                if upstream_models:
+                    MODEL_STORE.upsert_catalog(upstream_models, source="nous:/v1/models")
+        except Exception:
+            pass
+        if not upstream_models:
+            upstream_models = MODEL_STORE.get_catalog(fresh_only=False)
 
     models_list = list(upstream_models)
 
@@ -1549,23 +1621,30 @@ async def models():
         seen.add(mid)
         deduped.append(m)
     enriched = [get_model_meta(m.get("id", "")) for m in deduped]
-    # Preserve original id on meta
+    status_map = MODEL_STORE.status_map()
+    # Preserve original id on meta and expose account-scoped state without
+    # pretending that a catalog entry is globally deployable.
     for i, m in enumerate(deduped):
         if isinstance(enriched[i], dict):
-            enriched[i]["id"] = m.get("id")
-    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None}
+            mid = m.get("id")
+            enriched[i]["id"] = mid
+            st = status_map.get(mid, {})
+            enriched[i]["catalog_listed"] = True
+            enriched[i]["availability_state"] = st.get("state", "unknown")
+            enriched[i]["availability_scope"] = "account"
+            enriched[i]["reason_code"] = st.get("reason_code", "")
+            enriched[i]["checked_at"] = st.get("checked_at")
+    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
 
 @app.get("/v1/capabilities")
 async def capabilities():
-    models_list = []
     try:
-        status, data = await get_nous_json_with_retries("/v1/models")
-        if status == 200 and isinstance(data, dict):
-            models_list = data.get("data", [])
+        model_response = await models()
+        models_list = model_response.get("data", []) if isinstance(model_response, dict) else []
     except Exception:
-        models_list = CURATED_FREE_MODELS
+        models_list = []
     if not models_list:
-        models_list = CURATED_FREE_MODELS
+        models_list = MODEL_STORE.get_catalog(fresh_only=False) or CURATED_FREE_MODELS
     enriched = []
     for m in models_list:
         mid = m.get("id") if isinstance(m, dict) else m
@@ -1642,6 +1721,7 @@ async def chat_completions(request: Request):
     extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
+    record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
     metrics.record(error=(status != 200))
 
     if status != 200:
@@ -1678,6 +1758,7 @@ async def responses(request: Request):
     is_stream = body.get("stream", False)
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
+    record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
     if status != 200:
         return JSONResponse(status_code=status, content=result)
 
@@ -1735,6 +1816,7 @@ async def messages(request: Request):
     is_stream = body.get("stream", False)
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
+    record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}
@@ -1764,6 +1846,14 @@ async def prom():
         f'wrapper_nous_tokens_total {snap["total_tokens"]}',
     ]
     return Response("\n".join(lines), media_type="text/plain")
+
+@app.get("/metrics/model-status")
+async def model_status():
+    return {
+        "provider": "nous",
+        "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+        "states": MODEL_STORE.status_map(),
+    }
 
 @app.get("/healthz")
 async def healthz(): return await health()

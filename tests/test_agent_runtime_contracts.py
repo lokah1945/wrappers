@@ -402,3 +402,41 @@ def test_nvidia_kimi_skips_reasoning_effort_injection_for_claude_code_thinking()
     nv.translate_thinking_to_nim(body, "moonshotai/kimi-k2.6", {"type": "enabled", "budget_tokens": 1024})
     assert "reasoning_effort" not in body
     assert "chat_template_kwargs" not in body
+
+
+def test_nvidia_account_scoped_404_does_not_enter_retired_set():
+    nv = _load_nvidia_main()
+
+    class FakePool:
+        models_metadata = {}
+        models_cached = ["moonshotai/kimi-k2.6"]
+
+        async def refresh_models(self, force=False):
+            return list(self.models_cached)
+
+    async def fake_probe(pool, model_id, timeout_ms=120000):
+        return {
+            "ok": False,
+            "status": 404,
+            "reason": '{"detail":"Function \'fn\': Not found for account \'acct\'"}',
+            "account_scope": "acct-fingerprint",
+        }
+
+    old_probe = nv.probe_model
+    old_unavailable = set(nv._unavailable_models)
+    old_retired = set(nv._retired_models)
+    try:
+        nv.probe_model = fake_probe
+        nv._unavailable_models.clear()
+        nv._retired_models.clear()
+        import asyncio
+        asyncio.run(nv.verify_models(FakePool()))
+        assert "moonshotai/kimi-k2.6" in nv._unavailable_models
+        assert "moonshotai/kimi-k2.6" not in nv._retired_models
+        assert nv.is_model_unavailable("moonshotai/kimi-k2.6") is False
+    finally:
+        nv.probe_model = old_probe
+        nv._unavailable_models.clear()
+        nv._unavailable_models.update(old_unavailable)
+        nv._retired_models.clear()
+        nv._retired_models.update(old_retired)

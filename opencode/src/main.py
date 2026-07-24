@@ -22,6 +22,14 @@ from typing import Set
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+# Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
+try:
+    from common.model_state import ModelStateStore, classify_upstream_error
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from common.model_state import ModelStateStore, classify_upstream_error
+
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
@@ -62,6 +70,11 @@ logging.basicConfig(
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9103'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
+MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().parents[1] / 'model-state.db'))
+MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
+MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
+MODEL_STORE = ModelStateStore('opencode', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+_MODEL_REFRESH_TASK = None
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 MAX_CONNECTIONS_PER_HOST = int(os.environ.get('MAX_CONNECTIONS_PER_HOST', '100'))
@@ -394,6 +407,16 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         if url.endswith('/messages') and not headers.get('anthropic-version'):
             headers['anthropic-version'] = '2023-06-01'
         status, data = await proxy_request(method, url, json_body, headers, is_stream=is_stream)
+        model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
+        if model_id:
+            try:
+                from common.model_state import credential_fingerprint
+                if status == 200:
+                    MODEL_STORE.record_status(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
+                else:
+                    MODEL_STORE.record_error(model_id, key.api_key, status, data, endpoint=url)
+            except Exception as e:
+                logger.warning(f'[model-state] OpenCode result record failed: {e}')
         if status == 200:
             if is_stream:
                 return status, data, key
@@ -401,7 +424,8 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             return status, data, None
         tried += 1
         last_status, last_data = status, data
-        if _is_retriable_upstream_status(status, data):
+        classification = classify_upstream_error(status, data)
+        if _is_retriable_upstream_status(status, data) and classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden'):
             if _should_cooldown_key(status, data):
                 pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
             pool.release(key)
@@ -785,16 +809,48 @@ def start_env_watcher():
     except Exception as e:
         logger.warning(f'[env] watcher failed: {e}')
 
+class _CatalogRequest:
+    headers = {}
+
+
+async def refresh_model_catalog_once():
+    """Refresh the persistent OpenCode catalog independently of user traffic."""
+    try:
+        status, data, _ = await proxy_request_with_pool(
+            "GET", f"{OPENCODE_BASE}/models", None, _CatalogRequest()
+        )
+        models_data = data.get("data") or data.get("models") or [] if status == 200 and isinstance(data, dict) else []
+        if models_data:
+            MODEL_STORE.upsert_catalog(models_data, source="opencode:/models")
+            logger.info(f"[model-catalog] OpenCode refreshed {len(models_data)} models")
+    except Exception as e:
+        logger.warning(f"[model-catalog] OpenCode refresh failed: {e}")
+
+
+async def model_catalog_refresh_loop():
+    while True:
+        await asyncio.sleep(max(60, MODEL_CATALOG_REFRESH_SEC))
+        await refresh_model_catalog_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _session
+    global _session, _MODEL_REFRESH_TASK
     pool.load_from_env()
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed:
         set_dynamic_alias_target(seed, force=True)
     logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE} alias_target={get_dynamic_alias_target() or 'none'}")
+    _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
+    if _MODEL_REFRESH_TASK:
+        _MODEL_REFRESH_TASK.cancel()
+        try:
+            await _MODEL_REFRESH_TASK
+        except asyncio.CancelledError:
+            pass
+        _MODEL_REFRESH_TASK = None
     if _session is not None and not _session.closed:
         await _session.close()
     logger.info("Shutdown")
@@ -873,10 +929,20 @@ async def models(request: Request):
         fallback_all = [m for m in fallback_all if model_allowed(m.get("id", ""))]
     fallback = {"object": "list", "data": fallback_all, "free_only": free_only_enabled(), "dynamic_alias_target": tgt or None}
 
+    cached = MODEL_STORE.get_catalog(fresh_only=True)
     try:
-        status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
-        if status != 200 or not isinstance(data, dict):
-            return fallback
+        if cached:
+            data = {'data': cached}
+        else:
+            status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
+            if status == 200 and isinstance(data, dict) and (data.get('data') or data.get('models')):
+                MODEL_STORE.upsert_catalog(data.get('data') or data.get('models') or [], source='opencode:/models')
+            elif status != 200 or not isinstance(data, dict):
+                stale = MODEL_STORE.get_catalog(fresh_only=False)
+                if stale:
+                    data = {'data': stale}
+                else:
+                    return fallback
         ids = {m.get('id') for m in (data.get('data') or [])}
         aliases_to_add = []
         for a in ("sonnet", "opus", "haiku"):
@@ -893,8 +959,18 @@ async def models(request: Request):
                 _known_models.add(m.get('id', ''))
         if free_only_enabled():
             data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
+        status_map = MODEL_STORE.status_map()
+        for entry in data.get('data') or []:
+            if isinstance(entry, dict) and entry.get('id'):
+                state = status_map.get(entry['id'], {})
+                entry['catalog_listed'] = True
+                entry['availability_state'] = state.get('state', 'unknown')
+                entry['availability_scope'] = 'account'
+                entry['reason_code'] = state.get('reason_code', '')
+                entry['checked_at'] = state.get('checked_at')
         data['free_only'] = free_only_enabled()
         data['dynamic_alias_target'] = tgt or None
+        data['catalog_cached'] = bool(cached)
         return data
     except Exception as e:
         logger.warning(f"models: {e}")
@@ -905,15 +981,14 @@ async def capabilities(request: Request):
     _auth_check(request)
     models_list = []
     try:
-        status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
-        if status == 200 and isinstance(data, dict):
-            models_list = data.get("data") or []
-            global _known_models
-            for m in models_list:
-                if isinstance(m, dict) and m.get("id"):
-                    _known_models.add(m.get("id", ""))
+        model_response = await models(request)
+        models_list = model_response.get("data", []) if isinstance(model_response, dict) else []
+        global _known_models
+        for m in models_list:
+            if isinstance(m, dict) and m.get("id"):
+                _known_models.add(m.get("id", ""))
     except Exception:
-        models_list = []
+        models_list = MODEL_STORE.get_catalog(fresh_only=False)
     tgt = get_dynamic_alias_target()
     return {
         "object": "list",
@@ -1421,6 +1496,14 @@ async def get_metrics():
 async def prom():
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(pool.prom_metrics() + metrics.prom_metrics(), media_type="text/plain; version=0.0.4")
+
+@app.get("/metrics/model-status")
+async def model_status():
+    return {
+        "provider": "opencode",
+        "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+        "states": MODEL_STORE.status_map(),
+    }
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):

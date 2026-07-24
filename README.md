@@ -148,6 +148,12 @@ response = client.responses.create(
 )
 ```
 
+## Model catalog and availability safety
+
+All four wrappers now separate provider catalog data from credential/account availability. A public `/models` entry is not treated as proof that every account can invoke the model, and an account-scoped 404 is never converted into global retirement. Catalog data is stored in an ignored per-wrapper SQLite `model-state.db` with stale-while-revalidate behavior; account-scoped status and event history are stored with a credential fingerprint, never the raw API key.
+
+Classification and operational details are documented in [MODEL_AVAILABILITY.md](MODEL_AVAILABILITY.md). Each wrapper exposes `/metrics/model-status`. `MODEL_CATALOG_TTL_SEC` controls catalog freshness and defaults to six hours.
+
 ## Features
 
 - ✅ **Dynamic Aliases**: sonnet/haiku/opus resolve to last concrete model called

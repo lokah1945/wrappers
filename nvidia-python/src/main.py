@@ -60,6 +60,24 @@ from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
+# Import the dependency-free shared model state layer even when this wrapper is
+# launched from its own subdirectory by systemd/uvicorn.
+try:
+    from common.model_state import (
+        ModelStateStore,
+        classify_upstream_error,
+        credential_fingerprint,
+        error_text,
+    )
+except ImportError:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from common.model_state import (
+        ModelStateStore,
+        classify_upstream_error,
+        credential_fingerprint,
+        error_text,
+    )
+
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -73,49 +91,88 @@ except ImportError:
 _unavailable_models: set = set()
 _retired_models: set = set()
 _model_status: dict = {}
+_model_state_store: Optional[ModelStateStore] = None
 
 async def probe_model(pool, model_id: str, timeout_ms: int = 120000) -> dict:
-    """Probe a model for basic functionality (parity with Node verify)."""
+    """Probe one model and retain the original provider error for classification.
+
+    A probe is scoped to the credential used by the key pool.  It is not a
+    global statement about the provider's catalog.
+    """
     try:
         key = pool.peek_key()
         if not key:
-            return {"ok": False, "status": 0, "reason": "no_key"}
-        
+            return {"ok": False, "status": 0, "reason": "no_key", "account_scope": "unknown"}
+
         body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
-        # Dedicated short-lived probe session keeps verification isolated.
+        account_scope = credential_fingerprint(key.api_key)
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms/1000)) as s:
             async with s.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
-                if resp.status < 400:
-                    return {"ok": True, "status": resp.status, "reason": ""}
+                if 200 <= resp.status < 400:
+                    return {"ok": True, "status": resp.status, "reason": "", "account_scope": account_scope}
                 text = await resp.text()
-                return {"ok": False, "status": resp.status, "reason": text[:200]}
+                return {
+                    "ok": False,
+                    "status": resp.status,
+                    "reason": text[:4000],
+                    "account_scope": account_scope,
+                }
     except Exception as e:
-        return {"ok": False, "status": 0, "reason": str(e)[:200]}
+        return {"ok": False, "status": 0, "reason": str(e)[:4000], "account_scope": "unknown"}
+
 
 async def verify_models(pool):
-    """Full model verification sweep (from Node audit)."""
-    global _unavailable_models, _retired_models, _model_status
+    """Verify models without converting account failures into global retirement."""
+    global _unavailable_models, _retired_models, _model_status, _model_state_store
     ids = await pool.refresh_models(force=True) or []
     if not ids:
         return
-    
+
+    if _model_state_store:
+        metadata = getattr(pool, "models_metadata", {}) or {}
+        _model_state_store.upsert_catalog(
+            [metadata.get(mid) or {"id": mid} for mid in ids],
+            source="nvidia:/v1/models",
+        )
+
     sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
     results = {}
-    
+
     async def _probe(mid):
         async with sem:
             res = await probe_model(pool, mid, TTFT_TIMEOUT_MS)
             results[mid] = res
+            classification = classify_upstream_error(res.get("status", 0), res.get("reason", ""))
+            res["state"] = classification["state"]
+            res["reason_code"] = classification["reason_code"]
             if not res["ok"]:
-                if res["status"] in (404, 410):
+                # Only an explicit provider EOL/retirement is global.  A 404
+                # mentioning an account is account_unavailable and must never
+                # enter _retired_models.
+                if classification["state"] == "globally_retired":
                     _retired_models.add(mid)
+                else:
+                    _retired_models.discard(mid)
                 _unavailable_models.add(mid)
             else:
                 _unavailable_models.discard(mid)
                 _retired_models.discard(mid)
+                res["state"] = "available"
+                res["reason_code"] = "OK"
+
+            if _model_state_store:
+                _model_state_store.record_status(
+                    model_id=mid,
+                    account_scope=res.get("account_scope", "unknown"),
+                    state=res["state"],
+                    status_code=res.get("status", 0),
+                    reason_code=res.get("reason_code", ""),
+                    reason_detail=res.get("reason", ""),
+                    endpoint="/v1/chat/completions",
+                )
             _model_status[mid] = res
-    
+
     await asyncio.gather(*[_probe(mid) for mid in ids[:100]])  # cap for safety
     logger.info(f"[verify] sweep done: {len(_unavailable_models)} unavailable, {len(_retired_models)} retired")
 
@@ -377,6 +434,7 @@ BASE_LLM = (os.environ.get('NVIDIA_BASE_URL') or NVIDIA_BASE_URL).rstrip('/')
 BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/')
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
+MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).parent.parent / 'model-state.db'))
 MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 HEADERS_TIMEOUT_MS = int(os.environ.get('HEADERS_TIMEOUT_MS', '120000'))
@@ -880,18 +938,35 @@ async def _safe_response_body(resp) -> dict:
         return {'error': {'message': (text or f'HTTP {resp.status}')[:2000], 'type': 'api_error', 'code': resp.status}}
 
 def _normalize_upstream_error(status: int, data: dict, model_id: str = '') -> tuple:
-    """Convert upstream NIM errors to OpenAI-compatible format (A1). Returns (new_status, new_data)."""
+    """Convert upstream NIM errors to OpenAI-compatible format (A1).
+
+    Preserve account-scoped provider detail so Anthropic/Claude clients do not
+    receive an opaque generic "unknown error".
+    """
+    if not isinstance(data, dict):
+        data = {'error': {'message': error_text(data) or f'HTTP {status}', 'type': 'api_error'}}
+    if status >= 400 and not isinstance(data.get('error'), dict):
+        detail = data.get('detail') or data.get('message') or error_text(data) or f'HTTP {status}'
+        data = {'error': {'message': str(detail)[:2000], 'type': 'api_error', 'code': status}}
     if status == 404:
         msg = (data.get('error') or {}).get('message', '') or ''
-        if 'page not found' in msg.lower() or 'not found' in msg.lower():
+        lower = msg.lower()
+        # NVIDIA's account-scoped function miss must remain visible to the
+        # caller. It is not evidence of global model retirement.
+        if 'not found for account' in lower or ('function' in lower and 'for account' in lower):
+            return status, data
+        if 'page not found' in lower or 'route' in lower:
             model_part = f' "{model_id}"' if model_id else ''
             return 400, {'error': {'message': f'Model{model_part} not found at upstream provider', 'type': 'invalid_request_error', 'code': 'model_not_found'}}
     return status, data
 
 class Server:
     def __init__(self, app: FastAPI = None):
+        global _model_state_store
         self.app = app or FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
         self.pool = KeyPool()
+        self.model_state = ModelStateStore('nvidia', MODEL_STATE_DB)
+        _model_state_store = self.model_state
         self.metrics: Optional[Metrics] = None
         self.registry: Optional[Registry] = None
         self.responses_handler: Optional[ResponsesHandler] = None
@@ -933,9 +1008,26 @@ class Server:
         await self.registry.refresh(force=True)
         self.registry.start()
 
-        # Warm NIM model catalog before resolving Claude Code aliases
+        # Hydrate the last good persistent catalog first.  This keeps model
+        # discovery available during an upstream outage or process restart.
         try:
-            await self.pool.refresh_models(force=True)
+            cached_ids = self.model_state.get_ids(fresh_only=False)
+            if cached_ids and not self.pool.models_cached:
+                self.pool._models_cache = cached_ids
+                self.pool._models_cache_ts = time.time()
+                logger.info(f'[init] hydrated {len(cached_ids)} models from persistent catalog')
+        except Exception as e:
+            logger.warning(f'[init] persistent model catalog hydrate failed: {e}')
+
+        # Warm NIM model catalog before resolving Claude Code aliases.
+        try:
+            ids = await self.pool.refresh_models(force=True)
+            if ids:
+                metadata = getattr(self.pool, 'models_metadata', {}) or {}
+                self.model_state.upsert_catalog(
+                    [metadata.get(mid) or {"id": mid} for mid in ids],
+                    source='nvidia:/v1/models',
+                )
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
 
@@ -963,6 +1055,38 @@ class Server:
             asyncio.create_task(verify_models(self.pool))
         asyncio.create_task(verify_loop(self.pool))
         start_env_watcher()
+
+    def _model_status_view(self, metrics_status: Optional[dict] = None) -> dict:
+        """Merge persistent account-scoped state into discovery metadata."""
+        result = dict(metrics_status or {})
+        try:
+            for mid, state in self.model_state.status_map().items():
+                result[mid] = {
+                    'last_status': state.get('http_status', 0),
+                    'ok': state.get('state') == 'available',
+                    'reason': state.get('reason_detail', ''),
+                    'verified': True,
+                    'availability_state': state.get('state', 'unknown'),
+                    'availability_scope': 'account',
+                    'reason_code': state.get('reason_code', ''),
+                    'checked_at': state.get('checked_at'),
+                        }
+        except Exception as e:
+            logger.warning(f'[model-state] status read failed: {e}')
+        return result
+
+    def _record_model_response(self, model_id: str, key, status: int, payload: Any, endpoint: str):
+        """Persist provider result with account scope, never raw credentials."""
+        try:
+            self.model_state.record_error(
+                model_id=model_id,
+                account_credential=getattr(key, 'api_key', None),
+                status_code=status,
+                payload=payload,
+                endpoint=endpoint,
+            )
+        except Exception as e:
+            logger.warning(f'[model-state] response record failed: {e}')
 
     def _register_routes(self):
         app = self.app
@@ -1172,8 +1296,8 @@ class Server:
 
         @app.get('/metrics/model-status')
         async def metrics_model_status():
-            status = await self.metrics.get_model_status()
-            unavailable = await self.metrics.get_unavailable_models()
+            status = self._model_status_view(await self.metrics.get_model_status())
+            unavailable = {mid for mid, st in status.items() if st.get('availability_state') not in (None, 'available') or st.get('ok') is False}
             verified_count = sum(1 for s in status.values() if s.get('ok'))
             return {
                 'unavailable': list(unavailable),
@@ -1206,10 +1330,10 @@ class Server:
                 d = describe(model_id, BASE_LLM, BASE_GENAI)
                 if ad_hoc:
                     d['source'] = 'heuristic-adhoc'
-                status_cap = await self.metrics.get_model_status()
+                status_cap = self._model_status_view(await self.metrics.get_model_status())
                 return enrich_model_metadata(model_id, d, status_cap)
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
-            status_list = await self.metrics.get_model_status()
+            status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             return {
                 'object': 'list', 'models': enriched,
@@ -1231,7 +1355,7 @@ class Server:
         @app.get('/v1/models')
         async def models_route(request: Request):
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
-            status_list = await self.metrics.get_model_status()
+            status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             # Dynamic aliases: expose short names bound to current concrete target (if any)
             tgt = get_dynamic_alias_target()
@@ -1249,13 +1373,13 @@ class Server:
         async def model_info(model_id: str, request: Request):
             model_id = model_id.replace('%2F', '/').replace('%2f', '/')
             d = describe(model_id, BASE_LLM, BASE_GENAI)
-            status_cap = await self.metrics.get_model_status()
+            status_cap = self._model_status_view(await self.metrics.get_model_status())
             return enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/v1/engines')
         async def engines_route():
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
-            status_list = await self.metrics.get_model_status()
+            status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             return {'object': 'list', 'data': enriched}
 
@@ -1263,7 +1387,7 @@ class Server:
         async def engine_info(model_id: str):
             model_id = model_id.replace('%2F', '/').replace('%2f', '/')
             d = describe(model_id, BASE_LLM, BASE_GENAI)
-            status_cap = await self.metrics.get_model_status()
+            status_cap = self._model_status_view(await self.metrics.get_model_status())
             return enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/api/tags')
@@ -1791,6 +1915,7 @@ class Server:
                             self._in_flight = max(0, self._in_flight - 1)
                             key.decrement_in_flight()
                             body_text = await resp.text()
+                            self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                             await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                             if self.metrics:
                                 await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -1798,10 +1923,16 @@ class Server:
                             continue
                         if resp.status >= 400:
                             resp_body = await _safe_response_body(resp)
+                            self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
+                            classification = classify_upstream_error(resp.status, resp_body)
                             norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
                             self._in_flight = max(0, self._in_flight - 1)
                             key.decrement_in_flight()
-                            if attempt < max_attempts - 1:
+                            # Retry only failures that may change with time/key.
+                            # Account-scoped deployment, capability and route
+                            # errors must not be retried across identical keys.
+                            retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                            if retryable and attempt < max_attempts - 1:
                                 attempt += 1
                                 continue
                             return {'status': norm_status, 'data': resp_body}
@@ -1841,6 +1972,7 @@ class Server:
                             self._in_flight = max(0, self._in_flight - 1)
                             key.decrement_in_flight()
                             body_text = await resp.text()
+                            self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                             await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                             if self.metrics:
                                 await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -1848,12 +1980,16 @@ class Server:
                             continue
 
                         resp_data = await _safe_response_body(resp)
+                        classification = classify_upstream_error(resp.status, resp_data)
+                        if resp.status >= 400:
+                            self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
                         norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
 
                         if norm_status >= 400:
-                            if attempt < max_attempts - 1:
+                            retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                            if retryable and attempt < max_attempts - 1:
                                 attempt += 1
                                 continue
                             return {'status': norm_status, 'data': resp_data}
@@ -1962,6 +2098,7 @@ class Server:
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
+                    self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
                         await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -1986,13 +2123,16 @@ class Server:
                 key.decrement_in_flight()
 
                 if resp.status >= 400:
-                    if attempt < max_attempts - 1:
-                        attempt += 1
-                        continue
                     try:
                         err_data = json.loads(resp_data)
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
+                    self._record_model_response(model_id, key, resp.status, err_data, path)
+                    classification = classify_upstream_error(resp.status, err_data)
+                    retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                    if retryable and attempt < max_attempts - 1:
+                        attempt += 1
+                        continue
                     return JSONResponse(status_code=resp.status, content=err_data)
 
                 if self.metrics:
@@ -2102,6 +2242,7 @@ class Server:
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
+                    self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
                         await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -2166,10 +2307,15 @@ class Server:
 def enrich_model_metadata(model_id: str, desc: dict, status: dict) -> dict:
     result = dict(desc)
     st = status.get(model_id, {})
+    result['catalog_listed'] = True
     result['last_status'] = st.get('last_status', 0)
     result['ok'] = st.get('ok', True)
     result['reason'] = st.get('reason', '')
+    result['reason_code'] = st.get('reason_code', '')
     result['verified'] = st.get('verified', False)
+    result['availability_state'] = st.get('availability_state', 'unknown')
+    result['availability_scope'] = st.get('availability_scope', 'account')
+    result['checked_at'] = st.get('checked_at')
     return result
 
 

@@ -117,7 +117,8 @@ class Registry:
 
     async def refresh(self, force: bool = False) -> Dict[str, dict]:
         now = time.time()
-        if not force and self._last_sync and (now - self._last_sync) < REGISTRY_REFRESH_SEC * 1000:
+        # time.time() is in seconds; do not multiply the TTL by milliseconds.
+        if not force and self._last_sync and (now - self._last_sync) < REGISTRY_REFRESH_SEC:
             return self._map
 
         try:

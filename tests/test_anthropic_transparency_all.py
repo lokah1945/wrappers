@@ -11,8 +11,9 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT / "nvidia-python"))
+# Keep NVIDIA's `src` package first; OpenCode is loaded explicitly where needed.
 sys.path.insert(0, str(ROOT / "opencode"))
+sys.path.insert(0, str(ROOT / "nvidia-python"))
 
 os.environ.setdefault("LOG_FILE", "/tmp/wrapper-audit-logs/nvidia.log")
 os.environ.setdefault("EVENTS_FILE", "/tmp/wrapper-audit-logs/e.jsonl")

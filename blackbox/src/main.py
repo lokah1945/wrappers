@@ -18,6 +18,14 @@ import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
+# Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
+try:
+    from common.model_state import ModelStateStore, classify_upstream_error
+except ImportError:
+    import sys
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from common.model_state import ModelStateStore, classify_upstream_error
+
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -51,6 +59,11 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [blackbox] %(message
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9104'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 BLACKBOX_BASE = os.environ.get('BLACKBOX_BASE_URL', 'https://api.blackbox.ai').rstrip('/')
+MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().parents[1] / 'model-state.db'))
+MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
+MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
+MODEL_STORE = ModelStateStore('blackbox', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+_MODEL_REFRESH_TASK = None
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
@@ -293,6 +306,16 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         key = key_result['key']
         headers = _auth_headers(key.api_key, request)
         status, data = await proxy_request(method, url, json_body, headers, is_stream=is_stream)
+        model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
+        if model_id:
+            try:
+                if status == 200:
+                    from common.model_state import credential_fingerprint
+                    MODEL_STORE.record_status(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
+                else:
+                    MODEL_STORE.record_error(model_id, key.api_key, status, data, endpoint=url)
+            except Exception as e:
+                logger.warning(f'[model-state] Blackbox result record failed: {e}')
         if status == 200:
             if is_stream:
                 return status, data, key
@@ -300,7 +323,8 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             return status, data, None
         tried += 1
         last_status, last_data = status, data
-        if _is_retriable_upstream_status(status):
+        classification = classify_upstream_error(status, data)
+        if _is_retriable_upstream_status(status) and classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden'):
             if _should_cooldown_key(status, data):
                 pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
             pool.release(key)
@@ -665,16 +689,48 @@ def start_env_watcher():
         logger.warning(f'[env] watcher failed: {e}')
 
 
+class _CatalogRequest:
+    headers = {}
+
+
+async def refresh_model_catalog_once():
+    """Refresh the persistent Blackbox catalog independently of user traffic."""
+    try:
+        status, data, _ = await proxy_request_with_pool(
+            'GET', f'{BLACKBOX_BASE}/models', None, _CatalogRequest()
+        )
+        models_data = (data.get('data') or data.get('models') or []) if status == 200 and isinstance(data, dict) else []
+        if models_data:
+            MODEL_STORE.upsert_catalog(models_data, source='blackbox:/models')
+            logger.info(f'[model-catalog] Blackbox refreshed {len(models_data)} models')
+    except Exception as e:
+        logger.warning(f'[model-catalog] Blackbox refresh failed: {e}')
+
+
+async def model_catalog_refresh_loop():
+    while True:
+        await asyncio.sleep(max(60, MODEL_CATALOG_REFRESH_SEC))
+        await refresh_model_catalog_once()
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _session, _MODEL_REFRESH_TASK
     pool.load_from_env()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed:
         set_dynamic_alias_target(seed, force=True)
     start_env_watcher()
     logger.info(f'wrapper-blackbox starting on {BIND_HOST}:{LISTEN_PORT} base={BLACKBOX_BASE} free_only={free_only_enabled()} alias_target={get_dynamic_alias_target() or None}')
+    _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
-    global _session
+    if _MODEL_REFRESH_TASK:
+        _MODEL_REFRESH_TASK.cancel()
+        try:
+            await _MODEL_REFRESH_TASK
+        except asyncio.CancelledError:
+            pass
+        _MODEL_REFRESH_TASK = None
     if _session is not None and not _session.closed:
         await _session.close()
 
@@ -727,12 +783,18 @@ async def version():
 @app.get('/v1/models')
 async def models(request: Request):
     _auth_check(request)
+    cached = MODEL_STORE.get_catalog(fresh_only=True)
     fallback = {'object': 'list', 'data': _model_list_with_aliases(CURATED_FREE_MODELS), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None}
     try:
-        status, data, _ = await proxy_request_with_pool('GET', f'{BLACKBOX_BASE}/models', None, request)
-        if status != 200 or not isinstance(data, dict):
-            return fallback
-        upstream = data.get('data') or data.get('models') or []
+        if cached:
+            upstream = cached
+        else:
+            status, data, _ = await proxy_request_with_pool('GET', f'{BLACKBOX_BASE}/models', None, request)
+            upstream = (data.get('data') or data.get('models') or []) if status == 200 and isinstance(data, dict) else []
+            if upstream:
+                MODEL_STORE.upsert_catalog(upstream, source='blackbox:/models')
+            else:
+                upstream = MODEL_STORE.get_catalog(fresh_only=False)
         normalized = []
         for m in upstream:
             entry = m if isinstance(m, dict) else {'id': str(m), 'object': 'model', 'owned_by': 'blackbox'}
@@ -742,7 +804,7 @@ async def models(request: Request):
                     normalized.append(entry)
         if not normalized:
             normalized = fallback['data']
-        return {'object': 'list', 'data': _model_list_with_aliases(normalized), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None}
+        return {'object': 'list', 'data': _model_list_with_aliases(normalized), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'catalog_cached': bool(cached)}
     except Exception as e:
         logger.warning(f'models fallback: {e}')
         return fallback
@@ -760,7 +822,16 @@ def _model_list_with_aliases(models_in: list) -> list:
         if free_only_enabled() and not model_allowed(mid):
             continue
         seen.add(mid)
-        data.append({**m, 'object': m.get('object', 'model')})
+        state = MODEL_STORE.status_for(mid) or {}
+        data.append({
+            **m,
+            'object': m.get('object', 'model'),
+            'catalog_listed': True,
+            'availability_state': state.get('state', 'unknown'),
+            'availability_scope': 'account',
+            'reason_code': state.get('reason_code', ''),
+            'checked_at': state.get('checked_at'),
+        })
     tgt = get_dynamic_alias_target()
     for alias in ('sonnet', 'opus', 'haiku'):
         if alias in seen:
@@ -1075,6 +1146,15 @@ async def get_metrics():
 async def prom():
     from fastapi.responses import PlainTextResponse
     return PlainTextResponse(pool.prom_metrics() + metrics.prom_metrics(), media_type='text/plain; version=0.0.4')
+
+
+@app.get('/metrics/model-status')
+async def model_status():
+    return {
+        'provider': 'blackbox',
+        'catalog_age_sec': MODEL_STORE.catalog_age_sec(),
+        'states': MODEL_STORE.status_map(),
+    }
 
 
 @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
