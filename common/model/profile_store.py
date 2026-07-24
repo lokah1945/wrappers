@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 import time
 from pathlib import Path
 from .contracts import AliasBinding, CapabilityProfile, LimitProfile, ModelProfile, ProtocolProfile
@@ -15,6 +16,7 @@ class ModelProfileStore:
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
         self._initialized = False
+        self._write_lock = threading.RLock()
 
     def _connect(self) -> sqlite3.Connection:
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -59,45 +61,53 @@ class ModelProfileStore:
         self._initialized = True
 
     def save(self, profile: ModelProfile) -> None:
-        conn = self._connect()
-        try:
-            conn.execute(
-                """INSERT INTO model_profiles(provider,canonical_id,profile_json,profile_revision,updated_at)
-                   VALUES(?,?,?,?,?)
-                   ON CONFLICT(provider,canonical_id) DO UPDATE SET
-                     profile_json=excluded.profile_json,
-                     profile_revision=excluded.profile_revision,
-                     updated_at=excluded.updated_at""",
-                (
-                    profile.provider,
-                    profile.canonical_id,
-                    json.dumps(profile.to_dict(), ensure_ascii=False, default=str),
-                    profile.profile_revision,
-                    time.time(),
-                ),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        self.save_many([profile])
+
+    def save_many(self, profiles: list[ModelProfile]) -> None:
+        if not profiles:
+            return
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                for profile in profiles:
+                    conn.execute(
+                        """INSERT INTO model_profiles(provider,canonical_id,profile_json,profile_revision,updated_at)
+                           VALUES(?,?,?,?,?)
+                           ON CONFLICT(provider,canonical_id) DO UPDATE SET
+                             profile_json=excluded.profile_json,
+                             profile_revision=excluded.profile_revision,
+                             updated_at=excluded.updated_at""",
+                        (
+                            profile.provider,
+                            profile.canonical_id,
+                            json.dumps(profile.to_dict(), ensure_ascii=False, default=str),
+                            profile.profile_revision,
+                            time.time(),
+                        ),
+                    )
+                conn.commit()
+            finally:
+                conn.close()
 
     def save_alias(self, binding: AliasBinding, provider: str) -> None:
-        conn = self._connect()
-        try:
-            conn.execute(
-                """INSERT INTO model_alias_bindings
-                   (provider,scope_type,scope_id,alias,canonical_target,revision,source,updated_at)
-                   VALUES(?,?,?,?,?,?,?,?)
-                   ON CONFLICT(provider,scope_type,scope_id,alias) DO UPDATE SET
-                     canonical_target=excluded.canonical_target,
-                     revision=excluded.revision,
-                     source=excluded.source,
-                     updated_at=excluded.updated_at""",
-                (provider, binding.scope_type, binding.scope_id, binding.alias,
-                 binding.canonical_target, binding.revision, binding.source, time.time()),
-            )
-            conn.commit()
-        finally:
-            conn.close()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO model_alias_bindings
+                       (provider,scope_type,scope_id,alias,canonical_target,revision,source,updated_at)
+                       VALUES(?,?,?,?,?,?,?,?)
+                       ON CONFLICT(provider,scope_type,scope_id,alias) DO UPDATE SET
+                         canonical_target=excluded.canonical_target,
+                         revision=excluded.revision,
+                         source=excluded.source,
+                         updated_at=excluded.updated_at""",
+                    (provider, binding.scope_type, binding.scope_id, binding.alias,
+                     binding.canonical_target, binding.revision, binding.source, time.time()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
 
     def load_aliases(self, provider: str) -> list[AliasBinding]:
         conn = self._connect()
