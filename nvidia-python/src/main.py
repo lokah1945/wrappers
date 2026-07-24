@@ -166,7 +166,7 @@ async def verify_models(pool):
                 res["reason_code"] = "OK"
 
             if _model_state_store:
-                stored = _model_state_store.record_status(
+                stored = await _model_state_store.record_status_async(
                     model_id=mid,
                     account_scope=res.get("account_scope", "unknown"),
                     state=res["state"],
@@ -1087,11 +1087,11 @@ class Server:
             logger.warning(f'[model-state] status read failed: {e}')
         return result
 
-    def _record_model_response(self, model_id: str, key, status: int, payload: Any, endpoint: str):
+    async def _record_model_response(self, model_id: str, key, status: int, payload: Any, endpoint: str):
         """Persist and asynchronously publish provider result, never raw credentials."""
         credential = getattr(key, 'api_key', None)
         try:
-            result = self.model_state.record_error(
+            result = await self.model_state.record_error_async(
                 model_id=model_id,
                 account_credential=credential,
                 status_code=status,
@@ -1940,7 +1940,7 @@ class Server:
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
-                        self._record_model_response(model_id, key, resp.status, body_text, metric_path)
+                        await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                         if self.metrics:
                             await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -1948,7 +1948,7 @@ class Server:
                         continue
                     if resp.status >= 400:
                         resp_body = await _safe_response_body(resp)
-                        self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
+                        await self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
                         classification = classify_upstream_error(resp.status, resp_body)
                         norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
                         self._in_flight = max(0, self._in_flight - 1)
@@ -1997,7 +1997,7 @@ class Server:
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
-                        self._record_model_response(model_id, key, resp.status, body_text, metric_path)
+                        await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                         if self.metrics:
                             await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -2007,7 +2007,7 @@ class Server:
                     resp_data = await _safe_response_body(resp)
                     classification = classify_upstream_error(resp.status, resp_data)
                     if resp.status >= 400:
-                        self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
+                        await self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
                     norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
@@ -2082,7 +2082,7 @@ class Server:
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
-                    self._record_model_response(model_id, key, resp.status, body_text, path)
+                    await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
                         await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
@@ -2111,7 +2111,7 @@ class Server:
                         err_data = json.loads(resp_data)
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
-                    self._record_model_response(model_id, key, resp.status, err_data, path)
+                    await self._record_model_response(model_id, key, resp.status, err_data, path)
                     classification = classify_upstream_error(resp.status, err_data)
                     retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
                     if retryable and attempt < max_attempts - 1:
@@ -2226,7 +2226,7 @@ class Server:
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
-                    self._record_model_response(model_id, key, resp.status, body_text, path)
+                    await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
                         await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)

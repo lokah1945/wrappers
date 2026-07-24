@@ -14,6 +14,7 @@ stored, only a SHA-256 fingerprint.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
@@ -264,6 +265,18 @@ class ModelStateStore:
             return result
         finally:
             conn.close()
+
+    async def record_status_async(self, *args, **kwargs) -> dict[str, Any]:
+        """Run SQLite status persistence off the wrapper event loop."""
+        return await asyncio.to_thread(self.record_status, *args, **kwargs)
+
+    async def record_error_async(self, *args, **kwargs) -> dict[str, Any]:
+        """Run SQLite error persistence off the wrapper event loop."""
+        return await asyncio.to_thread(self.record_error, *args, **kwargs)
+
+    async def upsert_catalog_async(self, *args, **kwargs) -> list[str]:
+        """Run catalog persistence off the wrapper event loop."""
+        return await asyncio.to_thread(self.upsert_catalog, *args, **kwargs)
 
     def status_map(self, account_scope: str | None = None,
                    endpoint: str | None = None) -> dict[str, dict[str, Any]]:

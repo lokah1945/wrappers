@@ -1379,13 +1379,13 @@ class Metrics:
 metrics = Metrics()
 
 
-def record_model_result(model_id: str, key_entry, status: int, payload, endpoint: str) -> None:
+async def record_model_result(model_id: str, key_entry, status: int, payload, endpoint: str) -> None:
     """Persist account-scoped upstream outcome without hard-blocking models."""
     try:
         credential = getattr(key_entry, "api_key", None)
         from common.model_state import credential_fingerprint
         if status == 200:
-            stored = MODEL_STORE.record_status(
+            stored = await MODEL_STORE.record_status_async(
                 model_id=model_id or "unknown",
                 account_scope=credential_fingerprint(credential),
                 state="available",
@@ -1394,7 +1394,7 @@ def record_model_result(model_id: str, key_entry, status: int, payload, endpoint
                 endpoint=endpoint,
             )
         else:
-            stored = MODEL_STORE.record_error(model_id or "unknown", credential, status, payload, endpoint)
+            stored = await MODEL_STORE.record_error_async(model_id or "unknown", credential, status, payload, endpoint)
         MODEL_REGISTRY_CLIENT.schedule_observation(
             "nous", model_id or "unknown", stored.get("account_scope", "unknown"),
             stored.get("state", "unknown"), status, stored.get("reason_code", ""),
@@ -1744,7 +1744,7 @@ async def chat_completions(request: Request):
     extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
-    record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
+    await record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
     metrics.record(error=(status != 200))
 
     if status != 200:
@@ -1781,7 +1781,7 @@ async def responses(request: Request):
     is_stream = body.get("stream", False)
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="openai_responses")
-    record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
+    await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
     if status != 200:
         return JSONResponse(status_code=status, content=result)
 
@@ -1839,7 +1839,7 @@ async def messages(request: Request):
     is_stream = body.get("stream", False)
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="anthropic_messages")
-    record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
+    await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}

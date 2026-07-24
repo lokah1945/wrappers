@@ -325,10 +325,10 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             try:
                 if status == 200:
                     from common.model_state import credential_fingerprint
-                    stored = MODEL_STORE.record_status(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
+                    stored = await MODEL_STORE.record_status_async(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
                 else:
                     from common.model_state import credential_fingerprint
-                    stored = MODEL_STORE.record_error(model_id, key.api_key, status, data, endpoint=url)
+                    stored = await MODEL_STORE.record_error_async(model_id, key.api_key, status, data, endpoint=url)
                 MODEL_REGISTRY_CLIENT.schedule_observation(
                     'blackbox', model_id, stored.get('account_scope', credential_fingerprint(key.api_key)),
                     stored.get('state', 'unknown'), status, stored.get('reason_code', ''),
