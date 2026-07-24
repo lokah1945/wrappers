@@ -4,6 +4,7 @@
   "default_endpoint": "https://integrate.api.nvidia.com",
   "adapters": {
     "openai_chat": "nvidia.chat.v1",
+    "openai_responses": "responses-to-nvidia-chat.v1",
     "anthropic_messages": "anthropic-to-nvidia-chat.v2"
   },
   "policy": {

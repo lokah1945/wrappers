@@ -77,8 +77,8 @@ class LocalModelRegistry:
                 upstream = "openai_chat"
                 path = "/v1/chat/completions"
             elif surface == "openai_responses":
-                upstream = "openai_responses"
-                path = "/v1/responses"
+                upstream = "openai_chat" if "chat" in adapter else "openai_responses"
+                path = "/v1/chat/completions" if upstream == "openai_chat" else "/v1/responses"
             elif surface == "anthropic_messages":
                 upstream = "openai_chat" if "chat" in adapter else "anthropic_messages"
                 path = "/v1/chat/completions" if upstream == "openai_chat" else "/v1/messages"
