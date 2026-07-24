@@ -106,8 +106,17 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -
         body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
         account_scope = credential_fingerprint(key.api_key)
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000)) as session:
-            async with session.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
+        session = getattr(pool, "_agent", None)
+        owns_session = session is None or session.closed
+        if owns_session:
+            session = aiohttp.ClientSession()
+        try:
+            async with session.post(
+                f"{BASE_LLM}/v1/chat/completions",
+                json=body,
+                headers=headers,
+                timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000),
+            ) as resp:
                 if 200 <= resp.status < 300:
                     return {"ok": True, "status": resp.status, "reason": "", "account_scope": account_scope}
                 text = await resp.text()
@@ -117,6 +126,9 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -
                     "reason": text[:4000],
                     "account_scope": account_scope,
                 }
+        finally:
+            if owns_session:
+                await session.close()
     except Exception as exc:
         return {"ok": False, "status": 0, "reason": str(exc)[:4000], "account_scope": "unknown"}
 
