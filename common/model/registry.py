@@ -23,12 +23,13 @@ from .contracts import (
 )
 from .identity import AliasResolver
 from .profile_store import ModelProfileStore
+from .validation import validate_provider_name
 
 
 class LocalModelRegistry:
     def __init__(self, provider: str, manifest_root: str | Path | None = None,
                  profile_db_path: str | Path | None = None):
-        self.provider = provider
+        self.provider = validate_provider_name(provider)
         self.manifest_root = Path(manifest_root or Path(__file__).resolve().parents[2] / "model-registry")
         self.profiles: dict[str, ModelProfile] = {}
         self.profile_store = ModelProfileStore(profile_db_path) if profile_db_path else None

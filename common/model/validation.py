@@ -14,6 +14,15 @@ MAX_METADATA_BYTES = 65536
 MAX_REASON_CHARS = 4000
 
 
+def validate_provider_name(value: Any) -> str:
+    provider = str(value or "").strip().lower()
+    if not provider:
+        raise ValueError("provider is required")
+    if len(provider) > 64 or not provider.replace("-", "").replace("_", "").isalnum():
+        raise ValueError("provider name contains invalid characters")
+    return provider
+
+
 def validate_model_id(value: Any) -> str:
     model_id = str(value or "").strip()
     if not model_id:

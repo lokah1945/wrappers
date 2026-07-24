@@ -29,7 +29,7 @@ from .identity import AliasResolver, normalize_model_syntax, same_provider_model
 from .profile_store import ModelProfileStore
 from .registry import LocalModelRegistry
 from .sanitize import sanitize_error_detail
-from .validation import validate_catalog_entries, validate_model_id, validate_observation
+from .validation import validate_catalog_entries, validate_model_id, validate_observation, validate_provider_name
 
 __all__ = [
     "AliasBinding",
@@ -58,4 +58,5 @@ __all__ = [
     "validate_catalog_entries",
     "validate_model_id",
     "validate_observation",
+    "validate_provider_name",
 ]

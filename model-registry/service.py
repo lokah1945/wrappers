@@ -22,7 +22,7 @@ from fastapi.responses import JSONResponse  # noqa: E402
 
 from common.model import AliasBinding, LocalModelRegistry  # noqa: E402
 from common.model_state import ModelStateStore  # noqa: E402
-from common.model.validation import validate_catalog_entries, validate_observation  # noqa: E402
+from common.model.validation import validate_catalog_entries, validate_observation, validate_provider_name  # noqa: E402
 
 MODEL_REGISTRY_DB = os.environ.get(
     "MODEL_REGISTRY_DB", str(Path(__file__).resolve().parent / "registry-state.db")
@@ -82,10 +82,10 @@ def _require_internal(request: Request) -> None:
 
 
 def _provider(body: dict[str, Any]) -> str:
-    provider = str(body.get("provider") or "").strip().lower()
-    if not provider:
-        raise HTTPException(status_code=400, detail="provider is required")
-    return provider
+    try:
+        return validate_provider_name(body.get("provider"))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/health")
@@ -102,7 +102,10 @@ def health() -> dict[str, Any]:
 
 @app.get("/v1/models")
 def models(provider: str) -> dict[str, Any]:
-    provider = provider.strip().lower()
+    try:
+        provider = validate_provider_name(provider)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     profiles = central.list_models(provider)
     return {
         "object": "list",
@@ -117,7 +120,10 @@ def models(provider: str) -> dict[str, Any]:
 def model_info(canonical_id: str) -> dict[str, Any]:
     if "/" not in canonical_id:
         raise HTTPException(status_code=400, detail="canonical model id must include provider")
-    provider = canonical_id.split("/", 1)[0].lower()
+    try:
+        provider = validate_provider_name(canonical_id.split("/", 1)[0])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     profile = central.registry(provider).profiles.get(canonical_id)
     if profile is None:
         raise HTTPException(status_code=404, detail="Model profile not found")
