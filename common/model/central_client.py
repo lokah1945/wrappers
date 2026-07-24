@@ -110,6 +110,13 @@ class ModelRegistryClient:
             {"provider": provider, "models": models, "revision": revision},
         )
 
+    def schedule_catalog(self, provider: str, models: list[Any], revision: str) -> None:
+        """Queue catalog sync so discovery responses do not wait on the control plane."""
+        self._schedule(
+            "/internal/catalog",
+            {"provider": provider, "models": models, "revision": revision},
+        )
+
     @staticmethod
     def canonical_model_id(provider: str, model_id: str) -> str:
         prefix = f"{provider}/"
@@ -132,13 +139,28 @@ class ModelRegistryClient:
             },
         )
 
+    def _schedule(self, path: str, payload: dict[str, Any]) -> None:
+        if not self.enabled:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            self.dropped_observations += 1
+            return
+        try:
+            self._queue.put_nowait((path, payload))
+        except asyncio.QueueFull:
+            self.dropped_observations += 1
+            return
+        if ((self._worker is None or self._worker.done()) and
+                (self._start_task is None or self._start_task.done())):
+            self._start_task = loop.create_task(self.start())
+
     def schedule_observation(self, provider: str, model_id: str,
                              account_scope_hash: str, state: str, status: int,
                              reason_code: str, reason_detail: str,
                              endpoint: str) -> None:
         """Queue a bounded non-blocking observation; never affects inference."""
-        if not self.enabled:
-            return
         payload = {
             "provider": provider,
             "canonical_model_id": self.canonical_model_id(provider, model_id),
@@ -149,16 +171,4 @@ class ModelRegistryClient:
             "reason_detail": sanitize_error_detail(reason_detail),
             "endpoint": endpoint,
         }
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            self.dropped_observations += 1
-            return
-        try:
-            self._queue.put_nowait(("/internal/observations", payload))
-        except asyncio.QueueFull:
-            self.dropped_observations += 1
-            return
-        if ((self._worker is None or self._worker.done()) and
-                (self._start_task is None or self._start_task.done())):
-            self._start_task = loop.create_task(self.start())
+        self._schedule("/internal/observations", payload)

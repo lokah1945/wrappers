@@ -842,7 +842,7 @@ async def refresh_model_catalog_once():
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="opencode:/models")
             MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
-            await MODEL_REGISTRY_CLIENT.ingest_catalog("opencode", models_data, "runtime-catalog")
+            MODEL_REGISTRY_CLIENT.schedule_catalog("opencode", models_data, "runtime-catalog")
             logger.info(f"[model-catalog] OpenCode refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] OpenCode refresh failed: {e}")
@@ -961,7 +961,7 @@ async def models(request: Request):
             if status == 200 and isinstance(data, dict) and (data.get('data') or data.get('models')):
                 MODEL_STORE.upsert_catalog(data.get('data') or data.get('models') or [], source='opencode:/models')
                 MODEL_REGISTRY.register_catalog(data.get('data') or data.get('models') or [], revision='runtime-catalog')
-                await MODEL_REGISTRY_CLIENT.ingest_catalog('opencode', data.get('data') or data.get('models') or [], 'runtime-catalog')
+                MODEL_REGISTRY_CLIENT.schedule_catalog('opencode', data.get('data') or data.get('models') or [], 'runtime-catalog')
             elif status != 200 or not isinstance(data, dict):
                 stale = MODEL_STORE.get_catalog(fresh_only=False)
                 if stale:

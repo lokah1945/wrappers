@@ -723,7 +723,7 @@ async def refresh_model_catalog_once():
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source='blackbox:/models')
             MODEL_REGISTRY.register_catalog(models_data, revision='runtime-catalog')
-            await MODEL_REGISTRY_CLIENT.ingest_catalog('blackbox', models_data, 'runtime-catalog')
+            MODEL_REGISTRY_CLIENT.schedule_catalog('blackbox', models_data, 'runtime-catalog')
             logger.info(f'[model-catalog] Blackbox refreshed {len(models_data)} models')
     except Exception as e:
         logger.warning(f'[model-catalog] Blackbox refresh failed: {e}')
@@ -818,7 +818,7 @@ async def models(request: Request):
             if upstream:
                 MODEL_STORE.upsert_catalog(upstream, source='blackbox:/models')
                 MODEL_REGISTRY.register_catalog(upstream, revision='runtime-catalog')
-                await MODEL_REGISTRY_CLIENT.ingest_catalog('blackbox', upstream, 'runtime-catalog')
+                MODEL_REGISTRY_CLIENT.schedule_catalog('blackbox', upstream, 'runtime-catalog')
             else:
                 upstream = MODEL_STORE.get_catalog(fresh_only=False)
         normalized = []

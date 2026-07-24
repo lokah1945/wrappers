@@ -137,7 +137,7 @@ async def verify_models(pool):
         catalog_entries = [metadata.get(mid) or {"id": mid} for mid in ids]
         _model_state_store.upsert_catalog(catalog_entries, source="nvidia:/v1/models")
         MODEL_REGISTRY.register_catalog(catalog_entries, revision="runtime-catalog")
-        await MODEL_REGISTRY_CLIENT.ingest_catalog("nvidia", catalog_entries, "runtime-catalog")
+        MODEL_REGISTRY_CLIENT.schedule_catalog("nvidia", catalog_entries, "runtime-catalog")
 
     # Cover the whole catalog over successive sweeps instead of permanently
     # limiting verification to the first alphabetic 100 models.
@@ -1068,7 +1068,7 @@ class Server:
                     source='nvidia:/v1/models',
                 )
                 MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision='runtime-catalog')
-                await MODEL_REGISTRY_CLIENT.ingest_catalog('nvidia', [metadata.get(mid) or {"id": mid} for mid in ids], 'runtime-catalog')
+                MODEL_REGISTRY_CLIENT.schedule_catalog('nvidia', [metadata.get(mid) or {"id": mid} for mid in ids], 'runtime-catalog')
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
 

@@ -1428,7 +1428,7 @@ async def refresh_model_catalog_once():
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="nous:/v1/models")
             MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
-            await MODEL_REGISTRY_CLIENT.ingest_catalog("nous", models_data, "runtime-catalog")
+            MODEL_REGISTRY_CLIENT.schedule_catalog("nous", models_data, "runtime-catalog")
             logger.info(f"[model-catalog] Nous refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] Nous refresh failed: {e}")
@@ -1588,7 +1588,7 @@ async def models():
                 if upstream_models:
                     MODEL_STORE.upsert_catalog(upstream_models, source="nous:/v1/models")
                     MODEL_REGISTRY.register_catalog(upstream_models, revision="runtime-catalog")
-                    await MODEL_REGISTRY_CLIENT.ingest_catalog("nous", upstream_models, "runtime-catalog")
+                    MODEL_REGISTRY_CLIENT.schedule_catalog("nous", upstream_models, "runtime-catalog")
         except Exception:
             pass
         if not upstream_models:
