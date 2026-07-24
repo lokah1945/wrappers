@@ -115,6 +115,7 @@ def has_tool_result_block(msg: dict) -> bool:
 
 
 def format_tool_calls_as_dsml(tool_uses: list) -> str:
+    """DEPRECATED outbound helper — DO NOT use for Claude Code path.\n\n    Kept only as documentation of MiniMax DSML shape. Outbound A→O must use\n    OpenAI tool_calls; inbound O→A may still *parse* DSML if upstream leaks it.\n    """
     if not tool_uses:
         return ''
     invokes = []

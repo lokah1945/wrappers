@@ -141,7 +141,7 @@ BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.5-dynamic-alias"
+VERSION = "2.0.6-anthropic-tools"
 # No DEFAULT_MODEL/REASONING_MODEL - all model selection is transparent (client chooses)
 
 def free_only_enabled() -> bool:
@@ -574,6 +574,44 @@ def anthropic_to_openai(req: dict) -> dict:
         out["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": normalize_schema(t.get("input_schema", {}))}} for t in req["tools"] if t.get("name")]
     return out
 
+
+def _parse_dsml_from_text(text: str):
+    """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use list)."""
+    if not text or "DSML" not in str(text).replace("\uff5c", "|"):
+        return text or "", []
+    normalized = str(text).replace("\uff5c", "|").replace("<|DSML|", "|DSML|")
+    if "|DSML|tool_calls>" not in normalized:
+        return text, []
+    import re as _re
+    tools = []
+    clean_parts = []
+    OPEN = "|DSML|tool_calls>"
+    CLOSE = "</|DSML|tool_calls>"
+    cursor = 0
+    while True:
+        s_idx = normalized.find(OPEN, cursor)
+        if s_idx == -1:
+            clean_parts.append(normalized[cursor:])
+            break
+        if s_idx > cursor:
+            clean_parts.append(normalized[cursor:s_idx])
+        e_idx = normalized.find(CLOSE, s_idx)
+        if e_idx == -1:
+            clean_parts.append(normalized[s_idx:])
+            break
+        segment = normalized[s_idx:e_idx + len(CLOSE)]
+        for name, inner in _re.findall(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|invoke>', segment):
+            params = dict(_re.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
+            tools.append({
+                "type": "tool_use",
+                "id": f"toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}",
+                "name": name,
+                "input": params,
+            })
+        cursor = e_idx + len(CLOSE)
+    return "".join(clean_parts).strip(), tools
+
+
 def openai_to_anthropic(model: str, chat: dict) -> dict:
     """OpenAI chat completion → Anthropic message (Claude Code native blocks)."""
     msg = (chat.get("choices") or [{}])[0].get("message", {}) or {}
@@ -587,8 +625,12 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     if reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
 
-    tool_calls = msg.get("tool_calls") or []
-    if text or not tool_calls:
+    tool_calls = list(msg.get("tool_calls") or [])
+    dsml_tools = []
+    if isinstance(text, str) and "DSML" in text.replace("\uff5c", "|"):
+        text, dsml_tools = _parse_dsml_from_text(text)
+
+    if text or (not tool_calls and not dsml_tools):
         content.append({"type": "text", "text": text if isinstance(text, str) else str(text)})
 
     for tc in tool_calls:
@@ -603,6 +645,7 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
             "name": fn.get("name") or "",
             "input": inp if isinstance(inp, dict) else {"value": inp},
         })
+    content.extend(dsml_tools)
 
     if not content:
         content.append({"type": "text", "text": ""})
@@ -610,8 +653,8 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     u = chat.get("usage", {}) or {}
     fr = (chat.get("choices") or [{}])[0].get("finish_reason")
     stop_map = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}
-    stop_reason = "tool_use" if tool_calls and fr in (None, "tool_calls", "stop") else stop_map.get(fr, "end_turn")
-    if tool_calls:
+    stop_reason = stop_map.get(fr, "end_turn")
+    if tool_calls or dsml_tools:
         stop_reason = "tool_use"
     return {
         "id": chat.get("id", "msg_proxy"),
@@ -646,7 +689,6 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                     if line.startswith(b"data:"):
                         data = line[5:].strip()
                         if data in (b"[DONE]", b"", b'"[DONE]"'):
-                            yield "data: [DONE]\n\n"
                             if state and hasattr(state, "done"):
                                 try:
                                     done_evs = state.done()
@@ -659,6 +701,11 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                                             yield serialize_fn(ev) if callable(serialize_fn) else ev
                                 except Exception:
                                     pass
+                            # OpenAI chat clients expect [DONE]; Anthropic uses message_stop only
+                            if state is None or not hasattr(state, "translate_chunk"):
+                                yield "data: [DONE]\n\n"
+                            elif getattr(state, "__class__", type(None)).__name__ == "ResponsesStreamState":
+                                yield "data: [DONE]\n\n"
                             return
                         try:
                             parsed = json.loads(data)
@@ -693,74 +740,137 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                         yield ev
                     else:
                         yield serialize_fn(ev) if callable(serialize_fn) else ev
-            yield "data: [DONE]\n\n"
+            # Avoid trailing [DONE] on Anthropic SSE (Claude Code)
+            if state is None or getattr(state, "__class__", type(None)).__name__ != "AnthropicStreamState":
+                yield "data: [DONE]\n\n"
         except Exception:
             pass
         await upstream_resp.release()
 
 # Advanced streaming state machines
 class AnthropicStreamState:
-    def __init__(self, model): 
+    def __init__(self, model):
         self.model = model
         self.index = -1  # first content block must be index 0 (Anthropic SDK)
         self.message_started = False
         self.current_block = None
         self.tool_map = {}
+        self.finished = False
+        self.msg_id = f"msg-{int(time.time()*1000)}"
 
     def translate_chunk(self, chunk):
         events = []
         if not self.message_started:
-            events.append({"type": "message_start", "data": {"type": "message_start", "message": {"id": f"msg-{int(time.time()*1000)}", "role": "assistant", "model": self.model, "content": []}}})
+            events.append({"type": "message_start", "data": {"type": "message_start", "message": {
+                "id": self.msg_id, "type": "message", "role": "assistant", "model": self.model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            }}})
             self.message_started = True
 
-        if "choices" not in chunk: return events
-        ch = chunk["choices"][0]
-        delta = ch.get("delta", {})
+        if "choices" not in chunk:
+            return events
+        ch = (chunk.get("choices") or [{}])[0]
+        delta = ch.get("delta", {}) or {}
 
         # reasoning / thinking delta
         reason = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reason, str) and reason:
             if self.current_block != "thinking":
-                if self.current_block: events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                if self.current_block:
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
-                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "thinking", "thinking": ""}}})
+                events.append({"type": "content_block_start", "data": {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }})
                 self.current_block = "thinking"
-            events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": self.index, "delta": {"type": "thinking_delta", "thinking": reason}}})
+            events.append({"type": "content_block_delta", "data": {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "thinking_delta", "thinking": reason},
+            }})
 
-        if delta.get("content"):
+        # If content looks like DSML tool markup, do NOT emit as text_delta (prevent leak)
+        content = delta.get("content")
+        if isinstance(content, str) and content and "DSML" in content.replace("\uff5c", "|"):
+            # skip raw DSML text; structured tool_calls path should carry tools
+            content = None
+
+        if content:
             if self.current_block != "text":
-                if self.current_block: events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                if self.current_block:
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
-                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "text", "text": ""}}})
+                events.append({"type": "content_block_start", "data": {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "text", "text": ""},
+                }})
                 self.current_block = "text"
-            events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": self.index, "delta": {"type": "text_delta", "text": delta["content"]}}})
+            events.append({"type": "content_block_delta", "data": {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "text_delta", "text": content},
+            }})
 
-        for tc in delta.get("tool_calls", []):
+        for tc in delta.get("tool_calls", []) or []:
             idx = tc.get("index", 0)
+            fn = tc.get("function", {}) or {}
             if idx not in self.tool_map:
-                if self.current_block: 
+                if self.current_block:
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 self.tool_map[idx] = self.index
-                fn = tc.get("function", {})
-                events.append({"type": "content_block_start", "data": {"type": "content_block_start", "index": self.index, "content_block": {"type": "tool_use", "id": tc.get("id"), "name": fn.get("name", ""), "input": {}}}})
+                tid = tc.get("id") or f"toolu_{self.index}"
+                events.append({"type": "content_block_start", "data": {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "tool_use", "id": tid, "name": fn.get("name", "") or "", "input": {}},
+                }})
                 self.current_block = "tool_use"
             tidx = self.tool_map[idx]
-            if fn := tc.get("function", {}):
-                if "arguments" in fn:
-                    events.append({"type": "content_block_delta", "data": {"type": "content_block_delta", "index": tidx, "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}}})
+            if "arguments" in fn and fn.get("arguments") is not None:
+                events.append({"type": "content_block_delta", "data": {
+                    "type": "content_block_delta", "index": tidx,
+                    "delta": {"type": "input_json_delta", "partial_json": fn.get("arguments") or ""},
+                }})
 
-        if ch.get("finish_reason"):
-            if self.current_block:
+        if ch.get("finish_reason") and not self.finished:
+            self.finished = True
+            if self.current_block is not None:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             fr = ch.get("finish_reason")
             stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
                 {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
             )
-            events.append({"type": "message_delta", "data": {"type": "message_delta", "delta": {"stop_reason": stop}, "usage": chunk.get("usage", {})}})
+            events.append({"type": "message_delta", "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": chunk.get("usage") or {},
+            }})
             events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.current_block = None
         return events
+
+    def done(self):
+        """Emit terminal events if stream ended without finish_reason (prevent hang)."""
+        if self.finished:
+            return []
+        self.finished = True
+        events = []
+        if not self.message_started:
+            events.extend(self.translate_chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
+            return events
+        if self.current_block is not None:
+            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            self.current_block = None
+        stop = "tool_use" if self.tool_map else "end_turn"
+        events.append({"type": "message_delta", "data": {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {},
+        }})
+        events.append({"type": "message_stop", "data": {"type": "message_stop"}})
+        return events
+
 
 class ResponsesStreamState:
     """Full Responses streaming state (for Codex / Claude Code / OpenAI Responses SDK)"""

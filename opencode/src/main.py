@@ -13,6 +13,7 @@ Production features:
 
 import os
 import json
+import re
 import time
 import threading
 import asyncio
@@ -57,7 +58,7 @@ BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENCODE_BASE = os.environ.get('OPENCODE_BASE_URL', 'https://opencode.ai/zen/v1').rstrip('/')
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 # No DEFAULT_MODEL - all model selection is transparent (client chooses)
-VERSION = '1.0.4-dynamic-alias'
+VERSION = '1.0.5-anthropic-tools'
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""
@@ -436,29 +437,82 @@ def anthropic_to_openai(body: dict) -> dict:
         }} for t in body['tools'] if t.get('name')]
     return out
 
+
+def _parse_dsml_from_text(text: str) -> tuple:
+    """If upstream leaked MiniMax DSML tool markup into content, split to (clean_text, tool_use blocks)."""
+    if not text or 'DSML' not in text.replace('\uff5c', '|'):
+        return text or '', []
+    normalized = text.replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
+    if '|DSML|tool_calls>' not in normalized:
+        return text, []
+    tools = []
+    clean_parts = []
+    OPEN = '|DSML|tool_calls>'
+    CLOSE = '</|DSML|tool_calls>'
+    cursor = 0
+    while True:
+        s_idx = normalized.find(OPEN, cursor)
+        if s_idx == -1:
+            clean_parts.append(normalized[cursor:])
+            break
+        if s_idx > cursor:
+            clean_parts.append(normalized[cursor:s_idx])
+        e_idx = normalized.find(CLOSE, s_idx)
+        if e_idx == -1:
+            clean_parts.append(normalized[s_idx:])
+            break
+        segment = normalized[s_idx:e_idx + len(CLOSE)]
+        inv = re.findall(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|invoke>', segment)
+        for name, inner in inv:
+            params = dict(re.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
+            tools.append({
+                "type": "tool_use",
+                "id": f"toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}",
+                "name": name,
+                "input": params,
+            })
+        cursor = e_idx + len(CLOSE)
+    clean = ''.join(clean_parts).strip()
+    return clean, tools
+
+
 def openai_to_anthropic(model: str, data: dict) -> dict:
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
     text = msg.get('content') or ''
+    if text is None:
+        text = ''
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
     content = []
     if reasoning:
         content.append({"type": "thinking", "thinking": reasoning})
-    # Always emit a text block when no tools (Anthropic clients expect content blocks)
-    tool_calls = msg.get('tool_calls') or []
-    if text or not tool_calls:
-        content.append({"type": "text", "text": text or ""})
+
+    # Structured tool_calls (preferred) + DSML fallback if upstream leaked markup into content
+    tool_calls = list(msg.get('tool_calls') or [])
+    dsml_tools = []
+    if isinstance(text, str) and 'DSML' in text.replace('\uff5c', '|'):
+        text, dsml_tools = _parse_dsml_from_text(text)
+
+    if text or (not tool_calls and not dsml_tools):
+        content.append({"type": "text", "text": text if isinstance(text, str) else str(text)})
+
     for tc in tool_calls:
         fn = tc.get('function') or {}
         try:
             inp = json.loads(fn.get('arguments') or '{}')
         except Exception:
             inp = {"raw": fn.get('arguments', '')}
-        content.append({"type": "tool_use", "id": tc.get('id') or f"toolu_{int(time.time()*1000)}",
-                        "name": fn.get('name', ''), "input": inp if isinstance(inp, dict) else {"value": inp}})
+        content.append({
+            "type": "tool_use",
+            "id": tc.get('id') or f"toolu_{int(time.time()*1000)}",
+            "name": fn.get('name', ''),
+            "input": inp if isinstance(inp, dict) else {"value": inp},
+        })
+    content.extend(dsml_tools)
+
     if not content:
         content.append({"type": "text", "text": ""})
     fr = (data.get('choices') or [{}])[0].get('finish_reason')
-    if tool_calls:
+    if tool_calls or dsml_tools:
         stop = "tool_use"
     else:
         stop = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}.get(fr, "end_turn")
@@ -967,6 +1021,143 @@ async def responses(request: Request):
         pool.release(key)
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})
 
+
+class AnthropicStreamState:
+    """OpenAI chat SSE chunks → Anthropic Messages SSE (Claude Code native)."""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.index = -1
+        self.message_started = False
+        self.current_block = None  # thinking | text | tool_use
+        self.tool_map = {}
+        self.finished = False
+        self.msg_id = f"msg_{int(time.time()*1000)}"
+
+    def _sse(self, event: str, data: dict) -> str:
+        payload = dict(data)
+        if "type" not in payload:
+            payload["type"] = event
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def start_events(self):
+        if self.message_started:
+            return []
+        self.message_started = True
+        return [self._sse("message_start", {
+            "type": "message_start",
+            "message": {
+                "id": self.msg_id, "type": "message", "role": "assistant",
+                "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": {"input_tokens": 0, "output_tokens": 0,
+                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+            },
+        })]
+
+    def _close_block(self):
+        if self.current_block is None:
+            return []
+        ev = [self._sse("content_block_stop", {"type": "content_block_stop", "index": self.index})]
+        self.current_block = None
+        return ev
+
+    def translate_chunk(self, chunk: dict):
+        events = self.start_events()
+        if not chunk or "choices" not in chunk:
+            return events
+        ch = (chunk.get("choices") or [{}])[0]
+        delta = ch.get("delta") or {}
+
+        reason = delta.get("reasoning_content") or delta.get("reasoning")
+        if isinstance(reason, str) and reason:
+            if self.current_block != "thinking":
+                events.extend(self._close_block())
+                self.index += 1
+                events.append(self._sse("content_block_start", {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "thinking", "thinking": ""},
+                }))
+                self.current_block = "thinking"
+            events.append(self._sse("content_block_delta", {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "thinking_delta", "thinking": reason},
+            }))
+
+        if delta.get("content"):
+            if self.current_block != "text":
+                events.extend(self._close_block())
+                self.index += 1
+                events.append(self._sse("content_block_start", {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "text", "text": ""},
+                }))
+                self.current_block = "text"
+            events.append(self._sse("content_block_delta", {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "text_delta", "text": delta["content"]},
+            }))
+
+        for tc in delta.get("tool_calls") or []:
+            oi = tc.get("index", 0)
+            fn = tc.get("function") or {}
+            if oi not in self.tool_map:
+                events.extend(self._close_block())
+                self.index += 1
+                self.tool_map[oi] = self.index
+                tid = tc.get("id") or f"toolu_{self.index}"
+                events.append(self._sse("content_block_start", {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {
+                        "type": "tool_use", "id": tid,
+                        "name": fn.get("name") or "", "input": {},
+                    },
+                }))
+                self.current_block = "tool_use"
+            tidx = self.tool_map[oi]
+            if fn.get("arguments"):
+                events.append(self._sse("content_block_delta", {
+                    "type": "content_block_delta", "index": tidx,
+                    "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]},
+                }))
+
+        fr = ch.get("finish_reason")
+        if fr and not self.finished:
+            self.finished = True
+            events.extend(self._close_block())
+            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
+                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
+            )
+            usage = chunk.get("usage") or {}
+            events.append(self._sse("message_delta", {
+                "type": "message_delta",
+                "delta": {"stop_reason": stop, "stop_sequence": None},
+                "usage": {
+                    "input_tokens": usage.get("prompt_tokens", 0) or 0,
+                    "output_tokens": usage.get("completion_tokens", 0) or 0,
+                    "cache_creation_input_tokens": 0,
+                    "cache_read_input_tokens": 0,
+                },
+            }))
+            events.append(self._sse("message_stop", {"type": "message_stop"}))
+        return events
+
+    def force_done(self, stop="end_turn"):
+        if self.finished:
+            return []
+        self.finished = True
+        events = self._close_block()
+        if not self.message_started:
+            events.extend(self.start_events())
+        events.append(self._sse("message_delta", {
+            "type": "message_delta",
+            "delta": {"stop_reason": stop, "stop_sequence": None},
+            "usage": {"input_tokens": 0, "output_tokens": 0,
+                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+        }))
+        events.append(self._sse("message_stop", {"type": "message_stop"}))
+        return events
+
+
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     _auth_check(request)
@@ -1029,12 +1220,12 @@ async def anthropic_messages(request: Request):
             if status != 200:
                 pool.release(key)
                 return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(resp)}})
-            # Convert OpenAI SSE → Anthropic SSE (minimal text path)
+            # Convert OpenAI SSE → Anthropic SSE (text + thinking + tool_use)
+            state = AnthropicStreamState(model)
             async def gen():
-                msg_id = f"msg_{int(time.time()*1000)}"
                 try:
-                    yield f"event: message_start\ndata: {json.dumps({'type':'message_start','message':{'id':msg_id,'type':'message','role':'assistant','model':model,'content':[]}})}\n\n"
-                    started = False
+                    for ev in state.start_events():
+                        yield ev
                     buf = b""
                     async for chunk in resp.content.iter_any():
                         buf += chunk
@@ -1045,23 +1236,22 @@ async def anthropic_messages(request: Request):
                                 continue
                             payload = line[5:].strip()
                             if payload in (b"[DONE]", b""):
-                                continue
+                                for ev in state.force_done():
+                                    yield ev
+                                return
                             try:
                                 c = json.loads(payload)
                             except Exception:
                                 continue
-                            d = ((c.get("choices") or [{}])[0].get("delta") or {})
-                            if d.get("content"):
-                                if not started:
-                                    yield f"event: content_block_start\ndata: {json.dumps({'type':'content_block_start','index':0,'content_block':{'type':'text','text':''}})}\n\n"
-                                    started = True
-                                yield f"event: content_block_delta\ndata: {json.dumps({'type':'content_block_delta','index':0,'delta':{'type':'text_delta','text':d['content']}})}\n\n"
-                            fr = ((c.get("choices") or [{}])[0].get("finish_reason"))
-                            if fr:
-                                if started:
-                                    yield f"event: content_block_stop\ndata: {json.dumps({'type':'content_block_stop','index':0})}\n\n"
-                                yield f"event: message_delta\ndata: {json.dumps({'type':'message_delta','delta':{'stop_reason':'end_turn'},'usage':c.get('usage') or {}})}\n\n"
-                                yield f"event: message_stop\ndata: {json.dumps({'type':'message_stop'})}\n\n"
+                            for ev in state.translate_chunk(c):
+                                yield ev
+                    # upstream closed without [DONE]
+                    for ev in state.force_done():
+                        yield ev
+                except Exception as e:
+                    logger.error(f'[anthropic stream] {e}')
+                    for ev in state.force_done():
+                        yield ev
                 finally:
                     try:
                         await resp.release()
