@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import threading
 import json
 import os
 import sqlite3
@@ -51,6 +52,7 @@ class ModelStateStore:
         self.catalog_ttl_sec = int(catalog_ttl_sec or os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
         self.status_write_interval_sec = int(os.environ.get("MODEL_STATUS_WRITE_INTERVAL_SEC", "60"))
         self._initialized = False
+        self._write_lock = threading.RLock()
         self._last_status_write: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
 
     def _connect(self) -> sqlite3.Connection:
@@ -228,6 +230,18 @@ class ModelStateStore:
                       status_code: int = 0, reason_code: str = "",
                       reason_detail: str = "", endpoint: str = "",
                       retry_after_sec: int = 0) -> dict[str, Any]:
+        # Serialize read-modify-write counters and in-memory throttling across
+        # asyncio.to_thread workers and direct callers.
+        with self._write_lock:
+            return self._record_status_unlocked(
+                model_id, account_scope, state, status_code, reason_code,
+                reason_detail, endpoint, retry_after_sec,
+            )
+
+    def _record_status_unlocked(self, model_id: str, account_scope: str, state: str,
+                                status_code: int = 0, reason_code: str = "",
+                                reason_detail: str = "", endpoint: str = "",
+                                retry_after_sec: int = 0) -> dict[str, Any]:
         validated = validate_observation(model_id, account_scope, state, reason_code, reason_detail, endpoint)
         model_id = validated["model_id"]
         account_scope = validated["account_scope"]

@@ -80,13 +80,13 @@ class LocalModelRegistry:
                 source="explicit_config",
             ))
 
-    def register_profile(self, profile: ModelProfile) -> None:
+    def register_profile(self, profile: ModelProfile, persist: bool = True) -> None:
         if profile.provider != self.provider:
             raise ValueError(f"profile provider {profile.provider!r} != registry {self.provider!r}")
         if profile.policy.get("model_substitution", False) or profile.policy.get("provider_substitution", False):
             raise ValueError("transparent registry cannot register substitution-enabled profile")
         self.profiles[profile.canonical_id] = profile
-        if self.profile_store:
+        if self.profile_store and persist:
             self.profile_store.save(profile)
 
     def _default_protocols(self) -> tuple[ProtocolProfile, ...]:
@@ -114,6 +114,7 @@ class LocalModelRegistry:
     def register_catalog(self, models: Iterable[Any], revision: str = "catalog") -> list[str]:
         """Register catalog identities with unknown capabilities by default."""
         ids = []
+        profiles_to_persist = []
         for entry in models or []:
             if isinstance(entry, str):
                 provider_model_id = entry.strip()
@@ -158,8 +159,11 @@ class LocalModelRegistry:
                     protocols=self._default_protocols(),
                     provenance={"source": "provider_catalog", "metadata": metadata},
                 )
-            self.register_profile(profile)
+            self.register_profile(profile, persist=False)
+            profiles_to_persist.append(profile)
             ids.append(canonical)
+        if self.profile_store and profiles_to_persist:
+            self.profile_store.save_many(profiles_to_persist)
         return sorted(set(ids))
 
     def resolve(self, requested: str, scope_chain: list[tuple[str, str]] | None = None) -> ModelRef:
