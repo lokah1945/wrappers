@@ -488,7 +488,7 @@ INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
 LOAD_SHEDDING_ENABLED = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
 VERIFY_CONCURRENCY = int(os.environ.get('VERIFY_CONCURRENCY', '8'))
 VERIFY_INTERVAL = int(os.environ.get('VERIFY_INTERVAL', '600')) * 1000
-VERIFY_ON_BOOT = os.environ.get('VERIFY_ON_BOOT', 'true').lower() != 'false'
+VERIFY_ON_BOOT = os.environ.get('VERIFY_ON_BOOT', 'false').lower() != 'false'
 MODEL_REFRESH_SEC = int(os.environ.get('MODEL_REFRESH_SEC', '600'))
 MAX_STREAM_BUFFER_KB = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512'))
 MAX_STREAM_BUFFER = MAX_STREAM_BUFFER_KB * 1024
