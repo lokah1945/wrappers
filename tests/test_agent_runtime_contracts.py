@@ -414,7 +414,7 @@ def test_nvidia_account_scoped_404_does_not_enter_retired_set():
         async def refresh_models(self, force=False):
             return list(self.models_cached)
 
-    async def fake_probe(pool, model_id, timeout_ms=120000):
+    async def fake_probe(pool, model_id, timeout_ms=120000, key=None):
         return {
             "ok": False,
             "status": 404,

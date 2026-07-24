@@ -94,24 +94,21 @@ _unavailable_models: set = set()
 _retired_models: set = set()
 _model_status: dict = {}
 _model_state_store: Optional[ModelStateStore] = None
+_verify_cursor: int = 0
 
-async def probe_model(pool, model_id: str, timeout_ms: int = 120000) -> dict:
-    """Probe one model and retain the original provider error for classification.
-
-    A probe is scoped to the credential used by the key pool.  It is not a
-    global statement about the provider's catalog.
-    """
+async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -> dict:
+    """Probe one model for one credential/account scope."""
     try:
-        key = pool.peek_key()
+        key = key or pool.peek_key()
         if not key:
             return {"ok": False, "status": 0, "reason": "no_key", "account_scope": "unknown"}
 
         body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
         account_scope = credential_fingerprint(key.api_key)
-        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms/1000)) as s:
-            async with s.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
-                if 200 <= resp.status < 400:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000)) as session:
+            async with session.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
+                if 200 <= resp.status < 300:
                     return {"ok": True, "status": resp.status, "reason": "", "account_scope": account_scope}
                 text = await resp.text()
                 return {
@@ -120,70 +117,102 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000) -> dict:
                     "reason": text[:4000],
                     "account_scope": account_scope,
                 }
-    except Exception as e:
-        return {"ok": False, "status": 0, "reason": str(e)[:4000], "account_scope": "unknown"}
+    except Exception as exc:
+        return {"ok": False, "status": 0, "reason": str(exc)[:4000], "account_scope": "unknown"}
 
 
 async def verify_models(pool):
-    """Verify models without converting account failures into global retirement."""
-    global _unavailable_models, _retired_models, _model_status, _model_state_store
+    """Verify a rotating batch per configured credential scope.
+
+    Verification is account-scoped. Only explicit provider EOL can affect the
+    global retired set; all other outcomes remain observations.
+    """
+    global _unavailable_models, _retired_models, _model_status, _model_state_store, _verify_cursor
     ids = await pool.refresh_models(force=True) or []
     if not ids:
         return
 
     if _model_state_store:
         metadata = getattr(pool, "models_metadata", {}) or {}
-        _model_state_store.upsert_catalog(
-            [metadata.get(mid) or {"id": mid} for mid in ids],
-            source="nvidia:/v1/models",
-        )
-        MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision="runtime-catalog")
-        await MODEL_REGISTRY_CLIENT.ingest_catalog("nvidia", [metadata.get(mid) or {"id": mid} for mid in ids], "runtime-catalog")
+        catalog_entries = [metadata.get(mid) or {"id": mid} for mid in ids]
+        _model_state_store.upsert_catalog(catalog_entries, source="nvidia:/v1/models")
+        MODEL_REGISTRY.register_catalog(catalog_entries, revision="runtime-catalog")
+        await MODEL_REGISTRY_CLIENT.ingest_catalog("nvidia", catalog_entries, "runtime-catalog")
+
+    # Cover the whole catalog over successive sweeps instead of permanently
+    # limiting verification to the first alphabetic 100 models.
+    batch_size = min(100, len(ids))
+    start = _verify_cursor % len(ids)
+    probe_ids = [ids[(start + offset) % len(ids)] for offset in range(batch_size)]
+    _verify_cursor = (start + batch_size) % len(ids)
+
+    # Probe one representative key per distinct credential fingerprint. This
+    # avoids claiming that one account's deployment state applies to another.
+    probe_keys = []
+    seen_scopes = set()
+    for key in getattr(pool, "keys", []) or []:
+        scope = credential_fingerprint(getattr(key, "api_key", None))
+        if scope not in seen_scopes:
+            seen_scopes.add(scope)
+            probe_keys.append(key)
+    if not probe_keys:
+        peek_key = getattr(pool, "peek_key", None)
+        key = peek_key() if callable(peek_key) else None
+        if key:
+            probe_keys = [key]
+    if not probe_keys:
+        probe_keys = [None]
 
     sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
-    results = {}
+    observations: dict[str, list[dict]] = {}
 
-    async def _probe(mid):
+    async def _probe(mid, key):
         async with sem:
-            res = await probe_model(pool, mid, TTFT_TIMEOUT_MS)
-            results[mid] = res
+            res = await probe_model(pool, mid, TTFT_TIMEOUT_MS, key=key)
             classification = classify_upstream_error(res.get("status", 0), res.get("reason", ""))
             res["state"] = classification["state"]
             res["reason_code"] = classification["reason_code"]
-            if not res["ok"]:
-                # Only an explicit provider EOL/retirement is global.  A 404
-                # mentioning an account is account_unavailable and must never
-                # enter _retired_models.
-                if classification["state"] == "globally_retired":
-                    _retired_models.add(mid)
-                else:
-                    _retired_models.discard(mid)
-                _unavailable_models.add(mid)
-            else:
-                _unavailable_models.discard(mid)
+            observations.setdefault(mid, []).append(res)
+
+            if res["state"] == "globally_retired":
+                _retired_models.add(mid)
+            elif res.get("ok"):
                 _retired_models.discard(mid)
-                res["state"] = "available"
-                res["reason_code"] = "OK"
 
             if _model_state_store:
                 stored = await _model_state_store.record_status_async(
                     model_id=mid,
                     account_scope=res.get("account_scope", "unknown"),
-                    state=res["state"],
+                    state=res["state"] if not res.get("ok") else "available",
                     status_code=res.get("status", 0),
-                    reason_code=res.get("reason_code", ""),
+                    reason_code=res.get("reason_code", "OK" if res.get("ok") else ""),
                     reason_detail=res.get("reason", ""),
                     endpoint="/v1/chat/completions",
                 )
                 MODEL_REGISTRY_CLIENT.schedule_observation(
                     "nvidia", mid, stored.get("account_scope", "unknown"),
-                    res["state"], res.get("status", 0), res.get("reason_code", ""),
-                    res.get("reason", ""), "/v1/chat/completions",
+                    stored.get("state", res["state"]), res.get("status", 0),
+                    stored.get("reason_code", ""), stored.get("reason_detail", ""),
+                    "/v1/chat/completions",
                 )
-            _model_status[mid] = res
 
-    await asyncio.gather(*[_probe(mid) for mid in ids[:100]])  # cap for safety
-    logger.info(f"[verify] sweep done: {len(_unavailable_models)} unavailable, {len(_retired_models)} retired")
+    await asyncio.gather(*[_probe(mid, key) for mid in probe_ids for key in probe_keys])
+
+    # In-memory unavailable state is only a conservative aggregate for legacy
+    # metrics. It is never a global retirement decision.
+    for mid, results in observations.items():
+        if results and all(not result.get("ok") for result in results):
+            _unavailable_models.add(mid)
+        else:
+            _unavailable_models.discard(mid)
+        latest = max(results, key=lambda result: result.get("account_scope", ""))
+        _model_status[mid] = latest
+
+    _retired_models.intersection_update(set(ids))
+    logger.info(
+        f"[verify] sweep batch={len(probe_ids)} accounts={len(probe_keys)} "
+        f"unavailable={len(_unavailable_models)} retired={len(_retired_models)}"
+    )
 
 async def verify_loop(pool):
     while True:
