@@ -1136,6 +1136,9 @@ async def chat_completions(request: Request):
     if not check_rate_limit(client_ip):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
+    if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': 'max_tokens must be a positive integer'}})
+
     requested = body.get("model")
     # Transparent: only alias-map; do not inject DEFAULT_MODEL
     model = resolve_model(requested) if requested else requested
@@ -1148,6 +1151,8 @@ async def chat_completions(request: Request):
     for m in body.get('messages', []) or []:
         if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
             return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)"}})
+        if isinstance(m, dict) and m.get('role') == 'tool' and not m.get('tool_call_id'):
+            return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': "tool role requires tool_call_id"}})
     for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
         body.pop(bad, None)
     # Drop name:null tools (Codex/Hermes) before upstream

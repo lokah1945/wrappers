@@ -738,6 +738,8 @@ async def chat_completions(request: Request):
         body = await request.json()
     except Exception as e:
         return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}})
+    if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
+        return _jr(400, {"error": {"type": "invalid_request_error", "message": "max_tokens must be a positive integer"}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     if requested is not None:
         body["model"] = _normalize_model(requested)
@@ -749,6 +751,8 @@ async def chat_completions(request: Request):
     for m in body.get('messages', []) or []:
         if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
             return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)"}})
+        if isinstance(m, dict) and m.get('role') == 'tool' and not m.get('tool_call_id'):
+            return _jr(400, {"error": {"type": "invalid_request_error", "message": "tool role requires tool_call_id"}})
     is_stream = bool(body.get("stream", False))
 
     key_result = await pool.acquire()

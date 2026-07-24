@@ -1078,9 +1078,14 @@ class Server:
             if dep:
                 return JSONResponse(status_code=410, content={'error': {'message': f'Model "{dep["from"]}" has been renamed to "{dep["to"]}" in the NVIDIA NIM catalog. Update your request to use "{dep["to"]}".', 'type': 'invalid_request_error'}})
 
+            if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
+                return JSONResponse(status_code=400, content={'error': {'message': 'max_tokens must be a positive integer', 'type': 'invalid_request_error'}})
+
             for m in body.get('messages', []) or []:
                 if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
                     return JSONResponse(status_code=400, content={'error': {'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)", 'type': 'invalid_request_error'}})
+                if isinstance(m, dict) and m.get('role') == 'tool' and not m.get('tool_call_id'):
+                    return JSONResponse(status_code=400, content={'error': {'message': "tool role requires tool_call_id", 'type': 'invalid_request_error'}})
 
             body['model'] = resolve_target_model(body.get('model', ''))
             return await self._handle_chat_completions(body, request, raw)
