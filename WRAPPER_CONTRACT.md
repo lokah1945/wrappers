@@ -150,7 +150,7 @@ Model discovery and invocation availability are separate facts:
 - `404` messages such as `Function ... not found for account` mean `account_unavailable`, not global retirement.
 - Only explicit provider end-of-life/retirement evidence may become `globally_retired` and a default local hard block.
 - `401/403`, `429`, timeouts, `5xx`, and invalid parameters must retain their own error classes.
-- Background verification may inform discovery and fallback, but must not reject an explicit concrete model because of a transient or account-scoped result.
+- Background verification may inform discovery and observability, but must not reject an explicit concrete model because of a transient or account-scoped result and must never select another model.
 - Each wrapper persists a last-good catalog and account-scoped state in its ignored SQLite `model-state.db`; raw keys are never stored.
 
 See [MODEL_AVAILABILITY.md](MODEL_AVAILABILITY.md) for schema, TTL, and regression requirements.

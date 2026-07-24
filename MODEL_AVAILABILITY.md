@@ -22,7 +22,7 @@ A catalog entry is not proof of deployment or entitlement. An account-scoped fai
 | timeout/408/5xx | `transient_failure` | No |
 | 400/422 | `capability_mismatch` | No; fix request adaptation |
 
-Background probes may record state and influence fallback selection, but an explicit model selected by a client must not be rejected solely because a background probe failed. The NVIDIA wrapper only uses the explicit global-retirement state for its default preflight hard block; `STRICT_BLOCK_UNAVAILABLE_MODELS` is intentionally opt-in.
+Background probes may record state and influence observability only. They must never select another model. An explicit model selected by a client must not be rejected solely because a background probe failed. The NVIDIA wrapper only uses the explicit global-retirement state for its default preflight hard block; `STRICT_BLOCK_UNAVAILABLE_MODELS` is intentionally opt-in.
 
 ## Persistence
 

@@ -1820,246 +1820,204 @@ class Server:
         if stream_guard:
             return stream_guard
 
-        wants_reasoning = request_requires_reasoning(body, model_id)
-        candidates = [model_id] + self._build_fallback_candidates(model_id, wants_reasoning)
+        # Transparent contract: exactly one requested model.  Retries below
+        # rotate credentials only; they never construct model candidates.
         primary_body = json.loads(json.dumps(body))
+        cand_model = model_id
+        body = json.loads(json.dumps(primary_body))
+        body['model'] = cand_model
+        model_id = cand_model
 
-        for cand_model in candidates:
-            body = json.loads(json.dumps(primary_body))
-            body['model'] = cand_model
-            model_id = cand_model
+        if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
+            body['max_tokens'] = body['max_completion_tokens']
+            del body['max_completion_tokens']
 
-            if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
-                body['max_tokens'] = body['max_completion_tokens']
-                del body['max_completion_tokens']
+        clamp_max_tokens_for_model(body, model_id)
 
-            clamp_max_tokens_for_model(body, model_id)
+        if body.get('stream'):
+            body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
 
-            if body.get('stream'):
-                body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
+        headers = dict(req_headers)
 
-            headers = dict(req_headers)
+        for p, v in DEFAULT_PARAMS.items():
+            if body.get(p) is None:
+                num = float(v)
+                body[p] = num if num == int(num) else v
 
-            for p, v in DEFAULT_PARAMS.items():
-                if body.get(p) is None:
-                    num = float(v)
-                    body[p] = num if num == int(num) else v
+        preserved = {}
+        for p in ['chat_template_kwargs', 'reasoning_effort', 'extra_body', 'nvext']:
+            if body.get(p) is not None:
+                preserved[p] = body[p]
 
-            preserved = {}
-            for p in ['chat_template_kwargs', 'reasoning_effort', 'extra_body', 'nvext']:
-                if body.get(p) is not None:
-                    preserved[p] = body[p]
+        if isinstance(body.get('extra_body'), dict) and body['extra_body'].get('nvext'):
+            preserved['nvext'] = {**(preserved.get('nvext') or {}), **body['extra_body']['nvext']}
 
-            if isinstance(body.get('extra_body'), dict) and body['extra_body'].get('nvext'):
-                preserved['nvext'] = {**(preserved.get('nvext') or {}), **body['extra_body']['nvext']}
+        if isinstance(preserved.get('nvext'), dict) and 'stream' in preserved['nvext']:
+            del preserved['nvext']['stream']
 
-            if isinstance(preserved.get('nvext'), dict) and 'stream' in preserved['nvext']:
-                del preserved['nvext']['stream']
+        if isinstance(preserved.get('extra_body'), dict) and isinstance(preserved['extra_body'].get('nvext'), dict):
+            if 'stream' in preserved['extra_body']['nvext']:
+                del preserved['extra_body']['nvext']['stream']
+            if not preserved['extra_body']['nvext']:
+                del preserved['extra_body']['nvext']
 
-            if isinstance(preserved.get('extra_body'), dict) and isinstance(preserved['extra_body'].get('nvext'), dict):
-                if 'stream' in preserved['extra_body']['nvext']:
-                    del preserved['extra_body']['nvext']['stream']
-                if not preserved['extra_body']['nvext']:
-                    del preserved['extra_body']['nvext']
+        for p in PROACTIVE_DROP:
+            if p not in PROTECTED_PARAMS:
+                body.pop(p, None)
 
-            for p in PROACTIVE_DROP:
-                if p not in PROTECTED_PARAMS:
-                    body.pop(p, None)
+        reasoning_mechanism = (find_reasoning_config(model_id) or {}).get('mechanism')
+        if reasoning_mechanism in ('reasoning_effort', 'nemotron_chat_template') and body.get('chat_template_kwargs'):
+            del body['chat_template_kwargs']
 
-            reasoning_mechanism = (find_reasoning_config(model_id) or {}).get('mechanism')
-            if reasoning_mechanism in ('reasoning_effort', 'nemotron_chat_template') and body.get('chat_template_kwargs'):
-                del body['chat_template_kwargs']
+        for p, v in preserved.items():
+            body[p] = v
 
-            for p, v in preserved.items():
-                body[p] = v
+        target_url = f"{resolve_base(model_id)}/v1/chat/completions"
 
-            target_url = f"{resolve_base(model_id)}/v1/chat/completions"
+        start_ms = time.time() * 1000
+        attempt = 0
+        max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
-            start_ms = time.time() * 1000
-            attempt = 0
-            max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
+        while attempt < max_attempts:
+            key_result = await self.pool.acquire(model_id)
+            if not key_result:
+                if attempt < max_attempts - 1:
+                    attempt += 1
+                    continue
+                return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted — no capacity available for model {model_id}', 'type': 'server_error'}}}
 
-            while attempt < max_attempts:
-                key_result = await self.pool.acquire(model_id)
-                if not key_result:
-                    if attempt < max_attempts - 1:
-                        attempt += 1
-                        continue
-                    return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted — no capacity available for model {model_id}', 'type': 'server_error'}}}
+            key = key_result['key']
+            self._in_flight += 1
 
-                key = key_result['key']
-                self._in_flight += 1
+            try:
+                fwd_headers = {
+                    'Authorization': f'Bearer {key.api_key}',
+                    **headers,
+                }
 
-                try:
-                    fwd_headers = {
-                        'Authorization': f'Bearer {key.api_key}',
-                        **headers,
-                    }
+                is_streaming = bool(body.get('stream'))
+                is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', metric_path or ''))
+                # Production-grade timeout selection (parity with Node audit)
+                if is_streaming:
+                    timeout_sec = max(STREAM_REQUEST_TIMEOUT_SEC, ANTI_SILENCE_TIMEOUT_MS // 1000)
+                elif is_gen:
+                    timeout_sec = GEN_TIMEOUT_SEC
+                else:
+                    timeout_sec = REQUEST_TIMEOUT_SEC
 
-                    is_streaming = bool(body.get('stream'))
-                    is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', metric_path or ''))
-                    # Production-grade timeout selection (parity with Node audit)
-                    if is_streaming:
-                        timeout_sec = max(STREAM_REQUEST_TIMEOUT_SEC, ANTI_SILENCE_TIMEOUT_MS // 1000)
-                    elif is_gen:
-                        timeout_sec = GEN_TIMEOUT_SEC
-                    else:
-                        timeout_sec = REQUEST_TIMEOUT_SEC
-
-                    if body.get('stream'):
-                        resp = await self._session.post(
-                            target_url, json=body, headers=fwd_headers,
-                            timeout=aiohttp.ClientTimeout(total=timeout_sec),
-                        )
-                        if resp.status == 429:
-                            ra = int(resp.headers.get('retry-after', '65') or '65')
-                            self._in_flight = max(0, self._in_flight - 1)
-                            key.decrement_in_flight()
-                            body_text = await resp.text()
-                            self._record_model_response(model_id, key, resp.status, body_text, metric_path)
-                            await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
-                            if self.metrics:
-                                await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
-                            attempt += 1
-                            continue
-                        if resp.status >= 400:
-                            resp_body = await _safe_response_body(resp)
-                            self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
-                            classification = classify_upstream_error(resp.status, resp_body)
-                            norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
-                            self._in_flight = max(0, self._in_flight - 1)
-                            key.decrement_in_flight()
-                            # Retry only failures that may change with time/key.
-                            # Account-scoped deployment, capability and route
-                            # errors must not be retried across identical keys.
-                            retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
-                            if retryable and attempt < max_attempts - 1:
-                                attempt += 1
-                                continue
-                            return {'status': norm_status, 'data': resp_body}
-
-                        # Keep in-flight until the stream consumer finishes. The wrapper
-                        # owns release/decrement so every streaming surface (/chat,
-                        # /messages, /responses) closes capacity exactly once.
-                        released = False
-
-                        async def stream_wrapper(resp=resp, key=key):
-                            nonlocal released
-                            try:
-                                async for chunk, _ in resp.content.iter_chunks():
-                                    yield chunk
-                            finally:
-                                if not released:
-                                    released = True
-                                    try:
-                                        resp.release()
-                                    except Exception:
-                                        pass
-                                    self._in_flight = max(0, self._in_flight - 1)
-                                    try:
-                                        key.decrement_in_flight()
-                                    except Exception:
-                                        pass
-
-                        return {'stream': stream_wrapper(), 'key': key, 'start_ms': start_ms, 'status': 200}
-                    else:
-                        resp = await self._session.post(
-                            target_url, json=body, headers=fwd_headers,
-                            timeout=aiohttp.ClientTimeout(total=timeout_sec),
-                        )
-
-                        if resp.status == 429:
-                            ra = int(resp.headers.get('retry-after', '65') or '65')
-                            self._in_flight = max(0, self._in_flight - 1)
-                            key.decrement_in_flight()
-                            body_text = await resp.text()
-                            self._record_model_response(model_id, key, resp.status, body_text, metric_path)
-                            await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
-                            if self.metrics:
-                                await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
-                            attempt += 1
-                            continue
-
-                        resp_data = await _safe_response_body(resp)
-                        classification = classify_upstream_error(resp.status, resp_data)
-                        if resp.status >= 400:
-                            self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
-                        norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
+                if body.get('stream'):
+                    resp = await self._session.post(
+                        target_url, json=body, headers=fwd_headers,
+                        timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                    )
+                    if resp.status == 429:
+                        ra = int(resp.headers.get('retry-after', '65') or '65')
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
-
-                        if norm_status >= 400:
-                            retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
-                            if retryable and attempt < max_attempts - 1:
-                                attempt += 1
-                                continue
-                            return {'status': norm_status, 'data': resp_data}
-
+                        body_text = await resp.text()
+                        self._record_model_response(model_id, key, resp.status, body_text, metric_path)
+                        await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                         if self.metrics:
-                            await self.metrics.record_request(
-                                model=model_id, key_label=key.label,
-                                status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                                prompt_tokens=resp_data.get('usage', {}).get('prompt_tokens', 0),
-                                completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
-                                path=metric_path,
-                            )
-                        return {'status': resp.status, 'data': resp_data}
+                            await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                        attempt += 1
+                        continue
+                    if resp.status >= 400:
+                        resp_body = await _safe_response_body(resp)
+                        self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
+                        classification = classify_upstream_error(resp.status, resp_body)
+                        norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
+                        self._in_flight = max(0, self._in_flight - 1)
+                        key.decrement_in_flight()
+                        # Retry only failures that may change with time/key.
+                        # Account-scoped deployment, capability and route
+                        # errors must not be retried across identical keys.
+                        retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                        if retryable and attempt < max_attempts - 1:
+                            attempt += 1
+                            continue
+                        return {'status': norm_status, 'data': resp_body}
 
-                except asyncio.TimeoutError:
+                    # Keep in-flight until the stream consumer finishes. The wrapper
+                    # owns release/decrement so every streaming surface (/chat,
+                    # /messages, /responses) closes capacity exactly once.
+                    released = False
+
+                    async def stream_wrapper(resp=resp, key=key):
+                        nonlocal released
+                        try:
+                            async for chunk, _ in resp.content.iter_chunks():
+                                yield chunk
+                        finally:
+                            if not released:
+                                released = True
+                                try:
+                                    resp.release()
+                                except Exception:
+                                    pass
+                                self._in_flight = max(0, self._in_flight - 1)
+                                try:
+                                    key.decrement_in_flight()
+                                except Exception:
+                                    pass
+
+                    return {'stream': stream_wrapper(), 'key': key, 'start_ms': start_ms, 'status': 200}
+                else:
+                    resp = await self._session.post(
+                        target_url, json=body, headers=fwd_headers,
+                        timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                    )
+
+                    if resp.status == 429:
+                        ra = int(resp.headers.get('retry-after', '65') or '65')
+                        self._in_flight = max(0, self._in_flight - 1)
+                        key.decrement_in_flight()
+                        body_text = await resp.text()
+                        self._record_model_response(model_id, key, resp.status, body_text, metric_path)
+                        await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
+                        if self.metrics:
+                            await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                        attempt += 1
+                        continue
+
+                    resp_data = await _safe_response_body(resp)
+                    classification = classify_upstream_error(resp.status, resp_data)
+                    if resp.status >= 400:
+                        self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
+                    norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
-                    attempt += 1
-                    continue
-                except Exception as e:
-                    self._in_flight = max(0, self._in_flight - 1)
-                    key.decrement_in_flight()
-                    logger.error(f'[proxy_openai] error: {e}')
-                    attempt += 1
-                    continue
 
-            return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted for model {model_id}', 'type': 'server_error'}}}
+                    if norm_status >= 400:
+                        retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                        if retryable and attempt < max_attempts - 1:
+                            attempt += 1
+                            continue
+                        return {'status': norm_status, 'data': resp_data}
 
-        return {'status': 503, 'data': {'error': {'message': 'No candidate models available', 'type': 'server_error'}}}
+                    if self.metrics:
+                        await self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
+                            prompt_tokens=resp_data.get('usage', {}).get('prompt_tokens', 0),
+                            completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
+                            path=metric_path,
+                        )
+                    return {'status': resp.status, 'data': resp_data}
 
-    def _build_fallback_candidates(self, model_id: str, wants_reasoning: bool) -> list:
-        if os.environ.get('MODEL_FALLBACK_ENABLED', 'true') == 'false':
-            return []
-        primary = classify(model_id)
-        mtype = primary['type']
-        cached = self.pool.models_cached or []
-        seen = {str(model_id).lower()}
-        cands = []
-        for mid in cached:
-            if str(mid).lower() in seen:
+            except asyncio.TimeoutError:
+                self._in_flight = max(0, self._in_flight - 1)
+                key.decrement_in_flight()
+                attempt += 1
                 continue
-            c = classify(mid)
-            if c['type'] != mtype:
+            except Exception as e:
+                self._in_flight = max(0, self._in_flight - 1)
+                key.decrement_in_flight()
+                logger.error(f'[proxy_openai] error: {e}')
+                attempt += 1
                 continue
-            if wants_reasoning and not is_reasoning_model(mid):
-                continue
-            # Skip retired/unavailable
-            if is_model_unavailable(mid):
-                continue
-            cands.append(mid)
-        # Prefer smaller/faster instruct models first (avoid multi-minute fallbacks)
-        def _rank(mid: str) -> tuple:
-            s = str(mid).lower()
-            score = 50
-            if '8b' in s or '7b' in s or '3b' in s or 'mini' in s or 'nano' in s:
-                score = 0
-            elif '9b' in s or '12b' in s or '13b' in s:
-                score = 1
-            elif '27b' in s or '30b' in s or '32b' in s or '34b' in s:
-                score = 2
-            elif '70b' in s:
-                score = 3
-            elif '405b' in s or 'ultra' in s or '550b' in s:
-                score = 9
-            if 'instruct' in s:
-                score -= 1
-            return (score, len(s))
-        cands.sort(key=_rank)
-        return cands[:int(os.environ.get('MODEL_FALLBACK_MAX_HOPS', '2'))]
+
+        return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted for model {model_id}', 'type': 'server_error'}}}
+
 
     def _resolve_base(self, model_id: str) -> str:
         return route_upstream(model_id)
