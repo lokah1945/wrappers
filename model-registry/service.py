@@ -69,8 +69,12 @@ app = FastAPI(title="model-registry", version="0.1.0", docs_url=None, redoc_url=
 
 
 def _require_internal(request: Request) -> None:
+    """Fail closed: internal writes are disabled without an admin token."""
     if not ADMIN_TOKEN:
-        return
+        raise HTTPException(
+            status_code=503,
+            detail="Internal registry writes are disabled; configure MODEL_REGISTRY_ADMIN_TOKEN",
+        )
     auth = (request.headers.get("authorization") or "").strip()
     token = auth[7:] if auth.lower().startswith("bearer ") else auth
     if token != ADMIN_TOKEN:

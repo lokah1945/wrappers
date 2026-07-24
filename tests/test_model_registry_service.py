@@ -10,6 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def load_service(tmp_path):
     os.environ["MODEL_REGISTRY_DB"] = str(tmp_path / "registry.db")
+    os.environ["MODEL_REGISTRY_ADMIN_TOKEN"] = "test-token"
     spec = importlib.util.spec_from_file_location(
         "model_registry_service_test", ROOT / "model-registry" / "service.py"
     )
@@ -38,6 +39,7 @@ def test_registry_service_ingests_catalog_and_returns_call_plan(tmp_path):
     ingest = client.post(
         "/internal/catalog",
         json={"provider": "nvidia", "revision": "r1", "models": [{"id": "provider/model-a"}]},
+        headers={"Authorization": "Bearer test-token"},
     )
     assert ingest.status_code == 200
     plan = client.post(
