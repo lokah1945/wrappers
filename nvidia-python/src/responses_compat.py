@@ -352,13 +352,9 @@ class ResponsesHandler:
             # P2: store conversation for previous_response_id multi-turn
             rid_store = resp_obj.get('id')
             if rid_store:
-                from .main import input_to_messages
-                try:
-                    _RESPONSE_STORE[rid_store] = input_to_messages(chat_body, model)
-                    if len(_RESPONSE_STORE) > 200:
-                        _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
-                except Exception:
-                    pass
+                _RESPONSE_STORE[rid_store] = chat_body.get('messages', [])
+                if len(_RESPONSE_STORE) > 200:
+                    _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
             return resp_obj, None
 
         # Streaming: return async generator

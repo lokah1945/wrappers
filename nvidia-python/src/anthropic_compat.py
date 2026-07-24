@@ -144,7 +144,7 @@ def strip_cache_control(node):
 
 
 def sanitize_anthropic_tools(tools: list) -> tuple:
-    if not isinstance(tools) or not tools:
+    if not isinstance(tools, list) or not tools:
         return (tools or [], False)
     dropped_search_tool = False
     out = []

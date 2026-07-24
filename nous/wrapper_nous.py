@@ -936,9 +936,17 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
+    allow_methods=['*'],
+    allow_headers=['*'],
+    expose_headers=['*'],
+)
 
 async def _auth_check(request: Request):
+    if request.method == 'OPTIONS':
+        return  # CORS preflight passes without auth
     if not BEARER_TOKEN: return
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     token = auth.replace("Bearer ", "", 1).strip()
@@ -1062,6 +1070,39 @@ async def models():
         if isinstance(enriched[i], dict):
             enriched[i]["id"] = m.get("id")
     return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None}
+
+@app.get("/v1/capabilities")
+async def capabilities():
+    models_list = []
+    tok = await get_token()
+    sess = await get_session()
+    try:
+        async with sess.get(f"{NOUS_BASE}/v1/models", headers={"Authorization": f"Bearer {tok}"}) as r:
+            if r.status == 200:
+                data = await r.json()
+                models_list = data.get("data", []) if isinstance(data, dict) else []
+    except:
+        models_list = CURATED_FREE_MODELS
+    if not models_list:
+        models_list = CURATED_FREE_MODELS
+    enriched = []
+    for m in models_list:
+        mid = m.get("id") if isinstance(m, dict) else m
+        meta = get_model_meta(mid)
+        enriched.append({
+            "id": mid,
+            "capabilities": ["chat", "completion"],
+            "streaming": True,
+            "context_window": meta.get("context_window", 128000),
+            "max_tokens": meta.get("max_tokens", 4096),
+        })
+    tgt = get_dynamic_alias_target()
+    return {
+        "object": "list",
+        "models": enriched,
+        "summary": {"total": len(enriched), "by_type": {"chat": len(enriched)}},
+        "dynamic_alias_target": tgt or None,
+    }
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):

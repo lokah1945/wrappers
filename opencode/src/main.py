@@ -41,8 +41,16 @@ load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file_
 if not os.environ.get('OPENCODE_BASE_URL'):
     load_dotenv()
 
+LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/opencode/opencode.log')
 logger = logging.getLogger('wrapper-opencode')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [opencode] %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [opencode] %(message)s',
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(),
+    ],
+)
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9107'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
@@ -576,9 +584,17 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown")
 
 app = FastAPI(title="wrapper-opencode", version=VERSION, lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
+    allow_methods=['*'],
+    allow_headers=['*'],
+    expose_headers=['*'],
+)
 
 def _auth_check(request: Request):
+    if request.method == 'OPTIONS':
+        return  # CORS preflight passes without auth
     # G10 fix: if BEARER_TOKEN is set, auth is mandatory and must match.
     # If client sends a token (even wrong) we MUST reject on mismatch.
     # If BEARER_TOKEN empty, remain open (backwards-compatible, logged).
@@ -657,6 +673,35 @@ async def models(request: Request):
         pool.release(key)
         logger.warning(f"models: {e}")
         return fallback
+
+@app.get("/v1/capabilities")
+async def capabilities(request: Request):
+    _auth_check(request)
+    key_result = await pool.acquire()
+    models_list = []
+    if key_result:
+        key = key_result["key"]
+        try:
+            status, data = await proxy_request("GET", f"{OPENCODE_BASE}/models", None, _auth_headers(key.api_key, request))
+            pool.release(key)
+            if status == 200 and isinstance(data, dict):
+                models_list = data.get("data") or []
+        except Exception:
+            pool.release(key)
+    tgt = get_dynamic_alias_target()
+    return {
+        "object": "list",
+        "models": [
+            {
+                "id": m.get("id") if isinstance(m, dict) else m,
+                "capabilities": ["chat", "completion"],
+                "streaming": True,
+            }
+            for m in models_list
+        ],
+        "summary": {"total": len(models_list), "by_type": {"chat": len(models_list)}},
+        "dynamic_alias_target": tgt or None,
+    }
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):

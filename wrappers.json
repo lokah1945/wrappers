@@ -1,0 +1,45 @@
+{
+  "version": "1.0.0",
+  "updated": "2026-07-24",
+  "wrappers": [
+    {
+      "name": "nvidia",
+      "port": 9101,
+      "upstream": "nvidia-nim",
+      "type": "python",
+      "source": "nvidia-python/src/main.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/capabilities",
+      "auth": "BEARER_TOKEN",
+      "log_file": "nvidia_py.log",
+      "systemd": "wrapper-nvidia-python.service"
+    },
+    {
+      "name": "nous",
+      "port": 9106,
+      "upstream": "nous",
+      "type": "python",
+      "source": "nous/wrapper_nous.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/capabilities",
+      "auth": "BEARER_TOKEN",
+      "log_file": null,
+      "systemd": "wrapper-nous.service"
+    },
+    {
+      "name": "opencode",
+      "port": 9107,
+      "upstream": "opencode-zen",
+      "type": "python",
+      "source": "opencode/src/main.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/capabilities",
+      "auth": "BEARER_TOKEN",
+      "log_file": "opencode.log",
+      "systemd": "wrapper-opencode.service"
+    }
+  ]
+}
