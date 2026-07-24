@@ -912,7 +912,7 @@ def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok" if pool.available_keys > 0 else "degraded", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE}
+    return {"status": "ok" if pool.available_keys > 0 else "degraded", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE, "model_registry": MODEL_REGISTRY_CLIENT.stats()}
 
 
 @app.get("/ready")

@@ -1187,6 +1187,7 @@ class Server:
                 'keys': self.pool.total_keys,
                 'available': self.pool.available_keys,
                 'models_cached': len(self.pool.models_cached),
+                'model_registry': MODEL_REGISTRY_CLIENT.stats(),
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
             }

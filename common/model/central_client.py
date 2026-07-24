@@ -96,6 +96,16 @@ class ModelRegistryClient:
             self.failed_posts += 1
             return False
 
+    def stats(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "queue_depth": self._queue.qsize(),
+            "queue_limit": self.queue_limit,
+            "dropped_observations": self.dropped_observations,
+            "failed_posts": self.failed_posts,
+            "worker_running": bool(self._worker and not self._worker.done()),
+        }
+
     async def _observation_worker(self) -> None:
         while True:
             path, payload = await self._queue.get()

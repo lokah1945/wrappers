@@ -1510,6 +1510,7 @@ async def health():
         "keys": KEY_POOL.total_keys,
         "available": KEY_POOL.available_keys,
         "metrics": metrics.snapshot(),
+        "model_registry": MODEL_REGISTRY_CLIENT.stats(),
     }
 
 
