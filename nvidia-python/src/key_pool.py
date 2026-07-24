@@ -293,9 +293,8 @@ class KeyPool:
     def release_success(self, key: KeyEntry = None):
         """Compatibility release hook used by streaming proxy paths.
 
-        KeyEntry in-flight counters are decremented by the server path that owns
-        the stream. This method intentionally remains conservative so legacy
-        callers that expect a pool-level release hook do not crash.
+        KeyPool.acquire() reserves one per-key in-flight slot. This helper
+        releases that reservation for legacy streaming proxy paths.
         """
         try:
             if key is not None:

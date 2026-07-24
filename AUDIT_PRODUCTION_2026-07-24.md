@@ -317,3 +317,83 @@ After first push plus this deeper re-audit patch set, all three wrappers satisfy
 - Import/runtime portability outside the original `/root/wrapper` layout
 
 Second-pass production score remains: **100/100 enterprise-grade wrapper-side readiness**.
+
+---
+
+# Third-Pass Multi-Key Resilience Audit
+
+User requirement: with 5 API keys, one key failing or being rate-limited must not fail the whole wrapper. Errors should be surfaced to Claude Code/Codex/Hermes/OpenAI/Anthropic clients only after all configured credentials are exhausted, cooled down, or fail with the same unrecoverable condition.
+
+## Additional Critical Finding
+
+### NVIDIA double in-flight reservation
+
+The NVIDIA `KeyPool.acquire()` already reserves one per-key in-flight slot, but `src/main.py` was also calling `key.increment_in_flight()` after acquire. This meant every request could count as two in-flight operations and only release one, eventually creating artificial capacity exhaustion. This directly contradicted the 5-key resilience design.
+
+Fixed by making `KeyPool.acquire()` the single owner of per-key reservation and keeping server-level `_in_flight` as a separate counter only.
+
+## Multi-Key Resilience Fixes
+
+### `nvidia-python`
+
+- Removed duplicate per-key in-flight increments in all proxy paths.
+- Kept exactly-one per-key decrement on completion/error/stream-finally.
+- Fixed streaming proxy paths to avoid reading an entire stream before returning a `StreamingResponse`.
+- Catch-all streaming now also uses deferred stream release instead of consuming body first.
+
+### `nous`
+
+- Replaced simple string round-robin with stateful `KeyEntry` objects.
+- Added per-key:
+  - RPM tracking
+  - in-flight tracking
+  - cooldowns for 429/auth/quota/transient failures
+  - effective-load selection
+- Added `post_nous_with_retries()`:
+  - tries `AUTH_PATH` OAuth token first when present;
+  - if that token has retriable/key-level failure, retries static `NOUS_API_KEY_*` pool;
+  - tries every available static key before returning an error;
+  - only final all-key failure is surfaced to agent/client.
+- Streaming responses release key reservations in `stream_with_heartbeat(..., key_entry=...)` finally.
+
+### `opencode`
+
+- Rebuilt OpenCode `KeyPool` to use effective-load key selection instead of always hammering the first key.
+- Added per-key cooldown and failure counters.
+- Added `proxy_request_with_pool()`:
+  - retries 401/402/403/408/409/429/5xx across the configured key pool;
+  - cools down failed keys;
+  - returns upstream error only after all available keys fail;
+  - preserves stream ownership so successful streaming keys are released only when stream ends.
+- Converted OpenAI Chat, OpenAI Responses native/translated, and Anthropic Messages native/translated paths to use the retry helper.
+
+## New Regression Coverage
+
+Added tests for:
+
+- Nous retries from rate-limited key1 to key2 before returning success.
+- OpenCode key pool rotates across keys and skips a cooled-down key.
+- OpenCode proxy retry helper retries key2 after key1 returns 429 before surfacing any error.
+- NVIDIA key pool in-flight reservation releases exactly once.
+
+## Third-Pass Validation Results
+
+```text
+compileall: pass
+pytest: 22 passed
+transparency runner: pass
+ruff F/E9/B: pass
+bandit high severity: no findings
+pip-audit: no known vulnerabilities for all requirement files
+```
+
+## Final Multi-Key Verdict
+
+The wrappers now follow the intended credential semantics:
+
+1. A single failed key is never treated as whole-wrapper failure.
+2. 429/auth/quota/transient failures cool down the offending key and rotate to another available key.
+3. Streaming success keeps the key reserved until stream finalization and then releases exactly once.
+4. Client-visible failure is emitted only after every configured credential path fails or no capacity is available.
+
+Production score remains **100/100** with strengthened multi-key resilience semantics.

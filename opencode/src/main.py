@@ -333,6 +333,66 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
         return 502, {"error": {"message": str(e), "type": "api_error"}}
 
 
+
+
+def _retry_after_seconds(data, default=65) -> int:
+    if isinstance(data, dict):
+        err = data.get("error") if isinstance(data.get("error"), dict) else data
+        for k in ("retry_after", "retry_after_seconds", "retry-after"):
+            v = err.get(k) if isinstance(err, dict) else None
+            if v is not None:
+                try:
+                    return max(1, int(float(v)))
+                except (TypeError, ValueError):
+                    pass
+    return default
+
+
+def _is_retriable_upstream_status(status: int, data=None) -> bool:
+    if status in (401, 402, 403, 408, 409, 429):
+        return True
+    if status >= 500:
+        return True
+    return False
+
+
+async def proxy_request_with_pool(method: str, url: str, json_body: dict, request: Request, is_stream: bool = False):
+    """Call upstream with all available keys before surfacing an error.
+
+    A single rate-limited/bad key is cooled down and the request is retried with
+    the next key. Only after every available key fails do we return an error to
+    the client/agent.
+    """
+    attempts = max(1, pool.total_keys)
+    last_status = 503
+    last_data = {"error": {"message": "No capacity", "type": "server_error"}}
+    tried = 0
+    for _ in range(attempts):
+        key_result = await pool.acquire()
+        if not key_result:
+            break
+        key = key_result["key"]
+        headers = _auth_headers(key.api_key, request)
+        if url.endswith('/messages') and not headers.get('anthropic-version'):
+            headers['anthropic-version'] = '2023-06-01'
+        status, data = await proxy_request(method, url, json_body, headers, is_stream=is_stream)
+        if status == 200:
+            if is_stream:
+                return status, data, key
+            pool.release(key)
+            return status, data, None
+        tried += 1
+        last_status, last_data = status, data
+        if _is_retriable_upstream_status(status, data):
+            pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
+            pool.release(key)
+            continue
+        pool.release(key)
+        return status, data, None
+    if tried >= max(1, pool.total_keys) and isinstance(last_data, dict) and last_data.get("error"):
+        last_data = {"error": {**last_data["error"], "message": f"All configured OpenCode keys failed or are rate-limited. Last error: {last_data['error'].get('message', '')}"[:2000]}}
+    return last_status, last_data, None
+
 def _ensure_chat_message(data: dict) -> dict:
     """Normalize chat completion message for strict OpenAI clients."""
     if not isinstance(data, dict):
@@ -890,12 +950,6 @@ async def chat_completions(request: Request):
             return _jr(400, {"error": {"type": "invalid_request_error", "message": "tool role requires tool_call_id"}})
     is_stream = bool(body.get("stream", False))
 
-    key_result = await pool.acquire()
-    if not key_result:
-        return _jr(503, {"error": {"message": "No capacity", "type": "server_error"}})
-    key = key_result["key"]
-    headers = _auth_headers(key.api_key, request)
-
     # Prefer chat/completions; if model is responses/messages-native, still accept chat shape via conversion path upstream may reject — try chat first for openai-compatible clients
     family = _zen_family(body.get("model") or "")
     if family == "chat" or family == "google":
@@ -906,17 +960,15 @@ async def chat_completions(request: Request):
 
     try:
         if is_stream:
-            status, resp = await proxy_request("POST", url, body, headers, is_stream=True)
+            status, resp, key = await proxy_request_with_pool("POST", url, body, request, is_stream=True)
             if status != 200:
-                pool.release(key)
                 return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
             return StreamingResponse(
                 stream_passthrough(resp, key),
                 media_type="text/event-stream",
                 headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
             )
-        status, data = await proxy_request("POST", url, body, headers)
-        pool.release(key)
+        status, data, _ = await proxy_request_with_pool("POST", url, body, request)
         if status != 200:
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
         await metrics.record_request(model=body.get("model"), path="/v1/chat/completions",
@@ -924,7 +976,6 @@ async def chat_completions(request: Request):
                                      completion_tokens=(data.get("usage") or {}).get("completion_tokens", 0))
         return JSONResponse(_ensure_chat_message(data))
     except Exception as e:
-        pool.release(key)
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})
 
 @app.post("/v1/responses")
@@ -948,20 +999,13 @@ async def responses(request: Request):
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 
-    key_result = await pool.acquire()
-    if not key_result:
-        return _jr(503, {"error": {"message": "No capacity", "type": "server_error"}})
-    key = key_result["key"]
-    headers = _auth_headers(key.api_key, request)
-
     try:
         if family == "responses":
             # Native Zen Responses passthrough
             url = f"{OPENCODE_BASE}/responses"
             if is_stream:
-                status, resp = await proxy_request("POST", url, body, headers, is_stream=True)
+                status, resp, key = await proxy_request_with_pool("POST", url, body, request, is_stream=True)
                 if status != 200:
-                    pool.release(key)
                     return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
                 return StreamingResponse(
                     stream_passthrough(resp, key),
@@ -969,11 +1013,9 @@ async def responses(request: Request):
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                 )
             try:
-                status, data = await proxy_request("POST", url, body, headers)
+                status, data, _ = await proxy_request_with_pool("POST", url, body, request)
             except Exception as e:
-                pool.release(key)
                 return _jr(502, {"error": {"message": f"Zen upstream error: {e}", "type": "api_error"}})
-            pool.release(key)
             if status != 200:
                 err_data = data if isinstance(data, dict) else {"error": {"message": str(data)}}
                 return _jr(status, err_data)
@@ -988,9 +1030,8 @@ async def responses(request: Request):
         url = f"{OPENCODE_BASE}/chat/completions"
         if is_stream:
             # Stream chat chunks → strict Responses SSE envelope for Codex.
-            status, resp = await proxy_request("POST", url, chat_body, headers, is_stream=True)
+            status, resp, key = await proxy_request_with_pool("POST", url, chat_body, request, is_stream=True)
             if status != 200:
-                pool.release(key)
                 return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
             rid = f"resp_{int(time.time()*1000)}"
             async def gen():
@@ -1105,8 +1146,7 @@ async def responses(request: Request):
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
-        status, data = await proxy_request("POST", url, chat_body, headers)
-        pool.release(key)
+        status, data, _ = await proxy_request_with_pool("POST", url, chat_body, request)
         if status != 200:
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
         resp_obj = chat_to_responses(model, data)
@@ -1122,7 +1162,6 @@ async def responses(request: Request):
             _RESPONSE_STORE[body["id"]] = chat_body.get("messages", [])
         return JSONResponse(resp_obj)
     except Exception as e:
-        pool.release(key)
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})
 
 
@@ -1288,29 +1327,19 @@ async def anthropic_messages(request: Request):
     is_stream = bool(body.get("stream", False))
     family = _zen_family(model)
 
-    key_result = await pool.acquire()
-    if not key_result:
-        return _jr(503, {"type": "error", "error": {"type": "api_error", "message": "No capacity"}})
-    key = key_result["key"]
-    headers = _auth_headers(key.api_key, request)
-    # Anthropic clients often send x-api-key; Zen accepts Bearer
-    headers.setdefault("anthropic-version", request.headers.get("anthropic-version") or "2023-06-01")
-
     try:
         if family == "messages":
             url = f"{OPENCODE_BASE}/messages"
             if is_stream:
-                status, resp = await proxy_request("POST", url, body, headers, is_stream=True)
+                status, resp, key = await proxy_request_with_pool("POST", url, body, request, is_stream=True)
                 if status != 200:
-                    pool.release(key)
                     return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(resp)}})
                 return StreamingResponse(
                     stream_passthrough(resp, key, terminal_done=False),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                 )
-            status, data = await proxy_request("POST", url, body, headers)
-            pool.release(key)
+            status, data, _ = await proxy_request_with_pool("POST", url, body, request)
             if status != 200:
                 return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(data)}})
             return JSONResponse(data)
@@ -1320,9 +1349,8 @@ async def anthropic_messages(request: Request):
         openai_body["stream"] = is_stream
         url = f"{OPENCODE_BASE}/chat/completions"
         if is_stream:
-            status, resp = await proxy_request("POST", url, openai_body, headers, is_stream=True)
+            status, resp, key = await proxy_request_with_pool("POST", url, openai_body, request, is_stream=True)
             if status != 200:
-                pool.release(key)
                 return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(resp)}})
             # Convert OpenAI SSE → Anthropic SSE (text + thinking + tool_use)
             state = AnthropicStreamState(model)
@@ -1365,13 +1393,11 @@ async def anthropic_messages(request: Request):
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
-        status, data = await proxy_request("POST", url, openai_body, headers)
-        pool.release(key)
+        status, data, _ = await proxy_request_with_pool("POST", url, openai_body, request)
         if status != 200:
             return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(data)}})
         return JSONResponse(openai_to_anthropic(model, data))
     except Exception as e:
-        pool.release(key)
         return _jr(502, {"type": "error", "error": {"type": "api_error", "message": str(e)}})
 
 @app.get("/metrics")

@@ -156,3 +156,118 @@ def test_opencode_orphan_tool_output_repaired_and_console_script_exists():
     assert not any(m.get("role") == "tool" for m in out["messages"])
     assert out["messages"][-1]["role"] == "user"
     assert "Tool result" in out["messages"][-1]["content"]
+
+
+def test_nous_retries_next_key_on_rate_limit_before_returning_error():
+    wn = _load_nous()
+    wn.KEY_POOL.keys = [wn.KeyEntry("key1", "bad-token"), wn.KeyEntry("key2", "good-token")]
+    wn.KEY_POOL._rr = 0
+    calls = []
+    old_post = wn.post_nous
+    old_auth = wn._read_token_from_auth_path
+
+    async def fake_post(payload, token, stream=False, extra_headers=None):
+        calls.append(token)
+        if token == "bad-token":
+            return 429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}
+        return 200, {"choices": [{"message": {"content": "ok"}}]}
+
+    wn.post_nous = fake_post
+    wn._read_token_from_auth_path = lambda: None
+    try:
+        status, result, key_entry = asyncio.run(wn.post_nous_with_retries({"model": "m"}, stream=False))
+    finally:
+        wn.post_nous = old_post
+        wn._read_token_from_auth_path = old_auth
+
+    assert status == 200
+    assert calls == ["bad-token", "good-token"]
+    assert key_entry is None
+    assert wn.KEY_POOL.keys[0].is_blocked()
+    assert wn.KEY_POOL.keys[1].in_flight == 0
+
+
+def test_opencode_key_pool_rotates_and_skips_cooled_down_key():
+    oc = _load_opencode()
+    kp = oc.KeyPool()
+    old_env = {k: os.environ.get(k) for k in ("OPENCODE_API_KEY_1", "OPENCODE_API_KEY_2")}
+    os.environ["OPENCODE_API_KEY_1"] = "sk-test-key-111111"
+    os.environ["OPENCODE_API_KEY_2"] = "sk-test-key-222222"
+    try:
+        kp.load_from_env()
+        first = asyncio.run(kp.acquire())["key"]
+        second = asyncio.run(kp.acquire())["key"]
+        assert first.label != second.label
+        kp.release(first)
+        kp.release(second)
+        kp.mark_failure(first, 429, retry_after=60)
+        third = asyncio.run(kp.acquire())["key"]
+        assert third.label == second.label
+        kp.release(third)
+    finally:
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def test_nvidia_key_pool_inflight_reservation_releases_once():
+    for k in list(sys.modules):
+        if k == "src" or k.startswith("src."):
+            del sys.modules[k]
+    sys.path = [p for p in sys.path if "opencode" not in p]
+    sys.path.insert(0, str(ROOT / "nvidia-python"))
+    from src.key_pool import KeyPool  # type: ignore
+
+    old = os.environ.get("NVIDIA_API_KEY_1")
+    os.environ["NVIDIA_API_KEY_1"] = "nvapi-test-key-111111"
+    try:
+        kp = KeyPool().load_from_env()
+        entry = asyncio.run(kp.acquire("nvidia/test"))["key"]
+        assert entry.in_flight == 1
+        kp.release_success(entry)
+        assert entry.in_flight == 0
+    finally:
+        if old is None:
+            os.environ.pop("NVIDIA_API_KEY_1", None)
+        else:
+            os.environ["NVIDIA_API_KEY_1"] = old
+
+
+def test_opencode_proxy_retries_next_key_before_returning_upstream_error():
+    oc = _load_opencode()
+    old_pool = oc.pool
+    old_proxy = oc.proxy_request
+    old_env = {k: os.environ.get(k) for k in ("OPENCODE_API_KEY_1", "OPENCODE_API_KEY_2")}
+    os.environ["OPENCODE_API_KEY_1"] = "sk-test-key-bad111"
+    os.environ["OPENCODE_API_KEY_2"] = "sk-test-key-good222"
+    calls = []
+
+    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False):
+        token = (headers or {}).get("Authorization", "").replace("Bearer ", "")
+        calls.append(token)
+        if token == "sk-test-key-bad111":
+            return 429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}
+        return 200, {"choices": [{"message": {"content": "ok"}}]}
+
+    class Req:
+        headers = {}
+
+    try:
+        oc.pool = oc.KeyPool().load_from_env()
+        oc.proxy_request = fake_proxy
+        status, data, key = asyncio.run(oc.proxy_request_with_pool("POST", "https://example.test/chat/completions", {"model": "m"}, Req()))
+    finally:
+        oc.pool = old_pool
+        oc.proxy_request = old_proxy
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert status == 200
+    assert key is None
+    assert calls == ["sk-test-key-bad111", "sk-test-key-good222"]
+    assert data["choices"][0]["message"]["content"] == "ok"

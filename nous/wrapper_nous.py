@@ -35,46 +35,135 @@ import aiohttp
 # ============================================================================
 # KeyPool for multi-key rotation (parity with opencode/nvidia-python)
 # ============================================================================
+class KeyEntry:
+    """State for one Nous credential."""
+
+    def __init__(self, label: str, api_key: str):
+        self.label = label
+        self.api_key = api_key
+        self.timestamps: List[float] = []
+        self.hard_blocked_until = 0.0
+        self.block_reason = ""
+        self.in_flight = 0
+        self.total_requests = 0
+        self.total_429s = 0
+        self.total_failures = 0
+        self.last_used = 0.0
+
+    def current_rpm(self, window: int = 60) -> int:
+        now = time.time()
+        self.timestamps = [t for t in self.timestamps if now - t < window]
+        return len(self.timestamps)
+
+    @property
+    def effective_load(self) -> int:
+        return self.current_rpm() + self.in_flight
+
+    def is_blocked(self) -> bool:
+        if time.time() < self.hard_blocked_until:
+            return True
+        if self.hard_blocked_until:
+            self.hard_blocked_until = 0.0
+            self.block_reason = ""
+        return False
+
+    def record(self):
+        now = time.time()
+        self.timestamps.append(now)
+        self.total_requests += 1
+        self.last_used = now
+        self.in_flight += 1
+
+    def release(self):
+        if self.in_flight > 0:
+            self.in_flight -= 1
+
+    def block(self, seconds: int, reason: str):
+        seconds = max(1, min(int(seconds or 1), int(os.environ.get("KEY_COOLDOWN_MAX_SEC", "300"))))
+        self.hard_blocked_until = max(self.hard_blocked_until, time.time() + seconds)
+        self.block_reason = reason
+        self.total_failures += 1
+        if reason == "rate_limit":
+            self.total_429s += 1
+        logger.warning(f"[key_pool] Nous key {self.label} cooled down for {seconds}s ({reason})")
+
+    def stats(self) -> dict:
+        return {
+            "label": self.label,
+            "current_rpm": self.current_rpm(),
+            "in_flight": self.in_flight,
+            "effective_load": self.effective_load,
+            "hard_blocked": self.is_blocked(),
+            "hard_blocked_remaining_s": max(0, round(self.hard_blocked_until - time.time(), 1)),
+            "block_reason": self.block_reason or None,
+            "total_requests": self.total_requests,
+            "total_429s": self.total_429s,
+            "total_failures": self.total_failures,
+        }
+
+
 class KeyPool:
-    """Manages multiple Nous API keys with rotation and rate limiting."""
+    """Manages multiple Nous API keys with rotation, cooldown and in-flight tracking."""
 
     def __init__(self):
-        self.keys: List[str] = []
+        self.keys: List[KeyEntry] = []
         self._lock = threading.Lock()
-        self._current_idx = 0
+        self._rr = 0
+        self.hard_limit = int(os.environ.get("NOUS_HARD_LIMIT_RPM", os.environ.get("HARD_LIMIT_RPM", "60")))
 
     def load_from_env(self):
-        """Load keys from NOUS_API_KEY or NOUS_API_KEY_1, NOUS_API_KEY_2, etc."""
         env_keys = []
         seen = set()
-
-        # Check for NOUS_API_KEY (singular)
         key = os.environ.get("NOUS_API_KEY", "").strip()
         if key and key not in seen:
             env_keys.append(key)
             seen.add(key)
-
-        # Check for NOUS_API_KEY_1, NOUS_API_KEY_2, etc.
         for key_name, value in sorted(os.environ.items()):
             if key_name.startswith("NOUS_API_KEY_") and key_name != "NOUS_API_KEY":
                 v = value.strip()
                 if v and v not in seen and len(v) > 10:
                     env_keys.append(v)
                     seen.add(v)
-
-        self.keys = env_keys
-        self._current_idx = 0
-        logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s)")
+        self.hard_limit = int(os.environ.get("NOUS_HARD_LIMIT_RPM", os.environ.get("HARD_LIMIT_RPM", "60")))
+        self.keys = [KeyEntry(f"key{i+1}", k) for i, k in enumerate(env_keys)]
+        self._rr = 0
+        logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s) hard={self.hard_limit}rpm")
         return self
 
-    def acquire(self) -> Optional[str]:
-        """Get next available key (simple round-robin)."""
+    def acquire(self) -> Optional[KeyEntry]:
         with self._lock:
-            if not self.keys:
+            candidates = [k for k in self.keys if not k.is_blocked() and k.current_rpm() < self.hard_limit]
+            if not candidates:
                 return None
-            key = self.keys[self._current_idx]
-            self._current_idx = (self._current_idx + 1) % len(self.keys)
-            return key
+            min_load = min(k.effective_load for k in candidates)
+            best = [k for k in candidates if k.effective_load == min_load]
+            entry = best[self._rr % len(best)]
+            self._rr += 1
+            entry.record()
+            return entry
+
+    def release(self, entry: Optional[KeyEntry]):
+        if entry is None:
+            return
+        with self._lock:
+            entry.release()
+
+    def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None):
+        if entry is None:
+            return
+        if status_code == 429:
+            entry.block(retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "rate_limit")
+        elif status_code in (401, 402, 403):
+            entry.block(retry_after or int(os.environ.get("AUTH_KEY_COOLDOWN_SEC", "300")), "auth_or_quota")
+        elif status_code >= 500 or status_code in (408, 409):
+            entry.block(retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "transient")
+
+    def peek(self) -> Optional[KeyEntry]:
+        with self._lock:
+            for k in self.keys:
+                if not k.is_blocked():
+                    return k
+            return self.keys[0] if self.keys else None
 
     @property
     def total_keys(self) -> int:
@@ -82,8 +171,13 @@ class KeyPool:
 
     @property
     def available_keys(self) -> int:
-        return len(self.keys)
+        return sum(1 for k in self.keys if not k.is_blocked() and k.current_rpm() < self.hard_limit)
 
+    def all_stats(self) -> list:
+        return [k.stats() for k in self.keys]
+
+
+# ============================================================================
 
 # ============================================================================
 
@@ -400,6 +494,73 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
                 data = {"error": {"message": text[:2000], "type": "api_error"}}
             return resp.status, data
 
+
+def _retry_after_seconds(data, default=65) -> int:
+    if isinstance(data, dict):
+        err = data.get("error") if isinstance(data.get("error"), dict) else data
+        for k in ("retry_after", "retry_after_seconds", "retry-after"):
+            v = err.get(k) if isinstance(err, dict) else None
+            if v is not None:
+                try:
+                    return max(1, int(float(v)))
+                except (TypeError, ValueError):
+                    pass
+    return default
+
+
+def _is_retriable_upstream_status(status: int) -> bool:
+    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+
+
+async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None) -> tuple:
+    """Post to Nous using every available credential before surfacing failure.
+
+    OAuth AUTH_PATH remains supported. If that single token fails with a
+    retriable/key-level error and static NOUS_API_KEY_* values are available, the
+    wrapper transparently retries with the static key pool.
+
+    Returns (status, result, key_entry). key_entry is non-None only for a
+    successful streaming response and must be released when the stream ends.
+    """
+    last_status = 503
+    last_result = {"error": {"message": "No capacity", "type": "server_error"}}
+    tried = 0
+
+    oauth_token = _read_token_from_auth_path()
+    if oauth_token:
+        status, result = await post_nous(payload, oauth_token, stream=stream, extra_headers=extra_headers)
+        if status == 200:
+            return status, result, None
+        tried += 1
+        last_status, last_result = status, result
+        if not _is_retriable_upstream_status(status):
+            return status, result, None
+
+    attempts = max(1, KEY_POOL.total_keys)
+    for _ in range(attempts):
+        entry = KEY_POOL.acquire()
+        if not entry:
+            break
+        status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers)
+        if status == 200:
+            if stream:
+                return status, result, entry
+            KEY_POOL.release(entry)
+            return status, result, None
+        tried += 1
+        last_status, last_result = status, result
+        if _is_retriable_upstream_status(status):
+            KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result))
+            KEY_POOL.release(entry)
+            continue
+        KEY_POOL.release(entry)
+        return status, result, None
+
+    if tried >= max(1, KEY_POOL.total_keys + (1 if oauth_token else 0)) and isinstance(last_result, dict) and isinstance(last_result.get("error"), dict):
+        msg = last_result["error"].get("message", "")
+        last_result = {"error": {**last_result["error"], "message": f"All configured Nous credentials failed or are rate-limited. Last error: {msg}"[:2000]}}
+    return last_status, last_result, None
+
 # --------------------------------------------------------------------------
 # TRANSLATORS (reused + hardened)
 # --------------------------------------------------------------------------
@@ -697,7 +858,8 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
 # --------------------------------------------------------------------------
 async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                                 serialize_fn,
-                                state=None) -> AsyncGenerator[str, None]:
+                                state=None,
+                                key_entry: KeyEntry = None) -> AsyncGenerator[str, None]:
     """Proxy-side heartbeat + robust SSE finalization.
 
     Handles normal [DONE], upstream EOF without [DONE], and a final partial SSE
@@ -782,6 +944,7 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 upstream_resp.release()
             except Exception:
                 pass
+            KEY_POOL.release(key_entry)
 
 # Advanced streaming state machines
 class AnthropicStreamState:
@@ -1224,9 +1387,9 @@ async def get_token():
     if token:
         return token
     # Priority 2: Use KeyPool (NOUS_API_KEY, NOUS_API_KEY_1, etc.)
-    key = KEY_POOL.acquire()
-    if key:
-        return key
+    entry = KEY_POOL.peek()
+    if entry:
+        return entry.api_key
     logger.warning("[auth] No API key configured! Set NOUS_API_KEY* or AUTH_PATH.")
     return ""
 
@@ -1391,11 +1554,10 @@ async def chat_completions(request: Request):
         else:
             body.pop("tools", None)
 
-    tok = await get_token()
     is_stream = body.get("stream", False)
     extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta"] if request.headers.get(h)}
 
-    status, result = await post_nous(body, tok, stream=is_stream, extra_headers=extra_h)
+    status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
     metrics.record(error=(status != 200))
 
     if status != 200:
@@ -1403,7 +1565,7 @@ async def chat_completions(request: Request):
 
     if is_stream:
         async def gen():
-            async for line in stream_with_heartbeat(result, lambda x: f"data: {json.dumps(x)}\n\n"):
+            async for line in stream_with_heartbeat(result, lambda x: f"data: {json.dumps(x)}\n\n", key_entry=key_entry):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     if isinstance(result, dict):
@@ -1429,10 +1591,9 @@ async def responses(request: Request):
     chat_body = responses_to_chat(body)
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
-    tok = await get_token()
     is_stream = body.get("stream", False)
 
-    status, result = await post_nous(chat_body, tok, stream=is_stream)
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
     if status != 200:
         return JSONResponse(status_code=status, content=result)
 
@@ -1443,7 +1604,7 @@ async def responses(request: Request):
             # Codex requires output_item.added BEFORE first delta.
             for ev in state.start():
                 yield ev
-            async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state):
+            async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
                 yield line
             # Store full conversation for the next previous_response_id turn.
             await store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
@@ -1487,10 +1648,9 @@ async def messages(request: Request):
     # FREE_ONLY still enforces the *outgoing* model is free when enabled.
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
-    tok = await get_token()
     is_stream = body.get("stream", False)
 
-    status, result = await post_nous(chat_body, tok, stream=is_stream)
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}
@@ -1501,7 +1661,7 @@ async def messages(request: Request):
     if is_stream:
         state = AnthropicStreamState(chat_body["model"])
         async def gen():
-            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state):
+            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state, key_entry=key_entry):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 

@@ -1670,7 +1670,6 @@ class Server:
 
                 key = key_result['key']
                 self._in_flight += 1
-                key.increment_in_flight()
 
                 try:
                     fwd_headers = {
@@ -1846,7 +1845,6 @@ class Server:
 
             key = key_result['key']
             self._in_flight += 1
-            key.increment_in_flight()
             start_ms = time.time() * 1000
 
             try:
@@ -1876,6 +1874,19 @@ class Server:
                     attempt += 1
                     continue
 
+                if is_streaming and resp.status < 400:
+                    if self.metrics:
+                        await self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
+                            path=path,
+                        )
+                    return StreamingResponse(
+                        self._stream_proxy(resp, key),
+                        media_type='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+                    )
+
                 resp_data = await resp.read()
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
@@ -1897,12 +1908,6 @@ class Server:
                         path=path,
                     )
 
-                if is_streaming:
-                    return StreamingResponse(
-                        self._stream_proxy(resp, key),
-                        media_type='text/event-stream',
-                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
-                    )
                 return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
 
             except asyncio.TimeoutError:
@@ -1978,7 +1983,6 @@ class Server:
 
             key = key_result['key']
             self._in_flight += 1
-            key.increment_in_flight()
             start_ms = time.time() * 1000
 
             try:
@@ -2010,6 +2014,20 @@ class Server:
                     attempt += 1
                     continue
 
+                content_type = resp.headers.get('content-type', '')
+                if ('text/event-stream' in content_type or is_streaming) and resp.status < 400:
+                    if self.metrics:
+                        await self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
+                            path=path,
+                        )
+                    return StreamingResponse(
+                        self._stream_proxy(resp, key),
+                        media_type='text/event-stream',
+                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+                    )
+
                 resp_data = await resp.read()
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
@@ -2030,14 +2048,6 @@ class Server:
                         status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                         path=path,
                     )
-
-                content_type = resp.headers.get('content-type', '')
-                if 'text/event-stream' in content_type or is_streaming:
-                    async def stream_catchall(resp_data=resp_data, resp=resp):
-                        yield resp_data
-                        async for chunk, _ in resp.content.iter_chunks():
-                            yield chunk
-                    return StreamingResponse(stream_catchall(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive'})
 
                 try:
                     return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
