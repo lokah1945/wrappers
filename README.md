@@ -12,6 +12,24 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **nous**           | ✅ Production   | **100/100** | 9106   | Nous Research inference API |
 | **opencode**       | ✅ Production   | **100/100** | 9107   | OpenCode Zen gateway |
 
+## Recent Audit Findings (2026-07-24)
+
+### Security & Bug Fixes
+
+**Critical Issues Fixed:**
+- Missing imports in `nous/wrapper_nous.py` (aiohttp, run_in_threadpool)
+- Session resource leak - aiohttp sessions now properly closed on shutdown
+- Race condition in rate limiting (added threading.Lock)
+- Inconsistent auth error format in nvidia-python (now consistent across all paths)
+- Removed hardcoded DEFAULT_MODEL injection (transparent model selection)
+
+**Security Considerations:**
+- HTTP Header Injection (CVE-2026-33805): Validate Connection header handling
+- Header Smuggling (CVE-2025-64484): Normalize X-Forwarded-* headers
+- Request Smuggling: Validate Content-Length vs Transfer-Encoding conflicts
+
+See individual READMEs for detailed audit findings.
+
 ## Repository Layout
 
 ```
@@ -33,6 +51,7 @@ wrapper/
 ├── nous/                        # Nous Research proxy (Python)
 │   ├── wrapper_nous.py         # Main FastAPI application
 │   ├── .env.example            # Nous-specific config
+│   ├── model_catalog_template.json  # Codex model metadata template
 │   └── README.md
 │
 └── opencode/                    # OpenCode Zen proxy

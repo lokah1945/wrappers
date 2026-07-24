@@ -30,7 +30,21 @@ This wrapper **always** exposes standard SDK paths so Claude Code / Codex / Herm
 - `GET /v1/models`
 - `GET /health`, `/metrics`, `/metrics/prom`
 
+## Recent Audit Findings (2026-07-24)
+
+### Fixes Applied
+
+1. **Removed DEFAULT_MODEL**: Removed hardcoded `DEFAULT_MODEL = 'gpt-5.4-mini'` fallback. Model selection is now fully transparent - the client always chooses the model with no hidden defaults injected.
+
+### Security Considerations
+
+- HTTP Header Injection (CVE-2026-33805): Validate Connection header handling
+- Header Smuggling (CVE-2025-64484): Normalize X-Forwarded-* headers properly
+- Request Smuggling: Validate Content-Length vs Transfer-Encoding conflicts
+
 ## Quick Start
+
+### 1. Install
 
 ```bash
 cd /root/wrapper/opencode

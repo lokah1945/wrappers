@@ -35,6 +35,22 @@ See the [root README](../README.md) for the full overview.
 - ✅ Dynamic aliases (sonnet/haiku/opus)
 - ✅ Graceful shutdown + health with upstream check
 
+## Recent Audit Findings (2026-07-24)
+
+### Fixes Applied
+
+1. **Missing Imports**: Added `import aiohttp` and `from starlette.concurrency import run_in_threadpool`
+2. **Session Resource Leak**: Fixed aiohttp session not being closed on shutdown in lifespan
+3. **Race Condition in Rate Limiting**: Added `threading.Lock` for thread-safe rate limit tracking
+4. **OAuth Token Support**: Added `_read_token_from_auth_path()` for Hermes OAuth token reading
+5. **Session Event Loop Handling**: Fixed `get_session()` to properly recreate sessions when bound to dead event loops
+
+### Security Considerations
+
+- HTTP Header Injection (CVE-2026-33805): Validate Connection header handling
+- Header Smuggling (CVE-2025-64484): Normalize X-Forwarded-* headers properly
+- Request Smuggling: Validate Content-Length vs Transfer-Encoding conflicts
+
 ## Quick Start
 
 ```bash
@@ -61,8 +77,8 @@ AUTH_PATH=/root/.hermes/profiles/ilma/auth.json
 LISTEN_HOST=127.0.0.1
 LISTEN_PORT=9106
 
-DEFAULT_MODEL=tencent/hy3:free
-REASONING_MODEL=tencent/hy3:free
+# DEFAULT_MODEL and REASONING_MODEL removed - transparent model selection
+# Client always chooses the model; no hidden defaults
 
 BEARER_TOKEN=wrapper-local-key
 HEARTBEAT_INTERVAL_MS=5000

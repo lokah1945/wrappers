@@ -27,6 +27,20 @@ This is the **single source of truth** for wrapper-nvidia going forward.
 - Rich metrics (`/metrics`, Prometheus, ttft, pacing, model-status)
 - Bearer auth + health checks
 
+## Recent Audit Findings (2026-07-24)
+
+### Fixes Applied
+
+1. **Auth Error Format Consistency**: Fixed inconsistent error format in auth middleware - all paths now return `{'error': {'message': ..., 'type': ...}}` format for OpenAI SDK compatibility
+
+2. **Redundant Public Path Check**: Removed duplicate `/metrics/prom` check (was listed twice in public_paths and is_public conditions)
+
+### Security Considerations
+
+- HTTP Header Injection (CVE-2026-33805): Validate Connection header handling
+- Header Smuggling (CVE-2025-64484): Normalize X-Forwarded-* headers properly
+- Request Smuggling: Validate Content-Length vs Transfer-Encoding conflicts
+
 ## Quick Start
 
 ### 1. Install
