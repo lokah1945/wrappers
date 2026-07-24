@@ -35,6 +35,8 @@ def profile() -> ModelProfile:
 
 def test_concrete_identity_is_exact_and_catalog_independent():
     resolver = AliasResolver()
+    bracketed = resolver.resolve("provider/model[128k]", "nvidia")
+    assert bracketed.provider_model_id == "provider/model[128k]"
     ref = resolver.resolve("provider/model-a", "nvidia")
     assert ref.canonical_id == "nvidia/provider/model-a"
     assert ref.provider_model_id == "provider/model-a"

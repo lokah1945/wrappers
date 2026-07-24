@@ -2,25 +2,22 @@
 
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass
 from urllib.parse import unquote
 
 from .contracts import AliasBinding, ModelRef
-
-_CONTEXT_SUFFIX = re.compile(r"\[[0-9]+[mk]?\]$", re.IGNORECASE)
 
 
 def normalize_model_syntax(requested: str) -> str:
     """Normalize transport syntax only; never substitute a model.
 
     Provider-specific model IDs remain intact. The only transformations here
-    are whitespace, URL decoding, and a documented context annotation suffix.
+    are whitespace trimming and URL decoding; provider-specific annotations
+    must be handled by the provider adapter, not by this generic function.
     """
     if requested is None:
         return ""
-    value = unquote(str(requested)).strip()
-    return _CONTEXT_SUFFIX.sub("", value).strip()
+    return unquote(str(requested)).strip()
 
 
 def same_provider_model_id(provider: str, left: str, right: str) -> bool:
