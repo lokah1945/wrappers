@@ -140,6 +140,27 @@ def error_summary(body: dict | None) -> str:
     return f"error_type={error_type},error_code={code}"
 
 
+def _run_load(audit, repo, base_url, model, api_key, requests, concurrency) -> None:
+    """Bounded load test against one wrapper; records p50/p95/p99/TTFT to report."""
+    env = {**os.environ, "API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"}
+    cmd = [
+        sys.executable, "tests/perf/load_agent_sim.py",
+        "--base-url", base_url,
+        "--model", model,
+        "--requests", str(requests),
+        "--concurrency", str(concurrency),
+    ]
+    try:
+        proc = subprocess.run(cmd, cwd=repo, env=env, text=True,
+                              stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                              timeout=3600)
+        out = proc.stdout or ""
+        # Keep the metrics section (p50/p95/p99/TTFT/success) visible in report.
+        audit.log("PASS" if proc.returncode == 0 else "FAIL", "bounded load", out[-6000:])
+    except subprocess.TimeoutExpired:
+        audit.log("FAIL", "bounded load", "timed out")
+
+
 def main() -> int:
     args = parse_args()
     repo = (args.repo_dir or Path(__file__).resolve().parents[1]).resolve()
@@ -334,74 +355,49 @@ def main() -> int:
                                 continue
                             break
                         returned_model = body.get("model") if isinstance(body, dict) else None
-                        detail = f"wrapper_url={url}, model={model}, surface={surface}, api_key_env={args.api_key_env}, HTTP {last_status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                        if error:
-                            detail += f", transport_error={error}"
-                        # M-02: opencode.ai free tier "No capacity"/degraded is an
-                        # external outage, not a wrapper defect — treat as BLOCKED
-                        # (external dependency) not FAIL.
-                        external_down = (
-                            last_status in (503, 502)
-                            and isinstance(body, dict)
-                            and "no capacity" in str(body.get("error", {}).get("message", "")).lower()
-                        )
-                        ok = 200 <= last_status < 300 and returned_model in (None, model)
-                        if external_down:
-                            audit.log("BLOCKED", f"exact-model smoke [{surface}]", detail + ", external_outage=opencode.ai")
-                            continue
-                        audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
-        elif not args.wrapper_url or not args.model:
-            audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
-        elif not args.api_key_env or not os.environ.get(args.api_key_env):
-            audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")
-        else:
-            api_key = os.environ[args.api_key_env]
-            surfaces = args.surface or ["chat"]
-            for surface in surfaces:
-                if surface == "chat":
-                    path, payload = "/chat/completions", {"model": args.model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
-                elif surface == "responses":
-                    path, payload = "/responses", {"model": args.model, "input": "Reply exactly OK.", "max_output_tokens": 8}
-                elif surface == "messages":
-                    path, payload = "/messages", {"model": args.model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
-                else:
-                    audit.log("BLOCKED", "explicit model test", f"unknown surface: {surface}")
-                    continue
-                if args.run_smoke:
-                    status, ms, body, error = audit.http(
-                        f"{args.wrapper_url.rstrip('/')}{path}",
-                        method="POST",
-                        payload=payload,
-                        api_key=api_key,
-                        timeout=180,
-                    )
-                    returned_model = body.get("model") if isinstance(body, dict) else None
-                    identity_ok = returned_model in (None, args.model)
-                    ok = 200 <= status < 300 and identity_ok
-                    detail = (
-                        f"wrapper_url={args.wrapper_url}, model={args.model}, surface={surface}, "
-                        f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
-                        f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                    )
-                    if error:
-                        detail += f", transport_error={error}"
-                    audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
-            if args.run_load:
-                env = {**os.environ, "API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"}
-                cmd = [
-                    sys.executable, "tests/perf/load_agent_sim.py",
-                    "--base-url", args.wrapper_url,
-                    "--model", args.model,
-                    "--requests", str(args.requests),
-                    "--concurrency", str(args.concurrency),
-                ]
-                try:
-                    proc = subprocess.run(cmd, cwd=repo, env=env, text=True,
-                                          stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                          timeout=3600)
-                    audit.log("PASS" if proc.returncode == 0 else "FAIL", "bounded load", proc.stdout[-6000:])
-                except subprocess.TimeoutExpired:
-                    audit.log("FAIL", "bounded load", "timed out")
+                        if args.run_load:
+                            _run_load(audit, repo, args.wrapper_url or "http://127.0.0.1:9101/v1",
+                                      args.model or "nvidia/llama-3.3-nemotron-super-49b-v1", api_key,
+                                      args.requests, args.concurrency)
+                    elif not args.wrapper_url or not args.model:
+                        audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
+                    elif not args.api_key_env or not os.environ.get(args.api_key_env):
+                        audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")
+                    else:
+                        api_key = os.environ[args.api_key_env]
+                        surfaces = args.surface or ["chat"]
+                        for surface in surfaces:
+                            if surface == "chat":
+                                path, payload = "/chat/completions", {"model": args.model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
+                            elif surface == "responses":
+                                path, payload = "/responses", {"model": args.model, "input": "Reply exactly OK.", "max_output_tokens": 8}
+                            elif surface == "messages":
+                                path, payload = "/messages", {"model": args.model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
+                            else:
+                                audit.log("BLOCKED", "explicit model test", f"unknown surface: {surface}")
+                                continue
+                            if args.run_smoke:
+                                status, ms, body, error = audit.http(
+                                    f"{args.wrapper_url.rstrip('/')}{path}",
+                                    method="POST",
+                                    payload=payload,
+                                    api_key=api_key,
+                                    timeout=180,
+                                )
+                                returned_model = body.get("model") if isinstance(body, dict) else None
+                                identity_ok = returned_model in (None, args.model)
+                                ok = 200 <= status < 300 and identity_ok
+                                detail = (
+                                    f"wrapper_url={args.wrapper_url}, model={args.model}, surface={surface}, "
+                                    f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
+                                    f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                                )
+                                if error:
+                                    detail += f", transport_error={error}"
+                                audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
+                        if args.run_load:
+                            _run_load(audit, repo, args.wrapper_url, args.model, api_key,
+                                      args.requests, args.concurrency)
 
     audit.lines.extend([
         "",
@@ -414,6 +410,7 @@ def main() -> int:
         "- BLOCKED means the VPS did not provide the required service/configuration or an explicit test flag was not supplied.",
         "- FAIL means an available component violated an acceptance criterion.",
         "- A production-ready decision requires zero FAIL and no unreviewed BLOCKED result.",
+        "- The bounded load section reports ok/error count, latency p50/p95/p99, and TTFT p50/p95/p99.",
         "- The report intentionally does not include secrets or response bodies.",
     ])
 
