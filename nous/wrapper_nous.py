@@ -561,6 +561,57 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
         last_result = {"error": {**last_result["error"], "message": f"All configured Nous credentials failed or are rate-limited. Last error: {msg}"[:2000]}}
     return last_status, last_result, None
 
+
+
+async def get_nous_json_with_retries(path: str) -> tuple:
+    """GET Nous endpoint using OAuth/static key pool with all-key retry."""
+    url = f"{NOUS_BASE}{path}"
+    sess = await get_session()
+    last_status = 503
+    last_data = {"error": {"message": "No capacity", "type": "server_error"}}
+    oauth_token = _read_token_from_auth_path()
+    if oauth_token:
+        try:
+            async with sess.get(url, headers={"Authorization": f"Bearer {oauth_token}"}) as r:
+                text = await r.text()
+                try:
+                    data = json.loads(text) if text else {}
+                except Exception:
+                    data = {"error": {"message": text[:2000], "type": "api_error"}}
+                if r.status == 200:
+                    return r.status, data
+                last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
+                if not _is_retriable_upstream_status(r.status):
+                    return last_status, last_data
+        except Exception as e:
+            last_status, last_data = 502, {"error": {"message": str(e), "type": "api_error"}}
+    for _ in range(max(1, KEY_POOL.total_keys)):
+        entry = KEY_POOL.acquire()
+        if not entry:
+            break
+        try:
+            async with sess.get(url, headers={"Authorization": f"Bearer {entry.api_key}"}) as r:
+                text = await r.text()
+                try:
+                    data = json.loads(text) if text else {}
+                except Exception:
+                    data = {"error": {"message": text[:2000], "type": "api_error"}}
+                if r.status == 200:
+                    KEY_POOL.release(entry)
+                    return r.status, data
+                last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
+                if _is_retriable_upstream_status(r.status):
+                    KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
+                    KEY_POOL.release(entry)
+                    continue
+                KEY_POOL.release(entry)
+                return last_status, last_data
+        except Exception as e:
+            KEY_POOL.mark_failure(entry, 503, 15)
+            KEY_POOL.release(entry)
+            last_status, last_data = 502, {"error": {"message": str(e), "type": "api_error"}}
+    return last_status, last_data
+
 # --------------------------------------------------------------------------
 # TRANSLATORS (reused + hardened)
 # --------------------------------------------------------------------------
@@ -1344,12 +1395,11 @@ async def _auth_check(request: Request):
 @app.get("/health")
 async def health():
     try:
-        tok = await get_token()
-        if tok and CURATED_FREE_MODELS:
-            code, _ = await post_nous({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1}, tok)
+        if CURATED_FREE_MODELS:
+            code, _, _ = await post_nous_with_retries({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
             upstream = code == 200
         else:
-            upstream = True  # No token configured - skip upstream check
+            upstream = True
     except:
         upstream = False
     return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "metrics": metrics.snapshot()}
@@ -1401,15 +1451,12 @@ async def get_session():
 
 @app.get("/v1/models")
 async def models():
-    tok = await get_token()
-    sess = await get_session()
     upstream_models = []
     try:
-        async with sess.get(f"{NOUS_BASE}/v1/models", headers={"Authorization": f"Bearer {tok}"}) as r:
-            if r.status == 200:
-                data = await r.json()
-                upstream_models = data.get("data", []) if isinstance(data, dict) else []
-    except:
+        status, data = await get_nous_json_with_retries("/v1/models")
+        if status == 200 and isinstance(data, dict):
+            upstream_models = data.get("data", [])
+    except Exception:
         pass  # Will use curated fallback
 
     models_list = list(upstream_models)
@@ -1471,14 +1518,11 @@ async def models():
 @app.get("/v1/capabilities")
 async def capabilities():
     models_list = []
-    tok = await get_token()
-    sess = await get_session()
     try:
-        async with sess.get(f"{NOUS_BASE}/v1/models", headers={"Authorization": f"Bearer {tok}"}) as r:
-            if r.status == 200:
-                data = await r.json()
-                models_list = data.get("data", []) if isinstance(data, dict) else []
-    except:
+        status, data = await get_nous_json_with_retries("/v1/models")
+        if status == 200 and isinstance(data, dict):
+            models_list = data.get("data", [])
+    except Exception:
         models_list = CURATED_FREE_MODELS
     if not models_list:
         models_list = CURATED_FREE_MODELS

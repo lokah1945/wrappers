@@ -818,12 +818,8 @@ async def health():
 
 @app.get("/v1/models")
 async def models(request: Request):
-    """Proxy Zen GET /models (https://opencode.ai/zen/v1/models)."""
-    import logging as _lg
-    _lg.getLogger('wrapper-opencode').warning(f"DBG models: OPENCODE_BASE={OPENCODE_BASE!r} free_only={free_only_enabled()}")
+    """Proxy Zen GET /models with the same multi-key retry semantics as runtime calls."""
     _auth_check(request)
-    key_result = await pool.acquire()
-    # Even without keys, return curated aliases so Claude Code discovery works
     tgt = get_dynamic_alias_target()
     fallback_all = [
         {"id": "gpt-5.4-mini", "object": "model", "owned_by": "opencode-zen"},
@@ -840,7 +836,6 @@ async def models(request: Request):
     global _known_models
     for m in fallback_all:
         _known_models.add(m["id"])
-    # Add aliases (sonnet/haiku/opus) with dynamic_alias flag
     for alias in ("sonnet", "opus", "haiku"):
         if free_only_enabled() and not model_allowed(alias):
             continue
@@ -848,23 +843,15 @@ async def models(request: Request):
     if free_only_enabled():
         fallback_all = [m for m in fallback_all if model_allowed(m.get("id", ""))]
     fallback = {"object": "list", "data": fallback_all, "free_only": free_only_enabled(), "dynamic_alias_target": tgt or None}
-    if not key_result:
-        return fallback
-    key = key_result['key']
+
     try:
-        # Zen models endpoint is under base (base already includes /zen/v1)
-        status, data = await proxy_request("GET", f"{OPENCODE_BASE}/models", None, _auth_headers(key.api_key, request))
-        pool.release(key)
+        status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
         if status != 200 or not isinstance(data, dict):
             return fallback
-        # inject aliases (respect FREE_ONLY)
         ids = {m.get('id') for m in (data.get('data') or [])}
-        tgt = get_dynamic_alias_target()
-        # Add aliases after FREE_ONLY check to ensure correct filtering
         aliases_to_add = []
         for a in ("sonnet", "opus", "haiku"):
             if a not in ids:
-                # Check FREE_ONLY compatibility before adding
                 if free_only_enabled() and not model_allowed(a):
                     continue
                 entry = {"id": a, "object": "model", "owned_by": "alias", "dynamic_alias": True}
@@ -873,34 +860,31 @@ async def models(request: Request):
                 aliases_to_add.append(entry)
         (data.setdefault('data', [])).extend(aliases_to_add)
         for m in (data.get('data') or []):
-            _known_models.add(m.get('id', ''))
+            if isinstance(m, dict) and m.get('id'):
+                _known_models.add(m.get('id', ''))
         if free_only_enabled():
             data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
         data['free_only'] = free_only_enabled()
         data['dynamic_alias_target'] = tgt or None
         return data
     except Exception as e:
-        pool.release(key)
         logger.warning(f"models: {e}")
         return fallback
 
 @app.get("/v1/capabilities")
 async def capabilities(request: Request):
     _auth_check(request)
-    key_result = await pool.acquire()
     models_list = []
-    if key_result:
-        key = key_result["key"]
-        try:
-            status, data = await proxy_request("GET", f"{OPENCODE_BASE}/models", None, _auth_headers(key.api_key, request))
-            pool.release(key)
-            if status == 200 and isinstance(data, dict):
-                models_list = data.get("data") or []
-                global _known_models
-                for m in models_list:
+    try:
+        status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
+        if status == 200 and isinstance(data, dict):
+            models_list = data.get("data") or []
+            global _known_models
+            for m in models_list:
+                if isinstance(m, dict) and m.get("id"):
                     _known_models.add(m.get("id", ""))
-        except Exception:
-            pool.release(key)
+    except Exception:
+        models_list = []
     tgt = get_dynamic_alias_target()
     return {
         "object": "list",

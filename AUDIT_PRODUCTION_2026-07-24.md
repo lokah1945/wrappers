@@ -397,3 +397,58 @@ The wrappers now follow the intended credential semantics:
 4. Client-visible failure is emitted only after every configured credential path fails or no capacity is available.
 
 Production score remains **100/100** with strengthened multi-key resilience semantics.
+
+---
+
+# Fourth-Pass Monorepo Consistency / Wrapper Contract Audit
+
+The project goal is one mono-repo with multiple provider descendants. Provider adapters may differ, but the base handling model must be identical. This pass formalized and enforced that concept.
+
+## Contract Breakdown
+
+A new root document was added:
+
+```text
+WRAPPER_CONTRACT.md
+```
+
+It defines the shared wrapper invariants:
+
+- same client-facing surfaces (`/v1/chat/completions`, `/v1/responses`, `/v1/messages`, `/v1/models`, count tokens, health/metrics)
+- one-key failure is not whole-wrapper failure
+- all-key retry for key-level/retriable failures before client error
+- per-key cooldown and exact in-flight accounting
+- strict OpenAI/Responses/Anthropic stream terminal lifecycle
+- no raw provider tool markup leakage
+- `previous_response_id` continuity for tool loops
+- transparent model choice and dynamic aliases
+- SDK-shaped errors
+
+## Consistency Fixes Applied
+
+### Discovery/capability paths now follow retry semantics too
+
+- OpenCode `/v1/models` and `/v1/capabilities` now use the same multi-key retry helper as runtime requests.
+- Nous model/capability discovery now uses `get_nous_json_with_retries()` instead of a single token/key attempt.
+- Nous `/health` now uses `post_nous_with_retries()` so health reflects pool-level availability instead of one credential.
+
+### Runtime semantics preserved
+
+- NVIDIA remains the advanced NIM adapter but now aligns with the shared key reservation semantics.
+- Nous and OpenCode now align with NVIDIA-style “try all reasonable credentials before client-visible failure”.
+- Native provider differences are constrained to adapter boundaries only.
+
+## Fourth-Pass Validation
+
+```text
+compileall: pass
+pytest: 22 passed
+transparency runner: pass
+ruff F/E9/B: pass
+bandit high severity: no findings
+pip-audit: no known vulnerabilities for all requirement files
+```
+
+## Final Contract Verdict
+
+The mono-repo now has a documented and tested base wrapper contract. `nvidia-python`, `nous`, and `opencode` differ only where upstream behavior requires it, while client-facing runtime behavior is consistent for Claude Code, Codex, Hermes Agent, OpenClaw, OpenAI SDK, Anthropic SDK, and generic agent clients.
