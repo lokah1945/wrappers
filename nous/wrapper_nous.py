@@ -33,7 +33,7 @@ import sys
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 except ImportError:
     # Audit/transparency tooling may load a temporary copy of this file; the
     # monorepo root is still the current working directory in that mode.
@@ -42,7 +42,7 @@ except ImportError:
             sys.path.insert(0, str(_root))
             break
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 
 import aiohttp
 
@@ -244,6 +244,7 @@ MODEL_CATALOG_TTL_SEC = int(os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get("MODEL_CATALOG_REFRESH_SEC", "86400"))
 MODEL_STORE = ModelStateStore("nous", MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
 MODEL_REGISTRY = LocalModelRegistry("nous")
+MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
 KEY_POOL = KeyPool()
@@ -1422,6 +1423,7 @@ async def refresh_model_catalog_once():
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="nous:/v1/models")
             MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
+            await MODEL_REGISTRY_CLIENT.ingest_catalog("nous", models_data, "runtime-catalog")
             logger.info(f"[model-catalog] Nous refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] Nous refresh failed: {e}")
@@ -1579,6 +1581,7 @@ async def models():
                 if upstream_models:
                     MODEL_STORE.upsert_catalog(upstream_models, source="nous:/v1/models")
                     MODEL_REGISTRY.register_catalog(upstream_models, revision="runtime-catalog")
+                    await MODEL_REGISTRY_CLIENT.ingest_catalog("nous", upstream_models, "runtime-catalog")
         except Exception:
             pass
         if not upstream_models:

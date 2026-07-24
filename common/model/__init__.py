@@ -6,6 +6,7 @@ wrapper's native key pool is the only retry dimension.
 """
 
 from .call_plan import CallPlanError, build_call_plan
+from .central_client import ModelRegistryClient
 from .contracts import (
     AliasBinding,
     AvailabilityObservation,
@@ -32,6 +33,7 @@ __all__ = [
     "ErrorState",
     "LimitProfile",
     "LocalModelRegistry",
+    "ModelRegistryClient",
     "ModelProfile",
     "ModelRef",
     "ProtocolProfile",

@@ -25,12 +25,12 @@ from contextlib import asynccontextmanager
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore, classify_upstream_error
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import ModelStateStore, classify_upstream_error
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -77,6 +77,7 @@ MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
 MODEL_STORE = ModelStateStore('opencode', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
 MODEL_REGISTRY = LocalModelRegistry('opencode')
+MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
@@ -836,6 +837,7 @@ async def refresh_model_catalog_once():
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="opencode:/models")
             MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
+            await MODEL_REGISTRY_CLIENT.ingest_catalog("opencode", models_data, "runtime-catalog")
             logger.info(f"[model-catalog] OpenCode refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] OpenCode refresh failed: {e}")
@@ -952,6 +954,7 @@ async def models(request: Request):
             if status == 200 and isinstance(data, dict) and (data.get('data') or data.get('models')):
                 MODEL_STORE.upsert_catalog(data.get('data') or data.get('models') or [], source='opencode:/models')
                 MODEL_REGISTRY.register_catalog(data.get('data') or data.get('models') or [], revision='runtime-catalog')
+                await MODEL_REGISTRY_CLIENT.ingest_catalog('opencode', data.get('data') or data.get('models') or [], 'runtime-catalog')
             elif status != 200 or not isinstance(data, dict):
                 stale = MODEL_STORE.get_catalog(fresh_only=False)
                 if stale:

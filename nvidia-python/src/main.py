@@ -69,7 +69,7 @@ try:
         credential_fingerprint,
         error_text,
     )
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import (
@@ -78,7 +78,7 @@ except ImportError:
         credential_fingerprint,
         error_text,
     )
-    from common.model import LocalModelRegistry
+    from common.model import LocalModelRegistry, ModelRegistryClient
 
 try:
     from watchdog.observers import Observer
@@ -138,6 +138,7 @@ async def verify_models(pool):
             source="nvidia:/v1/models",
         )
         MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision="runtime-catalog")
+        await MODEL_REGISTRY_CLIENT.ingest_catalog("nvidia", [metadata.get(mid) or {"id": mid} for mid in ids], "runtime-catalog")
 
     sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
     results = {}
@@ -439,6 +440,7 @@ BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
 MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).parent.parent / 'model-state.db'))
 MODEL_REGISTRY = LocalModelRegistry('nvidia')
+MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 HEADERS_TIMEOUT_MS = int(os.environ.get('HEADERS_TIMEOUT_MS', '120000'))
@@ -1030,6 +1032,7 @@ class Server:
                     source='nvidia:/v1/models',
                 )
                 MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision='runtime-catalog')
+                await MODEL_REGISTRY_CLIENT.ingest_catalog('nvidia', [metadata.get(mid) or {"id": mid} for mid in ids], 'runtime-catalog')
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
 
