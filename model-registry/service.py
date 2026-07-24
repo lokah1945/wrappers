@@ -136,7 +136,8 @@ async def resolve(request: Request) -> dict[str, Any]:
     return {
         "requested_model": requested,
         "resolved": ref.to_dict(),
-        "model_changed": False if not ref.is_alias else True,
+        "alias_resolved": ref.is_alias,
+        "model_changed": False,
         "model_substitution": False,
     }
 

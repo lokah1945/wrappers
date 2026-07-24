@@ -36,12 +36,19 @@ class ModelRef:
     resolution_revision: str = ""
 
     @property
+    def alias_resolved(self) -> bool:
+        return self.is_alias
+
+    @property
     def model_changed(self) -> bool:
-        """Concrete model identity must not change during execution."""
-        return self.is_alias and self.requested_name != self.provider_model_id
+        """Alias resolution is not model substitution."""
+        return False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self) | {"model_changed": self.model_changed}
+        return asdict(self) | {
+            "alias_resolved": self.alias_resolved,
+            "model_changed": False,
+        }
 
 
 @dataclass(frozen=True)
