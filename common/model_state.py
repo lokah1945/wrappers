@@ -23,7 +23,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .model.errors import classify_upstream_error, error_text
+from .model.errors import classify_provider_error, classify_upstream_error, error_text, load_provider_error_manifest
 from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
@@ -43,6 +43,7 @@ class ModelStateStore:
     def __init__(self, provider: str, db_path: str | os.PathLike[str] | None = None,
                  catalog_ttl_sec: int | None = None):
         self.provider = str(provider)
+        self.provider_error_manifest = load_provider_error_manifest(self.provider)
         default_path = Path.cwd() / "model-state.db"
         self.db_path = Path(db_path or os.environ.get("MODEL_STATE_DB") or default_path)
         self.catalog_ttl_sec = int(catalog_ttl_sec or os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
@@ -363,7 +364,7 @@ class ModelStateStore:
 
     def record_error(self, model_id: str, account_credential: str | None,
                      status_code: int, payload: Any, endpoint: str = "") -> dict[str, Any]:
-        classification = classify_upstream_error(status_code, payload)
+        classification = classify_provider_error(self.provider, status_code, payload, self.provider_error_manifest)
         detail = sanitize_error_detail(payload)
         scope = credential_fingerprint(account_credential)
         return self.record_status(

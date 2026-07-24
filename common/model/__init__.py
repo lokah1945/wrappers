@@ -18,7 +18,13 @@ from .contracts import (
     ModelRef,
     ProtocolProfile,
 )
-from .errors import ErrorState, classify_upstream_error, error_text
+from .errors import (
+    ErrorState,
+    classify_provider_error,
+    classify_upstream_error,
+    error_text,
+    load_provider_error_manifest,
+)
 from .identity import AliasResolver, normalize_model_syntax, same_provider_model_id
 from .profile_store import ModelProfileStore
 from .registry import LocalModelRegistry
@@ -42,8 +48,10 @@ __all__ = [
     "ModelRef",
     "ProtocolProfile",
     "build_call_plan",
+    "classify_provider_error",
     "classify_upstream_error",
     "error_text",
+    "load_provider_error_manifest",
     "normalize_model_syntax",
     "sanitize_error_detail",
     "same_provider_model_id",

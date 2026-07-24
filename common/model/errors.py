@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from .contracts import ErrorClassification, ErrorState
@@ -17,6 +18,43 @@ def error_text(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, default=str)[:4000]
     except Exception:
         return str(payload)[:4000]
+
+
+def classify_provider_error(provider: str, status: int, payload: Any = "", manifest: dict[str, Any] | None = None) -> ErrorClassification:
+    """Apply provider-specific manifest rules before shared classification."""
+    text = error_text(payload).lower()
+    for rule in (manifest or {}).get("rules", []):
+        if int(rule.get("status", -1)) != int(status):
+            continue
+        needle = str(rule.get("body_contains") or "").lower()
+        if needle and needle not in text:
+            continue
+        # Generic manifest rules without a body signature are deliberately
+        # ignored here; the shared classifier has richer retry semantics.
+        if not needle:
+            continue
+        try:
+            state = ErrorState(str(rule.get("state")))
+        except ValueError:
+            continue
+        return ErrorClassification(
+            state=state,
+            reason_code=str(rule.get("reason_code") or rule.get("state") or "PROVIDER_RULE"),
+            retry_same_model=bool(rule.get("retry_same_model", False)),
+            rotate_key=bool(rule.get("rotate_key", False)),
+            hard_block=bool(rule.get("hard_block", False)),
+            account_scoped=state in {ErrorState.ACCOUNT_UNAVAILABLE, ErrorState.ACCOUNT_FORBIDDEN},
+        )
+    return classify_upstream_error(status, payload)
+
+
+def load_provider_error_manifest(provider: str) -> dict[str, Any]:
+    path = Path(__file__).resolve().parents[1] / "model-registry" / "manifests" / "errors" / f"{provider}.json"
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
 
 
 def classify_upstream_error(status: int, payload: Any = "") -> ErrorClassification:

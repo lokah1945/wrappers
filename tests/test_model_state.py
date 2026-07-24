@@ -4,6 +4,14 @@ import json
 from pathlib import Path
 
 from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
+from common.model.errors import classify_provider_error, load_provider_error_manifest
+
+
+def test_provider_manifest_rule_is_used_for_account_scoped_error():
+    manifest = load_provider_error_manifest("nvidia")
+    result = classify_provider_error("nvidia", 404, "Function fn not found for account acct", manifest)
+    assert result["state"] == "account_unavailable"
+    assert result["account_scoped"] is True
 
 
 def test_account_scoped_404_is_not_global_retirement():
