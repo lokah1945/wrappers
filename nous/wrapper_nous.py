@@ -33,7 +33,7 @@ import sys
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, classify_upstream_error
 except ImportError:
     # Audit/transparency tooling may load a temporary copy of this file; the
     # monorepo root is still the current working directory in that mode.
@@ -42,7 +42,7 @@ except ImportError:
             sys.path.insert(0, str(_root))
             break
     from common.model_state import ModelStateStore
-    from common.model import LocalModelRegistry, ModelRegistryClient
+    from common.model import LocalModelRegistry, ModelRegistryClient, classify_upstream_error
 
 import aiohttp
 
@@ -534,8 +534,8 @@ def _retry_after_seconds(data, default=65) -> int:
     return default
 
 
-def _is_retriable_upstream_status(status: int) -> bool:
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+def _is_retriable_upstream_status(status: int, data=None) -> bool:
+    return bool(classify_upstream_error(status, data).retry_same_model)
 
 
 def _looks_model_capacity_error(data) -> bool:
@@ -581,7 +581,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
         tried += 1
         last_status, last_result = status, result
-        if not _is_retriable_upstream_status(status):
+        if not _is_retriable_upstream_status(status, result):
             return status, result, None
 
     attempts = max(1, KEY_POOL.total_keys)
@@ -597,7 +597,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
         tried += 1
         last_status, last_result = status, result
-        if _is_retriable_upstream_status(status):
+        if _is_retriable_upstream_status(status, result):
             if _should_cooldown_key(status, result):
                 KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result))
             KEY_POOL.release(entry)
@@ -630,7 +630,7 @@ async def get_nous_json_with_retries(path: str) -> tuple:
                 if r.status == 200:
                     return r.status, data
                 last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
-                if not _is_retriable_upstream_status(r.status):
+                if not _is_retriable_upstream_status(r.status, last_data):
                     return last_status, last_data
         except Exception as e:
             last_status, last_data = 502, {"error": {"message": str(e), "type": "api_error"}}
@@ -649,7 +649,7 @@ async def get_nous_json_with_retries(path: str) -> tuple:
                     KEY_POOL.release(entry)
                     return r.status, data
                 last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
-                if _is_retriable_upstream_status(r.status):
+                if _is_retriable_upstream_status(r.status, last_data):
                     if _should_cooldown_key(r.status, last_data):
                         KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
                     KEY_POOL.release(entry)
