@@ -19,6 +19,7 @@ from .contracts import (
 )
 from .errors import ErrorState, classify_upstream_error, error_text
 from .identity import AliasResolver, normalize_model_syntax
+from .registry import LocalModelRegistry
 
 __all__ = [
     "AliasBinding",
@@ -30,6 +31,7 @@ __all__ = [
     "ErrorClassification",
     "ErrorState",
     "LimitProfile",
+    "LocalModelRegistry",
     "ModelProfile",
     "ModelRef",
     "ProtocolProfile",
