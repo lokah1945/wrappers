@@ -9,7 +9,7 @@ WorkingDirectory=/root/wrapper/opencode
 Environment=PYTHONPATH=/root/wrapper/opencode
 EnvironmentFile=-/root/wrapper/opencode/.env
 Environment=LOG_FILE=/root/wrapper/opencode/opencode.log
-ExecStartPre=/bin/bash -c 'git -C /root/wrapper rev-parse HEAD > /root/wrapper/.deployed_commit 2>/dev/null || true'
+ExecStartPre=/bin/bash -c 'mkdir -p /root/wrapper/runtime && git -C /root/wrapper rev-parse HEAD > /root/wrapper/runtime/opencode.commit 2>/dev/null || true'
 ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9103
 Restart=always
 RestartSec=3

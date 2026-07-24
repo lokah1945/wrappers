@@ -64,8 +64,8 @@ if [ "$MODE" = "status" ]; then
   exit 0
 fi
 
-if [ "$(id -u)" -ne 0 ]; then
-  fail "must be root (use sudo) for system-wide install, OR run as the target user for --user install"
+if [ "$(id -u)" -eq 0 ]; then
+  log "WARN: running as root — units install to /root/.config/systemd/user (user-level systemd for root)"
 fi
 
 # Deployment model: USER-LEVEL systemd (per wrapper runtime reality).

@@ -17,6 +17,21 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+
+def _resolve_git_commit() -> str:
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL, text=True
+        ).strip()
+    except Exception:
+        return "unknown"
+
+
+GIT_COMMIT = _resolve_git_commit()
+SOURCE_ROOT = str(ROOT)
+BUILD_TS = int(__import__("time").time())
+
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
@@ -93,6 +108,9 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "service": "model-registry",
+        "git_commit": GIT_COMMIT,
+        "source_root": SOURCE_ROOT,
+        "pid": os.getpid(),
         "providers_loaded": sorted(central.registries),
         "model_substitution": False,
         "provider_substitution": False,

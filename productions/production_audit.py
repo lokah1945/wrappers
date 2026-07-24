@@ -113,6 +113,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--wrapper-url", default=None, help="Wrapper /v1 base for explicit smoke/load")
     parser.add_argument("--model", default=None, help="Exact model for explicit smoke/load")
     parser.add_argument("--api-key-env", default="WRAPPER_API_KEY", help="Env var containing local wrapper token (default: WRAPPER_API_KEY)")
+    parser.add_argument("--surface", action="append", choices=["chat", "responses", "messages"],
+                        help="Surface to smoke (repeatable): chat=/v1/chat/completions, responses=/v1/responses, messages=/v1/messages")
     parser.add_argument("--run-tests", action="store_true")
     parser.add_argument("--run-smoke", action="store_true")
     parser.add_argument("--smoke-all", action="store_true",
@@ -159,18 +161,35 @@ def main() -> int:
     else:
         audit.log("PASS", "repository layout", "wrappers.json present")
 
-    # H-03: compare runtime against the deployed commit marker, not HEAD.
-    # The systemd unit writes the current HEAD into .deployed_commit at
-    # ExecStartPre time, so this reflects exactly what the running process
-    # was built from — independent of later report-only commits.
-    deployed_marker = repo / ".deployed_commit"
-    repo_commit = ""
-    if deployed_marker.is_file():
-        repo_commit = deployed_marker.read_text().strip()
-    if not repo_commit:
-        rc, out = audit.command(["git", "rev-parse", "HEAD"])
-        repo_commit = out.strip()
-    audit.log("PASS" if repo_commit else "FAIL", "deployed commit (marker)", repo_commit)
+    # H-04: compare runtime against the per-service deployed commit marker,
+    # not HEAD. systemd ExecStartPre writes <repo>/runtime/<svc>.commit at start
+    # time, so each process is tracked independently (no global race).
+    for name, port in [("model-registry", 9200), ("nvidia", 9101), ("nous", 9102), ("opencode", 9103), ("blackbox", 9104)]:
+        if name not in args.required_wrapper and name != "model-registry":
+            continue
+        svc = "model-registry" if name == "model-registry" else name
+        marker = repo / "runtime" / f"{svc}.commit"
+        repo_commit = marker.read_text().strip() if marker.is_file() else ""
+        if not repo_commit:
+            rc, out = audit.command(["git", "rev-parse", "HEAD"])
+            repo_commit = out.strip()
+        # runtime commit from health endpoint
+        rc, out = audit.command(
+            ["curl", "-sS", "-m", "5", f"http://127.0.0.1:{port}/health"]
+        )
+        runtime_commit = ""
+        if rc == 0 and out.strip():
+            try:
+                import json as _json
+                runtime_commit = _json.loads(out).get("git_commit", "")
+            except Exception:
+                runtime_commit = ""
+        if runtime_commit and repo_commit and runtime_commit[:12] != repo_commit[:12]:
+            audit.log("FAIL", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
+        elif not runtime_commit and name in args.required_wrapper:
+            audit.log("BLOCKED", f"runtime commit {name}", "health response has no git_commit/build identity")
+        else:
+            audit.log("PASS", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
     rc, branch = audit.command(["git", "branch", "--show-current"])
     audit.log("PASS" if rc == 0 and branch.strip() else "BLOCKED", "git branch", branch.strip() or "unknown")
     rc, origin = audit.command(["git", "remote", "get-url", "origin"])
@@ -269,58 +288,97 @@ def main() -> int:
         if args.smoke_all:
             # M-01: smoke every required wrapper with a known-good exact model.
             smoke_targets = [
-                ("http://127.0.0.1:9101/v1", "nvidia/llama-3.3-nemotron-super-49b-v1"),
-                ("http://127.0.0.1:9102/v1", "poolside/laguna-s-2.1:free"),
-                ("http://127.0.0.1:9103/v1", "deepseek-v4-flash-free"),
-                ("http://127.0.0.1:9104/v1", "blackboxai/nvidia/nemotron-nano-12b-v2-vl"),
+                ("http://127.0.0.1:9101/v1", "nvidia/llama-3.3-nemotron-super-49b-v1", ["chat", "responses"]),
+                ("http://127.0.0.1:9102/v1", "poolside/laguna-s-2.1:free", ["chat", "messages"]),
+                ("http://127.0.0.1:9103/v1", "deepseek-v4-flash-free", ["chat", "messages"]),
+                ("http://127.0.0.1:9104/v1", "blackboxai/nvidia/nemotron-nano-12b-v2-vl", ["chat", "messages"]),
             ]
             api_key = os.environ.get(args.api_key_env, "")
             if not api_key:
                 audit.log("BLOCKED", "explicit model test", "--api-key-env missing or empty")
-            for url, model in smoke_targets:
-                if args.run_smoke:
-                    status, ms, body, error = audit.http(
-                        f"{url.rstrip('/')}/chat/completions",
-                        method="POST",
-                        payload={"model": model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False},
-                        api_key=api_key, timeout=180,
-                    )
-                    returned_model = body.get("model") if isinstance(body, dict) else None
-                    ok = 200 <= status < 300 and returned_model in (None, model)
-                    detail = f"wrapper_url={url}, model={model}, surface=chat_completions, api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                    if error:
-                        detail += f", transport_error={error}"
-                    audit.log("PASS" if ok else "FAIL", "exact-model smoke", detail)
+            for url, model, surfaces in smoke_targets:
+                for surface in surfaces:
+                    if args.run_smoke:
+                        if surface == "chat":
+                            path, payload = "/chat/completions", {"model": model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
+                        elif surface == "responses":
+                            path, payload = "/responses", {"model": model, "input": "Reply exactly OK.", "max_output_tokens": 8}
+                        elif surface == "messages":
+                            path, payload = "/messages", {"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
+                        else:
+                            continue
+                        # Retry transient upstream errors (429/503) with backoff
+                        # — opencode.ai free tier is flaky but recovers quickly.
+                        last_status = 0
+                        status, ms, body, error = 0, 0.0, {}, None
+                        for attempt in range(3):
+                            status, ms, body, error = audit.http(
+                                f"{url.rstrip('/')}{path}",
+                                method="POST",
+                                payload=payload,
+                                api_key=api_key, timeout=180,
+                            )
+                            last_status = status
+                            if 200 <= status < 300:
+                                break
+                            if status in (429, 503):
+                                import time as _time
+                                _time.sleep(2 + attempt * 3)
+                                continue
+                            break
+                        returned_model = body.get("model") if isinstance(body, dict) else None
+                        detail = f"wrapper_url={url}, model={model}, surface={surface}, api_key_env={args.api_key_env}, HTTP {last_status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                        if error:
+                            detail += f", transport_error={error}"
+                        # M-02: opencode.ai free tier "No capacity"/degraded is an
+                        # external outage, not a wrapper defect — treat as BLOCKED
+                        # (external dependency) not FAIL.
+                        external_down = (
+                            last_status in (503, 502)
+                            and isinstance(body, dict)
+                            and "no capacity" in str(body.get("error", {}).get("message", "")).lower()
+                        )
+                        ok = 200 <= last_status < 300 and returned_model in (None, model)
+                        if external_down:
+                            audit.log("BLOCKED", f"exact-model smoke [{surface}]", detail + ", external_outage=opencode.ai")
+                            continue
+                        audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
         elif not args.wrapper_url or not args.model:
             audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
         elif not args.api_key_env or not os.environ.get(args.api_key_env):
             audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")
         else:
             api_key = os.environ[args.api_key_env]
-            if args.run_smoke:
-                status, ms, body, error = audit.http(
-                    f"{args.wrapper_url.rstrip('/')}/chat/completions",
-                    method="POST",
-                    payload={
-                        "model": args.model,
-                        "messages": [{"role": "user", "content": "Reply exactly OK."}],
-                        "max_tokens": 8,
-                        "stream": False,
-                    },
-                    api_key=api_key,
-                    timeout=180,
-                )
-                returned_model = body.get("model") if isinstance(body, dict) else None
-                identity_ok = returned_model in (None, args.model)
-                ok = 200 <= status < 300 and identity_ok
-                detail = (
-                    f"wrapper_url={args.wrapper_url}, model={args.model}, surface=chat_completions, "
-                    f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
-                    f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                )
-                if error:
-                    detail += f", transport_error={error}"
-                audit.log("PASS" if ok else "FAIL", "exact-model smoke", detail)
+            surfaces = args.surface or ["chat"]
+            for surface in surfaces:
+                if surface == "chat":
+                    path, payload = "/chat/completions", {"model": args.model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
+                elif surface == "responses":
+                    path, payload = "/responses", {"model": args.model, "input": "Reply exactly OK.", "max_output_tokens": 8}
+                elif surface == "messages":
+                    path, payload = "/messages", {"model": args.model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
+                else:
+                    audit.log("BLOCKED", "explicit model test", f"unknown surface: {surface}")
+                    continue
+                if args.run_smoke:
+                    status, ms, body, error = audit.http(
+                        f"{args.wrapper_url.rstrip('/')}{path}",
+                        method="POST",
+                        payload=payload,
+                        api_key=api_key,
+                        timeout=180,
+                    )
+                    returned_model = body.get("model") if isinstance(body, dict) else None
+                    identity_ok = returned_model in (None, args.model)
+                    ok = 200 <= status < 300 and identity_ok
+                    detail = (
+                        f"wrapper_url={args.wrapper_url}, model={args.model}, surface={surface}, "
+                        f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
+                        f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                    )
+                    if error:
+                        detail += f", transport_error={error}"
+                    audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
             if args.run_load:
                 env = {**os.environ, "API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"}
                 cmd = [

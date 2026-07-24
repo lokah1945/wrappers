@@ -7,8 +7,9 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=/root/wrapper
 Environment=PYTHONPATH=/root/wrapper
-EnvironmentFile=-/root/wrapper/model-registry/.env
-ExecStart=/usr/bin/python3 /root/wrapper/model-registry/service.py
+Environment=LOG_FILE=/root/wrapper/model-registry/registry.log
+ExecStartPre=/bin/bash -c 'mkdir -p /root/wrapper/runtime && git -C /root/wrapper rev-parse HEAD > /root/wrapper/runtime/model-registry.commit 2>/dev/null || true'
+ExecStart=/usr/bin/python3 model-registry/service.py
 Restart=always
 RestartSec=3
 StandardOutput=append:/root/wrapper/model-registry/registry.log
