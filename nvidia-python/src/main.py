@@ -791,18 +791,19 @@ def _csv_patterns(env_name: str, default: str = '') -> list:
 
 
 def is_model_unavailable(model_id: str) -> bool:
-    """Return True only for models that should be hard-blocked before upstream.
+    """Return True only for a confirmed local hard-block decision.
 
-    Verification sweeps can produce transient false negatives (429, probe shape,
-    slow model warmup, temporary provider capacity). A concrete client-selected
-    model must not be rejected just because a background probe failed. Hard block
-    only retired/404/410 models by default; optionally restore strict behavior
-    with STRICT_BLOCK_UNAVAILABLE_MODELS=true.
+    Account-scoped 404s, rate limits, timeouts, capability mismatches, and
+    unknown probe failures remain pass-through even when the legacy strict
+    setting is enabled. The strict setting may only block a legacy ``unknown``
+    state; explicit provider EOL is handled by ``_retired_models``.
     """
     if model_id in _retired_models:
         return True
-    if os.environ.get('STRICT_BLOCK_UNAVAILABLE_MODELS', 'false').lower() in ('1', 'true', 'yes', 'on'):
-        return model_id in _unavailable_models
+    strict = os.environ.get('STRICT_BLOCK_UNAVAILABLE_MODELS', 'false').lower() in ('1', 'true', 'yes', 'on')
+    if strict and model_id in _unavailable_models:
+        state = (_model_status.get(model_id) or {}).get('state')
+        return state == 'unknown'
     return False
 
 

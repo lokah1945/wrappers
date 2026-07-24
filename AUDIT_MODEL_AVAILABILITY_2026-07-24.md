@@ -20,7 +20,7 @@ The wrapper now classifies provider outcomes with separate global and credential
 - timeout and 5xx → transient;
 - 400/422 → capability/request mismatch.
 
-Only explicit provider EOL is eligible for NVIDIA's default local hard block. Explicit concrete client-selected models are no longer rejected because a background probe reported an account-scoped or transient failure.
+Only explicit provider EOL is eligible for NVIDIA's default local hard block. Explicit concrete client-selected models are no longer rejected because a background probe reported an account-scoped or transient failure. The legacy strict setting also excludes account-scoped, rate-limit, timeout, capability, and unknown-transient states, so enabling it cannot recreate the Kimi false-retirement path.
 
 The upstream NVIDIA account detail is preserved in normalized error responses, so Claude Code/SDK clients receive a diagnosable provider error rather than an opaque local retirement message.
 

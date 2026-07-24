@@ -434,6 +434,15 @@ def test_nvidia_account_scoped_404_does_not_enter_retired_set():
         assert "moonshotai/kimi-k2.6" in nv._unavailable_models
         assert "moonshotai/kimi-k2.6" not in nv._retired_models
         assert nv.is_model_unavailable("moonshotai/kimi-k2.6") is False
+        old_strict = os.environ.get("STRICT_BLOCK_UNAVAILABLE_MODELS")
+        os.environ["STRICT_BLOCK_UNAVAILABLE_MODELS"] = "true"
+        try:
+            assert nv.is_model_unavailable("moonshotai/kimi-k2.6") is False
+        finally:
+            if old_strict is None:
+                os.environ.pop("STRICT_BLOCK_UNAVAILABLE_MODELS", None)
+            else:
+                os.environ["STRICT_BLOCK_UNAVAILABLE_MODELS"] = old_strict
     finally:
         nv.probe_model = old_probe
         nv._unavailable_models.clear()
