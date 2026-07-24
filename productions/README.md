@@ -17,6 +17,7 @@ The runner is intentionally **non-destructive by default**:
 - `PRODUCTION_RUNBOOK.md` — staged VPS execution instructions and acceptance gates.
 - `run_production_audit.sh` — shell entrypoint.
 - `production_audit.py` — dependency-light audit/test runner.
+- `publish_production_report.sh` — guarded commit/push/release verification.
 - `reports/` — generated reports are written here by the VPS agent.
 
 ## Basic preflight
@@ -70,6 +71,17 @@ Reports are written to:
 ```text
 productions/reports/production-audit-YYYYMMDD-HHMMSS.md
 ```
+
+Publish exactly one report only after the audit exits and the code checkout is clean:
+
+```bash
+bash productions/publish_production_report.sh \
+  productions/reports/production-audit-YYYYMMDD-HHMMSS.md
+```
+
+The publisher refuses to run when `origin` is missing, non-report changes are
+present, secret-like values appear in the report, or remote SHA verification
+fails.
 
 The report contains statuses, timing, commit information, and remediation
 recommendations, but never secrets or response bodies.

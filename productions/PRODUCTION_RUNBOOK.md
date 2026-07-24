@@ -241,7 +241,27 @@ In a maintenance window:
 
 Never delete `model-state.db` or `registry-state.db` to make a test pass.
 
-## 11. Final acceptance
+## 11. Publish the report
+
+After the audit completes, publish the exact report through the guarded publisher:
+
+```bash
+bash productions/publish_production_report.sh \
+  productions/reports/production-audit-YYYYMMDD-HHMMSS.md
+```
+
+The publisher refuses to commit when:
+
+- `origin` is missing;
+- the working tree has non-report changes;
+- the report contains secret-like values;
+- staged files include anything other than the selected report;
+- remote SHA verification fails.
+
+If the VPS working tree is dirty, do not force-push. Preserve the diff, review
+it, commit approved code separately, then rerun the audit from the clean commit.
+
+## 12. Final acceptance
 
 Production can be marked ready only when:
 
