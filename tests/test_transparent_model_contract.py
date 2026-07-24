@@ -34,3 +34,14 @@ def test_all_wrappers_have_no_alternative_model_execution_markers():
         source = path.read_text()
         for marker in forbidden:
             assert marker not in source, f"{marker} found in {path}"
+
+
+def test_concrete_requests_do_not_mutate_dynamic_alias_state():
+    for path in (
+        ROOT / "nvidia-python" / "src" / "main.py",
+        ROOT / "nous" / "wrapper_nous.py",
+        ROOT / "opencode" / "src" / "main.py",
+        ROOT / "blackbox" / "src" / "main.py",
+    ):
+        source = path.read_text()
+        assert "set_dynamic_alias_target(m)" not in source
