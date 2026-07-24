@@ -1,5 +1,5 @@
 [Unit]
-Description=wrapper-opencode: OpenCode API proxy (port 9107)
+Description=wrapper-opencode: OpenCode API proxy (port 9103)
 After=network-online.target
 Wants=network-online.target
 
@@ -9,7 +9,7 @@ WorkingDirectory=/root/wrapper/opencode
 Environment=PYTHONPATH=/root/wrapper/opencode
 EnvironmentFile=-/root/wrapper/opencode/.env
 Environment=LOG_FILE=/root/wrapper/opencode/opencode.log
-ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9107
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9103
 Restart=always
 RestartSec=3
 StandardOutput=append:/root/wrapper/opencode/opencode.log

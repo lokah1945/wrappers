@@ -1,5 +1,5 @@
 [Unit]
-Description=wrapper-nous: Anthropic+Responses+Chat proxy for Nous (port 9106)
+Description=wrapper-nous: Anthropic+Responses+Chat proxy for Nous (port 9102)
 After=network-online.target
 Wants=network-online.target
 
