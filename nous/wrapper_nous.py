@@ -1516,18 +1516,18 @@ async def health():
 
 @app.get("/ready")
 async def ready():
+    """Readiness checks credentials and catalog reachability, not a hidden model."""
     try:
-        if CURATED_FREE_MODELS:
-            code, result, _ = await post_nous_with_retries({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
-            return {
-                "ready": code == 200,
-                "upstream_ok": code == 200,
-                "status_code": code,
-                "last_error": None if code == 200 else (result.get("error") if isinstance(result, dict) else str(result)),
-                "keys": KEY_POOL.total_keys,
-                "available": KEY_POOL.available_keys,
-            }
-        return {"ready": True, "upstream_ok": None, "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys}
+        status, result = await get_nous_json_with_retries("/v1/models")
+        has_credentials = KEY_POOL.total_keys > 0 or bool(_read_token_from_auth_path())
+        return {
+            "ready": status == 200 and has_credentials,
+            "upstream_ok": status == 200,
+            "status_code": status,
+            "last_error": None if status == 200 else (result.get("error") if isinstance(result, dict) else str(result)),
+            "keys": KEY_POOL.total_keys,
+            "available": KEY_POOL.available_keys,
+        }
     except Exception as e:
         return JSONResponse(status_code=503, content={"ready": False, "upstream_ok": False, "last_error": str(e), "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys})
 
