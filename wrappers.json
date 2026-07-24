@@ -1,5 +1,5 @@
 {
-  "version": "1.0.0",
+  "version": "1.1.0",
   "updated": "2026-07-24",
   "wrappers": [
     {
@@ -53,6 +53,19 @@
       "auth": "BEARER_TOKEN",
       "log_file": "blackbox.log",
       "systemd": "wrapper-blackbox.service"
+    },
+    {
+      "name": "model-registry",
+      "port": 9200,
+      "upstream": "model-intelligence-control-plane",
+      "type": "python",
+      "source": "model-registry/service.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/models",
+      "auth": "MODEL_REGISTRY_ADMIN_TOKEN",
+      "log_file": "registry.log",
+      "systemd": "wrapper-model-registry.service"
     }
   ]
 }

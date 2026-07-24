@@ -38,6 +38,7 @@ WRAPPERS=(
   "nous|nous|wrapper-nous.service|http://127.0.0.1:9102/health"
   "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9103/health"
   "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9104/health"
+  "model-registry|model-registry|wrapper-model-registry.service|http://127.0.0.1:9200/health"
 )
 
 selected_wrappers() {

@@ -1,0 +1,18 @@
+[Unit]
+Description=wrapper model intelligence registry (port 9200)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper
+Environment=PYTHONPATH=/root/wrapper
+EnvironmentFile=-/root/wrapper/model-registry/.env
+ExecStart=/usr/bin/python3 /root/wrapper/model-registry/service.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/wrapper/model-registry/registry.log
+StandardError=append:/root/wrapper/model-registry/registry.log
+
+[Install]
+WantedBy=default.target

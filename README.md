@@ -60,10 +60,26 @@ wrapper/
     ├── .env.example            # OpenCode-specific config
     └── README.md
 │
-└── blackbox/                    # BLACKBOX AI proxy
-    ├── src/main.py             # FastAPI entry point
-    ├── .env.example            # BLACKBOX-specific config
-    └── README.md
+├── blackbox/                    # BLACKBOX AI proxy
+│   ├── src/main.py             # FastAPI entry point
+│   ├── .env.example            # BLACKBOX-specific config
+│   └── README.md
+│
+└── model-registry/              # Central model knowledge/call-contract service
+    ├── service.py              # Exact model resolver and observation API
+    ├── manifests/              # Provider manifests
+    └── .env.example
+```
+
+## Central Model Registry (Port 9200)
+
+The model registry is a knowledge/control plane, not a fallback router. It resolves the exact requested model, provides one call plan, and stores sanitized observations. It never substitutes another model or provider. Wrapper inference remains local and may rotate only native credentials/keys.
+
+```bash
+cd model-registry
+pip install -r requirements.txt
+cp .env.example .env
+python service.py
 ```
 
 ## Quick Start
@@ -156,7 +172,7 @@ Classification and operational details are documented in [MODEL_AVAILABILITY.md]
 
 ## Features
 
-- ✅ **Dynamic Aliases**: sonnet/haiku/opus resolve to last concrete model called
+- ✅ **Explicit Model Identity**: no inference model fallback or provider substitution; only native key rotation is allowed
 - ✅ **Streaming SSE**: Full event sequences with heartbeat
 - ✅ **Tool Calls**: OpenAI function_calling + Anthropic tool_use formats
 - ✅ **Multi-turn**: previous_response_id support
