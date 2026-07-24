@@ -82,8 +82,14 @@ while IFS='|' read -r name dir unit health; do
     python3 -m pip install -r "${src_dir}/requirements.txt"
   fi
 
-  cp -f "$unit_src" "$unit_dst"
-  log "synced ${unit_src} -> ${unit_dst}"
+  # Unit files are kept portable in git. Render the repository path used by
+  # this installation instead of silently hardcoding /root/wrapper.
+  rendered_unit="$(mktemp)"
+  escaped_project="${PROJECT_DIR//&/\\&}"
+  sed "s#/root/wrapper#${escaped_project}#g" "$unit_src" > "$rendered_unit"
+  install -m 0644 "$rendered_unit" "$unit_dst"
+  rm -f "$rendered_unit"
+  log "rendered ${unit_src} -> ${unit_dst} (${PROJECT_DIR})"
   systemctl enable "$unit" 2>&1 || log "WARN: enable failed for ${unit}"
 done < <(selected_wrappers)
 
