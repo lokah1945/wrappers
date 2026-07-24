@@ -625,6 +625,15 @@ async def _safe_response_body(resp) -> dict:
             text = str(e)
         return {'error': {'message': (text or f'HTTP {resp.status}')[:2000], 'type': 'api_error', 'code': resp.status}}
 
+def _normalize_upstream_error(status: int, data: dict, model_id: str = '') -> tuple:
+    """Convert upstream NIM errors to OpenAI-compatible format (A1). Returns (new_status, new_data)."""
+    if status == 404:
+        msg = (data.get('error') or {}).get('message', '') or ''
+        if 'page not found' in msg.lower() or 'not found' in msg.lower():
+            model_part = f' "{model_id}"' if model_id else ''
+            return 400, {'error': {'message': f'Model{model_part} not found at upstream provider', 'type': 'invalid_request_error', 'code': 'model_not_found'}}
+    return status, data
+
 class Server:
     def __init__(self, app: FastAPI = None):
         self.app = app or FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
@@ -1292,6 +1301,9 @@ class Server:
             yield f'data: {json.dumps({"error": {"message": friendly, "type": "invalid_request_error"}})}\n\n'
 
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
+        anthro_version = (request.headers.get('anthropic-version') or '').strip()
+        if not anthro_version:
+            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'anthropic-version header is required')})
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
@@ -1461,12 +1473,13 @@ class Server:
                             continue
                         if resp.status >= 400:
                             resp_body = await _safe_response_body(resp)
+                            norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
                             self._in_flight = max(0, self._in_flight - 1)
                             key.decrement_in_flight()
                             if attempt < max_attempts - 1:
                                 attempt += 1
                                 continue
-                            return {'status': resp.status, 'data': resp_body}
+                            return {'status': norm_status, 'data': resp_body}
 
                         # Keep in-flight until stream consumer finishes (_stream_chat / anthropic finally).
                         async def stream_wrapper():
@@ -1498,14 +1511,15 @@ class Server:
                             continue
 
                         resp_data = await _safe_response_body(resp)
+                        norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
 
-                        if resp.status >= 400:
+                        if norm_status >= 400:
                             if attempt < max_attempts - 1:
                                 attempt += 1
                                 continue
-                            return {'status': resp.status, 'data': resp_data}
+                            return {'status': norm_status, 'data': resp_data}
 
                         if self.metrics:
                             await self.metrics.record_request(
