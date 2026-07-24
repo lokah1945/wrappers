@@ -355,10 +355,34 @@ def main() -> int:
                                 continue
                             break
                         returned_model = body.get("model") if isinstance(body, dict) else None
-                        if args.run_load:
-                            _run_load(audit, repo, args.wrapper_url or "http://127.0.0.1:9101/v1",
-                                      args.model or "nvidia/llama-3.3-nemotron-super-49b-v1", api_key,
-                                      args.requests, args.concurrency)
+                        detail = (
+                            f"wrapper={url}, model={model}, surface={surface}, "
+                            f"api_key_env={args.api_key_env}, HTTP {last_status}, {ms:.1f} ms, "
+                            f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                        )
+                        if error:
+                            detail += f", transport_error={error}"
+                        # M-02: upstream 503 (service unavailable) is an external outage,
+                        # not a wrapper defect -- treat as BLOCKED (external) not FAIL.
+                        # opencode.ai "No capacity" and any 503 from the provider both mean
+                        # the upstream is currently down/overloaded; the wrapper routed
+                        # and authenticated correctly.
+                        external_down = (
+                            last_status == 503
+                            or (
+                                last_status in (502,)
+                                and isinstance(body, dict)
+                                and "no capacity" in str(body.get("error", {}).get("message", "")).lower()
+                            )
+                        )
+                        ok = 200 <= last_status < 300 and returned_model in (None, model)
+                        if external_down:
+                            audit.log("BLOCKED", f"exact-model smoke [{surface}]", detail + ", external_outage=opencode.ai")
+                        else:
+                            audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
+                    # Per-wrapper bounded load (uses THIS wrapper's url/model, not defaults)
+                    if args.run_load:
+                        _run_load(audit, repo, url, model, api_key, args.requests, args.concurrency)
                     elif not args.wrapper_url or not args.model:
                         audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
                     elif not args.api_key_env or not os.environ.get(args.api_key_env):
