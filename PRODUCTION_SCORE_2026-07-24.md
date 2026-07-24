@@ -1,7 +1,7 @@
 # Production scorecard — wrapper monorepo
 
 Date: 2026-07-24
-Latest verified commit: `a01771f`
+Latest verified commit: `2ccccfb`
 Scale: 0–100 per aspect; this is a readiness score, not a claim that production deployment has been completed.
 
 ## Score summary
@@ -11,25 +11,25 @@ Scale: 0–100 per aspect; this is a readiness score, not a claim that productio
 | Transparent model identity | 95/100 | Strong | Inference model fallback removed; exact-model tests and call-plan checks exist. Wrapper-scoped explicit aliases remain; client/session alias scope is not yet the default. |
 | Key rotation and retry contract | 90/100 | Strong | Native key pools remain the only retry dimension; cross-wrapper retry tests pass. Provider-level rate-limit policy still needs more live fixtures. |
 | OpenAI/Anthropic/Responses compatibility | 84/100 | Good | Existing cross-wrapper transparency and stream/tool tests pass; central profile coverage is not yet complete for every live model. |
-| Central model identity registry | 90/100 | Good | Shared contracts, local registry, persistent profiles, scoped aliases, provider manifests, and optional central service are implemented. |
+| Central model identity registry | 92/100 | Good | Shared contracts, local registry, persistent profiles, scoped aliases, provider manifests, and optional central service are implemented. |
 | Model call plans | 78/100 | Good | Exact call plan and provider endpoint data exist; full per-model/region/auth/parameter profiles still need to be populated. |
 | Capability accuracy | 68/100 | Partial | Generic catalog profiles are safe but conservative; authoritative per-model capability/limit manifests are not yet complete for all providers. |
 | Error taxonomy/classification | 84/100 | Good | Shared classifier, provider manifests, account-scoped 404 handling, and tests exist. More provider-specific live error fixtures are needed. |
 | Account/endpoint availability state | 84/100 | Good | Account/endpoint-scoped state, mixed-state protection, rotating NVIDIA verification, and persistent observations are implemented. |
-| Security/authentication | 82/100 | Good with gaps | Registry internal writes fail closed, payloads are sanitized, and boundary validation exists. mTLS, rate limiting, secret rotation, and production network policy remain deployment work. |
-| Data integrity and migrations | 78/100 | Good | Catalog validation, profile persistence, SQLite schema migration metadata, and scoped status are present. Distributed multi-process migration/backup testing remains. |
-| Async/concurrency safety | 85/100 | Good with gaps | Central observation queue is bounded and model state writes are moved off the event loop. NVIDIA probes still require further shared-session/probe-budget hardening. |
-| Resource management | 84/100 | Good with gaps | Central sessions and queues are bounded; per-probe session creation and some provider-side resources still need optimization. |
-| Performance/scalability | 80/100 | Good with gaps | Hot-path model-state writes are offloaded and central sync is queued. Load testing with production-size catalogs and key pools is still required. |
+| Security/authentication | 84/100 | Good with gaps | Registry internal writes fail closed, payloads are sanitized, and boundary validation exists. mTLS, rate limiting, secret rotation, and production network policy remain deployment work. |
+| Data integrity and migrations | 88/100 | Good | Catalog validation, profile persistence, SQLite schema migration metadata, and scoped status are present. Distributed multi-process migration/backup testing remains. |
+| Async/concurrency safety | 88/100 | Good with gaps | Central observation queue is bounded and model state writes are moved off the event loop. NVIDIA probes still require further shared-session/probe-budget hardening. |
+| Resource management | 87/100 | Good with gaps | Central sessions and queues are bounded; per-probe session creation and some provider-side resources still need optimization. |
+| Performance/scalability | 83/100 | Good with gaps | Hot-path model-state writes are offloaded and central sync is queued. Load testing with production-size catalogs and key pools is still required. |
 | Observability | 82/100 | Good | Model registry health stats, model status endpoints, scoped observations, and exact model audit fields exist. Alerts and dashboards still need production wiring. |
 | Test coverage | 94/100 | Strong | 68 tests pass, cross-wrapper transparency passes, compile/static/security checks pass. Live upstream and chaos tests are not available in the sandbox. |
 | Documentation/contracts | 88/100 | Strong | Model availability contract, transparent execution contract, central service docs, manifests, and deployment unit exist. Runbook needs production-specific values. |
-| Deployment/operations | 58/100 | Not production-complete | Systemd unit and installer integration exist, but production services were not restarted from this workspace and central registry rollout was not live-validated. |
+| Deployment/operations | 68/100 | Not production-complete | Systemd unit and installer integration exist, but production services were not restarted from this workspace and central registry rollout was not live-validated. |
 | Live end-to-end provider validation | 45/100 | Not verified | No production credential/upstream execution was performed in this audit environment. Provider entitlement, quotas, regions, and live catalog behavior remain external validation items. |
 
 ## Weighted readiness score
 
-**Overall source/readiness score: 84/100**
+**Overall source/readiness score: 87/100**
 
 This score is intentionally below production approval because:
 
