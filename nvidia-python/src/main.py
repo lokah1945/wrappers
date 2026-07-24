@@ -51,10 +51,10 @@ import logging
 import re as re_module
 import threading
 from pathlib import Path
-from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator, Set
+from typing import Optional, Any, Set
 
 import aiohttp
-from fastapi import FastAPI, Request, HTTPException, Response, status
+from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
@@ -83,9 +83,7 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000) -> dict:
         
         body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
-        sess = await get_session() if 'get_session' in globals() else None
-        
-        # Use pool's session if available
+        # Dedicated short-lived probe session keeps verification isolated.
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout_ms/1000)) as s:
             async with s.post(f"{BASE_LLM}/v1/chat/completions", json=body, headers=headers) as resp:
                 if resp.status < 400:
@@ -163,7 +161,6 @@ from .anthropic_compat import (
     estimate_input_tokens,
     anthropic_error,
     extract_internal_reasoning,
-    _sse,
 )
 
 
@@ -348,9 +345,6 @@ from .capabilities import (
     CAPABILITY_PARAMS,
     CURATED_GENAI,
     get_capability_params,
-    MODEL_CONTEXT_WINDOWS,
-    DEFAULT_CONTEXT_WINDOW,
-    get_context_window,
 )
 from .responses_compat import ResponsesHandler
 from .metrics import Metrics
@@ -361,12 +355,18 @@ from . import loki_push
 load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/nvidia-python/nvidia_py.log')
+try:
+    os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
+    _log_file_handler = logging.FileHandler(LOG_FILE)
+except Exception:
+    LOG_FILE = '/tmp/wrapper-nvidia-python.log'
+    _log_file_handler = logging.FileHandler(LOG_FILE)
 logger = logging.getLogger('wrapper-nvidia')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        _log_file_handler,
         logging.StreamHandler(sys.stdout),
     ],
 )
@@ -960,7 +960,6 @@ class Server:
         @app.get('/events')
         async def events(request: Request):
             async def event_stream():
-                client_id = str(uuid.uuid4())
                 self._sse_clients.add(request)
                 yield 'event: connected\ndata: {"status":"ok"}\n\n'
                 try:
@@ -1447,15 +1446,11 @@ class Server:
         return JSONResponse(status_code=200, content=data)
 
     async def _stream_chat(self, result: dict, body: dict, request: Request):
-        key = result.get('key')
         stream = result.get('stream')
-        start_ms = result.get('start_ms', time.time() * 1000)
-        heartbeat_ms = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
         max_buffer = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512')) * 1024
         generated_chars = 0
         has_content = False
         stream_buffer = ''
-        last_usage = ''
         saw_done = False
         stream_error = None
 
@@ -1478,9 +1473,6 @@ class Server:
 
                 if re_module.search(r'data:\s*\[DONE\]', chunk_str):
                     saw_done = True
-
-                if '"usage"' in chunk_str:
-                    last_usage = chunk_str[-65536:]
 
                 stream_buffer += chunk_str
                 if len(stream_buffer) > max_buffer:
@@ -1614,7 +1606,6 @@ class Server:
         wants_reasoning = request_requires_reasoning(body, model_id)
         candidates = [model_id] + self._build_fallback_candidates(model_id, wants_reasoning)
         primary_body = json.loads(json.dumps(body))
-        fallback_used = None
 
         for cand_model in candidates:
             body = json.loads(json.dumps(primary_body))
@@ -1727,7 +1718,7 @@ class Server:
                         # /messages, /responses) closes capacity exactly once.
                         released = False
 
-                        async def stream_wrapper():
+                        async def stream_wrapper(resp=resp, key=key):
                             nonlocal released
                             try:
                                 async for chunk, _ in resp.content.iter_chunks():
@@ -2042,7 +2033,7 @@ class Server:
 
                 content_type = resp.headers.get('content-type', '')
                 if 'text/event-stream' in content_type or is_streaming:
-                    async def stream_catchall():
+                    async def stream_catchall(resp_data=resp_data, resp=resp):
                         yield resp_data
                         async for chunk, _ in resp.content.iter_chunks():
                             yield chunk

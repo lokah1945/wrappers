@@ -12,10 +12,9 @@ Three translators:
 import re
 import json
 import time
-import asyncio
-from typing import Dict, List, Optional, Any, AsyncGenerator
+from typing import Optional, AsyncGenerator
 
-from .capabilities import MODEL_CONTEXT_WINDOWS, DEFAULT_CONTEXT_WINDOW, get_context_window
+from .capabilities import get_context_window
 
 
 _FINISH_TO_STOP = {
@@ -995,7 +994,9 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         # Best-effort release for aiohttp responses
         try:
             if hasattr(stream, 'release'):
-                await stream.release()
+                maybe = stream.release()
+                if hasattr(maybe, '__await__'):
+                    await maybe
         except Exception:
             pass
         if open_idx is not None:

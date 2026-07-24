@@ -22,16 +22,14 @@ Upstream: https://inference-api.nousresearch.com/v1/chat/completions
 import os
 import json
 import time
-import random
 import asyncio
 import threading
 import logging
-from typing import Optional, Dict, Any, List, AsyncGenerator, Set
+from typing import Optional, Dict, List, AsyncGenerator, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import aiohttp
-from starlette.concurrency import run_in_threadpool
 
 
 # ============================================================================
@@ -92,7 +90,6 @@ class KeyPool:
 from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.concurrency import run_in_threadpool
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -389,7 +386,7 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
         resp = await sess.post(url, json=payload, headers=headers)
         if resp.status != 200:
             text = await resp.text()
-            await resp.release()
+            resp.release()
             return resp.status, _normalize_upstream_error(resp.status, text)
         return 200, resp
     else:

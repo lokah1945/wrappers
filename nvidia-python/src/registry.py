@@ -22,7 +22,7 @@ import json
 import time
 import asyncio
 import logging
-from typing import Dict, Optional, Any
+from typing import Dict, Optional
 
 import aiohttp
 

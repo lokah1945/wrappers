@@ -18,7 +18,7 @@ import time
 import threading
 import asyncio
 import logging
-from typing import Optional, Dict, Any, Set
+from typing import Set
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -43,12 +43,18 @@ if not os.environ.get('OPENCODE_BASE_URL'):
     load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/opencode/opencode.log')
+try:
+    os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
+    _log_file_handler = logging.FileHandler(LOG_FILE)
+except Exception:
+    LOG_FILE = '/tmp/wrapper-opencode.log'
+    _log_file_handler = logging.FileHandler(LOG_FILE)
 logger = logging.getLogger('wrapper-opencode')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [opencode] %(message)s',
     handlers=[
-        logging.FileHandler(LOG_FILE),
+        _log_file_handler,
         logging.StreamHandler(),
     ],
 )
@@ -302,7 +308,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             )
             if resp.status >= 400:
                 text = await resp.text()
-                await resp.release()
+                resp.release()
                 try:
                     data = json.loads(text)
                 except Exception:
@@ -994,7 +1000,6 @@ async def responses(request: Request):
                 buffer = b""
                 tool_accs = []
                 next_output_index = 1
-                stream_error = None
 
                 def emit(etype, payload):
                     nonlocal seq
@@ -1071,7 +1076,6 @@ async def responses(request: Request):
                         async for out in process_payload(tail[5:].strip()):
                             yield out
                 except Exception as e:
-                    stream_error = e
                     logger.error(f"[responses stream] {e}")
                     if not acc_text and not any(tool_accs):
                         acc_text = f"[upstream stream error: {e}]"
@@ -1354,7 +1358,7 @@ async def anthropic_messages(request: Request):
                         yield ev
                 finally:
                     try:
-                        await resp.release()
+                        resp.release()
                     except Exception:
                         pass
                     pool.release(key)
@@ -1383,6 +1387,10 @@ async def prom():
 async def catch_all(path: str, request: Request):
     return _jr(404, {"error": {"message": f"Unsupported: /{path}", "type": "not_found_error"}})
 
-if __name__ == "__main__":
+def main():
     import uvicorn
     uvicorn.run("src.main:app", host=BIND_HOST, port=LISTEN_PORT, log_level="info")
+
+
+if __name__ == "__main__":
+    main()

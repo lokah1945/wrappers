@@ -16,9 +16,8 @@ Provides:
 import os
 import time
 import asyncio
-import json
 import logging
-from typing import Optional, List, Dict, Any, Set, Tuple
+from typing import Optional, List, Dict, Set, Tuple
 
 import aiohttp
 
@@ -446,7 +445,6 @@ class KeyPool:
 
     # ── Selection & Pacing Queue ─────────────────────────────────────────
     async def acquire(self, model: str = '', signal=None) -> Optional[dict]:
-        start = time.time()
         chosen, waited_s = await self._acquire_slot(model, signal)
         if chosen is None:
             return None
@@ -458,7 +456,6 @@ class KeyPool:
         hard = self.hard_limit
         interval = self._admit_interval
         my_ticket: Optional[int] = None
-        on_abort = None
         abort_promise = None
 
         # Load shedding check (safe outside lock)
@@ -522,7 +519,7 @@ class KeyPool:
 
                     if avail and not model_saturated:
                         idle_rpm = 3
-                        def rpm_ok(s: KeyEntry) -> bool:
+                        def rpm_ok(s: KeyEntry, idle_rpm=idle_rpm) -> bool:
                             current = s.current_rpm()
                             if current < idle_rpm:
                                 return True
@@ -759,7 +756,6 @@ class KeyPool:
         return [s.stats(self.soft_limit, self.hard_limit) for s in self.keys]
 
     def key_details(self) -> list:
-        now = time.time()
         return [
             {
                 'label': k.label,
@@ -838,7 +834,6 @@ class KeyPool:
 
     # ── Model Discovery ───────────────────────────────────────────────────
     async def _fetch_models(self) -> List[str]:
-        agent = self._agent
         base_url = os.environ.get('NVIDIA_BASE_URL', NVIDIA_BASE_URL).rstrip('/')
 
         # Keyless-first discovery

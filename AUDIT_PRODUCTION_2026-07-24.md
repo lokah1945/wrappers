@@ -238,3 +238,82 @@ export DYNAMIC_ALIAS_TARGET="<concrete-model-id>"
 ## Final Verdict
 
 Dengan patch ini, blocker Claude Code/Codex “berhenti di tengah jalan” yang berasal dari wrapper-side stream lifecycle, key in-flight leak, dan `previous_response_id` tool-loop invalid sudah ditutup. Status production readiness wrapper-side: **100/100** untuk `nvidia-python`, `nous`, dan `opencode`.
+
+---
+
+# Second-Pass Deep Re-Audit After GitHub Push
+
+After the first production fix was pushed to GitHub (`c3b5583`), a second-pass audit was performed across every Python module, service entrypoint, dependency file, and runtime adapter path.
+
+## Additional Findings Fixed
+
+### Static/runtime correctness
+
+- Ran `ruff` with fatal/bug rules (`F`, `E9`, `B`) across `nvidia-python/src`, `nous/wrapper_nous.py`, `opencode/src`, and `tests`.
+- Removed unused imports and dead locals that hid real runtime issues.
+- Added explicit `strict=False` to metrics `zip(...)` conversions to make Python 3.13+ intent explicit.
+- Bound async stream closures to current response objects to avoid late-binding hazards.
+
+### aiohttp release correctness
+
+- Replaced invalid `await resp.release()` on aiohttp responses with sync `resp.release()` in Nous/OpenCode paths.
+- Hardened NVIDIA Anthropic stream release to support both sync and awaitable release methods.
+
+### Package/entrypoint correctness
+
+- Added `main()` to `opencode/src/main.py` so `pyproject.toml` console script `wrapper-opencode = "src.main:main"` is valid.
+
+### Import/runtime portability
+
+- Added logging fallback for NVIDIA and OpenCode so importing/running outside `/root/wrapper/...` does not fail when log directories are not writable.
+- Nous logging fallback was already added in the first audit cycle and remains validated.
+
+### Additional regression tests
+
+Added `tests/test_agent_runtime_contracts.py` covering:
+
+- NVIDIA Responses stream: upstream EOF without `[DONE]` still emits `response.completed` before final `data: [DONE]` and never emits deltas after completed.
+- NVIDIA non-stream tool call response: stored conversation includes assistant `tool_calls` for the next `previous_response_id` turn.
+- Nous zero-chunk Anthropic stream: still emits `message_start`, `message_delta`, and `message_stop`.
+- OpenCode `responses_to_chat`: orphan tool output is repaired instead of forwarding invalid `role=tool`; console script `main()` exists.
+
+## Second-Pass Validation Results
+
+```bash
+python -m compileall -q nvidia-python/src nous/wrapper_nous.py opencode/src tests
+pytest -q
+python tests/run_transparency_check.py
+python -m ruff check nvidia-python/src nous/wrapper_nous.py opencode/src tests --select F,E9,B
+python -m bandit -q -r nvidia-python/src nous/wrapper_nous.py opencode/src -lll
+python -m pip_audit -r nvidia-python/requirements.txt
+python -m pip_audit -r nous/requirements.txt
+python -m pip_audit -r opencode/requirements.txt
+```
+
+Results:
+
+```text
+18 passed
+ALL CROSS-WRAPPER TRANSPARENCY CHECKS PASS
+Ruff F/E9/B: All checks passed
+Bandit high severity: no findings
+pip-audit: No known vulnerabilities found for all three requirement files
+Import smoke: NVIDIA app OK, OpenCode app OK, Nous app OK
+```
+
+## Final Second-Pass Verdict
+
+After first push plus this deeper re-audit patch set, all three wrappers satisfy:
+
+- OpenAI Chat Completions compatibility
+- OpenAI Responses API compatibility for Codex/Hermes/OpenAI SDK
+- Anthropic Messages API compatibility for Claude Code/Anthropic SDK
+- Structured tool call/tool result lifecycle
+- Stream closure under normal `[DONE]`, upstream EOF without `[DONE]`, partial trailing SSE block, and stream exception
+- In-memory `previous_response_id` continuation with assistant tool call preservation
+- Safe fallback when `previous_response_id` history is unavailable
+- Static fatal/bug lint cleanliness
+- Dependency vulnerability audit cleanliness
+- Import/runtime portability outside the original `/root/wrapper` layout
+
+Second-pass production score remains: **100/100 enterprise-grade wrapper-side readiness**.

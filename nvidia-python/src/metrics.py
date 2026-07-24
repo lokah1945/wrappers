@@ -19,7 +19,6 @@ Provides:
   - prune()                    — delete old data
 """
 
-import os
 import time
 import asyncio
 import aiosqlite
@@ -241,7 +240,7 @@ class Metrics:
             cursor = await self._db.execute("SELECT * FROM model_status")
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-            return {row[0]: dict(zip(cols, row)) for row in rows}
+            return {row[0]: dict(zip(cols, row, strict=False)) for row in rows}
         except Exception:
             return {}
 
@@ -295,7 +294,7 @@ class Metrics:
             )
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, row)) for row in rows]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
         except Exception:
             return []
 
@@ -307,7 +306,7 @@ class Metrics:
             )
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, row)) for row in rows]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
         except Exception:
             return []
 
@@ -454,7 +453,7 @@ class Metrics:
             cols = [d[0] for d in cursor.description]
             out = []
             for row in rows:
-                d = dict(zip(cols, row))
+                d = dict(zip(cols, row, strict=False))
                 req = d.get('requests', 0)
                 d['non_streaming_count'] = req - (d.get('streaming_count', 0) or 0)
                 d['success_rate'] = round((d.get('success_count', 0) or 0) / req * 100, 1) if req else 0.0
@@ -510,7 +509,7 @@ class Metrics:
             ''', (since,))
             rows = await cursor.fetchall()
             cols = [d[0] for d in cursor.description]
-            return [dict(zip(cols, row)) for row in rows]
+            return [dict(zip(cols, row, strict=False)) for row in rows]
         except Exception:
             return []
 

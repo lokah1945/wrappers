@@ -12,7 +12,6 @@ import sys
 import json
 import time
 import asyncio
-from pathlib import Path
 
 try:
     import aiohttp
