@@ -90,16 +90,31 @@ STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '9
 # No DEFAULT_MODEL - all model selection is transparent (client chooses)
 VERSION = '1.0.5-anthropic-tools'
 
-# Build identity (H-04)
+# Build identity (H-04/H-02): resolve git root + source root from __file__, portable
+def _resolve_git_root():
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        p = os.path.dirname(os.path.abspath(__file__))
+        while p and p != os.path.dirname(p):
+            if os.path.isdir(os.path.join(p, '.git')):
+                return p
+            p = os.path.dirname(p)
+        return '/root/wrapper'
+
 def _resolve_git_commit():
     try:
         import subprocess
-        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/root/wrapper', stderr=subprocess.DEVNULL).decode().strip()
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=_resolve_git_root(), stderr=subprocess.DEVNULL).decode().strip()
     except Exception:
         return 'unknown'
 
 GIT_COMMIT = _resolve_git_commit()
-SOURCE_ROOT = '/root/wrapper/opencode'
+SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../opencode (up from src/)
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""

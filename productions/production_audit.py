@@ -112,9 +112,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--registry-url", default="http://127.0.0.1:9200")
     parser.add_argument("--wrapper-url", default=None, help="Wrapper /v1 base for explicit smoke/load")
     parser.add_argument("--model", default=None, help="Exact model for explicit smoke/load")
-    parser.add_argument("--api-key-env", default=None, help="Env var containing local wrapper token")
+    parser.add_argument("--api-key-env", default="WRAPPER_API_KEY", help="Env var containing local wrapper token (default: WRAPPER_API_KEY)")
     parser.add_argument("--run-tests", action="store_true")
     parser.add_argument("--run-smoke", action="store_true")
+    parser.add_argument("--smoke-all", action="store_true",
+                        help="Smoke every required wrapper with a known-good exact model (M-01)")
     parser.add_argument("--run-load", action="store_true")
     parser.add_argument("--requests", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=5)
@@ -157,9 +159,18 @@ def main() -> int:
     else:
         audit.log("PASS", "repository layout", "wrappers.json present")
 
-    rc, out = audit.command(["git", "rev-parse", "HEAD"])
-    repo_commit = out.strip()
-    audit.log("PASS" if rc == 0 else "FAIL", "deployed commit", repo_commit)
+    # H-03: compare runtime against the deployed commit marker, not HEAD.
+    # The systemd unit writes the current HEAD into .deployed_commit at
+    # ExecStartPre time, so this reflects exactly what the running process
+    # was built from — independent of later report-only commits.
+    deployed_marker = repo / ".deployed_commit"
+    repo_commit = ""
+    if deployed_marker.is_file():
+        repo_commit = deployed_marker.read_text().strip()
+    if not repo_commit:
+        rc, out = audit.command(["git", "rev-parse", "HEAD"])
+        repo_commit = out.strip()
+    audit.log("PASS" if repo_commit else "FAIL", "deployed commit (marker)", repo_commit)
     rc, branch = audit.command(["git", "branch", "--show-current"])
     audit.log("PASS" if rc == 0 and branch.strip() else "BLOCKED", "git branch", branch.strip() or "unknown")
     rc, origin = audit.command(["git", "remote", "get-url", "origin"])
@@ -255,7 +266,32 @@ def main() -> int:
         audit.log("PASS" if rc == 0 else "FAIL", "cross-wrapper transparency", out)
 
     if args.run_smoke or args.run_load:
-        if not args.wrapper_url or not args.model:
+        if args.smoke_all:
+            # M-01: smoke every required wrapper with a known-good exact model.
+            smoke_targets = [
+                ("http://127.0.0.1:9101/v1", "nvidia/llama-3.3-nemotron-super-49b-v1"),
+                ("http://127.0.0.1:9102/v1", "poolside/laguna-s-2.1:free"),
+                ("http://127.0.0.1:9103/v1", "deepseek-v4-flash-free"),
+                ("http://127.0.0.1:9104/v1", "blackboxai/nvidia/nemotron-nano-12b-v2-vl"),
+            ]
+            api_key = os.environ.get(args.api_key_env, "")
+            if not api_key:
+                audit.log("BLOCKED", "explicit model test", "--api-key-env missing or empty")
+            for url, model in smoke_targets:
+                if args.run_smoke:
+                    status, ms, body, error = audit.http(
+                        f"{url.rstrip('/')}/chat/completions",
+                        method="POST",
+                        payload={"model": model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False},
+                        api_key=api_key, timeout=180,
+                    )
+                    returned_model = body.get("model") if isinstance(body, dict) else None
+                    ok = 200 <= status < 300 and returned_model in (None, model)
+                    detail = f"wrapper_url={url}, model={model}, surface=chat_completions, api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                    if error:
+                        detail += f", transport_error={error}"
+                    audit.log("PASS" if ok else "FAIL", "exact-model smoke", detail)
+        elif not args.wrapper_url or not args.model:
             audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
         elif not args.api_key_env or not os.environ.get(args.api_key_env):
             audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")

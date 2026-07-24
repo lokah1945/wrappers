@@ -57,21 +57,26 @@ fi
 if [ "$MODE" = "status" ]; then
   while IFS='|' read -r name dir unit health; do
     log "status ${unit}"
-    systemctl is-active "$unit" 2>&1 || true
-    systemctl is-enabled "$unit" 2>&1 || true
-    systemctl show "$unit" -p MainPID,NRestarts,ActiveState,SubState --no-pager 2>&1 || true
+    systemctl --user is-active "$unit" 2>&1 || true
+    systemctl --user is-enabled "$unit" 2>&1 || true
+    systemctl --user show "$unit" -p MainPID,NRestarts,ActiveState,SubState --no-pager 2>&1 || true
   done < <(selected_wrappers)
   exit 0
 fi
 
 if [ "$(id -u)" -ne 0 ]; then
-  fail "must be root (use sudo)"
+  fail "must be root (use sudo) for system-wide install, OR run as the target user for --user install"
 fi
+
+# Deployment model: USER-LEVEL systemd (per wrapper runtime reality).
+# Services run under the invoking user's manager, not the system manager.
+USER_UNIT_DIR="/root/.config/systemd/user"
+mkdir -p "$USER_UNIT_DIR"
 
 while IFS='|' read -r name dir unit health; do
   src_dir="${PROJECT_DIR}/${dir}"
   unit_src="${src_dir}/systemd/${unit}"
-  unit_dst="/etc/systemd/system/${unit}"
+  unit_dst="${USER_UNIT_DIR}/${unit}"
   [ -d "$src_dir" ] || fail "missing wrapper dir: $src_dir"
   [ -f "$unit_src" ] || fail "missing systemd unit: $unit_src"
 
@@ -90,11 +95,11 @@ while IFS='|' read -r name dir unit health; do
   install -m 0644 "$rendered_unit" "$unit_dst"
   rm -f "$rendered_unit"
   log "rendered ${unit_src} -> ${unit_dst} (${PROJECT_DIR})"
-  systemctl enable "$unit" 2>&1 || log "WARN: enable failed for ${unit}"
+  systemctl --user daemon-reload
+  systemctl --user enable "$unit" 2>&1 || log "WARN: enable failed for ${unit}"
 done < <(selected_wrappers)
 
-systemctl daemon-reload
-log "systemd daemon-reload OK"
+log "systemd user daemon-reload OK"
 
 if [ "$MODE" = "no-restart" ]; then
   log "skipping restart (--no-restart)"
@@ -103,8 +108,8 @@ fi
 
 while IFS='|' read -r name dir unit health; do
   log "restarting ${unit}"
-  systemctl reset-failed "$unit" 2>&1 || true
-  systemctl restart "$unit"
+  systemctl --user reset-failed "$unit" 2>&1 || true
+  systemctl --user restart "$unit"
   sleep 2
   if curl -sS -m 5 "$health" > "/tmp/${unit}.health.json" 2>&1; then
     log "✅ ${name} healthy"
@@ -113,7 +118,7 @@ while IFS='|' read -r name dir unit health; do
   else
     log "❌ ${name} health failed"
     tail -30 "/tmp/${unit}.health.json" || true
-    journalctl -u "$unit" --since "30 seconds ago" --no-pager | tail -20 || true
+    journalctl --user -u "$unit" --since "30 seconds ago" --no-pager | tail -20 || true
     exit 1
   fi
 done < <(selected_wrappers)

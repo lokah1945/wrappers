@@ -512,19 +512,35 @@ try:
 except Exception:
     VERSION = '8.6.5-py'
 
-# Build identity (H-04): git_commit + source_root resolved from repo root
+# Build identity (H-04/H-02): resolve git root + source root from __file__, portable
+def _resolve_git_root():
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ['git', 'rev-parse', '--show-toplevel'],
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        # fallback: walk up to find .git
+        p = os.path.dirname(os.path.abspath(__file__))
+        while p and p != os.path.dirname(p):
+            if os.path.isdir(os.path.join(p, '.git')):
+                return p
+            p = os.path.dirname(p)
+        return '/root/wrapper'
+
 def _resolve_git_commit():
     try:
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
-            cwd='/root/wrapper', stderr=subprocess.DEVNULL
+            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL
         ).decode().strip()
     except Exception:
         return 'unknown'
 
 GIT_COMMIT = _resolve_git_commit()
-SOURCE_ROOT = '/root/wrapper/nvidia-python'
+SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../nvidia-python (up from src/)
 
 REASONING_CONFIGS = [
     {'patterns': ['deepseek-v4', 'deepseek-r1', 'deepseek-reasoner'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True, 'thinking': True}, 'requires_reasoning': True},
