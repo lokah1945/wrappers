@@ -25,10 +25,12 @@ from contextlib import asynccontextmanager
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model import LocalModelRegistry
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model import LocalModelRegistry
 
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -74,6 +76,7 @@ MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().p
 MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
 MODEL_STORE = ModelStateStore('opencode', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+MODEL_REGISTRY = LocalModelRegistry('opencode')
 _MODEL_REFRESH_TASK = None
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
@@ -265,7 +268,7 @@ def _normalize_model(model: str) -> str:
     if is_alias_name(m):
         tgt = get_dynamic_alias_target()
         return tgt if tgt else m
-    set_dynamic_alias_target(m)
+    # Concrete requests never mutate process-wide alias state.
     return m
 
 
@@ -822,6 +825,7 @@ async def refresh_model_catalog_once():
         models_data = data.get("data") or data.get("models") or [] if status == 200 and isinstance(data, dict) else []
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="opencode:/models")
+            MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
             logger.info(f"[model-catalog] OpenCode refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] OpenCode refresh failed: {e}")
@@ -937,6 +941,7 @@ async def models(request: Request):
             status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
             if status == 200 and isinstance(data, dict) and (data.get('data') or data.get('models')):
                 MODEL_STORE.upsert_catalog(data.get('data') or data.get('models') or [], source='opencode:/models')
+                MODEL_REGISTRY.register_catalog(data.get('data') or data.get('models') or [], revision='runtime-catalog')
             elif status != 200 or not isinstance(data, dict):
                 stale = MODEL_STORE.get_catalog(fresh_only=False)
                 if stale:

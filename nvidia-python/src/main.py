@@ -69,6 +69,7 @@ try:
         credential_fingerprint,
         error_text,
     )
+    from common.model import LocalModelRegistry
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import (
@@ -77,6 +78,7 @@ except ImportError:
         credential_fingerprint,
         error_text,
     )
+    from common.model import LocalModelRegistry
 
 try:
     from watchdog.observers import Observer
@@ -135,6 +137,7 @@ async def verify_models(pool):
             [metadata.get(mid) or {"id": mid} for mid in ids],
             source="nvidia:/v1/models",
         )
+        MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision="runtime-catalog")
 
     sem = asyncio.Semaphore(VERIFY_CONCURRENCY)
     results = {}
@@ -435,6 +438,7 @@ BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/'
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
 MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).parent.parent / 'model-state.db'))
+MODEL_REGISTRY = LocalModelRegistry('nvidia')
 MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 HEADERS_TIMEOUT_MS = int(os.environ.get('HEADERS_TIMEOUT_MS', '120000'))
@@ -697,9 +701,10 @@ def get_dynamic_alias_target() -> str:
 
 
 def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
-    """Bind all aliases to this concrete model (called when client uses a real model id).
-    
-    When force=True (from env seed), skip validation. Otherwise reject unknown models (RC-2)."""
+    """Bind aliases only from explicit operator configuration.
+
+    Concrete client requests never mutate alias state. ``force=True`` is used
+    for the explicit environment seed during startup."""
     global _dynamic_alias_target, ALIAS_TO_NIM
     if not model_id or is_alias_name(model_id):
         return
@@ -741,7 +746,7 @@ def load_alias_config(pool: KeyPool = None):
         if id_val and not is_alias_name(str(id_val)):
             discovery_map[discovery_alias(str(id_val))] = str(id_val)
     DISCOVERY_TO_NIM = discovery_map
-    logger.info(f'[alias] dynamic mode on | target={get_dynamic_alias_target() or "(none yet — aliases pass through until a concrete model is called)"} | discovery={len(DISCOVERY_TO_NIM)}')
+    logger.info(f'[alias] dynamic mode on | target={get_dynamic_alias_target() or "(none — aliases require explicit binding)"} | discovery={len(DISCOVERY_TO_NIM)}')
 
 
 def discovery_alias(nim_id: str) -> str:
@@ -751,9 +756,9 @@ def discovery_alias(nim_id: str) -> str:
 def resolve_target_model(requested_model: str) -> str:
     """Transparent resolve with dynamic aliases.
 
-    - Concrete id (minimaxai/minimax-m3, z-ai/glm-5.2, ...) → pass through AND bind aliases to it.
-    - Alias (sonnet/haiku/opus/claude-*) → resolve to current dynamic target if bound; else pass through unchanged.
-    - No hardcoded default model under any alias.
+    - Concrete id → pass through unchanged and never mutate alias state.
+    - Alias → resolve only to an explicit operator binding; otherwise pass through unchanged.
+    - No hardcoded or last-request default model under any alias.
     """
     m = _strip_context_suffix(requested_model)
     if not m:
@@ -763,14 +768,10 @@ def resolve_target_model(requested_model: str) -> str:
     # Discovery reverse: claude-meta-llama-3.1-8b-instruct → meta/llama-3.1-8b-instruct
     if m.startswith(DISCOVERY_PREFIX) and DISCOVERY_TO_NIM.get(m):
         concrete = DISCOVERY_TO_NIM[m]
-        set_dynamic_alias_target(concrete)
         return concrete
 
-    # Deprecated catalog renames (provider-level, not alias hardcode)
-    redirect = resolve_deprecated_redirect(m)
-    if redirect:
-        set_dynamic_alias_target(redirect)
-        return redirect
+    # Concrete deprecated IDs are not silently redirected. The provider or
+    # an explicit operator alias must decide what to do with them.
 
     # Virtual alias names → dynamic target
     if is_alias_name(m) or lower in _ALIAS_NAME_SET:
@@ -780,8 +781,7 @@ def resolve_target_model(requested_model: str) -> str:
         # No concrete model bound yet — do not invent one; pass alias through
         return m
 
-    # Concrete provider model id
-    set_dynamic_alias_target(m)
+    # Concrete provider model id: pass through unchanged.
     return m
 
 
@@ -1029,6 +1029,7 @@ class Server:
                     [metadata.get(mid) or {"id": mid} for mid in ids],
                     source='nvidia:/v1/models',
                 )
+                MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision='runtime-catalog')
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
 

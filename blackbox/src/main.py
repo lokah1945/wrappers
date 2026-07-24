@@ -21,10 +21,12 @@ from contextlib import asynccontextmanager
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model import LocalModelRegistry
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model import LocalModelRegistry
 
 import aiohttp
 from fastapi import FastAPI, Request, HTTPException
@@ -63,6 +65,7 @@ MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().p
 MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
 MODEL_STORE = ModelStateStore('blackbox', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+MODEL_REGISTRY = LocalModelRegistry('blackbox')
 _MODEL_REFRESH_TASK = None
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
@@ -159,7 +162,7 @@ def _normalize_model(model: str) -> str:
         return ''
     if is_alias_name(m):
         return get_dynamic_alias_target() or m
-    set_dynamic_alias_target(m)
+    # Concrete requests never mutate process-wide alias state.
     return m
 
 
@@ -702,6 +705,7 @@ async def refresh_model_catalog_once():
         models_data = (data.get('data') or data.get('models') or []) if status == 200 and isinstance(data, dict) else []
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source='blackbox:/models')
+            MODEL_REGISTRY.register_catalog(models_data, revision='runtime-catalog')
             logger.info(f'[model-catalog] Blackbox refreshed {len(models_data)} models')
     except Exception as e:
         logger.warning(f'[model-catalog] Blackbox refresh failed: {e}')
@@ -793,6 +797,7 @@ async def models(request: Request):
             upstream = (data.get('data') or data.get('models') or []) if status == 200 and isinstance(data, dict) else []
             if upstream:
                 MODEL_STORE.upsert_catalog(upstream, source='blackbox:/models')
+                MODEL_REGISTRY.register_catalog(upstream, revision='runtime-catalog')
             else:
                 upstream = MODEL_STORE.get_catalog(fresh_only=False)
         normalized = []

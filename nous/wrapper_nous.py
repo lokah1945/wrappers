@@ -33,6 +33,7 @@ import sys
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
     from common.model_state import ModelStateStore
+    from common.model import LocalModelRegistry
 except ImportError:
     # Audit/transparency tooling may load a temporary copy of this file; the
     # monorepo root is still the current working directory in that mode.
@@ -41,6 +42,7 @@ except ImportError:
             sys.path.insert(0, str(_root))
             break
     from common.model_state import ModelStateStore
+    from common.model import LocalModelRegistry
 
 import aiohttp
 
@@ -241,6 +243,7 @@ MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().p
 MODEL_CATALOG_TTL_SEC = int(os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get("MODEL_CATALOG_REFRESH_SEC", "86400"))
 MODEL_STORE = ModelStateStore("nous", MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
+MODEL_REGISTRY = LocalModelRegistry("nous")
 _MODEL_REFRESH_TASK = None
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
 KEY_POOL = KeyPool()
@@ -384,8 +387,7 @@ def resolve_model(m: str) -> str:
     if is_alias_name(key):
         tgt = get_dynamic_alias_target()
         return tgt if tgt else m
-    # concrete
-    set_dynamic_alias_target(m)
+    # concrete: pass through unchanged; explicit requests never mutate aliases.
     return m
 
 # Full Codex-compatible ModelInfo template (loaded from model_catalog_template.json)
@@ -1410,6 +1412,7 @@ async def refresh_model_catalog_once():
         models_data = data.get("data", []) if status == 200 and isinstance(data, dict) else []
         if models_data:
             MODEL_STORE.upsert_catalog(models_data, source="nous:/v1/models")
+            MODEL_REGISTRY.register_catalog(models_data, revision="runtime-catalog")
             logger.info(f"[model-catalog] Nous refreshed {len(models_data)} models")
     except Exception as e:
         logger.warning(f"[model-catalog] Nous refresh failed: {e}")
@@ -1566,6 +1569,7 @@ async def models():
                 upstream_models = data.get("data", [])
                 if upstream_models:
                     MODEL_STORE.upsert_catalog(upstream_models, source="nous:/v1/models")
+                    MODEL_REGISTRY.register_catalog(upstream_models, revision="runtime-catalog")
         except Exception:
             pass
         if not upstream_models:
