@@ -48,6 +48,11 @@ class ModelRegistryClient:
             {"provider": provider, "models": models, "revision": revision},
         )
 
+    @staticmethod
+    def canonical_model_id(provider: str, model_id: str) -> str:
+        prefix = f"{provider}/"
+        return model_id if model_id.startswith(prefix) else prefix + model_id
+
     async def observe(self, provider: str, canonical_model_id: str,
                       account_scope_hash: str, state: str, status: int,
                       reason_code: str, reason_detail: str, endpoint: str) -> bool:
@@ -64,3 +69,26 @@ class ModelRegistryClient:
                 "endpoint": endpoint,
             },
         )
+
+    def schedule_observation(self, provider: str, model_id: str,
+                             account_scope_hash: str, state: str, status: int,
+                             reason_code: str, reason_detail: str,
+                             endpoint: str) -> None:
+        """Best-effort non-blocking observation; never affects inference."""
+        if not self.enabled:
+            return
+        import asyncio
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self.observe(
+                provider,
+                self.canonical_model_id(provider, model_id),
+                account_scope_hash,
+                state,
+                status,
+                reason_code,
+                reason_detail,
+                endpoint,
+            ))
+        except RuntimeError:
+            return

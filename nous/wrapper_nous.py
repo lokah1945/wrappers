@@ -1383,9 +1383,9 @@ def record_model_result(model_id: str, key_entry, status: int, payload, endpoint
     """Persist account-scoped upstream outcome without hard-blocking models."""
     try:
         credential = getattr(key_entry, "api_key", None)
+        from common.model_state import credential_fingerprint
         if status == 200:
-            from common.model_state import credential_fingerprint
-            MODEL_STORE.record_status(
+            stored = MODEL_STORE.record_status(
                 model_id=model_id or "unknown",
                 account_scope=credential_fingerprint(credential),
                 state="available",
@@ -1394,7 +1394,12 @@ def record_model_result(model_id: str, key_entry, status: int, payload, endpoint
                 endpoint=endpoint,
             )
         else:
-            MODEL_STORE.record_error(model_id or "unknown", credential, status, payload, endpoint)
+            stored = MODEL_STORE.record_error(model_id or "unknown", credential, status, payload, endpoint)
+        MODEL_REGISTRY_CLIENT.schedule_observation(
+            "nous", model_id or "unknown", stored.get("account_scope", "unknown"),
+            stored.get("state", "unknown"), status, stored.get("reason_code", ""),
+            stored.get("reason_detail", ""), endpoint,
+        )
     except Exception as e:
         logger.warning(f"[model-state] Nous result record failed: {e}")
 

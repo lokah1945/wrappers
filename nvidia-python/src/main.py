@@ -166,7 +166,7 @@ async def verify_models(pool):
                 res["reason_code"] = "OK"
 
             if _model_state_store:
-                _model_state_store.record_status(
+                stored = _model_state_store.record_status(
                     model_id=mid,
                     account_scope=res.get("account_scope", "unknown"),
                     state=res["state"],
@@ -174,6 +174,11 @@ async def verify_models(pool):
                     reason_code=res.get("reason_code", ""),
                     reason_detail=res.get("reason", ""),
                     endpoint="/v1/chat/completions",
+                )
+                MODEL_REGISTRY_CLIENT.schedule_observation(
+                    "nvidia", mid, stored.get("account_scope", "unknown"),
+                    res["state"], res.get("status", 0), res.get("reason_code", ""),
+                    res.get("reason", ""), "/v1/chat/completions",
                 )
             _model_status[mid] = res
 
@@ -969,6 +974,7 @@ class Server:
         self.app = app or FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
         self.pool = KeyPool()
         self.model_state = ModelStateStore('nvidia', MODEL_STATE_DB)
+        self.model_registry_client = MODEL_REGISTRY_CLIENT
         _model_state_store = self.model_state
         self.metrics: Optional[Metrics] = None
         self.registry: Optional[Registry] = None
@@ -1081,14 +1087,20 @@ class Server:
         return result
 
     def _record_model_response(self, model_id: str, key, status: int, payload: Any, endpoint: str):
-        """Persist provider result with account scope, never raw credentials."""
+        """Persist and asynchronously publish provider result, never raw credentials."""
+        credential = getattr(key, 'api_key', None)
         try:
-            self.model_state.record_error(
+            result = self.model_state.record_error(
                 model_id=model_id,
-                account_credential=getattr(key, 'api_key', None),
+                account_credential=credential,
                 status_code=status,
                 payload=payload,
                 endpoint=endpoint,
+            )
+            self.model_registry_client.schedule_observation(
+                'nvidia', model_id, result.get('account_scope', credential_fingerprint(credential)),
+                result.get('state', 'unknown'), status, result.get('reason_code', ''),
+                result.get('reason_detail', ''), endpoint,
             )
         except Exception as e:
             logger.warning(f'[model-state] response record failed: {e}')
