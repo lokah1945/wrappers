@@ -22,16 +22,22 @@ from .contracts import (
     ProtocolProfile,
 )
 from .identity import AliasResolver
+from .profile_store import ModelProfileStore
 
 
 class LocalModelRegistry:
-    def __init__(self, provider: str, manifest_root: str | Path | None = None):
+    def __init__(self, provider: str, manifest_root: str | Path | None = None,
+                 profile_db_path: str | Path | None = None):
         self.provider = provider
         self.manifest_root = Path(manifest_root or Path(__file__).resolve().parents[2] / "model-registry")
         self.profiles: dict[str, ModelProfile] = {}
+        self.profile_store = ModelProfileStore(profile_db_path) if profile_db_path else None
         self.aliases = AliasResolver()
         self.provider_manifest = self._load_provider_manifest()
         self.error_manifest = self._load_error_manifest()
+        if self.profile_store:
+            for profile in self.profile_store.load(self.provider):
+                self.profiles[profile.canonical_id] = profile
 
     def _load_provider_manifest(self) -> dict[str, Any]:
         path = self.manifest_root / "manifests" / "providers" / f"{self.provider}.json"
@@ -58,6 +64,8 @@ class LocalModelRegistry:
         if profile.policy.get("model_substitution", False) or profile.policy.get("provider_substitution", False):
             raise ValueError("transparent registry cannot register substitution-enabled profile")
         self.profiles[profile.canonical_id] = profile
+        if self.profile_store:
+            self.profile_store.save(profile)
 
     def _default_protocols(self) -> tuple[ProtocolProfile, ...]:
         adapters = self.provider_manifest.get("adapters", {})

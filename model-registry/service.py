@@ -40,7 +40,7 @@ class CentralRegistry:
         if not provider:
             raise ValueError("provider is required")
         if provider not in self.registries:
-            registry = LocalModelRegistry(provider, ROOT / "model-registry")
+            registry = LocalModelRegistry(provider, ROOT / "model-registry", MODEL_REGISTRY_DB)
             state = ModelStateStore(provider, MODEL_REGISTRY_DB)
             cached = state.get_catalog(fresh_only=False)
             if cached:

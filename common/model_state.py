@@ -27,7 +27,7 @@ from .model.errors import classify_upstream_error, error_text
 from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def credential_fingerprint(value: str | None) -> str:
@@ -106,7 +106,26 @@ class ModelStateStore:
                 key TEXT PRIMARY KEY,
                 value TEXT NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS model_state_migrations (
+                version INTEGER PRIMARY KEY,
+                applied_at REAL NOT NULL
+            );
         """)
+        row = conn.execute(
+            "SELECT value FROM model_state_meta WHERE key='schema_version'"
+        ).fetchone()
+        current_version = int(row[0]) if row and str(row[0]).isdigit() else 1
+        if current_version > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"model state schema {current_version} is newer than supported {SCHEMA_VERSION}"
+            )
+        # Version 2 records the migration framework and keeps existing tables
+        # backward-compatible. Future schema changes must add an explicit step.
+        if current_version < 2:
+            conn.execute(
+                "INSERT OR IGNORE INTO model_state_migrations(version, applied_at) VALUES(2,?)",
+                (time.time(),),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO model_state_meta(key,value) VALUES('schema_version',?)",
             (str(SCHEMA_VERSION),),

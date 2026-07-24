@@ -473,7 +473,7 @@ BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/'
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
 MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).parent.parent / 'model-state.db'))
-MODEL_REGISTRY = LocalModelRegistry('nvidia')
+MODEL_REGISTRY = LocalModelRegistry('nvidia', profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))

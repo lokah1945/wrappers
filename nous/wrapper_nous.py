@@ -243,7 +243,7 @@ MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().p
 MODEL_CATALOG_TTL_SEC = int(os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get("MODEL_CATALOG_REFRESH_SEC", "86400"))
 MODEL_STORE = ModelStateStore("nous", MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
-MODEL_REGISTRY = LocalModelRegistry("nous")
+MODEL_REGISTRY = LocalModelRegistry("nous", profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")

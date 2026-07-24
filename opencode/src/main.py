@@ -76,7 +76,7 @@ MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().p
 MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '86400'))
 MODEL_STORE = ModelStateStore('opencode', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
-MODEL_REGISTRY = LocalModelRegistry('opencode')
+MODEL_REGISTRY = LocalModelRegistry('opencode', profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
