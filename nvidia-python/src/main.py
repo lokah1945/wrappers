@@ -180,14 +180,20 @@ from .capabilities import (
 from .responses_compat import ResponsesHandler
 from .metrics import Metrics
 from .registry import Registry
+from . import alert_history
+from . import loki_push
 
 load_dotenv()
 
+LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/nvidia-python/nvidia_py.log')
 logger = logging.getLogger('wrapper-nvidia')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] %(message)s',
-    handlers=[logging.FileHandler("/root/wrapper/nvidia-python/nvidia_py.log"), logging.StreamHandler()],
+    handlers=[
+        logging.FileHandler(LOG_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
 )
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9101'))
@@ -418,6 +424,7 @@ _ALIAS_NAME_SET = {
 }
 _dynamic_alias_target: str = ''  # last concrete model id seen from any client request
 _dynamic_alias_lock = threading.Lock()
+_known_models: Set[str] = set()  # known model ids for alias validation (RC-2)
 
 
 def _norm_alias_key(s: str) -> str:
@@ -452,13 +459,18 @@ def get_dynamic_alias_target() -> str:
         return _dynamic_alias_target or ''
 
 
-def set_dynamic_alias_target(model_id: str) -> None:
-    """Bind all aliases to this concrete model (called when client uses a real model id)."""
+def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
+    """Bind all aliases to this concrete model (called when client uses a real model id).
+    
+    When force=True (from env seed), skip validation. Otherwise reject unknown models (RC-2)."""
     global _dynamic_alias_target, ALIAS_TO_NIM
     if not model_id or is_alias_name(model_id):
         return
     mid = str(model_id).strip()
     if not mid:
+        return
+    if not force and mid not in _known_models:
+        logger.debug(f'[alias] ignoring unknown model {mid!r} — not in known model catalog')
         return
     with _dynamic_alias_lock:
         if _dynamic_alias_target != mid:
@@ -475,18 +487,18 @@ def load_alias_config(pool: KeyPool = None):
       DYNAMIC_ALIAS_TARGET=minimaxai/minimax-m3
     Discovery reverse-map still built from catalog (claude-org-name → org/name).
     """
-    global DISCOVERY_TO_NIM, ALIAS_TO_NIM
-    seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or os.environ.get('ALIAS_DYNAMIC_TARGET') or '').strip()
-    if seed and not is_alias_name(seed):
-        set_dynamic_alias_target(seed)
-    else:
-        # Keep map empty or pointing at current dynamic target
-        tgt = get_dynamic_alias_target()
-        ALIAS_TO_NIM = {a: tgt for a in _ALIAS_NAME_SET} if tgt else {}
-
+    global DISCOVERY_TO_NIM, ALIAS_TO_NIM, _known_models
     all_ids = set((pool.models_cached if pool else []) or [])
     for c in CURATED_GENAI:
         all_ids.add(c)
+    _known_models = set(s for s in all_ids if s and not is_alias_name(str(s)))
+    seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or os.environ.get('ALIAS_DYNAMIC_TARGET') or '').strip()
+    if seed and not is_alias_name(seed):
+        set_dynamic_alias_target(seed, force=True)
+    else:
+        tgt = get_dynamic_alias_target()
+        ALIAS_TO_NIM = {a: tgt for a in _ALIAS_NAME_SET} if tgt else {}
+
     discovery_map = {}
     for id_val in all_ids:
         if id_val and not is_alias_name(str(id_val)):
@@ -635,6 +647,24 @@ class Server:
         self.metrics = Metrics(DB_PATH)
         await self.metrics.init()
 
+        EVENTS_FILE = os.environ.get('EVENTS_FILE', '/root/wrapper/nvidia/metrics_data/wrapper-events.jsonl')
+        os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
+
+        async def _write_event(ev: dict):
+            try:
+                with open(EVENTS_FILE, 'a') as f:
+                    f.write(json.dumps(ev) + '\n')
+            except Exception:
+                pass
+
+        self.metrics.on_request(lambda ev: asyncio.create_task(_write_event(ev)))
+        self.metrics.on_rate_limit(lambda ev: asyncio.create_task(_write_event(ev)))
+
+        alert_history.SOURCE = EVENTS_FILE
+        loki_push.SOURCE = EVENTS_FILE
+        asyncio.create_task(alert_history.mode_daemon())
+        asyncio.create_task(loki_push.daemon())
+
         self.registry = Registry()
         self.registry.set_external_agent(self._session)
         await self.registry.refresh(force=True)
@@ -678,6 +708,9 @@ class Server:
         async def auth_middleware(request: Request, call_next):
             path = request.url.path
             method = request.method
+            # CORS preflight must pass without auth so browser SDKs work
+            if method == 'OPTIONS':
+                return await call_next(request)
             public_paths = ['/health', '/metrics/prom', '/', '/dashboard.html', '/dashboard', '/favicon.ico', '/events']
             is_public = (path in public_paths
                          or path == '/metrics/prom'
@@ -1050,7 +1083,6 @@ class Server:
             try:
                 _b = _json.loads(raw)
                 _temp = _b.get('temperature')
-                # Deep scan for any string-valued temperature-like keys
                 _scan = []
                 def _walk(o, path=''):
                     if isinstance(o, dict):
@@ -1062,20 +1094,24 @@ class Server:
                         for i, v in enumerate(o):
                             _walk(v, f'{path}[{i}]')
                 _walk(_b)
-                logger.warning(f"[DBG responses] top_temp={_temp!r} suspicious={_scan} model={_b.get('model')}")
+                logger.debug(f"[DBG responses] top_temp={_temp!r} suspicious={_scan} model={_b.get('model')}")
             except Exception as _e:
-                logger.warning(f"[DBG responses] parse fail {_e}")
-            result, stream, status_code = await self.responses_handler.handle_responses_api(request, raw)
-            if stream is not None:
-                return StreamingResponse(stream, media_type='text/event-stream', headers={
-                    'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
-                })
-            if result is not None and result.get('error'):
-                sc = status_code or (400 if result['error'].get('type') == 'invalid_request_error' else 502)
-                return JSONResponse(status_code=sc, content={'error': result['error']})
-            if result is not None:
-                return JSONResponse(status_code=200, content=result)
-            return JSONResponse(status_code=500, content={'error': {'message': 'Unexpected error', 'type': 'server_error'}})
+                logger.debug(f"[DBG responses] parse fail {_e}")
+            try:
+                result, stream, status_code = await self.responses_handler.handle_responses_api(request, raw)
+                if stream is not None:
+                    return StreamingResponse(stream, media_type='text/event-stream', headers={
+                        'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
+                    })
+                if result is not None and result.get('error'):
+                    sc = status_code or (400 if result['error'].get('type') == 'invalid_request_error' else 502)
+                    return JSONResponse(status_code=sc, content={'error': result['error']})
+                if result is not None:
+                    return JSONResponse(status_code=200, content=result)
+                return JSONResponse(status_code=500, content={'error': {'message': 'Unexpected error', 'type': 'server_error'}})
+            except Exception as e:
+                logger.exception(f"[responses_api] Unhandled exception: {e}")
+                return JSONResponse(status_code=500, content={'error': {'message': f'Internal server error: {e}', 'type': 'server_error'}})
 
         @app.post('/v1/messages')
         async def anthropic_messages(request: Request):
@@ -1781,11 +1817,37 @@ async def get_server() -> Server:
 def create_app() -> FastAPI:
     global server
     app = FastAPI(title='wrapper-nvidia', docs_url=None, redoc_url=None, openapi_url=None)
-    # P3 CORS hardening (parity with nous/opencode) for codex-cli cross-origin if needed
-    app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+    # P3 CORS: reflective allow for localhost/127.0.0.1 (any port) so browser SDKs
+    # (OpenAI/Anthropic/Codex) preflight works, while blocking non-local origins.
+    allowed_cors_hosts = {'127.0.0.1', 'localhost', '::1'}
+
+    def _cors_origin(origin: str) -> str:
+        if not origin:
+            return ''
+        try:
+            from urllib.parse import urlparse
+            host = urlparse(origin).hostname or ''
+        except Exception:
+            return ''
+        if host in allowed_cors_hosts:
+            return origin
+        return ''
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
+        allow_methods=['*'],
+        allow_headers=['*'],
+        expose_headers=['*'],
+    )
 
     server = Server(app)
     server._register_routes()
+
+    @app.exception_handler(Exception)
+    async def global_exception_handler(request: Request, exc: Exception):
+        logger.exception(f"[global] Unhandled exception on {request.method} {request.url.path}: {exc}")
+        return JSONResponse(status_code=500, content={'error': {'message': 'Internal server error', 'type': 'server_error'}})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
