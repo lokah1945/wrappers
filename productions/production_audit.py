@@ -164,10 +164,17 @@ def main() -> int:
     # H-04: compare runtime against the per-service deployed commit marker,
     # not HEAD. systemd ExecStartPre writes <repo>/runtime/<svc>.commit at start
     # time, so each process is tracked independently (no global race).
+    svc_map = {
+        "model-registry": "model-registry",
+        "nvidia": "nvidia-python",
+        "nous": "nous",
+        "opencode": "opencode",
+        "blackbox": "blackbox",
+    }
     for name, port in [("model-registry", 9200), ("nvidia", 9101), ("nous", 9102), ("opencode", 9103), ("blackbox", 9104)]:
         if name not in args.required_wrapper and name != "model-registry":
             continue
-        svc = "model-registry" if name == "model-registry" else name
+        svc = svc_map[name]
         marker = repo / "runtime" / f"{svc}.commit"
         repo_commit = marker.read_text().strip() if marker.is_file() else ""
         if not repo_commit:
