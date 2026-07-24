@@ -1531,7 +1531,7 @@ async def ready():
 @app.get("/version")
 async def version(): return {"version": VERSION}
 
-# Curated fallback models for Codex/Claude Code discovery (when upstream unavailable)
+# Curated discovery manifest for stale/upstream-unavailable catalog responses
 CURATED_FREE_MODELS = [
     {"id": "tencent/hy3:free", "object": "model", "owned_by": "nous", "context_window": 128000, "max_tokens": 4096, "supports_tools": True},
     {"id": "poolside/laguna-s-2.1:free", "object": "model", "owned_by": "nous", "context_window": 1048576, "max_tokens": 131072, "supports_tools": True},
@@ -1603,7 +1603,7 @@ async def models():
     for m in CURATED_FREE_MODELS:
         _known_models.add(m["id"])
 
-    # FIX: Add curated fallback models for Codex model discovery when upstream is unavailable
+    # Add the curated discovery manifest only when upstream catalog is unavailable; it is not an inference fallback
     # Codex CLI needs to discover models before making chat requests
     if not upstream_models or len(upstream_models) == 0:
         for m in CURATED_FREE_MODELS:

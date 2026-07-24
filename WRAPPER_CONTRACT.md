@@ -120,7 +120,7 @@ Provider-specific code is allowed for:
 
 - BLACKBOX base URL and model id policy
 - FREE_ONLY defaulting to `yes`
-- curated fallback free model list and free allowlist
+- curated discovery manifest and free allowlist
 - translating Responses and Anthropic Messages into BLACKBOX chat completions
 
 Current status:

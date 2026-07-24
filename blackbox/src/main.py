@@ -77,7 +77,7 @@ REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT_SEC', '600'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '900'))
 VERSION = '1.0.0-contract'
 
-# Conservative curated fallback. Upstream /models is authoritative when online.
+# Curated discovery manifest only; it never substitutes an inference model.
 CURATED_FREE_MODELS = [
     {'id': 'blackboxai/nvidia/nemotron-3-super-120b-a12b:free', 'object': 'model', 'owned_by': 'blackbox', 'supports_tools': True},
     {'id': 'blackboxai/x-ai/grok-code-fast-1:free', 'object': 'model', 'owned_by': 'blackbox', 'supports_tools': True},
