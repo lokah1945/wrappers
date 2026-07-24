@@ -40,6 +40,7 @@ class Audit:
 
     def log(self, level: str, title: str, detail: str = "") -> None:
         clean = REDACT.sub(r"\1[REDACTED]", str(detail))
+        clean = re.sub(r"(?i)(https?://)[^/@\s]+:[^/@\s]+@", r"\1[REDACTED]@", clean)
         self.lines.append(f"- **{level}** — {title}: {clean}")
         if level == "PASS":
             self.passes += 1
@@ -48,7 +49,16 @@ class Audit:
         elif level == "BLOCKED":
             self.blocked += 1
 
-    def command(self, cmd: list[str], timeout: int = 120) -> tuple[int, str]:
+    def command(self, cmd: list[str], timeout: int = 120, isolated: bool = False) -> tuple[int, str]:
+        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
+        if isolated:
+            # Production credentials and registry configuration must never leak
+            # into unit/contract tests. Fixtures own their fake credentials.
+            for key in list(env):
+                if key.startswith(("NVIDIA_API_KEY", "NOUS_API_KEY", "OPENCODE_API_KEY", "BLACKBOX_API_KEY")):
+                    env.pop(key, None)
+            for key in ("AUTH_PATH", "BEARER_TOKEN", "MODEL_REGISTRY_URL", "MODEL_REGISTRY_ADMIN_TOKEN", "MODEL_STATE_DB"):
+                env.pop(key, None)
         try:
             proc = subprocess.run(
                 cmd,
@@ -57,7 +67,7 @@ class Audit:
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 timeout=timeout,
-                env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"},
+                env=env,
             )
             return proc.returncode, REDACT.sub(r"\1[REDACTED]", proc.stdout[-6000:])
         except FileNotFoundError:
@@ -105,7 +115,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-load", action="store_true")
     parser.add_argument("--requests", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=5)
+    parser.add_argument("--required-wrapper", action="append", default=[],
+                        help="Wrapper name required to be ready; repeatable")
+    parser.add_argument("--require-registry", action="store_true")
     return parser.parse_args()
+
+
+def error_summary(body: dict | None) -> str:
+    if not isinstance(body, dict):
+        return "error_type=unstructured"
+    error = body.get("error") if isinstance(body.get("error"), dict) else body
+    if not isinstance(error, dict):
+        return "error_type=unknown"
+    error_type = error.get("type") or body.get("type") or "unknown"
+    code = error.get("code") or error.get("provider_code") or "none"
+    return f"error_type={error_type},error_code={code}"
 
 
 def main() -> int:
@@ -130,7 +154,12 @@ def main() -> int:
         audit.log("PASS", "repository layout", "wrappers.json present")
 
     rc, out = audit.command(["git", "rev-parse", "HEAD"])
-    audit.log("PASS" if rc == 0 else "FAIL", "deployed commit", out.strip())
+    repo_commit = out.strip()
+    audit.log("PASS" if rc == 0 else "FAIL", "deployed commit", repo_commit)
+    rc, branch = audit.command(["git", "branch", "--show-current"])
+    audit.log("PASS" if rc == 0 and branch.strip() else "BLOCKED", "git branch", branch.strip() or "unknown")
+    rc, origin = audit.command(["git", "remote", "get-url", "origin"])
+    audit.log("PASS" if rc == 0 and origin.strip() else "BLOCKED", "git origin", "configured" if origin.strip() else "missing")
     rc, out = audit.command(["git", "status", "--porcelain"])
     if rc == 0 and not out.strip():
         audit.log("PASS", "working tree", "clean")
@@ -168,6 +197,7 @@ def main() -> int:
         path = repo / name
         audit.log("PASS" if path.is_file() else "BLOCKED", f"config presence {name}", "present" if path.is_file() else "missing")
 
+    unit_states = {}
     if shutil.which("systemctl"):
         units = [
             "wrapper-model-registry.service",
@@ -178,9 +208,13 @@ def main() -> int:
         ]
         for unit in units:
             rc, out = audit.command(["systemctl", "is-active", unit], timeout=15)
-            audit.log("PASS" if rc == 0 and out.strip() == "active" else "BLOCKED", f"systemd {unit}", out.strip() or "inactive")
+            state = out.strip() or "inactive"
+            unit_states[unit.removesuffix(".service").removeprefix("wrapper-")] = state
+            required = unit.removesuffix(".service").removeprefix("wrapper-") in args.required_wrapper
+            level = "PASS" if rc == 0 and state == "active" else ("FAIL" if required else "BLOCKED")
+            audit.log(level, f"systemd {unit}", state)
     else:
-        audit.log("BLOCKED", "systemd availability", "systemctl is not available")
+        audit.log("FAIL" if args.required_wrapper or args.require_registry else "BLOCKED", "systemd availability", "systemctl is not available")
 
     endpoints = {
         "registry": f"{args.registry_url.rstrip('/')}/health",
@@ -197,10 +231,21 @@ def main() -> int:
             detail += f", {error}"
         elif isinstance(body, dict):
             detail += f", status={body.get('status', body.get('ok', 'unknown'))}"
-        audit.log("PASS" if ok else "BLOCKED", f"endpoint {name}", detail)
+        required = name in args.required_wrapper or (name == "registry" and args.require_registry)
+        endpoint_level = "PASS" if ok else ("FAIL" if required else "BLOCKED")
+        audit.log(endpoint_level, f"endpoint {name}", detail)
+        unit_name = "model-registry" if name == "registry" else name
+        if ok and unit_name in unit_states and unit_states[unit_name] != "active":
+            audit.log("FAIL", f"orphan runtime {name}", "endpoint is healthy but its systemd unit is not active")
+        if isinstance(body, dict):
+            runtime_commit = body.get("git_commit") or body.get("commit")
+            if runtime_commit and repo_commit and runtime_commit != repo_commit:
+                audit.log("FAIL", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
+            elif not runtime_commit and name in args.required_wrapper:
+                audit.log("BLOCKED", f"runtime commit {name}", "health response has no git_commit/build identity")
 
     if args.run_tests:
-        rc, out = audit.command([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], timeout=1800)
+        rc, out = audit.command([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], timeout=1800, isolated=True)
         audit.log("PASS" if rc == 0 else "FAIL", "repository tests", out)
         rc, out = audit.command([sys.executable, "tests/run_transparency_check.py"], timeout=300)
         audit.log("PASS" if rc == 0 else "FAIL", "cross-wrapper transparency", out)
@@ -228,9 +273,13 @@ def main() -> int:
                 returned_model = body.get("model") if isinstance(body, dict) else None
                 identity_ok = returned_model in (None, args.model)
                 ok = 200 <= status < 300 and identity_ok
-                detail = f"HTTP {status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}"
+                detail = (
+                    f"wrapper_url={args.wrapper_url}, model={args.model}, surface=chat_completions, "
+                    f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
+                    f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
+                )
                 if error:
-                    detail += f", {error}"
+                    detail += f", transport_error={error}"
                 audit.log("PASS" if ok else "FAIL", "exact-model smoke", detail)
             if args.run_load:
                 env = {**os.environ, "API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"}
