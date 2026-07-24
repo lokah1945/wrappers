@@ -112,3 +112,4 @@ htmlcov/
 .env
 .env.local
 .env.*.local
+nvidia/
