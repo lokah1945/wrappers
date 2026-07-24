@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 import json
 import os
 import sqlite3
@@ -28,6 +29,7 @@ from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
 SCHEMA_VERSION = 2
+logger = logging.getLogger("model-state")
 
 
 def credential_fingerprint(value: str | None) -> str:
@@ -191,9 +193,11 @@ class ModelStateStore:
             for row in rows:
                 try:
                     metadata = json.loads(row["metadata_json"] or "{}")
-                except Exception:
+                except Exception as exc:
+                    logger.warning("catalog metadata corrupt for %s: %s", row["model_id"], exc)
                     metadata = {"id": row["model_id"]}
                 if not isinstance(metadata, dict):
+                    logger.warning("catalog metadata is not an object for %s", row["model_id"])
                     metadata = {"id": row["model_id"]}
                 metadata.setdefault("id", row["model_id"])
                 # Internal timestamps remain in SQLite; never leak them as
