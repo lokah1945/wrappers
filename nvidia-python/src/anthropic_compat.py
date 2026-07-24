@@ -230,17 +230,15 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
         if role in ('system', 'developer'):
             continue
 
+        # Anthropic rarely uses role=tool; tool_result is usually in user content blocks.
         if role == 'tool':
-            tool_result_content = content if isinstance(content, list) else []
-            text_parts = []
-            for blk in tool_result_content:
-                if isinstance(blk, dict) and blk.get('type') == 'tool_result':
-                    c = blk.get('content', '')
-                    c = _flatten_text(c) if isinstance(c, (list, dict)) else c
-                    text_content = c if isinstance(c, str) else json.dumps(c)
-                    text_parts.append(f'<tool_result id="{blk.get("tool_use_id", "")}">\n{text_content}\n</tool_result>')
-            if text_parts:
-                msgs.append({'role': 'user', 'content': '\n\n'.join(text_parts)})
+            tcid = m.get('tool_call_id') or m.get('tool_use_id') or ''
+            c = content
+            if isinstance(c, list):
+                c = _flatten_text(c)
+            elif not isinstance(c, str):
+                c = json.dumps(c) if c is not None else ''
+            msgs.append({'role': 'tool', 'tool_call_id': tcid, 'content': c or ''})
             continue
 
         if isinstance(content, str):
@@ -249,46 +247,83 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
 
         parts = []
         tool_uses = []
+        reasoning_parts = []
         raw_content = content if isinstance(content, list) else []
 
         for blk in raw_content:
             if not isinstance(blk, dict):
                 continue
-            t = blk.get('type')
-            if t == 'text':
+            bt = blk.get('type')
+            if bt == 'text':
                 parts.append({'type': 'text', 'text': blk.get('text', '')})
-            elif t == 'thinking':
-                parts.append({'type': 'text', 'text': f'  thinking\n{blk.get("thinking", "")}\n  response\n'})
-            elif t == 'image':
-                src = blk.get('source', {})
-                url = ''
+            elif bt == 'thinking':
+                # Keep reasoning as separate field for models that accept it; do NOT
+                # inject MiniMax-style "thinking/response" markup into visible text.
+                reasoning_parts.append(blk.get('thinking', '') or '')
+            elif bt == 'redacted_thinking':
+                reasoning_parts.append('[redacted]')
+            elif bt == 'image':
+                src = blk.get('source', {}) or {}
                 if src.get('type') == 'base64':
                     url = f'data:{src.get("media_type", "image/png")};base64,{src.get("data", "")}'
+                elif src.get('type') == 'url':
+                    url = src.get('url', '')
                 else:
                     url = src.get('url', '')
                 parts.append({'type': 'image_url', 'image_url': {'url': url}})
-            elif t == 'tool_use':
+            elif bt == 'tool_use':
                 tool_uses.append(blk)
-            elif t == 'tool_result':
-                c = blk.get('content', '')
-                c = _flatten_text(c) if isinstance(c, (list, dict)) else c
-                text_content = c if isinstance(c, str) else json.dumps(c)
-                parts.append({'type': 'text', 'text': f'<tool_result id="{blk.get("tool_use_id", "")}">\n{text_content}\n</tool_result>'})
-
-        if tool_uses:
-            dsml = format_tool_calls_as_dsml(tool_uses)
-            parts.append({'type': 'text', 'text': dsml})
+            elif bt == 'tool_result':
+                # Standard OpenAI tool result message (NOT user text / NOT DSML)
+                rc = blk.get('content', '')
+                if isinstance(rc, list):
+                    txt = _flatten_text(rc)
+                elif isinstance(rc, str):
+                    txt = rc
+                else:
+                    txt = '' if rc is None else json.dumps(rc)
+                msgs.append({
+                    'role': 'tool',
+                    'tool_call_id': blk.get('tool_use_id') or blk.get('id') or '',
+                    'content': txt,
+                })
 
         if role == 'user':
+            # Only emit user message for non-tool_result content
             if parts:
-                if all(p['type'] == 'text' for p in parts):
+                if all(p.get('type') == 'text' for p in parts):
                     msgs.append({'role': 'user', 'content': '\n\n'.join(p['text'] for p in parts)})
                 else:
                     msgs.append({'role': 'user', 'content': parts})
         elif role == 'assistant':
             am = {'role': 'assistant'}
-            txt = '\n\n'.join(p['text'] for p in parts if p['type'] == 'text')
-            am['content'] = txt or ''
+            if len(parts) > 1:
+                am['content'] = parts
+            elif parts:
+                am['content'] = parts[0].get('text', '') if parts[0].get('type') == 'text' else parts
+            else:
+                am['content'] = None if tool_uses else ''
+            if tool_uses:
+                am['tool_calls'] = []
+                for blk in tool_uses:
+                    args = blk.get('input', {})
+                    if not isinstance(args, str):
+                        args = json.dumps(args or {})
+                    am['tool_calls'].append({
+                        'id': blk.get('id') or f'toolu_{int(time.time()*1000)}',
+                        'type': 'function',
+                        'function': {
+                            'name': blk.get('name') or '',
+                            'arguments': args,
+                        },
+                    })
+                if am.get('content') is None:
+                    am['content'] = ''
+            if reasoning_parts:
+                am['reasoning_content'] = '\n'.join(reasoning_parts)
+            # Skip empty assistant shells
+            if not tool_uses and not am.get('content') and not reasoning_parts:
+                continue
             msgs.append(am)
 
     oai['messages'] = msgs
@@ -312,17 +347,33 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
         if dropped:
             pass
         if cleaned:
-            oai['tools'] = [
-                {
+            oai_tools = []
+            for ttool in cleaned:
+                if not isinstance(ttool, dict):
+                    continue
+                # Anthropic native: {name, description, input_schema}
+                # OpenAI nested: {type, function:{name, description, parameters}}
+                if isinstance(ttool.get('function'), dict):
+                    fn = ttool['function']
+                    name = fn.get('name') or ''
+                    desc = fn.get('description') or ''
+                    params = fn.get('parameters') or fn.get('input_schema') or {}
+                else:
+                    name = ttool.get('name') or ''
+                    desc = ttool.get('description') or ''
+                    params = ttool.get('input_schema') or ttool.get('parameters') or {}
+                if not name:
+                    continue
+                oai_tools.append({
                     'type': 'function',
                     'function': {
-                        'name': (t.get('function', t) if isinstance(t, dict) else {}).get('name', ''),
-                        'description': (t.get('function', t) if isinstance(t, dict) else {}).get('description', ''),
-                        'parameters': (t.get('function', t) if isinstance(t, dict) else {}).get('parameters', t.get('input_schema', {})),
+                        'name': name,
+                        'description': desc,
+                        'parameters': params if isinstance(params, dict) else {},
                     },
-                }
-                for t in cleaned
-            ]
+                })
+            if oai_tools:
+                oai['tools'] = oai_tools
 
     tc = a.get('tool_choice')
     if tc:
@@ -485,7 +536,10 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
         'role': 'assistant',
         'model': model,
         'content': content,
-        'stop_reason': _FINISH_TO_STOP.get(choice.get('finish_reason')),
+        'stop_reason': (
+            'tool_use' if any(c.get('type') == 'tool_use' for c in content)
+            else _FINISH_TO_STOP.get(choice.get('finish_reason'), 'end_turn')
+        ),
         'stop_sequence': None,
         'usage': usage,
     }
@@ -972,6 +1026,25 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     if errored:
         capture['errored'] = True
         capture['errorMessage'] = error_message or 'upstream connection error'
+        # Still close the Anthropic SSE cleanly so Claude Code / SDKs do not hang mid-turn
+        if not sent_text_or_tool_block:
+            empty_idx = next_index
+            yield _sse('content_block_start', {
+                'type': 'content_block_start', 'index': empty_idx,
+                'content_block': {'type': 'text', 'text': ''},
+            })
+            yield _sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': empty_idx,
+                'delta': {'type': 'text_delta', 'text': f'[upstream stream error: {error_message}]'},
+            })
+            yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
+        yield _sse('message_delta', {
+            'type': 'message_delta',
+            'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+            'usage': {'input_tokens': input_tokens or 0, 'output_tokens': 0,
+                      'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
+        })
+        yield _sse('message_stop', {'type': 'message_stop'})
         return
 
     if not sent_text_or_tool_block and not errored:
@@ -981,6 +1054,10 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
             'content_block': {'type': 'text', 'text': ''},
         })
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
+
+    # Prefer tool_use stop when tools were emitted
+    if tool_map and final_stop == 'end_turn':
+        final_stop = 'tool_use'
 
     estimated_output = max(1, (generated_chars + 3) // 4)
     reported_input = usage.get('prompt_tokens', input_tokens or 0)

@@ -551,9 +551,18 @@ def anthropic_to_openai(req: dict) -> dict:
                 msgs.append({"role": "tool", "tool_call_id": tc, "content": txt})
 
         final_c = parts if len(parts) > 1 else (parts[0]["text"] if parts else None)
-        am = {"role": role, "content": final_c}
-        if tools: am["tool_calls"] = tools
-        if reasoning: am["reasoning_content"] = "\n".join(reasoning)
+        # Skip empty user shells (e.g. message was only tool_result blocks already emitted)
+        if role == "user" and not parts and not tools and not reasoning:
+            continue
+        if role == "assistant" and not parts and not tools and not reasoning:
+            continue
+        am = {"role": role, "content": final_c if final_c is not None else ("" if tools else None)}
+        if tools:
+            am["tool_calls"] = tools
+            if am.get("content") is None:
+                am["content"] = ""
+        if reasoning:
+            am["reasoning_content"] = "\n".join(reasoning)
         msgs.append(am)
 
     out = {"model": model, "messages": msgs, "stream": req.get("stream", False)}
@@ -566,29 +575,56 @@ def anthropic_to_openai(req: dict) -> dict:
     return out
 
 def openai_to_anthropic(model: str, chat: dict) -> dict:
-    msg = (chat.get("choices") or [{}])[0].get("message", {})
+    """OpenAI chat completion → Anthropic message (Claude Code native blocks)."""
+    msg = (chat.get("choices") or [{}])[0].get("message", {}) or {}
     text = msg.get("content") or ""
+    if text is None:
+        text = ""
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
-    if reasoning: text = (reasoning + "\n" + text).strip() if text else reasoning
 
     content = []
-    if reasoning: content.append({"type": "thinking", "thinking": reasoning})
-    if text: content.append({"type": "text", "text": text})
+    # Keep thinking SEPARATE — never concatenate into text (Claude Code contract)
+    if reasoning:
+        content.append({"type": "thinking", "thinking": reasoning})
 
-    for tc in msg.get("tool_calls") or []:
-        fn = tc.get("function", {})
-        try: inp = json.loads(fn.get("arguments", "") or "{}")
-        except: inp = {}
-        content.append({"type": "tool_use", "id": tc.get("id"), "name": fn.get("name"), "input": inp})
+    tool_calls = msg.get("tool_calls") or []
+    if text or not tool_calls:
+        content.append({"type": "text", "text": text if isinstance(text, str) else str(text)})
 
-    if not content: content.append({"type": "text", "text": ""})
-    u = chat.get("usage", {})
+    for tc in tool_calls:
+        fn = tc.get("function", {}) or {}
+        try:
+            inp = json.loads(fn.get("arguments", "") or "{}")
+        except Exception:
+            inp = {"raw": fn.get("arguments", "")}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}",
+            "name": fn.get("name") or "",
+            "input": inp if isinstance(inp, dict) else {"value": inp},
+        })
+
+    if not content:
+        content.append({"type": "text", "text": ""})
+
+    u = chat.get("usage", {}) or {}
     fr = (chat.get("choices") or [{}])[0].get("finish_reason")
-    stop_map = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}
+    stop_map = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}
+    stop_reason = "tool_use" if tool_calls and fr in (None, "tool_calls", "stop") else stop_map.get(fr, "end_turn")
+    if tool_calls:
+        stop_reason = "tool_use"
     return {
-        "id": chat.get("id", "msg_proxy"), "type": "message", "role": "assistant", "model": model,
-        "content": content, "stop_reason": stop_map.get(fr, "end_turn"),
-        "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
+        "id": chat.get("id", "msg_proxy"),
+        "type": "message",
+        "role": "assistant",
+        "model": model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": u.get("prompt_tokens", 0) or 0,
+            "output_tokens": u.get("completion_tokens", 0) or 0,
+        },
     }
 
 # --------------------------------------------------------------------------
@@ -717,7 +753,11 @@ class AnthropicStreamState:
         if ch.get("finish_reason"):
             if self.current_block:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            events.append({"type": "message_delta", "data": {"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": chunk.get("usage", {})}})
+            fr = ch.get("finish_reason")
+            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
+                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
+            )
+            events.append({"type": "message_delta", "data": {"type": "message_delta", "delta": {"stop_reason": stop}, "usage": chunk.get("usage", {})}})
             events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.current_block = None
         return events

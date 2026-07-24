@@ -406,11 +406,25 @@ def anthropic_to_openai(body: dict) -> dict:
                 txt = rc if isinstance(rc, str) else "\n".join(x.get('text','') for x in (rc or []) if isinstance(x, dict))
                 msgs.append({"role": "tool", "tool_call_id": b.get('tool_use_id'), "content": txt})
             elif t == 'thinking':
-                pass  # upstream-specific
+                # Preserve as reasoning_content — never dump raw into text
+                pass
+        # Collect thinking blocks
+        thinking_parts = []
+        for b in (c if isinstance(c, list) else []):
+            if isinstance(b, dict) and b.get('type') == 'thinking':
+                thinking_parts.append(b.get('thinking') or '')
         final = parts if len(parts) > 1 else (parts[0]['text'] if parts else ('' if tools else None))
-        am = {"role": role, "content": final}
+        if role == 'user' and not parts and not tools:
+            continue  # only tool_results already emitted
+        if role == 'assistant' and not parts and not tools and not thinking_parts:
+            continue
+        am = {"role": role, "content": final if final is not None else ('' if tools else None)}
         if tools:
             am['tool_calls'] = tools
+            if am.get('content') is None:
+                am['content'] = ''
+        if thinking_parts:
+            am['reasoning_content'] = '\n'.join(thinking_parts)
         if role != 'tool':
             msgs.append(am)
     out = {"model": model, "messages": msgs, "stream": bool(body.get('stream')),
@@ -444,7 +458,10 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     if not content:
         content.append({"type": "text", "text": ""})
     fr = (data.get('choices') or [{}])[0].get('finish_reason')
-    stop = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}.get(fr, "end_turn")
+    if tool_calls:
+        stop = "tool_use"
+    else:
+        stop = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}.get(fr, "end_turn")
     u = data.get('usage') or {}
     return {"id": data.get('id') or f"msg_{int(time.time()*1000)}", "type": "message", "role": "assistant",
             "model": model, "content": content, "stop_reason": stop, "stop_sequence": None,

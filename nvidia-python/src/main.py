@@ -1320,8 +1320,10 @@ class Server:
 
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
         anthro_version = (request.headers.get('anthropic-version') or '').strip()
+        # Claude Code always sends this; default for other Anthropic-compatible clients
         if not anthro_version:
-            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'anthropic-version header is required')})
+            anthro_version = '2023-06-01'
+
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
@@ -1352,6 +1354,14 @@ class Server:
         except ValueError as e:
             return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', str(e))})
 
+        # anthropic_to_openai may return a structured error instead of raising
+        if isinstance(openai_body, dict) and openai_body.get('error'):
+            err = openai_body['error']
+            return JSONResponse(
+                status_code=400,
+                content={'error': anthropic_error(err.get('type', 'invalid_request_error'), err.get('message', 'Invalid request'))},
+            )
+
         apply_default_reasoning(openai_body, model_id)
         openai_body['model'] = model_id
 
@@ -1360,15 +1370,33 @@ class Server:
 
         result = await self.proxy_openai(openai_body, forward_headers(request), model_id, request, metric_path='/v1/messages')
 
+        expect_thinking = bool(
+            isinstance(body.get('thinking'), dict) and body['thinking'].get('type') == 'enabled'
+        ) or bool(body.get('extended_thinking'))
+        try:
+            input_tok_est = estimate_input_tokens(body)
+        except Exception:
+            input_tok_est = 0
+
         if result.get('stream'):
             async def anthropic_stream():
                 try:
-                    async for chunk in stream_openai_to_anthropic(result['stream'], model_id, {}, start_ms=result.get('start_ms', time.time() * 1000)):
+                    async for chunk in stream_openai_to_anthropic(
+                        result['stream'],
+                        model_id,
+                        {},
+                        input_tokens=input_tok_est,
+                        expect_thinking=expect_thinking,
+                        start_ms=result.get('start_ms', time.time() * 1000),
+                    ):
                         yield chunk
                 except Exception as e:
                     logger.error(f'[anthropic_stream] error: {e}')
-                    # Emit error event for Claude Code SDK compatibility
-                    yield _sse('message_stop', {'type': 'message_stop'})
+                    # Best-effort terminal event so clients don't hang mid-turn
+                    try:
+                        yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
+                    except Exception:
+                        pass
             return StreamingResponse(
                 anthropic_stream(),
                 media_type='text/event-stream',
@@ -1385,7 +1413,7 @@ class Server:
             err = data['error']
             return JSONResponse(status_code=status_code, content={'error': anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error'))})
 
-        anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}")
+        anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
         return JSONResponse(status_code=200, content=anthropic_resp)
 
     async def proxy_openai(self, body: dict, req_headers: dict, model: str, req: Request = None, metric_path: str = '/v1/chat/completions'):
