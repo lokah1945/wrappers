@@ -1,7 +1,7 @@
 # Production scorecard — wrapper monorepo
 
 Date: 2026-07-24
-Latest verified commit: `2ccccfb`
+Latest verified commit: `68e1bc8`
 Scale: 0–100 per aspect; this is a readiness score, not a claim that production deployment has been completed.
 
 ## Score summary
