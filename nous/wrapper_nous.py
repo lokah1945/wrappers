@@ -550,7 +550,7 @@ def _should_cooldown_key(status: int, data) -> bool:
     return status in (401, 402, 403, 408, 409, 429) or status >= 500
 
 
-async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None) -> tuple:
+async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None, client_surface: str = "openai_chat") -> tuple:
     """Post to Nous using every available credential before surfacing failure.
 
     OAuth AUTH_PATH remains supported. If that single token fails with a
@@ -560,6 +560,15 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     Returns (status, result, key_entry). key_entry is non-None only for a
     successful streaming response and must be released when the stream ends.
     """
+    model_id = str(payload.get("model") or "").strip()
+    if model_id:
+        try:
+            call_plan = MODEL_REGISTRY.call_plan(model_id, client_surface)
+            if call_plan.model.provider_model_id != model_id:
+                return 500, {"error": {"type": "server_error", "message": "Model identity changed during call-plan resolution", "code": "MODEL_ID_MUTATION"}}, None
+        except ValueError as exc:
+            return 400, {"error": {"type": "invalid_request_error", "message": str(exc), "code": "MODEL_CALL_PLAN_INVALID"}}, None
+
     last_status = 503
     last_result = {"error": {"message": "No capacity", "type": "server_error"}}
     tried = 0
@@ -1761,7 +1770,7 @@ async def responses(request: Request):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
 
-    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="openai_responses")
     record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
     if status != 200:
         return JSONResponse(status_code=status, content=result)
@@ -1819,7 +1828,7 @@ async def messages(request: Request):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
 
-    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream)
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="anthropic_messages")
     record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code

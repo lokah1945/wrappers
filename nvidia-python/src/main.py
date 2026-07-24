@@ -1821,6 +1821,14 @@ class Server:
         if stream_guard:
             return stream_guard
 
+        client_surface = 'anthropic_messages' if metric_path == '/v1/messages' else 'openai_chat'
+        try:
+            call_plan = MODEL_REGISTRY.call_plan(model_id, client_surface)
+            if call_plan.model.provider_model_id != model_id:
+                return {'status': 500, 'data': {'error': {'message': 'Model identity changed during call-plan resolution', 'type': 'server_error', 'code': 'MODEL_ID_MUTATION'}}}
+        except ValueError as exc:
+            return {'status': 400, 'data': {'error': {'message': str(exc), 'type': 'invalid_request_error', 'code': 'MODEL_CALL_PLAN_INVALID'}}}
+
         # Transparent contract: exactly one requested model.  Retries below
         # rotate credentials only; they never construct model candidates.
         primary_body = json.loads(json.dumps(body))
@@ -1873,7 +1881,7 @@ class Server:
         for p, v in preserved.items():
             body[p] = v
 
-        target_url = f"{resolve_base(model_id)}/v1/chat/completions"
+        target_url = f"{resolve_base(call_plan.model.provider_model_id)}{call_plan.path}"
 
         start_ms = time.time() * 1000
         attempt = 0

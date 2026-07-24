@@ -412,6 +412,16 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         status, data = await proxy_request(method, url, json_body, headers, is_stream=is_stream)
         model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
         if model_id:
+            surface = 'anthropic_messages' if '/messages' in url else ('openai_responses' if '/responses' in url else 'openai_chat')
+            try:
+                call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
+                if call_plan.model.provider_model_id != model_id:
+                    pool.release(key)
+                    return 500, {'error': {'type': 'server_error', 'message': 'Model identity changed during call-plan resolution', 'code': 'MODEL_ID_MUTATION'}}, None
+            except ValueError as exc:
+                pool.release(key)
+                return 400, {'error': {'type': 'invalid_request_error', 'message': str(exc), 'code': 'MODEL_CALL_PLAN_INVALID'}}, None
+        if model_id:
             try:
                 from common.model_state import credential_fingerprint
                 if status == 200:
