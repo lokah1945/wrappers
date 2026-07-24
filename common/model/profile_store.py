@@ -11,7 +11,7 @@ from .contracts import AliasBinding, CapabilityProfile, LimitProfile, ModelProfi
 
 
 class ModelProfileStore:
-    SCHEMA_VERSION = 1
+    SCHEMA_VERSION = 2
 
     def __init__(self, db_path: str | Path):
         self.db_path = Path(db_path)
@@ -53,10 +53,17 @@ class ModelProfileStore:
                 PRIMARY KEY(provider, scope_type, scope_id, alias)
             );
         """)
-        conn.execute(
-            "INSERT OR IGNORE INTO model_profile_schema(version, applied_at) VALUES(?,?)",
-            (self.SCHEMA_VERSION, time.time()),
-        )
+        row = conn.execute("SELECT MAX(version) AS version FROM model_profile_schema").fetchone()
+        current_version = int(row["version"] or 1) if row else 1
+        if current_version > self.SCHEMA_VERSION:
+            raise RuntimeError(
+                f"profile schema {current_version} is newer than supported {self.SCHEMA_VERSION}"
+            )
+        if current_version < 2:
+            conn.execute(
+                "INSERT OR IGNORE INTO model_profile_schema(version, applied_at) VALUES(2,?)",
+                (time.time(),),
+            )
         conn.commit()
         self._initialized = True
 
