@@ -60,7 +60,6 @@ class LocalModelRegistry:
 
     def _default_protocols(self) -> tuple[ProtocolProfile, ...]:
         adapters = self.provider_manifest.get("adapters", {})
-        endpoint = self.provider_manifest.get("default_endpoint", "")
         # Endpoint is completed by the provider adapter; path is the shared
         # protocol path and never changes model identity.
         result = []
