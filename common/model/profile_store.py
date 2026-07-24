@@ -6,8 +6,6 @@ import json
 import sqlite3
 import time
 from pathlib import Path
-from typing import Any
-
 from .contracts import AliasBinding, CapabilityProfile, LimitProfile, ModelProfile, ProtocolProfile
 
 

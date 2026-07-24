@@ -75,7 +75,9 @@ class LocalModelRegistry:
 
     def _default_protocols(self) -> tuple[ProtocolProfile, ...]:
         adapters = self.provider_manifest.get("adapters", {})
-        # Endpoint is completed by the provider adapter; path is the shared
+        base_url = str(self.provider_manifest.get("default_endpoint") or "")
+        # Endpoint path is shared protocol data; base URL remains provider-scoped.
+
         # protocol path and never changes model identity.
         result = []
         for surface, adapter in adapters.items():
@@ -90,7 +92,7 @@ class LocalModelRegistry:
                 path = "/v1/chat/completions" if upstream == "openai_chat" else "/v1/messages"
             else:
                 continue
-            result.append(ProtocolProfile(surface, upstream, path, adapter, "1"))
+            result.append(ProtocolProfile(surface, upstream, path, adapter, "1", base_url=base_url))
         return tuple(result)
 
     def register_catalog(self, models: Iterable[Any], revision: str = "catalog") -> list[str]:

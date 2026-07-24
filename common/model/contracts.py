@@ -90,6 +90,7 @@ class ProtocolProfile:
     adapter_version: str = "1"
     model_field: str = "model"
     streaming: bool | None = None
+    base_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -142,6 +143,7 @@ class CallPlan:
     key_rotation_allowed: bool = True
     model_substitution_allowed: bool = False
     parameter_rules: dict[str, Any] = field(default_factory=dict)
+    base_url: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)

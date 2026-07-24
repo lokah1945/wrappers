@@ -33,4 +33,5 @@ def build_call_plan(profile: ModelProfile, model_ref, client_surface: str) -> Ca
         key_rotation_allowed=bool(profile.policy.get("key_rotation", True)),
         model_substitution_allowed=False,
         parameter_rules=dict(profile.request_rules),
+        base_url=protocol.base_url,
     )
