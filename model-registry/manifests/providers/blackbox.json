@@ -1,0 +1,16 @@
+{
+  "provider": "blackbox",
+  "catalog_url": "https://api.blackbox.ai/models",
+  "default_endpoint": "https://api.blackbox.ai",
+  "adapters": {
+    "openai_chat": "blackbox.chat.v1",
+    "openai_responses": "responses-to-blackbox-chat.v1",
+    "anthropic_messages": "anthropic-to-blackbox-chat.v1"
+  },
+  "policy": {
+    "transparent": true,
+    "model_substitution": false,
+    "provider_substitution": false,
+    "key_rotation": true
+  }
+}

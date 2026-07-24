@@ -1,0 +1,16 @@
+{
+  "provider": "opencode",
+  "catalog_url": "https://opencode.ai/zen/v1/models",
+  "default_endpoint": "https://opencode.ai/zen/v1",
+  "adapters": {
+    "openai_chat": "opencode.chat.v1",
+    "openai_responses": "opencode.responses.v1",
+    "anthropic_messages": "opencode.messages.v1"
+  },
+  "policy": {
+    "transparent": true,
+    "model_substitution": false,
+    "provider_substitution": false,
+    "key_rotation": true
+  }
+}

@@ -20,7 +20,7 @@ def test_account_scoped_404_is_not_global_retirement():
 def test_only_explicit_provider_eol_is_global_retirement():
     assert classify_upstream_error(410, "model reached its end of life")['state'] == 'globally_retired'
     assert classify_upstream_error(410, "temporary unavailable")['state'] != 'globally_retired'
-    assert classify_upstream_error(429, "model capacity")['state'] == 'rate_limited'
+    assert classify_upstream_error(429, "model capacity")['state'] == 'model_rate_limited'
     assert classify_upstream_error(503, "gateway timeout")['state'] == 'transient_failure'
 
 

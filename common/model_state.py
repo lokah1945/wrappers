@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
+from .model.errors import classify_upstream_error, error_text
+
 SCHEMA_VERSION = 1
 
 
@@ -30,55 +32,6 @@ def credential_fingerprint(value: str | None) -> str:
     if not value:
         return "unknown"
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()[:24]
-
-
-def _text_from_payload(payload: Any) -> str:
-    if payload is None:
-        return ""
-    if isinstance(payload, str):
-        raw = payload
-    else:
-        try:
-            raw = json.dumps(payload, ensure_ascii=False)
-        except Exception:
-            raw = str(payload)
-    return raw[:4000]
-
-
-def classify_upstream_error(status: int, payload: Any = "") -> dict[str, Any]:
-    """Classify provider errors without guessing global retirement.
-
-    In particular, NVIDIA's "Function ... Not found for account" is scoped to
-    one account and must never become a global retired-model decision.
-    """
-    text = _text_from_payload(payload)
-    lower = text.lower()
-
-    if status == 200 or (status and status < 400):
-        return {"state": "available", "reason_code": "OK"}
-    if status in (401, 403):
-        return {"state": "account_forbidden", "reason_code": "AUTH_OR_PERMISSION"}
-    if status == 404:
-        if "not found for account" in lower or "for account" in lower and "function" in lower:
-            return {"state": "account_unavailable", "reason_code": "NOT_DEPLOYED_FOR_ACCOUNT"}
-        if "page not found" in lower or "route" in lower:
-            return {"state": "wrong_route", "reason_code": "UPSTREAM_ROUTE_NOT_FOUND"}
-        return {"state": "unknown", "reason_code": "MODEL_NOT_FOUND_OR_UNAVAILABLE"}
-    if status == 410:
-        # Only treat 410 as global retirement when the provider explicitly says
-        # that the model/function reached end-of-life or was retired.
-        if any(term in lower for term in ("end of life", "eol", "retired", "deprecated", "sunset")):
-            return {"state": "globally_retired", "reason_code": "PROVIDER_EOL"}
-        return {"state": "unknown", "reason_code": "HTTP_410_UNCONFIRMED"}
-    if status == 429:
-        if any(term in lower for term in ("model", "deployment", "capacity")):
-            return {"state": "rate_limited", "reason_code": "MODEL_OR_DEPLOYMENT_RATE_LIMIT"}
-        return {"state": "rate_limited", "reason_code": "KEY_RATE_LIMIT"}
-    if status in (408, 425) or status >= 500 or status == 0:
-        return {"state": "transient_failure", "reason_code": "UPSTREAM_TRANSIENT"}
-    if status in (400, 422):
-        return {"state": "capability_mismatch", "reason_code": "INVALID_REQUEST_OR_PARAMETER"}
-    return {"state": "unknown", "reason_code": f"HTTP_{status}"}
 
 
 class ModelStateStore:
@@ -331,7 +284,7 @@ class ModelStateStore:
     def record_error(self, model_id: str, account_credential: str | None,
                      status_code: int, payload: Any, endpoint: str = "") -> dict[str, Any]:
         classification = classify_upstream_error(status_code, payload)
-        detail = _text_from_payload(payload)
+        detail = error_text(payload)
         scope = credential_fingerprint(account_credential)
         return self.record_status(
             model_id=model_id,
@@ -343,9 +296,6 @@ class ModelStateStore:
             endpoint=endpoint,
         )
 
-
-def error_text(payload: Any) -> str:
-    return _text_from_payload(payload)
 
 
 __all__ = [

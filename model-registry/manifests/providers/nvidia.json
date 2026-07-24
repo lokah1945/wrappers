@@ -1,0 +1,15 @@
+{
+  "provider": "nvidia",
+  "catalog_url": "https://integrate.api.nvidia.com/v1/models",
+  "default_endpoint": "https://integrate.api.nvidia.com",
+  "adapters": {
+    "openai_chat": "nvidia.chat.v1",
+    "anthropic_messages": "anthropic-to-nvidia-chat.v2"
+  },
+  "policy": {
+    "transparent": true,
+    "model_substitution": false,
+    "provider_substitution": false,
+    "key_rotation": true
+  }
+}

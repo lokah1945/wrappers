@@ -143,6 +143,8 @@ Non-retriable client/request errors (for example malformed JSON, invalid roles, 
 
 ## Model Catalog and Availability Contract
 
+**Model substitution is forbidden.** A failed model must never be replaced by another model or provider; only the native credential/key pool may rotate credentials for the same model.
+
 Model discovery and invocation availability are separate facts:
 
 - A provider `/models` catalog is a provider-level inventory.

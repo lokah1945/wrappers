@@ -425,7 +425,7 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         tried += 1
         last_status, last_data = status, data
         classification = classify_upstream_error(status, data)
-        if _is_retriable_upstream_status(status, data) and classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden'):
+        if _is_retriable_upstream_status(status, data) and classification['retry_same_model']:
             if _should_cooldown_key(status, data):
                 pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
             pool.release(key)
