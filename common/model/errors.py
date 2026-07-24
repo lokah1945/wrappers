@@ -28,7 +28,7 @@ def classify_upstream_error(status: int, payload: Any = "") -> ErrorClassificati
     text = error_text(payload)
     lower = text.lower()
 
-    if status == 200 or (status and status < 400):
+    if 200 <= status < 300:
         return ErrorClassification(ErrorState.AVAILABLE, "OK")
     if status == 401:
         return ErrorClassification(
