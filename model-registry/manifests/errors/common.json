@@ -1,0 +1,18 @@
+{
+  "version": "1",
+  "rules": [
+    {"status": 401, "state": "invalid_credential", "retry_same_model": true, "rotate_key": true},
+    {"status": 403, "state": "account_forbidden", "retry_same_model": true, "rotate_key": true},
+    {"status": 404, "body_contains": "not found for account", "state": "account_unavailable", "retry_same_model": true, "rotate_key": true},
+    {"status": 404, "body_contains": "page not found", "state": "wrong_route", "retry_same_model": false, "rotate_key": false},
+    {"status": 429, "state": "key_rate_limited", "retry_same_model": true, "rotate_key": true},
+    {"status": 400, "state": "capability_mismatch", "retry_same_model": false, "rotate_key": false},
+    {"status": 422, "state": "capability_mismatch", "retry_same_model": false, "rotate_key": false},
+    {"status": 410, "body_contains": "end of life", "state": "globally_retired", "hard_block": true}
+  ],
+  "invariants": {
+    "model_substitution": false,
+    "provider_substitution": false,
+    "key_rotation": true
+  }
+}

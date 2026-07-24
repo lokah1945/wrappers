@@ -30,9 +30,18 @@ class LocalModelRegistry:
         self.profiles: dict[str, ModelProfile] = {}
         self.aliases = AliasResolver()
         self.provider_manifest = self._load_provider_manifest()
+        self.error_manifest = self._load_error_manifest()
 
     def _load_provider_manifest(self) -> dict[str, Any]:
         path = self.manifest_root / "manifests" / "providers" / f"{self.provider}.json"
+        try:
+            data = json.loads(path.read_text())
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _load_error_manifest(self) -> dict[str, Any]:
+        path = self.manifest_root / "manifests" / "errors" / f"{self.provider}.json"
         try:
             data = json.loads(path.read_text())
             return data if isinstance(data, dict) else {}
