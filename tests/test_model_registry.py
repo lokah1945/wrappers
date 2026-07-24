@@ -1,6 +1,13 @@
 from pathlib import Path
 
-from common.model import AliasBinding, LocalModelRegistry
+from common.model import (
+    AliasBinding,
+    CapabilityProfile,
+    LimitProfile,
+    LocalModelRegistry,
+    ModelProfile,
+    ProtocolProfile,
+)
 
 
 ROOT = Path(__file__).resolve().parents[1]

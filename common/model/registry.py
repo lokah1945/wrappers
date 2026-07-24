@@ -8,6 +8,7 @@ it merely because a catalog/profile is incomplete.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Iterable
 
@@ -95,20 +96,36 @@ class LocalModelRegistry:
             prefix = f"{self.provider}/"
             canonical = provider_model_id if provider_model_id.startswith(prefix) else prefix + provider_model_id
             raw_id = provider_model_id[len(prefix):] if provider_model_id.startswith(prefix) else provider_model_id
-            profile = ModelProfile(
-                canonical_id=canonical,
-                provider=self.provider,
-                provider_model_id=raw_id,
-                profile_revision=revision,
-                catalog_revision=revision,
-                capabilities=CapabilityProfile(
-                    input_modalities=("text",),
-                    output_modalities=("text",),
-                ),
-                limits=LimitProfile(),
-                protocols=self._default_protocols(),
-                provenance={"source": "provider_catalog", "metadata": metadata},
-            )
+            existing = self.profiles.get(canonical)
+            if existing is not None:
+                # Catalog refresh is observational. It may update provenance
+                # and revision, but must never erase an authoritative/manual
+                # capability, limit, protocol, or request-rule profile.
+                provenance = dict(existing.provenance)
+                provenance["catalog"] = {
+                    "source": "provider_catalog",
+                    "metadata": metadata,
+                }
+                profile = replace(
+                    existing,
+                    catalog_revision=revision,
+                    provenance=provenance,
+                )
+            else:
+                profile = ModelProfile(
+                    canonical_id=canonical,
+                    provider=self.provider,
+                    provider_model_id=raw_id,
+                    profile_revision=revision,
+                    catalog_revision=revision,
+                    capabilities=CapabilityProfile(
+                        input_modalities=("text",),
+                        output_modalities=("text",),
+                    ),
+                    limits=LimitProfile(),
+                    protocols=self._default_protocols(),
+                    provenance={"source": "provider_catalog", "metadata": metadata},
+                )
             self.register_profile(profile)
             ids.append(canonical)
         return sorted(set(ids))
