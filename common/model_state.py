@@ -256,7 +256,14 @@ class ModelStateStore:
         finally:
             conn.close()
 
-    def status_map(self, account_scope: str | None = None) -> dict[str, dict[str, Any]]:
+    def status_map(self, account_scope: str | None = None,
+                   endpoint: str | None = None) -> dict[str, dict[str, Any]]:
+        """Return scoped status without collapsing conflicting accounts.
+
+        Without a scope filter, a model observed as available for one account
+        and unavailable for another is returned as ``mixed`` rather than being
+        misrepresented by whichever row happened to be newest.
+        """
         conn = self._connect()
         try:
             query = """SELECT * FROM model_account_status
@@ -265,15 +272,47 @@ class ModelStateStore:
             if account_scope:
                 query += " AND account_scope=?"
                 params.append(account_scope)
+            if endpoint:
+                query += " AND endpoint=?"
+                params.append(endpoint)
             query += " ORDER BY checked_at DESC"
             rows = conn.execute(query, params).fetchall()
-            result: dict[str, dict[str, Any]] = {}
+            grouped: dict[str, list[dict[str, Any]]] = {}
             for row in rows:
-                mid = row["model_id"]
-                # If multiple endpoints/status rows exist, expose the newest.
-                if mid in result and result[mid].get("checked_at", 0) >= row["checked_at"]:
-                    continue
-                result[mid] = dict(row)
+                grouped.setdefault(row["model_id"], []).append(dict(row))
+
+            result: dict[str, dict[str, Any]] = {}
+            for mid, entries in grouped.items():
+                states = {entry.get("state") for entry in entries}
+                scopes = {entry.get("account_scope") for entry in entries}
+                endpoints = {entry.get("endpoint") for entry in entries}
+                newest = max(entries, key=lambda entry: entry.get("checked_at", 0))
+                if len(states) > 1:
+                    result[mid] = {
+                        "model_id": mid,
+                        "state": "mixed",
+                        "reason_code": "MULTIPLE_ACCOUNT_OR_ENDPOINT_STATES",
+                        "reason_detail": "Availability differs by account or endpoint",
+                        "http_status": 0,
+                        "checked_at": newest.get("checked_at", 0),
+                        "scope_count": len(scopes),
+                        "endpoint_count": len(endpoints),
+                        "scoped_states": [
+                            {
+                                "account_scope": entry.get("account_scope"),
+                                "endpoint": entry.get("endpoint"),
+                                "state": entry.get("state"),
+                                "checked_at": entry.get("checked_at"),
+                            }
+                            for entry in entries
+                        ],
+                    }
+                else:
+                    result[mid] = dict(newest)
+                    if len(scopes) > 1:
+                        result[mid]["account_scope"] = "multiple"
+                    if len(endpoints) > 1:
+                        result[mid]["endpoint"] = "multiple"
             return result
         finally:
             conn.close()

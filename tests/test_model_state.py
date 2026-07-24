@@ -52,3 +52,15 @@ def test_catalog_does_not_delete_last_good_snapshot_on_empty_refresh(tmp_path: P
     store.upsert_catalog([{"id": "vendor/model-a"}], source="first")
     store.upsert_catalog([], source="empty-upstream")
     assert store.get_ids() == ["vendor/model-a"]
+
+
+def test_unscoped_status_does_not_collapse_conflicting_accounts(tmp_path: Path):
+    db = tmp_path / "model-state.db"
+    store = ModelStateStore("test-provider", db)
+    store.record_status("vendor/model-a", "account-a", "available", 200, "OK")
+    store.record_status("vendor/model-a", "account-b", "account_unavailable", 404, "NOT_DEPLOYED_FOR_ACCOUNT")
+    state = store.status_for("vendor/model-a")
+    assert state["state"] == "mixed"
+    assert state["reason_code"] == "MULTIPLE_ACCOUNT_OR_ENDPOINT_STATES"
+    assert store.status_for("vendor/model-a", "account-a")["state"] == "available"
+    assert store.status_for("vendor/model-a", "account-b")["state"] == "account_unavailable"
