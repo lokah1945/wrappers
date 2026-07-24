@@ -197,23 +197,23 @@ Quick smoke:
 
 ```bash
 curl -s http://localhost:9101/health
-curl -s http://localhost:9106/health
-curl -s http://localhost:9107/health
+curl -s http://localhost:9102/health
+curl -s http://localhost:9103/health
 
 curl -s http://localhost:9101/v1/models | jq '.data | length'
-curl -s http://localhost:9106/v1/models | jq '.data | length'
-curl -s http://localhost:9107/v1/models | jq '.data | length'
+curl -s http://localhost:9102/v1/models | jq '.data | length'
+curl -s http://localhost:9103/v1/models | jq '.data | length'
 ```
 
 ## Recommended Runtime Env
 
 ```bash
 # Claude/Anthropic clients
-export ANTHROPIC_BASE_URL="http://localhost:9101/v1"   # or 9106 / 9107
+export ANTHROPIC_BASE_URL="http://localhost:9101/v1"   # or 9102 / 9103 / 9104
 export ANTHROPIC_API_KEY="<BEARER_TOKEN-or-any-if-open>"
 
 # OpenAI/Codex clients
-export OPENAI_BASE_URL="http://localhost:9101/v1"      # or 9106 / 9107
+export OPENAI_BASE_URL="http://localhost:9101/v1"      # or 9102 / 9103 / 9104
 export OPENAI_API_KEY="<BEARER_TOKEN-or-any-if-open>"
 
 # Optional but recommended
@@ -547,3 +547,48 @@ live BLACKBOX smoke: models OK, chat OK
 | nous | ✅ | ✅ | ✅ | ✅ | 100/100 |
 | opencode | ✅ | ✅ | ✅ | ✅ | 100/100 |
 | blackbox | ✅ | ✅ | ✅ default yes | ✅ | 100/100 |
+
+---
+
+# Sixth-Pass Performance & Reliability Audit
+
+Goal: the wrapper should add minimal overhead versus direct upstream access while being more resilient under many concurrent agents/clients.
+
+## Implemented
+
+- Standardized active ports to sequential `9101-9104`:
+  - nvidia-python: `9101`
+  - nous: `9102`
+  - opencode: `9103`
+  - blackbox: `9104`
+- Updated `wrappers.json`, README, `.env.example`, systemd, and installer metadata.
+- Added env-configurable connection pools to Nous/OpenCode/Blackbox:
+  - `MAX_CONNECTIONS`
+  - `MAX_CONNECTIONS_PER_HOST`
+  - `CONNECT_TIMEOUT_SEC`
+  - `REQUEST_TIMEOUT_SEC`
+  - `STREAM_REQUEST_TIMEOUT_SEC`
+- Split health/readiness semantics:
+  - `/health` is fast local process/pool health.
+  - `/ready` can perform upstream/pool readiness checks.
+- Added concurrency regression tests for key acquire/release and response-store bounding.
+- Added performance scripts:
+  - `tests/perf/bench_proxy_latency.py`
+  - `tests/perf/load_agent_sim.py`
+- Added `PERFORMANCE_RELIABILITY_AUDIT.md` with benchmark commands and acceptance criteria.
+
+## Validation
+
+```text
+compileall: pass
+pytest: pass
+transparency runner: pass
+ruff F/E9/B: pass
+bandit high severity: no findings
+pip-audit: no known vulnerabilities
+install.sh syntax: pass
+```
+
+## Verdict
+
+The monorepo now has explicit performance/reliability instrumentation and tests. The hot path avoids per-request client sessions, successful streams are not pre-buffered, health is not upstream-dependent, and concurrency tests assert no key-pool in-flight leaks under parallel usage.

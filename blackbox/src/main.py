@@ -48,11 +48,14 @@ except Exception:
 logger = logging.getLogger('wrapper-blackbox')
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [blackbox] %(message)s', handlers=[_log_file_handler, logging.StreamHandler()])
 
-LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9108'))
+LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9104'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 BLACKBOX_BASE = os.environ.get('BLACKBOX_BASE_URL', 'https://api.blackbox.ai').rstrip('/')
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
+MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
+MAX_CONNECTIONS_PER_HOST = int(os.environ.get('MAX_CONNECTIONS_PER_HOST', '100'))
+CONNECT_TIMEOUT_SEC = int(os.environ.get('CONNECT_TIMEOUT_SEC', '30'))
 REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT_SEC', '600'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '900'))
 VERSION = '1.0.0-contract'
@@ -173,7 +176,7 @@ async def get_session():
                 await _session.close()
             except Exception:
                 pass
-        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC)))
+        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC), connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True))
     return _session
 
 
@@ -223,7 +226,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
     headers = headers or {}
     try:
         if is_stream:
-            resp = await sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=STREAM_REQUEST_TIMEOUT_SEC))
+            resp = await sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=STREAM_REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC))
             if resp.status >= 400:
                 text = await resp.text()
                 resp.release()
@@ -233,7 +236,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                     data = text
                 return resp.status, _normalize_upstream_error(resp.status, data)
             return 200, resp
-        async with sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC)) as resp:
+        async with sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC)) as resp:
             text = await resp.text()
             try:
                 data = json.loads(text) if text else {}
@@ -704,6 +707,16 @@ def _auth_check(request: Request):
 @app.get('/health')
 async def health():
     return {'status': 'ok' if pool.available_keys > 0 else 'degraded', 'version': VERSION, 'keys': pool.total_keys, 'available': pool.available_keys, 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'base': BLACKBOX_BASE, 'metrics': await metrics.summary()}
+
+
+@app.get('/ready')
+async def ready(request: Request):
+    _auth_check(request)
+    try:
+        status, data, _ = await proxy_request_with_pool('GET', f'{BLACKBOX_BASE}/models', None, request)
+        return {'ready': status == 200, 'upstream_ok': status == 200, 'status_code': status, 'last_error': None if status == 200 else (data.get('error') if isinstance(data, dict) else str(data)), 'keys': pool.total_keys, 'available': pool.available_keys}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={'ready': False, 'upstream_ok': False, 'last_error': str(e), 'keys': pool.total_keys, 'available': pool.available_keys})
 
 
 @app.get('/version')

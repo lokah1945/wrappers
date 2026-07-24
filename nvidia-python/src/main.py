@@ -895,7 +895,7 @@ class Server:
             # CORS preflight must pass without auth so browser SDKs work
             if method == 'OPTIONS':
                 return await call_next(request)
-            public_paths = ['/health', '/metrics/prom', '/', '/dashboard.html', '/dashboard', '/favicon.ico', '/events']
+            public_paths = ['/health', '/ready', '/metrics/prom', '/', '/dashboard.html', '/dashboard', '/favicon.ico', '/events']
             is_public = (path in public_paths
                          or path == '/metrics/prom'
                          or (method == 'GET' and path == '/v1/models')
@@ -939,6 +939,17 @@ class Server:
                 'models_cached': len(self.pool.models_cached),
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
+            }
+
+        @app.get('/ready')
+        async def ready():
+            return {
+                'ready': self.pool.available_keys > 0,
+                'upstream_ok': len(self.pool.models_cached) > 0,
+                'keys': self.pool.total_keys,
+                'available': self.pool.available_keys,
+                'models_cached': len(self.pool.models_cached),
+                'unavailable_models': len(_unavailable_models),
             }
 
         @app.get('/version')

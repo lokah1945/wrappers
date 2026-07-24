@@ -17,7 +17,7 @@
     },
     {
       "name": "nous",
-      "port": 9106,
+      "port": 9102,
       "upstream": "nous",
       "type": "python",
       "source": "nous/wrapper_nous.py",
@@ -30,7 +30,7 @@
     },
     {
       "name": "opencode",
-      "port": 9107,
+      "port": 9103,
       "upstream": "opencode-zen",
       "type": "python",
       "source": "opencode/src/main.py",
@@ -43,7 +43,7 @@
     },
     {
       "name": "blackbox",
-      "port": 9108,
+      "port": 9104,
       "upstream": "blackbox-ai",
       "type": "python",
       "source": "blackbox/src/main.py",

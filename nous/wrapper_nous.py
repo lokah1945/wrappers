@@ -227,10 +227,15 @@ NOUS_BASE = os.environ.get("NOUS_BASE_URL", "https://inference-api.nousresearch.
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
 KEY_POOL = KeyPool()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
-LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9106"))
+LISTEN_PORT = int(os.environ.get("LISTEN_PORT", "9102"))
 BEARER_TOKEN = os.environ.get("BEARER_TOKEN", "").strip()
 HEARTBEAT_MS = int(os.environ.get("HEARTBEAT_INTERVAL_MS", "5000"))
 MAX_CONCURRENT = int(os.environ.get("MAX_CONCURRENT_STREAMS", "32"))
+MAX_CONNECTIONS = int(os.environ.get("MAX_CONNECTIONS", "200"))
+MAX_CONNECTIONS_PER_HOST = int(os.environ.get("MAX_CONNECTIONS_PER_HOST", "100"))
+CONNECT_TIMEOUT_SEC = int(os.environ.get("CONNECT_TIMEOUT_SEC", "30"))
+REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT_SEC", "600"))
+STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get("STREAM_REQUEST_TIMEOUT_SEC", "900"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
 VERSION = "2.0.6-anthropic-tools"
 # No DEFAULT_MODEL/REASONING_MODEL - all model selection is transparent (client chooses)
@@ -1409,15 +1414,35 @@ async def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
+    return {
+        "ok": True,
+        "status": "ok" if KEY_POOL.available_keys > 0 or bool(_read_token_from_auth_path()) else "degraded",
+        "version": VERSION,
+        "port": LISTEN_PORT,
+        "free_only": free_only_enabled(),
+        "dynamic_alias_target": get_dynamic_alias_target() or None,
+        "keys": KEY_POOL.total_keys,
+        "available": KEY_POOL.available_keys,
+        "metrics": metrics.snapshot(),
+    }
+
+
+@app.get("/ready")
+async def ready():
     try:
         if CURATED_FREE_MODELS:
-            code, _, _ = await post_nous_with_retries({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
-            upstream = code == 200
-        else:
-            upstream = True
-    except:
-        upstream = False
-    return {"ok": True, "version": VERSION, "upstream_ok": upstream, "port": LISTEN_PORT, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "metrics": metrics.snapshot()}
+            code, result, _ = await post_nous_with_retries({"model": CURATED_FREE_MODELS[0]["id"], "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+            return {
+                "ready": code == 200,
+                "upstream_ok": code == 200,
+                "status_code": code,
+                "last_error": None if code == 200 else (result.get("error") if isinstance(result, dict) else str(result)),
+                "keys": KEY_POOL.total_keys,
+                "available": KEY_POOL.available_keys,
+            }
+        return {"ready": True, "upstream_ok": None, "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys}
+    except Exception as e:
+        return JSONResponse(status_code=503, content={"ready": False, "upstream_ok": False, "last_error": str(e), "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys})
 
 @app.get("/version")
 async def version(): return {"version": VERSION}
@@ -1461,7 +1486,7 @@ async def get_token():
 async def get_session():
     global _SESSION
     if _SESSION is None or _SESSION.closed:
-        _SESSION = aiohttp.ClientSession()
+        _SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC), connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True))
     return _SESSION
 
 @app.get("/v1/models")

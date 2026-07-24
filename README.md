@@ -9,9 +9,9 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | Wrapper            | Status          | Score   | Port   | Use Case |
 |--------------------|-----------------|---------|--------|----------|
 | **nvidia-python**  | ✅ Production   | **100/100** | 9101   | NVIDIA NIM API proxy |
-| **nous**           | ✅ Production   | **100/100** | 9106   | Nous Research inference API |
-| **opencode**       | ✅ Production   | **100/100** | 9107   | OpenCode Zen gateway |
-| **blackbox**       | ✅ Production   | **100/100** | 9108   | BLACKBOX AI API proxy |
+| **nous**           | ✅ Production   | **100/100** | 9102   | Nous Research inference API |
+| **opencode**       | ✅ Production   | **100/100** | 9103   | OpenCode Zen gateway |
+| **blackbox**       | ✅ Production   | **100/100** | 9104   | BLACKBOX AI API proxy |
 
 ## Recent Audit Findings (2026-07-24)
 
@@ -77,31 +77,31 @@ cp .env.example .env   # add your NVIDIA_API_KEY_*
 python -m uvicorn src.main:app --port 9101
 ```
 
-### 2. Nous Research Proxy (Port 9106)
+### 2. Nous Research Proxy (Port 9102)
 
 ```bash
 cd nous
 pip install -r requirements.txt
-python -m uvicorn wrapper_nous:app --port 9106
+python -m uvicorn wrapper_nous:app --port 9102
 ```
 
-### 3. OpenCode Zen Proxy (Port 9107)
+### 3. OpenCode Zen Proxy (Port 9103)
 
 ```bash
 cd opencode
 pip install -r requirements.txt
 cp .env.example .env   # add your API keys
-python -m uvicorn src.main:app --port 9107
+python -m uvicorn src.main:app --port 9103
 ```
 
 
-### 4. BLACKBOX AI Proxy (Port 9108)
+### 4. BLACKBOX AI Proxy (Port 9104)
 
 ```bash
 cd blackbox
 pip install -r requirements.txt
 cp .env.example .env   # add BLACKBOX_API_KEY_*
-python -m uvicorn src.main:app --port 9108
+python -m uvicorn src.main:app --port 9104
 ```
 
 ## Client Configuration
@@ -109,7 +109,7 @@ python -m uvicorn src.main:app --port 9108
 ### Claude Code CLI
 
 ```bash
-export ANTHROPIC_BASE_URL="http://localhost:9101/v1"  # or 9106/9107
+export ANTHROPIC_BASE_URL="http://localhost:9101/v1"  # or 9102/9103/9104
 export ANTHROPIC_API_KEY="test-key"  # or your actual key
 
 # Test

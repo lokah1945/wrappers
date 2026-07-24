@@ -3,9 +3,9 @@
 #
 # Installs one or all Python wrapper services using the same layout/contract:
 #   nvidia-python -> port 9101
-#   nous          -> port 9106
-#   opencode      -> port 9107
-#   blackbox      -> port 9108
+#   nous          -> port 9102
+#   opencode      -> port 9103
+#   blackbox      -> port 9104
 #
 # Usage:
 #   sudo ./install.sh                         # install all wrappers
@@ -35,9 +35,9 @@ fail() { printf '[install][ERROR] %s\n' "$*" >&2; exit 1; }
 # name|dir|unit|health
 WRAPPERS=(
   "nvidia-python|nvidia-python|wrapper-nvidia-python.service|http://127.0.0.1:9101/health"
-  "nous|nous|wrapper-nous.service|http://127.0.0.1:9106/health"
-  "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9107/health"
-  "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9108/health"
+  "nous|nous|wrapper-nous.service|http://127.0.0.1:9102/health"
+  "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9103/health"
+  "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9104/health"
 )
 
 selected_wrappers() {

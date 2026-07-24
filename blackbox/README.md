@@ -4,7 +4,7 @@ OpenAI- and Anthropic-compatible FastAPI proxy for the BLACKBOX AI public API.
 
 - Upstream base: `https://api.blackbox.ai`
 - OpenAI-compatible upstream path: `/chat/completions`
-- Local default port: `9108`
+- Local default port: `9104`
 - Default policy: `FREE_ONLY=yes`
 
 ## Features
@@ -26,7 +26,7 @@ OpenAI- and Anthropic-compatible FastAPI proxy for the BLACKBOX AI public API.
 cd /root/wrapper/blackbox
 cp .env.example .env
 # BLACKBOX_API_KEY_1=sk-...
-python -m uvicorn src.main:app --host 0.0.0.0 --port 9108
+python -m uvicorn src.main:app --host 0.0.0.0 --port 9104
 ```
 
 ## FREE_ONLY
@@ -49,7 +49,7 @@ DYNAMIC_ALIAS_TARGET=blackboxai/x-ai/grok-code-fast-1:free
 
 ```python
 from openai import OpenAI
-client = OpenAI(base_url="http://localhost:9108/v1", api_key="local")
+client = OpenAI(base_url="http://localhost:9104/v1", api_key="local")
 print(client.chat.completions.create(
     model="blackboxai/x-ai/grok-code-fast-1:free",
     messages=[{"role":"user","content":"hello"}],
@@ -59,7 +59,7 @@ print(client.chat.completions.create(
 ### Claude Code / Anthropic SDK
 
 ```bash
-export ANTHROPIC_BASE_URL=http://localhost:9108/v1
+export ANTHROPIC_BASE_URL=http://localhost:9104/v1
 export ANTHROPIC_API_KEY=local
 ```
 
