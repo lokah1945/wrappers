@@ -512,6 +512,19 @@ def _is_retriable_upstream_status(status: int) -> bool:
     return status in (401, 402, 403, 408, 409, 429) or status >= 500
 
 
+def _looks_model_capacity_error(data) -> bool:
+    blob = json.dumps(data, ensure_ascii=False).lower() if isinstance(data, dict) else str(data).lower()
+    return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
+
+
+def _should_cooldown_key(status: int, data) -> bool:
+    if status == 429 and _looks_model_capacity_error(data):
+        return False
+    if status == 404 and _looks_model_capacity_error(data):
+        return False
+    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+
+
 async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None) -> tuple:
     """Post to Nous using every available credential before surfacing failure.
 
@@ -550,7 +563,8 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
         tried += 1
         last_status, last_result = status, result
         if _is_retriable_upstream_status(status):
-            KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result))
+            if _should_cooldown_key(status, result):
+                KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result))
             KEY_POOL.release(entry)
             continue
         KEY_POOL.release(entry)
@@ -601,7 +615,8 @@ async def get_nous_json_with_retries(path: str) -> tuple:
                     return r.status, data
                 last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
                 if _is_retriable_upstream_status(r.status):
-                    KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
+                    if _should_cooldown_key(r.status, last_data):
+                        KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
                     KEY_POOL.release(entry)
                     continue
                 KEY_POOL.release(entry)

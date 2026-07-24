@@ -1,0 +1,19 @@
+[Unit]
+Description=wrapper-blackbox: BLACKBOX AI API proxy (port 9108)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper/blackbox
+Environment=PYTHONPATH=/root/wrapper/blackbox
+EnvironmentFile=-/root/wrapper/blackbox/.env
+Environment=LOG_FILE=/root/wrapper/blackbox/blackbox.log
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9108
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/wrapper/blackbox/blackbox.log
+StandardError=append:/root/wrapper/blackbox/blackbox.log
+
+[Install]
+WantedBy=default.target

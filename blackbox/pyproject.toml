@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "wrapper-blackbox"
+version = "1.0.0"
+description = "Production Blackbox AI proxy (OpenAI + Anthropic compatible)"
+authors = [{name = "Arena Agent"}]
+requires-python = ">=3.10"
+dependencies = [
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.30",
+    "aiohttp>=3.10",
+    "python-dotenv>=1.0",
+    "pydantic>=2.0",
+    "watchdog>=4.0.0",
+]
+
+[project.scripts]
+wrapper-blackbox = "src.main:main"

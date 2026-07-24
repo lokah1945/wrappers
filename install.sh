@@ -1,111 +1,114 @@
 #!/usr/bin/env bash
-# install.sh — canonical installer for wrapper-nvidia
-# Runs as root in the wrapper collection. Idempotent.
+# install.sh — canonical installer for the wrappers monorepo.
 #
-# What this does:
-#  1. Validate .env exists (warn if missing)
-#  2. Sync canonical /etc/systemd/system/wrapper-nvidia.service
-#  3. Remove duplicate /etc/systemd/system/nvidia-wrapper.service if present
-#  4. Install node_modules npm ci if missing
-#  5. systemd daemon-reload + enable + restart
-#  6. Smoke-test /health
+# Installs one or all Python wrapper services using the same layout/contract:
+#   nvidia-python -> port 9101
+#   nous          -> port 9106
+#   opencode      -> port 9107
+#   blackbox      -> port 9108
 #
 # Usage:
-#   ./install.sh              # full install + restart + smoke test
-#   ./install.sh --status     # only show service status (no changes)
-#   ./install.sh --no-restart # install (copy unit, daemon-reload) but DO NOT restart
-#
-set -eu
+#   sudo ./install.sh                         # install all wrappers
+#   sudo ./install.sh --wrapper blackbox      # install one wrapper
+#   sudo ./install.sh --status                # status for all wrappers
+#   sudo ./install.sh --wrapper nous --status # status for one wrapper
+#   sudo ./install.sh --no-restart            # copy units/install deps only
+
+set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-SERVICE_NAME="wrapper-nvidia.service"
-SERVICE_PATH="/etc/systemd/system/${SERVICE_NAME}"
-INTERNAL_UNIT="${PROJECT_DIR}/${SERVICE_NAME}"
-DUPLICATE_UNIT="/etc/systemd/system/nvidia-wrapper.service"
+MODE="install"
+WRAPPER="all"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --wrapper) WRAPPER="${2:-}"; shift 2 ;;
+    --status|status) MODE="status"; shift ;;
+    --no-restart) MODE="no-restart"; shift ;;
+    *) echo "[install][ERROR] unknown argument: $1" >&2; exit 1 ;;
+  esac
+done
 
 log() { printf '[install] %s\n' "$*"; }
 fail() { printf '[install][ERROR] %s\n' "$*" >&2; exit 1; }
 
-MODE="${1:-install}"
+# name|dir|unit|health
+WRAPPERS=(
+  "nvidia-python|nvidia-python|wrapper-nvidia-python.service|http://127.0.0.1:9101/health"
+  "nous|nous|wrapper-nous.service|http://127.0.0.1:9106/health"
+  "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9107/health"
+  "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9108/health"
+)
 
-# ---- mode: status (no changes) ----
-if [ "${MODE}" = "--status" ] || [ "${MODE}" = "status" ]; then
-  systemctl is-active "${SERVICE_NAME}" 2>&1 || true
-  systemctl is-enabled "${SERVICE_NAME}" 2>&1 || true
-  systemctl show "${SERVICE_NAME}" -p MainPID,NRestarts,ActiveState,SubState --no-pager 2>&1 || true
+selected_wrappers() {
+  for item in "${WRAPPERS[@]}"; do
+    IFS='|' read -r name dir unit health <<<"$item"
+    if [ "$WRAPPER" = "all" ] || [ "$WRAPPER" = "$name" ] || [ "$WRAPPER" = "$dir" ]; then
+      printf '%s\n' "$item"
+    fi
+  done
+}
+
+if [ -z "$(selected_wrappers)" ]; then
+  fail "unknown wrapper: ${WRAPPER}"
+fi
+
+if [ "$MODE" = "status" ]; then
+  while IFS='|' read -r name dir unit health; do
+    log "status ${unit}"
+    systemctl is-active "$unit" 2>&1 || true
+    systemctl is-enabled "$unit" 2>&1 || true
+    systemctl show "$unit" -p MainPID,NRestarts,ActiveState,SubState --no-pager 2>&1 || true
+  done < <(selected_wrappers)
   exit 0
 fi
 
-# ---- main install path ----
 if [ "$(id -u)" -ne 0 ]; then
   fail "must be root (use sudo)"
 fi
 
-[ -f "${PROJECT_DIR}/.env" ] || log "WARN: .env not found at ${PROJECT_DIR}/.env — populate before starting"
+while IFS='|' read -r name dir unit health; do
+  src_dir="${PROJECT_DIR}/${dir}"
+  unit_src="${src_dir}/systemd/${unit}"
+  unit_dst="/etc/systemd/system/${unit}"
+  [ -d "$src_dir" ] || fail "missing wrapper dir: $src_dir"
+  [ -f "$unit_src" ] || fail "missing systemd unit: $unit_src"
 
-# Sync canonical service file
-if [ -f "${INTERNAL_UNIT}" ]; then
-  cp -f "${INTERNAL_UNIT}" "${SERVICE_PATH}"
-  log "synced ${INTERNAL_UNIT} -> ${SERVICE_PATH}"
-else
-  log "WARN: no internal unit at ${INTERNAL_UNIT}; using whatever is in ${SERVICE_PATH}"
-fi
+  [ -f "${src_dir}/.env" ] || log "WARN: ${dir}/.env missing — copy ${dir}/.env.example and fill credentials before runtime"
 
-# Remove duplicate nvidia-wrapper.service if it exists
-if [ -f "${DUPLICATE_UNIT}" ]; then
-  log "removing duplicate unit ${DUPLICATE_UNIT}"
-  systemctl stop  nvidia-wrapper.service 2>/dev/null || true
-  systemctl disable nvidia-wrapper.service 2>/dev/null || true
-  rm -f "${DUPLICATE_UNIT}"
-fi
+  if [ -f "${src_dir}/requirements.txt" ]; then
+    log "installing Python deps for ${name}"
+    python3 -m pip install -r "${src_dir}/requirements.txt"
+  fi
 
-# Install deps if needed
-if [ ! -d "${PROJECT_DIR}/node_modules" ]; then
-  log "installing node deps (npm ci --omit=dev)..."
-  (cd "${PROJECT_DIR}" && npm ci --omit=dev)
-else
-  log "node_modules present — skipping install"
-fi
+  cp -f "$unit_src" "$unit_dst"
+  log "synced ${unit_src} -> ${unit_dst}"
+  systemctl enable "$unit" 2>&1 || log "WARN: enable failed for ${unit}"
+done < <(selected_wrappers)
 
 systemctl daemon-reload
 log "systemd daemon-reload OK"
 
-# Enable at boot
-systemctl enable "${SERVICE_NAME}" 2>&1 || log "WARN: enable failed"
-log "${SERVICE_NAME} will auto-start on boot"
-
-if [ "${MODE}" = "--no-restart" ]; then
+if [ "$MODE" = "no-restart" ]; then
   log "skipping restart (--no-restart)"
   exit 0
 fi
 
-# Stop orphan (PPID != 1) processes on port 9100 if present
-PORT_PID=$(ss -tlnp 2>/dev/null | awk -v port=':9100' '$4 ~ port { gsub(/.*pid=/, "", $7); gsub(/,.*/, "", $7); print $7 }' | head -1)
-if [ -n "${PORT_PID:-}" ] && [ "${PORT_PID}" != "" ]; then
-  PARENT=$(ps -o ppid= -p "${PORT_PID}" 2>/dev/null | tr -d ' ')
-  if [ "${PARENT}" != "1" ] && [ -n "${PARENT}" ]; then
-    log "orphan PID ${PORT_PID} (PPID=${PARENT}) holds port 9100 — killing"
-    kill -TERM "${PORT_PID}" 2>/dev/null || true
-    sleep 2
-    kill -KILL "${PORT_PID}" 2>/dev/null || true
+while IFS='|' read -r name dir unit health; do
+  log "restarting ${unit}"
+  systemctl reset-failed "$unit" 2>&1 || true
+  systemctl restart "$unit"
+  sleep 2
+  if curl -sS -m 5 "$health" > "/tmp/${unit}.health.json" 2>&1; then
+    log "✅ ${name} healthy"
+    cat "/tmp/${unit}.health.json"
+    printf '\n'
+  else
+    log "❌ ${name} health failed"
+    tail -30 "/tmp/${unit}.health.json" || true
+    journalctl -u "$unit" --since "30 seconds ago" --no-pager | tail -20 || true
+    exit 1
   fi
-fi
-
-# Reset and start
-systemctl reset-failed "${SERVICE_NAME}" 2>&1 || true
-systemctl restart "${SERVICE_NAME}"
-sleep 2
-
-# Smoke test
-if curl -sS -m 5 http://127.0.0.1:9100/health > /tmp/wrapper-health.json 2>&1; then
-  log "✅ service healthy:"
-  cat /tmp/wrapper-health.json
-  printf '\n'
-else
-  log "❌ service health failed:"
-  tail -30 /tmp/wrapper-health.json || true
-  journalctl -u "${SERVICE_NAME}" --since "30 seconds ago" --no-pager | tail -20 || true
-  exit 1
-fi
+done < <(selected_wrappers)
 
 log "install complete"

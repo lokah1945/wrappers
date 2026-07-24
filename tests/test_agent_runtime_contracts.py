@@ -271,3 +271,95 @@ def test_opencode_proxy_retries_next_key_before_returning_upstream_error():
     assert key is None
     assert calls == ["sk-test-key-bad111", "sk-test-key-good222"]
     assert data["choices"][0]["message"]["content"] == "ok"
+
+
+def _load_blackbox():
+    for k in list(sys.modules):
+        if k == "src" or k.startswith("src."):
+            del sys.modules[k]
+    sys.path = [p for p in sys.path if "opencode" not in p and "nvidia-python" not in p]
+    sys.path.insert(0, str(ROOT / "blackbox"))
+    import src.main as bb  # type: ignore
+
+    return bb
+
+
+def test_blackbox_free_only_defaults_true_and_blocks_non_free_model():
+    bb = _load_blackbox()
+    old = os.environ.pop("FREE_ONLY", None)
+    try:
+        assert bb.free_only_enabled() is True
+        assert bb.model_allowed("blackboxai/nvidia/nemotron-3-super-120b-a12b:free")
+        assert not bb.model_allowed("blackboxai/openai/gpt-5.5")
+    finally:
+        if old is not None:
+            os.environ["FREE_ONLY"] = old
+
+
+def test_blackbox_responses_to_chat_repairs_orphan_tool_result():
+    bb = _load_blackbox()
+    out = bb.responses_to_chat({
+        "model": "blackboxai/nvidia/nemotron-3-super-120b-a12b:free",
+        "input": [{"type": "function_call_output", "call_id": "missing", "output": "ok"}],
+    })
+    assert not any(m.get("role") == "tool" for m in out["messages"])
+    assert out["messages"][-1]["role"] == "user"
+
+
+def test_blackbox_proxy_retries_next_key_before_error():
+    bb = _load_blackbox()
+    old_pool = bb.pool
+    old_proxy = bb.proxy_request
+    old_env = {k: os.environ.get(k) for k in ("BLACKBOX_API_KEY_1", "BLACKBOX_API_KEY_2")}
+    os.environ["BLACKBOX_API_KEY_1"] = "sk-blackbox-bad111"
+    os.environ["BLACKBOX_API_KEY_2"] = "sk-blackbox-good222"
+    calls = []
+
+    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False):
+        token = (headers or {}).get("Authorization", "").replace("Bearer ", "")
+        calls.append(token)
+        if token == "sk-blackbox-bad111":
+            return 429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}
+        return 200, {"choices": [{"message": {"content": "ok"}}]}
+
+    class Req:
+        headers = {}
+
+    try:
+        bb.pool = bb.KeyPool().load_from_env()
+        bb.proxy_request = fake_proxy
+        status, data, key = asyncio.run(bb.proxy_request_with_pool("POST", "https://example.test/chat/completions", {"model": "m"}, Req()))
+    finally:
+        bb.pool = old_pool
+        bb.proxy_request = old_proxy
+        for k, v in old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    assert status == 200
+    assert key is None
+    assert calls == ["sk-blackbox-bad111", "sk-blackbox-good222"]
+    assert data["choices"][0]["message"]["content"] == "ok"
+
+
+def test_blackbox_anthropic_tools_structured_no_dsml():
+    bb = _load_blackbox()
+    body = {
+        "model": "blackboxai/nvidia/nemotron-3-super-120b-a12b:free",
+        "max_tokens": 32,
+        "messages": [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "plan"}, {"type": "tool_use", "id": "t1", "name": "Bash", "input": {"command": "pwd"}}]},
+            {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]},
+        ],
+        "tools": [{"name": "Bash", "input_schema": {"type": "object"}}],
+    }
+    oai = bb.anthropic_to_openai(body)
+    blob = json.dumps(oai, ensure_ascii=False)
+    assert "DSML" not in blob.replace("\uff5c", "|")
+    assert any(m.get("tool_calls") for m in oai["messages"])
+    assert any(m.get("role") == "tool" for m in oai["messages"])
+    a = bb.openai_to_anthropic("m", {"choices": [{"message": {"content": "", "tool_calls": [{"id": "c1", "function": {"name": "Bash", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}], "usage": {}})
+    assert a["stop_reason"] == "tool_use"
+    assert any(c["type"] == "tool_use" for c in a["content"])

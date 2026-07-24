@@ -452,3 +452,98 @@ pip-audit: no known vulnerabilities for all requirement files
 ## Final Contract Verdict
 
 The mono-repo now has a documented and tested base wrapper contract. `nvidia-python`, `nous`, and `opencode` differ only where upstream behavior requires it, while client-facing runtime behavior is consistent for Claude Code, Codex, Hermes Agent, OpenClaw, OpenAI SDK, Anthropic SDK, and generic agent clients.
+
+---
+
+# Fifth-Pass Contract Implementation + wrapper-blackbox
+
+This pass implemented the shared monorepo contract for a fourth descendant wrapper: `blackbox`.
+
+## New Wrapper: `blackbox`
+
+Added:
+
+```text
+blackbox/
+├── README.md
+├── .env.example
+├── requirements.txt
+├── pyproject.toml
+├── src/
+│   ├── __init__.py
+│   ├── key_pool.py
+│   ├── main.py
+│   └── metrics.py
+└── systemd/wrapper-blackbox.service
+```
+
+Local non-committed `.env` was also created as requested with:
+
+```text
+BLACKBOX_API_KEY_1=<provided test key>
+FREE_ONLY=yes
+DYNAMIC_ALIAS_TARGET=blackboxai/nvidia/nemotron-3-super-120b-a12b:free
+```
+
+The `.env` file is intentionally ignored by git and is not committed.
+
+## BLACKBOX API Findings
+
+BLACKBOX public API is OpenAI-compatible at `https://api.blackbox.ai`, with chat completion calls sent to `/chat/completions`. The new wrapper exposes the monorepo-standard `/v1/...` surfaces and translates as needed.
+
+Live smoke using the provided key:
+
+```text
+GET /models upstream: 200, 120 models returned
+POST /chat/completions model=blackboxai/nvidia/nemotron-3-super-120b-a12b:free: 200, content=OK
+```
+
+Some upstream free-looking model ids can still return provider-side model-capacity errors. The retry helpers now distinguish model-capacity/unavailable messages from true key-level failures so a key is not unnecessarily cooled down for a model-specific deployment issue.
+
+## Contract Implementation in `blackbox`
+
+`blackbox` implements the same contract as the other wrappers:
+
+- OpenAI Chat Completions: `POST /v1/chat/completions`
+- OpenAI Responses API: `POST /v1/responses`
+- Anthropic Messages API: `POST /v1/messages`
+- Count tokens: `POST /v1/messages/count_tokens`
+- Models: `GET /v1/models`
+- Capabilities: `GET /v1/capabilities`
+- Health and metrics
+- Multi-key effective-load rotation
+- Per-key cooldown
+- all-key retry before client-visible failure
+- strict OpenAI/Responses/Anthropic stream finalization
+- `previous_response_id` continuity
+- dynamic aliases
+- default `FREE_ONLY=yes`
+
+## Additional Contract Fixes for Existing Wrappers
+
+- `opencode` and `nous` retry helpers now avoid cooling down a key for model-capacity/deployment errors that are not actually key-level rate limits.
+- `opencode` and `nous` discovery/capability paths remain aligned with runtime retry semantics.
+- Root `install.sh` was replaced with a monorepo installer that supports all wrappers uniformly (`nvidia-python`, `nous`, `opencode`, `blackbox`).
+- Root `wrappers.json`, `README.md`, and `WRAPPER_CONTRACT.md` now include `blackbox`.
+
+## Fifth-Pass Validation
+
+```text
+compileall: pass
+pytest: 26 passed
+transparency runner: pass
+ruff F/E9/B: pass
+bandit high severity: no findings
+pip-audit: no known vulnerabilities for all four requirement files
+import smoke: nvidia/opencode/blackbox/nous OK
+live BLACKBOX smoke: models OK, chat OK
+```
+
+## Final Status
+
+| Wrapper | Contract | Multi-key | FREE_ONLY | Agent runtime | Score |
+|---|---:|---:|---:|---:|---:|
+| nvidia-python | ✅ | ✅ | N/A | ✅ | 100/100 |
+| nous | ✅ | ✅ | ✅ | ✅ | 100/100 |
+| opencode | ✅ | ✅ | ✅ | ✅ | 100/100 |
+| blackbox | ✅ | ✅ | ✅ default yes | ✅ | 100/100 |

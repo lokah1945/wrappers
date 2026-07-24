@@ -40,6 +40,19 @@
       "auth": "BEARER_TOKEN",
       "log_file": "opencode.log",
       "systemd": "wrapper-opencode.service"
+    },
+    {
+      "name": "blackbox",
+      "port": 9108,
+      "upstream": "blackbox-ai",
+      "type": "python",
+      "source": "blackbox/src/main.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/capabilities",
+      "auth": "BEARER_TOKEN",
+      "log_file": "blackbox.log",
+      "systemd": "wrapper-blackbox.service"
     }
   ]
 }

@@ -356,6 +356,19 @@ def _is_retriable_upstream_status(status: int, data=None) -> bool:
     return False
 
 
+def _looks_model_capacity_error(data) -> bool:
+    blob = json.dumps(data, ensure_ascii=False).lower() if isinstance(data, dict) else str(data).lower()
+    return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
+
+
+def _should_cooldown_key(status: int, data) -> bool:
+    if status == 429 and _looks_model_capacity_error(data):
+        return False
+    if status == 404 and _looks_model_capacity_error(data):
+        return False
+    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+
+
 async def proxy_request_with_pool(method: str, url: str, json_body: dict, request: Request, is_stream: bool = False):
     """Call upstream with all available keys before surfacing an error.
 
@@ -384,7 +397,8 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         tried += 1
         last_status, last_data = status, data
         if _is_retriable_upstream_status(status, data):
-            pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
+            if _should_cooldown_key(status, data):
+                pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
             pool.release(key)
             continue
         pool.release(key)

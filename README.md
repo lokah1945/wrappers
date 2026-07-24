@@ -11,6 +11,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **nvidia-python**  | ✅ Production   | **100/100** | 9101   | NVIDIA NIM API proxy |
 | **nous**           | ✅ Production   | **100/100** | 9106   | Nous Research inference API |
 | **opencode**       | ✅ Production   | **100/100** | 9107   | OpenCode Zen gateway |
+| **blackbox**       | ✅ Production   | **100/100** | 9108   | BLACKBOX AI API proxy |
 
 ## Recent Audit Findings (2026-07-24)
 
@@ -54,9 +55,14 @@ wrapper/
 │   ├── model_catalog_template.json  # Codex model metadata template
 │   └── README.md
 │
-└── opencode/                    # OpenCode Zen proxy
+├── opencode/                    # OpenCode Zen proxy
     ├── src/main.py             # FastAPI entry point
     ├── .env.example            # OpenCode-specific config
+    └── README.md
+│
+└── blackbox/                    # BLACKBOX AI proxy
+    ├── src/main.py             # FastAPI entry point
+    ├── .env.example            # BLACKBOX-specific config
     └── README.md
 ```
 
@@ -86,6 +92,16 @@ cd opencode
 pip install -r requirements.txt
 cp .env.example .env   # add your API keys
 python -m uvicorn src.main:app --port 9107
+```
+
+
+### 4. BLACKBOX AI Proxy (Port 9108)
+
+```bash
+cd blackbox
+pip install -r requirements.txt
+cp .env.example .env   # add BLACKBOX_API_KEY_*
+python -m uvicorn src.main:app --port 9108
 ```
 
 ## Client Configuration
@@ -147,14 +163,14 @@ response = client.responses.create(
 
 All wrappers achieved **100/100** production readiness score:
 
-| Feature | nvidia-python | nous | opencode |
-|---------|--------------|------|----------|
-| Claude Code alias | ✅ | ✅ | ✅ |
-| Streaming SSE | ✅ | ✅ | ✅ |
-| Tool calls | ✅ | ✅ | ✅ |
-| Multi-turn | ✅ | ✅ | ✅ |
-| FREE_ONLY | N/A | ✅ | ✅ |
-| Error format | ✅ | ✅ | ✅ |
+| Feature | nvidia-python | nous | opencode | blackbox |
+|---------|--------------|------|----------|----------|
+| Claude Code alias | ✅ | ✅ | ✅ | ✅ |
+| Streaming SSE | ✅ | ✅ | ✅ | ✅ |
+| Tool calls | ✅ | ✅ | ✅ | ✅ |
+| Multi-turn | ✅ | ✅ | ✅ | ✅ |
+| FREE_ONLY | N/A | ✅ | ✅ | ✅ (default yes) |
+| Error format | ✅ | ✅ | ✅ | ✅ |
 
 ## License
 

@@ -111,6 +111,25 @@ Current status:
 - Chat, Responses native, Responses translated, Messages native, Messages translated, model discovery, and capabilities use unified retry semantics.
 - Native Anthropic streams do not get OpenAI `[DONE]`; OpenAI-compatible streams do.
 
+
+### `blackbox`
+
+BLACKBOX AI exposes an OpenAI-compatible public API (`/chat/completions`) with a broad model catalog. The wrapper keeps BLACKBOX provider details behind the adapter boundary while exposing the same monorepo contract.
+
+Provider-specific code is allowed for:
+
+- BLACKBOX base URL and model id policy
+- FREE_ONLY defaulting to `yes`
+- curated fallback free model list and free allowlist
+- translating Responses and Anthropic Messages into BLACKBOX chat completions
+
+Current status:
+
+- `KeyPool` uses effective-load selection and per-key cooldowns.
+- `proxy_request_with_pool()` retries all available BLACKBOX keys for retriable statuses before surfacing errors.
+- Chat, Responses, Anthropic Messages, model discovery, and capabilities use unified retry semantics.
+- FREE_ONLY is enabled by default; aliases should be seeded to a free concrete model.
+
 ## Retriable Status Semantics
 
 These statuses are treated as credential/provider-transient and should trigger retry on another key if available:
