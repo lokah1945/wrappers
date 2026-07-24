@@ -1452,6 +1452,7 @@ async def lifespan(app: FastAPI):
     start_env_watcher()
     # Load API keys from environment before the daily catalog task starts.
     KEY_POOL.load_from_env()
+    await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
     if _MODEL_REFRESH_TASK:
@@ -1461,6 +1462,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _MODEL_REFRESH_TASK = None
+    await MODEL_REGISTRY_CLIENT.stop()
     # Cleanup: close aiohttp session
     global _SESSION
     if _SESSION is not None and not _SESSION.closed:

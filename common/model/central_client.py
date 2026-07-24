@@ -7,7 +7,9 @@ profiles/cache.
 
 from __future__ import annotations
 
+import asyncio
 import os
+from contextlib import suppress
 from typing import Any
 
 import aiohttp
@@ -21,6 +23,14 @@ class ModelRegistryClient:
         self.base_url = (base_url or os.environ.get("MODEL_REGISTRY_URL", "")).rstrip("/")
         self.token = token if token is not None else os.environ.get("MODEL_REGISTRY_ADMIN_TOKEN", "")
         self.timeout = aiohttp.ClientTimeout(total=timeout_sec)
+        self.queue_limit = int(os.environ.get("MODEL_REGISTRY_OBSERVATION_QUEUE", "1000"))
+        self._session: aiohttp.ClientSession | None = None
+        self._session_lock: asyncio.Lock | None = None
+        self._worker: asyncio.Task | None = None
+        self._start_task: asyncio.Task | None = None
+        self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=self.queue_limit)
+        self.dropped_observations = 0
+        self.failed_posts = 0
 
     @property
     def enabled(self) -> bool:
@@ -32,17 +42,67 @@ class ModelRegistryClient:
             headers["Authorization"] = f"Bearer {self.token}"
         return headers
 
-    async def _post(self, path: str, payload: dict[str, Any]) -> bool:
+    async def _ensure_session(self) -> aiohttp.ClientSession | None:
         if not self.enabled:
+            return None
+        loop = asyncio.get_running_loop()
+        if self._session is not None:
+            owner_loop = getattr(self._session, "_loop", None)
+            if not self._session.closed and owner_loop is loop:
+                return self._session
+        if self._session_lock is None:
+            self._session_lock = asyncio.Lock()
+        async with self._session_lock:
+            if self._session is not None and not self._session.closed:
+                await self._session.close()
+            self._session = aiohttp.ClientSession(timeout=self.timeout)
+        return self._session
+
+    async def start(self) -> None:
+        if not self.enabled:
+            return
+        await self._ensure_session()
+        if self._worker is None or self._worker.done():
+            self._worker = asyncio.create_task(self._observation_worker())
+
+    async def stop(self) -> None:
+        if self._start_task is not None and not self._start_task.done():
+            self._start_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._start_task
+        self._start_task = None
+        if self._worker is not None:
+            self._worker.cancel()
+            with suppress(asyncio.CancelledError):
+                await self._worker
+            self._worker = None
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def _post(self, path: str, payload: dict[str, Any]) -> bool:
+        session = await self._ensure_session()
+        if session is None:
             return False
         try:
-            async with aiohttp.ClientSession(timeout=self.timeout) as session:
-                async with session.post(
-                    f"{self.base_url}{path}", json=payload, headers=self._headers()
-                ) as response:
-                    return 200 <= response.status < 300
+            async with session.post(
+                f"{self.base_url}{path}", json=payload, headers=self._headers()
+            ) as response:
+                ok = 200 <= response.status < 300
+                if not ok:
+                    self.failed_posts += 1
+                return ok
         except Exception:
+            self.failed_posts += 1
             return False
+
+    async def _observation_worker(self) -> None:
+        while True:
+            path, payload = await self._queue.get()
+            try:
+                await self._post(path, payload)
+            finally:
+                self._queue.task_done()
 
     async def ingest_catalog(self, provider: str, models: list[Any], revision: str) -> bool:
         return await self._post(
@@ -76,21 +136,29 @@ class ModelRegistryClient:
                              account_scope_hash: str, state: str, status: int,
                              reason_code: str, reason_detail: str,
                              endpoint: str) -> None:
-        """Best-effort non-blocking observation; never affects inference."""
+        """Queue a bounded non-blocking observation; never affects inference."""
         if not self.enabled:
             return
-        import asyncio
+        payload = {
+            "provider": provider,
+            "canonical_model_id": self.canonical_model_id(provider, model_id),
+            "account_scope_hash": account_scope_hash,
+            "state": state,
+            "http_status": status,
+            "reason_code": reason_code,
+            "reason_detail": sanitize_error_detail(reason_detail),
+            "endpoint": endpoint,
+        }
         try:
             loop = asyncio.get_running_loop()
-            loop.create_task(self.observe(
-                provider,
-                self.canonical_model_id(provider, model_id),
-                account_scope_hash,
-                state,
-                status,
-                reason_code,
-                reason_detail,
-                endpoint,
-            ))
         except RuntimeError:
+            self.dropped_observations += 1
             return
+        try:
+            self._queue.put_nowait(("/internal/observations", payload))
+        except asyncio.QueueFull:
+            self.dropped_observations += 1
+            return
+        if ((self._worker is None or self._worker.done()) and
+                (self._start_task is None or self._start_task.done())):
+            self._start_task = loop.create_task(self.start())

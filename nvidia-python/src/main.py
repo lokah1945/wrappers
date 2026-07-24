@@ -986,6 +986,7 @@ class Server:
         self._start_time = time.time()
 
     async def init(self):
+        await MODEL_REGISTRY_CLIENT.start()
         self.pool.load_from_env()
         self._agent = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS)
         self._session = aiohttp.ClientSession(connector=self._agent)
@@ -2368,6 +2369,7 @@ def create_app() -> FastAPI:
                     await server.metrics.close()
                 if server.registry:
                     server.registry.stop()
+                await MODEL_REGISTRY_CLIENT.stop()
 
     app.router.lifespan_context = lifespan
     return app

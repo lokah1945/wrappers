@@ -863,6 +863,7 @@ async def lifespan(app: FastAPI):
     if seed:
         set_dynamic_alias_target(seed, force=True)
     logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE} alias_target={get_dynamic_alias_target() or 'none'}")
+    await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
     if _MODEL_REFRESH_TASK:
@@ -872,6 +873,7 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         _MODEL_REFRESH_TASK = None
+    await MODEL_REGISTRY_CLIENT.stop()
     if _session is not None and not _session.closed:
         await _session.close()
     logger.info("Shutdown")
