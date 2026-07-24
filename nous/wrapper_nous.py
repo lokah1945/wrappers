@@ -200,8 +200,13 @@ def free_only_anthropic_error(model_id: str) -> dict:
         },
     }
 
+LOG_FILE = os.environ.get("LOG_FILE", "/root/wrapper/nous/wrapper_nous.log")
+try:
+    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+except Exception:
+    LOG_FILE = "/tmp/wrapper-nous.log"
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s",
-                    handlers=[logging.FileHandler("/root/wrapper/nous/wrapper_nous.log"), logging.StreamHandler()])
+                    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
 logger = logging.getLogger("wrapper-nous")
 
 # --------------------------------------------------------------------------
@@ -420,6 +425,25 @@ def strip_cache_control(obj):
     elif isinstance(obj, list):
         for x in obj: strip_cache_control(x)
 
+
+
+def repair_orphan_tool_messages(messages):
+    seen = set()
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    seen.add(tc["id"])
+            out.append(m)
+        elif m.get("role") == "tool" and (m.get("tool_call_id") not in seen):
+            tcid = m.get("tool_call_id") or ""
+            out.append({"role": "user", "content": f"Tool result{(' for ' + tcid) if tcid else ''}: {m.get('content', '')}"})
+        else:
+            out.append(m)
+    return out
 def responses_to_chat(body: dict) -> dict:
     model = resolve_model(body.get("model"))
     msgs = []
@@ -458,6 +482,7 @@ def responses_to_chat(body: dict) -> dict:
         else:
             msgs.insert(0, {"role": "system", "content": body["instructions"]})
 
+    msgs = repair_orphan_tool_messages(msgs)
     out = {"model": model, "messages": msgs, "stream": body.get("stream", False)}
     if body.get("max_output_tokens"): out["max_tokens"] = max(int(body["max_output_tokens"]), 1024)
     else: out["max_tokens"] = 4096
@@ -673,12 +698,52 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
 # --------------------------------------------------------------------------
 # STREAMING WITH HEARTBEAT + PROPER STATE MACHINES (FIXED for Hermes/Codex)
 # --------------------------------------------------------------------------
-async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse, 
-                                serialize_fn, 
+async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
+                                serialize_fn,
                                 state=None) -> AsyncGenerator[str, None]:
-    """Proxy-side heartbeat + proper chunk forwarding + state machine support"""
+    """Proxy-side heartbeat + robust SSE finalization.
+
+    Handles normal [DONE], upstream EOF without [DONE], and a final partial SSE
+    block without a trailing blank line. Terminal events are emitted exactly once
+    so Codex/OpenAI SDK and Claude Code do not hang mid-run.
+    """
     last_hb = time.time()
     buffer = b""
+    terminated = False
+
+    async def emit_state_done():
+        if state and hasattr(state, "done"):
+            done_evs = state.done()
+            if isinstance(done_evs, str):
+                done_evs = [done_evs]
+            for ev in (done_evs or []):
+                if isinstance(ev, str):
+                    yield ev
+                else:
+                    yield serialize_fn(ev) if callable(serialize_fn) else ev
+
+    async def handle_payload(data: bytes):
+        nonlocal terminated
+        if data in (b"[DONE]", b"", b'"[DONE]"'):
+            async for ev in emit_state_done():
+                yield ev
+            if state is None or getattr(state, "__class__", type(None)).__name__ == "ResponsesStreamState":
+                yield "data: [DONE]\n\n"
+            terminated = True
+            return
+        try:
+            parsed = json.loads(data)
+            if state and hasattr(state, "translate_chunk"):
+                for ev in state.translate_chunk(parsed):
+                    if isinstance(ev, str):
+                        yield ev
+                    else:
+                        yield serialize_fn(ev)
+            else:
+                yield f"data: {data.decode()}\n\n"
+        except Exception:
+            yield f"data: {data.decode(errors='replace')}\n\n"
+
     try:
         async for chunk in upstream_resp.content.iter_any():
             buffer += chunk
@@ -686,66 +751,40 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 block, buffer = buffer.split(b"\n\n", 1)
                 for line in block.split(b"\n"):
                     line = line.strip()
-                    if line.startswith(b"data:"):
-                        data = line[5:].strip()
-                        if data in (b"[DONE]", b"", b'"[DONE]"'):
-                            if state and hasattr(state, "done"):
-                                try:
-                                    done_evs = state.done()
-                                    if isinstance(done_evs, str):
-                                        done_evs = [done_evs]
-                                    for ev in (done_evs or []):
-                                        if isinstance(ev, str):
-                                            yield ev
-                                        else:
-                                            yield serialize_fn(ev) if callable(serialize_fn) else ev
-                                except Exception:
-                                    pass
-                            # OpenAI chat clients expect [DONE]; Anthropic uses message_stop only
-                            if state is None or not hasattr(state, "translate_chunk"):
-                                yield "data: [DONE]\n\n"
-                            elif getattr(state, "__class__", type(None)).__name__ == "ResponsesStreamState":
-                                yield "data: [DONE]\n\n"
-                            return
-                        try:
-                            parsed = json.loads(data)
-                            if state and hasattr(state, "translate_chunk"):
-                                events = state.translate_chunk(parsed)
-                                for ev in events:
-                                    # ResponsesStreamState emits pre-formatted SSE strings
-                                    if isinstance(ev, str):
-                                        yield ev
-                                    else:
-                                        yield serialize_fn(ev)
-                            else:
-                                yield f"data: {data.decode()}\n\n"
-                        except:
-                            yield f"data: {data.decode()}\n\n"
+                    if not line.startswith(b"data:"):
+                        continue
+                    async for out in handle_payload(line[5:].strip()):
+                        yield out
+                    if terminated:
+                        return
 
-            # Heartbeat
             now = time.time()
             if now - last_hb > (HEARTBEAT_MS / 1000):
                 yield ": heartbeat\n\n"
                 last_hb = now
     finally:
-        # Stream ended without [DONE] (Nous Responses API does not always send it).
-        # Emit completion exactly once so OpenAI Responses SDK / Codex can finalize.
         try:
-            if state and hasattr(state, "done"):
-                done_evs = state.done()
-                if isinstance(done_evs, str):
-                    done_evs = [done_evs]
-                for ev in (done_evs or []):
-                    if isinstance(ev, str):
+            if not terminated:
+                # Flush a final partial SSE block if upstream omitted the blank line.
+                tail = buffer.strip()
+                if tail:
+                    for line in tail.split(b"\n"):
+                        line = line.strip()
+                        if line.startswith(b"data:"):
+                            async for out in handle_payload(line[5:].strip()):
+                                yield out
+                            if terminated:
+                                break
+                if not terminated:
+                    async for ev in emit_state_done():
                         yield ev
-                    else:
-                        yield serialize_fn(ev) if callable(serialize_fn) else ev
-            # Avoid trailing [DONE] on Anthropic SSE (Claude Code)
-            if state is None or getattr(state, "__class__", type(None)).__name__ != "AnthropicStreamState":
-                yield "data: [DONE]\n\n"
-        except Exception:
-            pass
-        await upstream_resp.release()
+                    if state is None or getattr(state, "__class__", type(None)).__name__ != "AnthropicStreamState":
+                        yield "data: [DONE]\n\n"
+        finally:
+            try:
+                upstream_resp.release()
+            except Exception:
+                pass
 
 # Advanced streaming state machines
 class AnthropicStreamState:
@@ -758,14 +797,22 @@ class AnthropicStreamState:
         self.finished = False
         self.msg_id = f"msg-{int(time.time()*1000)}"
 
+    def _usage(self, raw=None):
+        raw = raw or {}
+        return {
+            "input_tokens": raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0,
+            "output_tokens": raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0,
+            "cache_creation_input_tokens": raw.get("cache_creation_input_tokens", 0) or 0,
+            "cache_read_input_tokens": raw.get("cache_read_input_tokens", 0) or 0,
+        }
+
     def translate_chunk(self, chunk):
         events = []
         if not self.message_started:
             events.append({"type": "message_start", "data": {"type": "message_start", "message": {
                 "id": self.msg_id, "type": "message", "role": "assistant", "model": self.model,
                 "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0,
-                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
+                "usage": self._usage(),
             }}})
             self.message_started = True
 
@@ -844,7 +891,7 @@ class AnthropicStreamState:
             events.append({"type": "message_delta", "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": chunk.get("usage") or {},
+                "usage": self._usage(chunk.get("usage") or {}),
             }})
             events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.current_block = None
@@ -854,11 +901,14 @@ class AnthropicStreamState:
         """Emit terminal events if stream ended without finish_reason (prevent hang)."""
         if self.finished:
             return []
-        self.finished = True
         events = []
         if not self.message_started:
-            events.extend(self.translate_chunk({"choices": [{"delta": {}, "finish_reason": "stop"}]}))
-            return events
+            self.message_started = True
+            events.append({"type": "message_start", "data": {"type": "message_start", "message": {
+                "id": self.msg_id, "type": "message", "role": "assistant", "model": self.model,
+                "content": [], "stop_reason": None, "stop_sequence": None,
+                "usage": self._usage(),
+            }}})
         if self.current_block is not None:
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             self.current_block = None
@@ -866,9 +916,10 @@ class AnthropicStreamState:
         events.append({"type": "message_delta", "data": {
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
-            "usage": {},
+            "usage": self._usage(),
         }})
         events.append({"type": "message_stop", "data": {"type": "message_stop"}})
+        self.finished = True
         return events
 
 
@@ -880,6 +931,7 @@ class ResponsesStreamState:
         self.seq = 0
         self.text_idx = 1
         self.tool_acc = {}
+        self._next_tool_index = 1
         self.reasoning_started = False
         self.started = False
         self._active_tool_id = None
@@ -924,10 +976,11 @@ class ResponsesStreamState:
     def tool_delta(self, call_id, name, args):
         events = []
         if call_id not in self.tool_acc:
-            self.tool_acc[call_id] = {"name": name, "args": ""}
-            # Make the tool item "active" BEFORE sending its delta (Codex requires this).
+            self.tool_acc[call_id] = {"name": name, "args": "", "output_index": self._next_tool_index}
+            self._next_tool_index += 1
+            # Make the tool item active BEFORE sending its delta (Codex requires this).
             events.append(self.emit("response.output_item.added", {
-                "output_index": 1,
+                "output_index": self.tool_acc[call_id]["output_index"],
                 "item": {
                     "id": call_id, "type": "function_call", "status": "in_progress",
                     "call_id": call_id, "name": name, "arguments": "",
@@ -936,7 +989,7 @@ class ResponsesStreamState:
         self.tool_acc[call_id]["name"] = self.tool_acc[call_id]["name"] or name
         self.tool_acc[call_id]["args"] += args
         events.append(self.emit("response.function_call.delta", {
-            "item_id": call_id, "output_index": 1, "delta": args,
+            "item_id": call_id, "output_index": self.tool_acc[call_id]["output_index"], "delta": args,
         }))
         return events
 
@@ -972,15 +1025,28 @@ class ResponsesStreamState:
         # item is added but never marked done).
         for call_id, info in self.tool_acc.items():
             events.append(self.emit("response.output_item.done", {
-                "output_index": 1,
+                "output_index": info.get("output_index", 1),
                 "item": {
                     "id": call_id, "type": "function_call", "status": "completed",
                     "call_id": call_id, "name": info.get("name", ""),
                     "arguments": info.get("args", ""),
                 },
             }))
-        events.append(self.emit("response.completed", {"response": {"id": rid, "status": "completed", "usage": norm}}))
+        output = [{"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+        for call_id, info in self.tool_acc.items():
+            output.append({"id": call_id, "type": "function_call", "status": "completed", "call_id": call_id, "name": info.get("name", ""), "arguments": info.get("args", "")})
+        events.append(self.emit("response.completed", {"response": {"id": rid, "model": self.model, "status": "completed", "output": output, "usage": norm}}))
         return events
+
+    def assistant_message(self):
+        text = getattr(self, "final_text", "")
+        msg = {"role": "assistant", "content": text or (None if self.tool_acc else "")}
+        if self.tool_acc:
+            msg["tool_calls"] = [
+                {"id": call_id, "type": "function", "function": {"name": info.get("name", ""), "arguments": info.get("args", "")}}
+                for call_id, info in self.tool_acc.items()
+            ]
+        return msg
 
     def translate_chunk(self, chunk):
         """Convert OpenAI chat chunk → Responses events"""
@@ -1090,6 +1156,13 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown complete")
 
 app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict) and ("error" in detail or detail.get("type") == "error"):
+        return JSONResponse(status_code=exc.status_code, content=detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": {"type": "api_error", "message": str(detail)}})
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
@@ -1370,15 +1443,13 @@ async def responses(request: Request):
         rid = f"resp-{int(time.time()*1000)}"
         state = ResponsesStreamState(rid, chat_body["model"])
         async def gen():
-            # FIX: Codex v0.145 requires output_item.added BEFORE first delta
+            # Codex requires output_item.added BEFORE first delta.
             for ev in state.start():
                 yield ev
-            # serialize_fn only used for non-str events; ResponsesStreamState yields SSE strings
             async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state):
                 yield line
-            # FIX: Ensure response.completed is emitted for Codex
-            for ev in state.done():
-                yield ev
+            # Store full conversation for the next previous_response_id turn.
+            await store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)

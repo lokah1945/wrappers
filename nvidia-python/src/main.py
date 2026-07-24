@@ -158,13 +158,188 @@ def start_env_watcher():
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
 from .anthropic_compat import (
     anthropic_to_openai,
-    openai_to_anthropic,
+    openai_to_anthropic as _openai_to_anthropic_impl,
     stream_openai_to_anthropic,
     estimate_input_tokens,
     anthropic_error,
     extract_internal_reasoning,
     _sse,
 )
+
+
+def openai_to_anthropic(*args, **kwargs):
+    """Compatibility wrapper around anthropic_compat.openai_to_anthropic.
+
+    Native nvidia code calls (openai_response, model, ...). Some cross-wrapper
+    tooling imports src.main and calls the opencode/nous order (model, response).
+    Accept both without changing the actual translator.
+    """
+    if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], dict):
+        model, data = args[0], args[1]
+        rest = args[2:]
+        return _openai_to_anthropic_impl(data, model, *rest, **kwargs)
+    return _openai_to_anthropic_impl(*args, **kwargs)
+
+
+def _parse_dsml_from_text(text: str) -> tuple:
+    """Split leaked MiniMax DSML tool markup into (clean_text, tool_use blocks)."""
+    if not text or 'DSML' not in str(text).replace('\uff5c', '|'):
+        return text or '', []
+    normalized = str(text).replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
+    if '|DSML|tool_calls>' not in normalized:
+        return text, []
+    tools = []
+    clean_parts = []
+    open_tag = '|DSML|tool_calls>'
+    close_tag = '</|DSML|tool_calls>'
+    cursor = 0
+    while True:
+        s_idx = normalized.find(open_tag, cursor)
+        if s_idx == -1:
+            clean_parts.append(normalized[cursor:])
+            break
+        if s_idx > cursor:
+            clean_parts.append(normalized[cursor:s_idx])
+        e_idx = normalized.find(close_tag, s_idx)
+        if e_idx == -1:
+            # Incomplete DSML should not be leaked as-is to clients.
+            break
+        segment = normalized[s_idx:e_idx + len(close_tag)]
+        for name, inner in re_module.findall(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|invoke>', segment):
+            params = dict(re_module.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
+            tools.append({
+                'type': 'tool_use',
+                'id': f'toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}',
+                'name': name,
+                'input': params,
+            })
+        cursor = e_idx + len(close_tag)
+    return ''.join(clean_parts).strip(), tools
+
+
+class AnthropicStreamState:
+    """Small OpenAI-chat-SSE → Anthropic-SSE state machine used by tests/tools."""
+
+    def __init__(self, model: str):
+        self.model = model
+        self.index = -1
+        self.message_started = False
+        self.current_block = None
+        self.tool_map = {}
+        self.finished = False
+        self.msg_id = f"msg_{int(time.time()*1000)}"
+
+    def _sse(self, event: str, data: dict) -> str:
+        payload = dict(data or {})
+        payload.setdefault('type', event)
+        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
+
+    def start_events(self):
+        if self.message_started:
+            return []
+        self.message_started = True
+        return [self._sse('message_start', {
+            'type': 'message_start',
+            'message': {
+                'id': self.msg_id, 'type': 'message', 'role': 'assistant',
+                'model': self.model, 'content': [], 'stop_reason': None, 'stop_sequence': None,
+                'usage': {'input_tokens': 0, 'output_tokens': 0,
+                          'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
+            },
+        })]
+
+    def _close_block(self):
+        if self.current_block is None:
+            return []
+        ev = [self._sse('content_block_stop', {'type': 'content_block_stop', 'index': self.index})]
+        self.current_block = None
+        return ev
+
+    def translate_chunk(self, chunk: dict):
+        events = self.start_events()
+        if not isinstance(chunk, dict) or 'choices' not in chunk:
+            return events
+        ch = (chunk.get('choices') or [{}])[0]
+        delta = ch.get('delta') or {}
+
+        reason = delta.get('reasoning_content') or delta.get('reasoning')
+        if isinstance(reason, str) and reason:
+            if self.current_block != 'thinking':
+                events.extend(self._close_block())
+                self.index += 1
+                events.append(self._sse('content_block_start', {
+                    'type': 'content_block_start', 'index': self.index,
+                    'content_block': {'type': 'thinking', 'thinking': ''},
+                }))
+                self.current_block = 'thinking'
+            events.append(self._sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': self.index,
+                'delta': {'type': 'thinking_delta', 'thinking': reason},
+            }))
+
+        content = delta.get('content')
+        if isinstance(content, str) and content and 'DSML' in content.replace('\uff5c', '|'):
+            content = None
+        if content:
+            if self.current_block != 'text':
+                events.extend(self._close_block())
+                self.index += 1
+                events.append(self._sse('content_block_start', {
+                    'type': 'content_block_start', 'index': self.index,
+                    'content_block': {'type': 'text', 'text': ''},
+                }))
+                self.current_block = 'text'
+            events.append(self._sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': self.index,
+                'delta': {'type': 'text_delta', 'text': content},
+            }))
+
+        for tc in delta.get('tool_calls') or []:
+            oi = tc.get('index', 0)
+            fn = tc.get('function') or {}
+            if oi not in self.tool_map:
+                events.extend(self._close_block())
+                self.index += 1
+                self.tool_map[oi] = self.index
+                tid = tc.get('id') or f'toolu_{self.index}'
+                events.append(self._sse('content_block_start', {
+                    'type': 'content_block_start', 'index': self.index,
+                    'content_block': {'type': 'tool_use', 'id': tid, 'name': fn.get('name') or '', 'input': {}},
+                }))
+                self.current_block = 'tool_use'
+            if fn.get('arguments'):
+                events.append(self._sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': self.tool_map[oi],
+                    'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
+                }))
+
+        fr = ch.get('finish_reason')
+        if fr and not self.finished:
+            events.extend(self.force_done('tool_use' if (fr == 'tool_calls' or self.tool_map) else {'stop': 'end_turn', 'length': 'max_tokens', 'content_filter': 'refusal'}.get(fr, 'end_turn')))
+        return events
+
+    def force_done(self, stop='end_turn'):
+        if self.finished:
+            return []
+        self.finished = True
+        events = []
+        if not self.message_started:
+            events.extend(self.start_events())
+        events.extend(self._close_block())
+        if self.tool_map and stop == 'end_turn':
+            stop = 'tool_use'
+        events.append(self._sse('message_delta', {
+            'type': 'message_delta',
+            'delta': {'stop_reason': stop, 'stop_sequence': None},
+            'usage': {'input_tokens': 0, 'output_tokens': 0,
+                      'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
+        }))
+        events.append(self._sse('message_stop', {'type': 'message_stop'}))
+        return events
+
+    # opencode/nous naming compatibility
+    done = force_done
+
 from .capabilities import (
     classify,
     describe,
@@ -1281,6 +1456,8 @@ class Server:
         has_content = False
         stream_buffer = ''
         last_usage = ''
+        saw_done = False
+        stream_error = None
 
         try:
             async for chunk in stream:
@@ -1299,6 +1476,9 @@ class Server:
                             except (json.JSONDecodeError, ValueError):
                                 pass
 
+                if re_module.search(r'data:\s*\[DONE\]', chunk_str):
+                    saw_done = True
+
                 if '"usage"' in chunk_str:
                     last_usage = chunk_str[-65536:]
 
@@ -1308,15 +1488,20 @@ class Server:
 
                 yield chunk_str
         except Exception as e:
+            stream_error = e
             logger.error(f'[stream error] _stream_chat: {e}')
-        finally:
-            if key:
-                key.decrement_in_flight()
-            self._in_flight = max(0, self._in_flight - 1)
 
-        if not has_content and not re_module.search(r'data:\s*\[DONE\]', stream_buffer):
-            friendly = f'The context/history for model "{body.get("model", "")}" is too large and exceeds the model\'s limit (or the upstream connection closed immediately). Please exit the current session and start a clean one.'
-            yield f'data: {json.dumps({"error": {"message": friendly, "type": "invalid_request_error"}})}\n\n'
+        if not saw_done and not re_module.search(r'data:\s*\[DONE\]', stream_buffer):
+            if not has_content:
+                friendly = f"The context/history for model '{body.get('model', '')}' is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one."
+                if stream_error:
+                    friendly = f'{friendly} Upstream stream error: {stream_error}'
+                yield f'data: {json.dumps({"error": {"message": friendly, "type": "invalid_request_error"}})}\n\n'
+            elif stream_error:
+                yield f'data: {json.dumps({"error": {"message": f"Upstream stream interrupted: {stream_error}", "type": "api_error"}})}\n\n'
+            # Always terminate OpenAI Chat SSE explicitly. Several agents wait
+            # for [DONE] and otherwise stop mid-run on upstream EOF.
+            yield 'data: [DONE]\n\n'
 
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
         anthro_version = (request.headers.get('anthropic-version') or '').strip()
@@ -1327,39 +1512,39 @@ class Server:
         try:
             body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
-            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', f'Invalid JSON: {e}')})
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f'Invalid JSON: {e}'))
         if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
-            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer')})
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer'))
 
         sys_field = body.get('system')
         if sys_field is not None and not isinstance(sys_field, (str, list)):
-            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', '"system" must be a string or array of content blocks')})
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', '"system" must be a string or array of content blocks'))
 
         for t in body.get('tools', []) or []:
             if not isinstance(t.get('input_schema'), dict):
-                return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'tool.input_schema must be an object')})
+                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool.input_schema must be an object'))
 
         model_id = resolve_target_model(body.get('model', ''))
         body['model'] = model_id
 
         if is_model_unavailable(model_id):
-            return JSONResponse(status_code=404, content={'error': anthropic_error('not_found_error', f'Model {model_id} is retired or unavailable')})
+            return JSONResponse(status_code=404, content=anthropic_error('not_found_error', f'Model {model_id} is retired or unavailable'))
 
         stream_guard = guard_stream_unsupported(body, model_id)
         if stream_guard:
-            return JSONResponse(status_code=stream_guard['status'], content={'error': anthropic_error('invalid_request_error', stream_guard['data']['error']['message'])})
+            return JSONResponse(status_code=stream_guard['status'], content=anthropic_error('invalid_request_error', stream_guard['data']['error']['message']))
 
         try:
             openai_body = anthropic_to_openai(body, self.registry.get_official_context(model_id) if self.registry else None)
         except ValueError as e:
-            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', str(e))})
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', str(e)))
 
         # anthropic_to_openai may return a structured error instead of raising
         if isinstance(openai_body, dict) and openai_body.get('error'):
             err = openai_body['error']
             return JSONResponse(
                 status_code=400,
-                content={'error': anthropic_error(err.get('type', 'invalid_request_error'), err.get('message', 'Invalid request'))},
+                content=anthropic_error(err.get('type', 'invalid_request_error'), err.get('message', 'Invalid request')),
             )
 
         apply_default_reasoning(openai_body, model_id)
@@ -1411,7 +1596,7 @@ class Server:
         data = result.get('data', {})
         if status_code != 200 and data.get('error'):
             err = data['error']
-            return JSONResponse(status_code=status_code, content={'error': anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error'))})
+            return JSONResponse(status_code=status_code, content=anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error')))
 
         anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
         return JSONResponse(status_code=200, content=anthropic_resp)
@@ -1537,16 +1722,28 @@ class Server:
                                 continue
                             return {'status': norm_status, 'data': resp_body}
 
-                        # Keep in-flight until stream consumer finishes (_stream_chat / anthropic finally).
+                        # Keep in-flight until the stream consumer finishes. The wrapper
+                        # owns release/decrement so every streaming surface (/chat,
+                        # /messages, /responses) closes capacity exactly once.
+                        released = False
+
                         async def stream_wrapper():
+                            nonlocal released
                             try:
                                 async for chunk, _ in resp.content.iter_chunks():
                                     yield chunk
                             finally:
-                                try:
-                                    await resp.release()
-                                except Exception:
-                                    pass
+                                if not released:
+                                    released = True
+                                    try:
+                                        resp.release()
+                                    except Exception:
+                                        pass
+                                    self._in_flight = max(0, self._in_flight - 1)
+                                    try:
+                                        key.decrement_in_flight()
+                                    except Exception:
+                                        pass
 
                         return {'stream': stream_wrapper(), 'key': key, 'start_ms': start_ms, 'status': 200}
                     else:

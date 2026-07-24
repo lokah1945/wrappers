@@ -525,6 +525,25 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
 # G11 fix: previous_response_id store for codex multi-turn server-side history
 _RESPONSE_STORE: dict = {}
 
+
+
+def _repair_orphan_tool_messages(messages):
+    seen = set()
+    out = []
+    for m in messages:
+        if not isinstance(m, dict):
+            continue
+        if m.get("role") == "assistant":
+            for tc in m.get("tool_calls") or []:
+                if isinstance(tc, dict) and tc.get("id"):
+                    seen.add(tc["id"])
+            out.append(m)
+        elif m.get("role") == "tool" and (m.get("tool_call_id") not in seen):
+            tcid = m.get("tool_call_id") or ""
+            out.append({"role": "user", "content": f"Tool result{(' for ' + tcid) if tcid else ''}: {m.get('content', '')}"})
+        else:
+            out.append(m)
+    return out
 def responses_to_chat(body: dict) -> dict:
     model = _normalize_model(body.get('model') or '')
     msgs = []
@@ -566,6 +585,7 @@ def responses_to_chat(body: dict) -> dict:
             msgs[0]['content'] = body['instructions'] + "\n\n" + str(msgs[0].get('content') or '')
         else:
             msgs.insert(0, {"role": "system", "content": body['instructions']})
+    msgs = _repair_orphan_tool_messages(msgs)
     out = {"model": model, "messages": msgs, "stream": bool(body.get('stream', False))}
     if body.get('max_output_tokens') is not None:
         out['max_tokens'] = int(body['max_output_tokens'])
@@ -617,18 +637,49 @@ def chat_to_responses(model: str, data: dict) -> dict:
                       "output_tokens": u.get('completion_tokens', 0) or 0,
                       "total_tokens": u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
 
-async def stream_passthrough(resp, key, heartbeat=True):
-    """Yield upstream SSE bytes + proxy heartbeats; always release key/resp."""
+
+def _assistant_message_from_chat(data: dict, fallback_text: str = "", tool_accs=None) -> dict:
+    msg = (data.get('choices') or [{}])[0].get('message', {}) if isinstance(data, dict) else {}
+    content = msg.get('content')
+    if content is None:
+        content = fallback_text if fallback_text is not None else None
+    tool_calls = msg.get('tool_calls') or []
+    if tool_accs:
+        tool_calls = [
+            {"id": acc.get("call_id"), "type": "function", "function": {"name": acc.get("name", ""), "arguments": acc.get("args", "")}}
+            for acc in tool_accs if acc
+        ]
+    out = {"role": "assistant", "content": content if content not in ("", None) else (None if tool_calls else "")}
+    if tool_calls:
+        out["tool_calls"] = tool_calls
+    return out
+
+async def stream_passthrough(resp, key, heartbeat=True, terminal_done=True):
+    """Yield upstream SSE bytes + proxy heartbeats; always release key/resp.
+
+    For OpenAI-compatible streams, synthesize a final data: [DONE] on upstream
+    EOF without one. Anthropic native pass-through disables this because its
+    terminal event is message_stop, not [DONE].
+    """
     last_hb = time.time()
+    saw_done = False
     try:
         async for chunk in resp.content.iter_any():
+            if isinstance(chunk, (bytes, bytearray)):
+                if b"data: [DONE]" in chunk or b"data:[DONE]" in chunk:
+                    saw_done = True
+            else:
+                if "data: [DONE]" in str(chunk) or "data:[DONE]" in str(chunk):
+                    saw_done = True
             yield chunk
             if heartbeat and (time.time() - last_hb) > (HEARTBEAT_MS / 1000.0):
                 yield b": heartbeat\n\n"
                 last_hb = time.time()
+        if terminal_done and not saw_done:
+            yield b"data: [DONE]\n\n"
     finally:
         try:
-            await resp.release()
+            resp.release()
         except Exception:
             pass
         pool.release(key)
@@ -664,6 +715,13 @@ async def lifespan(app: FastAPI):
     logger.info("Shutdown")
 
 app = FastAPI(title="wrapper-opencode", version=VERSION, lifespan=lifespan)
+
+@app.exception_handler(HTTPException)
+async def _http_exception_handler(request: Request, exc: HTTPException):
+    detail = exc.detail
+    if isinstance(detail, dict) and ("error" in detail or detail.get("type") == "error"):
+        return JSONResponse(status_code=exc.status_code, content=detail)
+    return JSONResponse(status_code=exc.status_code, content={"error": {"type": "api_error", "message": str(detail)}})
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
@@ -915,7 +973,7 @@ async def responses(request: Request):
                 return _jr(status, err_data)
             # Zen may return {"type":"error",...} even with 200 in some paths — normalize
             if isinstance(data, dict) and data.get("type") == "error":
-                return _jr(400, data.get("error", {"message": "Zen error"}))
+                return _jr(400, {"error": data.get("error", {"message": "Zen error", "type": "api_error"})})
             return JSONResponse(data)
 
         # Translate via chat/completions for non-GPT Zen models
@@ -923,7 +981,7 @@ async def responses(request: Request):
         chat_body["stream"] = is_stream
         url = f"{OPENCODE_BASE}/chat/completions"
         if is_stream:
-            # Stream chat chunks → minimal Responses SSE envelope
+            # Stream chat chunks → strict Responses SSE envelope for Codex.
             status, resp = await proxy_request("POST", url, chat_body, headers, is_stream=True)
             if status != 200:
                 pool.release(key)
@@ -931,73 +989,115 @@ async def responses(request: Request):
             rid = f"resp_{int(time.time()*1000)}"
             async def gen():
                 seq = 0
+                acc_text = ""
+                acc_usage = None
+                buffer = b""
+                tool_accs = []
+                next_output_index = 1
+                stream_error = None
+
                 def emit(etype, payload):
                     nonlocal seq
                     seq += 1
                     return f"event: {etype}\ndata: {json.dumps({'type': etype, 'sequence_number': seq, **payload})}\n\n"
-                item_added = False
-                acc_text = ""  # FIX: Track accumulated text for Codex
-                acc_usage = None
+
+                def usage_obj():
+                    if acc_usage:
+                        return acc_usage
+                    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+
+                def get_tool_acc(tc):
+                    nonlocal next_output_index
+                    idx = tc.get("index") if isinstance(tc.get("index"), int) else len(tool_accs)
+                    acc = tool_accs[idx] if idx < len(tool_accs) else None
+                    if acc is None:
+                        acc = {"call_id": tc.get("id") or f"call_{idx}_{int(time.time()*1000)}", "name": "", "args": "", "output_index": next_output_index, "added": False}
+                        next_output_index += 1
+                        while len(tool_accs) <= idx:
+                            tool_accs.append(None)
+                        tool_accs[idx] = acc
+                    if tc.get("id"):
+                        acc["call_id"] = tc["id"]
+                    return acc
+
+                async def process_payload(payload: bytes):
+                    nonlocal acc_text, acc_usage
+                    if payload in (b"[DONE]", b"", b'"[DONE]"'):
+                        return
+                    try:
+                        c = json.loads(payload)
+                    except Exception:
+                        return
+                    if c.get("usage"):
+                        u = c["usage"]
+                        acc_usage = {"input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)) or 0,
+                                     "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)) or 0,
+                                     "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
+                    d = ((c.get("choices") or [{}])[0].get("delta") or {})
+                    if d.get("content"):
+                        content = d["content"]
+                        acc_text += content
+                        yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": content})
+                    for tc in d.get("tool_calls") or []:
+                        acc = get_tool_acc(tc)
+                        fn = tc.get("function") or {}
+                        if not acc["added"]:
+                            acc["added"] = True
+                            yield emit("response.output_item.added", {"output_index": acc["output_index"], "item": {"id": acc["call_id"], "type": "function_call", "status": "in_progress", "call_id": acc["call_id"], "name": acc["name"], "arguments": ""}})
+                        if fn.get("name"):
+                            acc["name"] += fn["name"]
+                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
+                        if fn.get("arguments"):
+                            acc["args"] += fn["arguments"]
+                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
+
                 try:
                     yield emit("response.created", {"response": {"id": rid, "model": model, "status": "in_progress"}})
                     yield emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}})
-                    buf = b""
+                    yield emit("response.output_item.added", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
+                    yield emit("response.content_part.added", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
                     async for chunk in resp.content.iter_any():
-                        buf += chunk
-                        while b"\n" in buf:
-                            line, buf = buf.split(b"\n", 1)
+                        buffer += chunk
+                        while b"\n" in buffer:
+                            line, buffer = buffer.split(b"\n", 1)
                             line = line.strip()
                             if not line.startswith(b"data:"):
                                 continue
-                            payload = line[5:].strip()
-                            if payload in (b"[DONE]", b""):
-                                continue
-                            try:
-                                c = json.loads(payload)
-                            except Exception:
-                                continue
-                            if c.get("usage"):
-                                u = c["usage"]
-                                acc_usage = {"input_tokens": u.get("prompt_tokens", 0) or 0,
-                                             "output_tokens": u.get("completion_tokens", 0) or 0,
-                                             "total_tokens": u.get("total_tokens", 0) or 0}
-                            d = ((c.get("choices") or [{}])[0].get("delta") or {})
-                            if d.get("content"):
-                                content = d["content"]
-                                acc_text += content  # FIX: Accumulate text for Codex
-                                # G8 fix: Codex v0.145 requires output_item.added BEFORE first delta
-                                if not item_added:
-                                    item_added = True
-                                    yield emit("response.output_item.added", {
-                                        "output_index": 0,
-                                        "item": {"id": "msg-1", "type": "message", "status": "in_progress",
-                                                 "role": "assistant", "content": []}})
-                                    yield emit("response.content_part.added", {
-                                        "item_id": "msg-1", "output_index": 0, "content_index": 0,
-                                        "part": {"type": "output_text", "text": ""}})
-                                yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "delta": content})
-                    if item_added:
-                        yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
-                        yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0,
-                                                                  "part": {"type": "output_text", "text": acc_text, "annotations": []}})
-                        yield emit("response.output_item.done", {"output_index": 0,
-                                "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant",
-                                         "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}})
-                    # G9 fix: include usage in completed event
-                    completed = {"response": {"id": rid, "model": model, "status": "completed"}}
-                    # Always include usage object for OpenAI Responses SDK compatibility
-                    completed["response"]["usage"] = acc_usage if acc_usage else {
-                        "input_tokens": 0,
-                        "output_tokens": 0,
-                        "total_tokens": 0
-                    }
-                    yield emit("response.completed", completed)
+                            async for out in process_payload(line[5:].strip()):
+                                yield out
+                    # Flush final partial line if any.
+                    tail = buffer.strip()
+                    if tail.startswith(b"data:"):
+                        async for out in process_payload(tail[5:].strip()):
+                            yield out
+                except Exception as e:
+                    stream_error = e
+                    logger.error(f"[responses stream] {e}")
+                    if not acc_text and not any(tool_accs):
+                        acc_text = f"[upstream stream error: {e}]"
+                        yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": acc_text})
                 finally:
                     try:
-                        await resp.release()
+                        resp.release()
                     except Exception:
                         pass
                     pool.release(key)
+
+                msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
+                yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
+                yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": acc_text, "annotations": []}})
+                yield emit("response.output_item.done", {"output_index": 0, "item": msg_item})
+                outputs = [msg_item]
+                completed_tools = [a for a in tool_accs if a]
+                for acc in completed_tools:
+                    fc_item = {"id": acc["call_id"], "type": "function_call", "status": "completed", "call_id": acc["call_id"], "name": acc["name"], "arguments": acc["args"]}
+                    yield emit("response.output_item.done", {"output_index": acc["output_index"], "item": fc_item})
+                    outputs.append(fc_item)
+                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj()}})
+                yield "data: [DONE]\n\n"
+                _RESPONSE_STORE[rid] = list(chat_body.get("messages", [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)]
+                if len(_RESPONSE_STORE) > 200:
+                    _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
@@ -1009,7 +1109,7 @@ async def responses(request: Request):
         # G11: store conversation for previous_response_id multi-turn
         rid_store = resp_obj.get("id")
         if rid_store:
-            _RESPONSE_STORE[rid_store] = chat_body.get("messages", [])
+            _RESPONSE_STORE[rid_store] = list(chat_body.get("messages", [])) + [_assistant_message_from_chat(data)]
             # keep store bounded
             if len(_RESPONSE_STORE) > 200:
                 _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
@@ -1201,7 +1301,7 @@ async def anthropic_messages(request: Request):
                     pool.release(key)
                     return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(resp)}})
                 return StreamingResponse(
-                    stream_passthrough(resp, key),
+                    stream_passthrough(resp, key, terminal_done=False),
                     media_type="text/event-stream",
                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"},
                 )

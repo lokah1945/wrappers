@@ -291,6 +291,19 @@ class KeyPool:
         logger.info(f'[key_pool] Loaded {len(self.keys)} key(s) | soft={self.soft_limit} hard={self.hard_limit} rpm')
         return self
 
+    def release_success(self, key: KeyEntry = None):
+        """Compatibility release hook used by streaming proxy paths.
+
+        KeyEntry in-flight counters are decremented by the server path that owns
+        the stream. This method intentionally remains conservative so legacy
+        callers that expect a pool-level release hook do not crash.
+        """
+        try:
+            if key is not None:
+                key.decrement_in_flight()
+        except Exception:
+            pass
+
     @property
     def total_keys(self) -> int:
         return len(self.keys)
