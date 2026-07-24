@@ -26,7 +26,7 @@ import random
 import asyncio
 import threading
 import logging
-from typing import Optional, Dict, Any, List, AsyncGenerator
+from typing import Optional, Dict, Any, List, AsyncGenerator, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -220,6 +220,7 @@ _ALIAS_NAME_SET = {
 }
 _dynamic_alias_target: str = ""
 _dynamic_alias_lock = threading.Lock()
+_known_models: Set[str] = set()
 
 # Optional static metadata for known upstream free models (display only)
 MODEL_METADATA = {
@@ -236,12 +237,15 @@ def get_dynamic_alias_target() -> str:
     with _dynamic_alias_lock:
         return _dynamic_alias_target or ""
 
-def set_dynamic_alias_target(model_id: str) -> None:
+def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
     global _dynamic_alias_target
     if not model_id or is_alias_name(model_id):
         return
     mid = str(model_id).strip()
     if not mid:
+        return
+    if not force and mid not in _known_models:
+        logger.debug(f"[alias] ignoring unknown model {mid!r} — not in known model catalog")
         return
     with _dynamic_alias_lock:
         if _dynamic_alias_target != mid:
@@ -920,7 +924,7 @@ def check_rate_limit(ip: str):
 async def lifespan(app: FastAPI):
     seed = (os.environ.get("DYNAMIC_ALIAS_TARGET") or "").strip()
     if seed:
-        set_dynamic_alias_target(seed)
+        set_dynamic_alias_target(seed, force=True)
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
     start_env_watcher()
     # Load API keys from environment
@@ -1025,6 +1029,15 @@ async def models():
         pass  # Will use curated fallback
 
     models_list = list(upstream_models)
+
+    global _known_models
+    _known_models = set()
+    for m in models_list:
+        mid = m.get("id") if isinstance(m, dict) else None
+        if mid:
+            _known_models.add(mid)
+    for m in CURATED_FREE_MODELS:
+        _known_models.add(m["id"])
 
     # FIX: Add curated fallback models for Codex model discovery when upstream is unavailable
     # Codex CLI needs to discover models before making chat requests
@@ -1163,6 +1176,12 @@ async def chat_completions(request: Request):
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     if isinstance(result, dict):
         _ensure_chat_content(result)
+        if not result.get('usage'):
+            result['usage'] = {
+                'prompt_tokens': 0,
+                'completion_tokens': 0,
+                'total_tokens': 0,
+            }
     return JSONResponse(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---

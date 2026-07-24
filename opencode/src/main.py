@@ -17,7 +17,7 @@ import time
 import threading
 import asyncio
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Set
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -135,6 +135,7 @@ _ALIAS_NAME_SET = {
 }
 _dynamic_alias_target = ''
 _dynamic_alias_lock = threading.Lock()
+_known_models: Set[str] = set()
 
 def is_alias_name(model_id: str) -> bool:
     if not model_id:
@@ -145,7 +146,7 @@ def get_dynamic_alias_target() -> str:
     with _dynamic_alias_lock:
         return _dynamic_alias_target or ''
 
-def set_dynamic_alias_target(model_id: str) -> None:
+def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
     global _dynamic_alias_target
     if not model_id or is_alias_name(model_id):
         return
@@ -153,6 +154,9 @@ def set_dynamic_alias_target(model_id: str) -> None:
     if mid.lower().startswith('opencode/'):
         mid = mid.split('/', 1)[1]
     if not mid:
+        return
+    if not force and mid not in _known_models:
+        logger.debug(f'[alias] ignoring unknown model {mid!r} — not in known model catalog')
         return
     with _dynamic_alias_lock:
         if _dynamic_alias_target != mid:
@@ -334,10 +338,15 @@ def _ensure_chat_message(data: dict) -> dict:
         msg = ch0.get("message") or {}
         if msg.get("content") is None:
             msg["content"] = ""
-        # Keep reasoning_content if present; do not move it into content (transparent)
         ch0["message"] = msg
         choices[0] = ch0
         data["choices"] = choices
+        if not data.get('usage'):
+            data['usage'] = {
+                'prompt_tokens': 0,
+                'completion_tokens': 0,
+                'total_tokens': 0,
+            }
     except Exception:
         pass
     return data
@@ -576,7 +585,7 @@ async def lifespan(app: FastAPI):
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed:
-        set_dynamic_alias_target(seed)
+        set_dynamic_alias_target(seed, force=True)
     logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE} alias_target={get_dynamic_alias_target() or 'none'}")
     yield
     if _session is not None and not _session.closed:
@@ -632,6 +641,9 @@ async def models(request: Request):
         {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "north-mini-code-free", "object": "model", "owned_by": "opencode-zen"},
     ]
+    global _known_models
+    for m in fallback_all:
+        _known_models.add(m["id"])
     # Add aliases (sonnet/haiku/opus) with dynamic_alias flag
     for alias in ("sonnet", "opus", "haiku"):
         if free_only_enabled() and not model_allowed(alias):
@@ -664,6 +676,8 @@ async def models(request: Request):
                     entry["rooted_model"] = tgt
                 aliases_to_add.append(entry)
         (data.setdefault('data', [])).extend(aliases_to_add)
+        for m in (data.get('data') or []):
+            _known_models.add(m.get('id', ''))
         if free_only_enabled():
             data['data'] = [m for m in (data.get('data') or []) if model_allowed(m.get('id', ''))]
         data['free_only'] = free_only_enabled()
@@ -686,6 +700,9 @@ async def capabilities(request: Request):
             pool.release(key)
             if status == 200 and isinstance(data, dict):
                 models_list = data.get("data") or []
+                global _known_models
+                for m in models_list:
+                    _known_models.add(m.get("id", ""))
         except Exception:
             pool.release(key)
     tgt = get_dynamic_alias_target()
