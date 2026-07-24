@@ -1,16 +1,17 @@
 [Unit]
-Description=wrapper-nvidia (Python) FastAPI NVIDIA NIM proxy
+Description=wrapper-nvidia-python: NVIDIA NIM FastAPI proxy (port 9101)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9101
 WorkingDirectory=/root/wrapper/nvidia-python
-Restart=always
-RestartSec=3
+Environment=PYTHONPATH=/root/wrapper/nvidia-python
 EnvironmentFile=-/root/wrapper/nvidia-python/.env
 Environment=LOG_FILE=/root/wrapper/nvidia-python/nvidia_py.log
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9101
+Restart=always
+RestartSec=3
 StandardOutput=append:/root/wrapper/nvidia-python/nvidia_py.log
 StandardError=append:/root/wrapper/nvidia-python/nvidia_py.log
 

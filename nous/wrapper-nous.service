@@ -1,17 +1,19 @@
 [Unit]
-Description=wrapper-nous v2.0.0 (FastAPI) — 100/100 OpenAI + Anthropic compatible proxy for Nous Research
+Description=wrapper-nous: Anthropic+Responses+Chat proxy for Nous (port 9106)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
+WorkingDirectory=/root/wrapper/nous
+Environment=PYTHONPATH=/root/wrapper/nous
 EnvironmentFile=-/root/wrapper/nous/.env
-ExecStart=/usr/bin/python3 -m uvicorn wrapper_nous:app --host 127.0.0.1 --port 9106 --workers 1
+Environment=LOG_FILE=/root/wrapper/nous/wrapper_nous.log
+ExecStart=/usr/bin/python3 wrapper_nous.py
 Restart=always
 RestartSec=3
-WorkingDirectory=/root/wrapper/nous
-StandardOutput=journal
-StandardError=journal
+StandardOutput=append:/root/wrapper/nous/wrapper_nous.log
+StandardError=append:/root/wrapper/nous/wrapper_nous.log
 
 [Install]
 WantedBy=default.target

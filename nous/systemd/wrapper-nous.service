@@ -1,15 +1,17 @@
 [Unit]
-Description=wrapper-nous: Anthropic+Responses+Chat proxy for Nous (port 9107)
+Description=wrapper-nous: Anthropic+Responses+Chat proxy for Nous (port 9106)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /root/wrapper/nous/wrapper_nous.py
+WorkingDirectory=/root/wrapper/nous
+Environment=PYTHONPATH=/root/wrapper/nous
+EnvironmentFile=-/root/wrapper/nous/.env
+Environment=LOG_FILE=/root/wrapper/nous/wrapper_nous.log
+ExecStart=/usr/bin/python3 wrapper_nous.py
 Restart=always
 RestartSec=3
-WorkingDirectory=/root/wrapper/nous
-EnvironmentFile=-/root/wrapper/nous/.env
 StandardOutput=append:/root/wrapper/nous/wrapper_nous.log
 StandardError=append:/root/wrapper/nous/wrapper_nous.log
 
