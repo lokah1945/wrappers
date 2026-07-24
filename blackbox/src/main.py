@@ -45,8 +45,9 @@ from .key_pool import KeyPool
 from .metrics import Metrics
 
 ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / '.env')
-load_dotenv()
+if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
+    load_dotenv(ROOT / '.env')
+    load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/blackbox/blackbox.log')
 try:
@@ -76,6 +77,17 @@ CONNECT_TIMEOUT_SEC = int(os.environ.get('CONNECT_TIMEOUT_SEC', '30'))
 REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT_SEC', '600'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '900'))
 VERSION = '1.0.0-contract'
+
+# Build identity (H-04)
+def _resolve_git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/root/wrapper', stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return 'unknown'
+
+GIT_COMMIT = _resolve_git_commit()
+SOURCE_ROOT = '/root/wrapper/blackbox'
 
 # Curated discovery manifest only; it never substitutes an inference model.
 CURATED_FREE_MODELS = [
@@ -787,7 +799,7 @@ def _auth_check(request: Request):
 
 @app.get('/health')
 async def health():
-    return {'status': 'ok' if pool.available_keys > 0 else 'degraded', 'version': VERSION, 'keys': pool.total_keys, 'available': pool.available_keys, 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'base': BLACKBOX_BASE, 'metrics': await metrics.summary(), 'model_registry': MODEL_REGISTRY_CLIENT.stats()}
+    return {'status': 'ok' if pool.available_keys > 0 else 'degraded', 'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid(), 'keys': pool.total_keys, 'available': pool.available_keys, 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'base': BLACKBOX_BASE, 'metrics': await metrics.summary(), 'model_registry': MODEL_REGISTRY_CLIENT.stats()}
 
 
 @app.get('/ready')
@@ -802,7 +814,7 @@ async def ready(request: Request):
 
 @app.get('/version')
 async def version():
-    return {'version': VERSION}
+    return {'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid()}
 
 
 @app.get('/v1/models')

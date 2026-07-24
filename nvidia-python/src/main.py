@@ -459,7 +459,8 @@ from .registry import Registry
 from . import alert_history
 from . import loki_push
 
-load_dotenv()
+if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
+    load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/nvidia-python/nvidia_py.log')
 try:
@@ -510,6 +511,20 @@ try:
     VERSION = f"{importlib.metadata.version('wrapper-nvidia')}-py"
 except Exception:
     VERSION = '8.6.5-py'
+
+# Build identity (H-04): git_commit + source_root resolved from repo root
+def _resolve_git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd='/root/wrapper', stderr=subprocess.DEVNULL
+        ).decode().strip()
+    except Exception:
+        return 'unknown'
+
+GIT_COMMIT = _resolve_git_commit()
+SOURCE_ROOT = '/root/wrapper/nvidia-python'
 
 REASONING_CONFIGS = [
     {'patterns': ['deepseek-v4', 'deepseek-r1', 'deepseek-reasoner'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True, 'thinking': True}, 'requires_reasoning': True},
@@ -1200,6 +1215,9 @@ class Server:
             return {
                 'status': 'ok' if self.pool.available_keys > 0 else 'degraded',
                 'version': VERSION,
+                'git_commit': GIT_COMMIT,
+                'source_root': SOURCE_ROOT,
+                'pid': os.getpid(),
                 'keys': self.pool.total_keys,
                 'available': self.pool.available_keys,
                 'models_cached': len(self.pool.models_cached),
@@ -1221,7 +1239,7 @@ class Server:
 
         @app.get('/version')
         async def version():
-            return {'version': VERSION}
+            return {'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid()}
 
         @app.get('/api/version')
         async def api_version():

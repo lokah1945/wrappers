@@ -59,6 +59,9 @@ class Audit:
                     env.pop(key, None)
             for key in ("AUTH_PATH", "BEARER_TOKEN", "MODEL_REGISTRY_URL", "MODEL_REGISTRY_ADMIN_TOKEN", "MODEL_STATE_DB"):
                 env.pop(key, None)
+            # H-03: prevent wrapper source from reloading .env at import time so
+            # production keys cannot re-enter an isolated test process.
+            env["WRAPPER_SKIP_DOTENV"] = "true"
         try:
             proc = subprocess.run(
                 cmd,
@@ -115,8 +118,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--run-load", action="store_true")
     parser.add_argument("--requests", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=5)
-    parser.add_argument("--required-wrapper", action="append", default=[],
-                        help="Wrapper name required to be ready; repeatable")
+    parser.add_argument("--required-wrapper", action="append",
+                        default=["model-registry", "nvidia", "nous", "opencode", "blackbox"],
+                        help="Wrapper name required to be ready; repeatable (default: all 5)")
     parser.add_argument("--require-registry", action="store_true")
     return parser.parse_args()
 
@@ -207,7 +211,7 @@ def main() -> int:
             "wrapper-blackbox.service",
         ]
         for unit in units:
-            rc, out = audit.command(["systemctl", "is-active", unit], timeout=15)
+            rc, out = audit.command(["systemctl", "--user", "is-active", unit], timeout=15)
             state = out.strip() or "inactive"
             unit_states[unit.removesuffix(".service").removeprefix("wrapper-")] = state
             required = unit.removesuffix(".service").removeprefix("wrapper-") in args.required_wrapper

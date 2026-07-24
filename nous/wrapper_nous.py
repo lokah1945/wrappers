@@ -212,7 +212,9 @@ def load_dotenv():
                         k, v = line.strip().split("=", 1)
                         os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
 
-load_dotenv()
+
+if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
+    load_dotenv()
 
 # .env hot reload watcher (parity with opencode/nvidia-python)
 try:
@@ -260,6 +262,17 @@ REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT_SEC", "600"))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get("STREAM_REQUEST_TIMEOUT_SEC", "900"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
 VERSION = "2.0.6-anthropic-tools"
+
+# Build identity (H-04)
+def _resolve_git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/root/wrapper', stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return 'unknown'
+
+GIT_COMMIT = _resolve_git_commit()
+SOURCE_ROOT = '/root/wrapper/nous'
 # No DEFAULT_MODEL/REASONING_MODEL - all model selection is transparent (client chooses)
 
 def free_only_enabled() -> bool:
@@ -1505,6 +1518,9 @@ async def health():
         "ok": True,
         "status": "ok" if KEY_POOL.available_keys > 0 or bool(_read_token_from_auth_path()) else "degraded",
         "version": VERSION,
+        "git_commit": GIT_COMMIT,
+        "source_root": SOURCE_ROOT,
+        "pid": os.getpid(),
         "port": LISTEN_PORT,
         "free_only": free_only_enabled(),
         "dynamic_alias_target": get_dynamic_alias_target() or None,
@@ -1533,7 +1549,7 @@ async def ready():
         return JSONResponse(status_code=503, content={"ready": False, "upstream_ok": False, "last_error": str(e), "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys})
 
 @app.get("/version")
-async def version(): return {"version": VERSION}
+async def version(): return {"version": VERSION, "git_commit": GIT_COMMIT, "source_root": SOURCE_ROOT, "pid": os.getpid()}
 
 # Curated discovery manifest for stale/upstream-unavailable catalog responses
 CURATED_FREE_MODELS = [

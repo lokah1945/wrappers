@@ -47,10 +47,12 @@ except ImportError:
 from .key_pool import KeyPool
 from .metrics import Metrics
 
-load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
+if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
+    load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 # Fallback: also try cwd-relative .env (for direct uvicorn launches)
 if not os.environ.get('OPENCODE_BASE_URL'):
-    load_dotenv()
+    if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
+        load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/opencode/opencode.log')
 try:
@@ -87,6 +89,17 @@ REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT_SEC', '600'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '900'))
 # No DEFAULT_MODEL - all model selection is transparent (client chooses)
 VERSION = '1.0.5-anthropic-tools'
+
+# Build identity (H-04)
+def _resolve_git_commit():
+    try:
+        import subprocess
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd='/root/wrapper', stderr=subprocess.DEVNULL).decode().strip()
+    except Exception:
+        return 'unknown'
+
+GIT_COMMIT = _resolve_git_commit()
+SOURCE_ROOT = '/root/wrapper/opencode'
 
 def free_only_enabled() -> bool:
     """FREE_ONLY=yes|true|1 → only models with 'free' in the name."""
@@ -913,7 +926,7 @@ def _auth_check(request: Request):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok" if pool.available_keys > 0 else "degraded", "version": VERSION, "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE, "model_registry": MODEL_REGISTRY_CLIENT.stats()}
+    return {"status": "ok" if pool.available_keys > 0 else "degraded", "version": VERSION, "git_commit": GIT_COMMIT, "source_root": SOURCE_ROOT, "pid": os.getpid(), "keys": pool.total_keys, "available": pool.available_keys, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "base": OPENCODE_BASE, "model_registry": MODEL_REGISTRY_CLIENT.stats()}
 
 
 @app.get("/ready")
