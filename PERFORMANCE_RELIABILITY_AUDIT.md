@@ -157,3 +157,24 @@ bandit high severity: no findings
 pip-audit: no known vulnerabilities
 install.sh syntax: pass
 ```
+
+## NVIDIA Claude Code Kimi Guardrail
+
+A production incident was reviewed where Claude Code reported the selected NVIDIA
+model `moonshotai/kimi-k2.6` as unavailable even though the model exists and the
+API key is valid. The wrapper now avoids two false-negative patterns:
+
+1. Background model-verification transient failures are no longer hard-blocking
+   explicit client-selected models. Only retired/404/410 models are blocked by
+   default. Strict behavior can be restored with `STRICT_BLOCK_UNAVAILABLE_MODELS=true`.
+2. `moonshotai/kimi-k2.6` output tokens are capped to the NVIDIA Build example
+   limit of `16384`, and Claude/Anthropic `thinking` does not inject
+   `reasoning_effort` for this model by default.
+
+Config overrides:
+
+```text
+MODEL_MAX_TOKENS_CAPS=moonshotai/kimi-k2.6:16384
+DISABLE_REASONING_INJECTION_PATTERNS=moonshotai/kimi-k2.6,kimi-k2.6
+STRICT_BLOCK_UNAVAILABLE_MODELS=false
+```

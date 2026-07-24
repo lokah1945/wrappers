@@ -363,3 +363,42 @@ def test_blackbox_anthropic_tools_structured_no_dsml():
     a = bb.openai_to_anthropic("m", {"choices": [{"message": {"content": "", "tool_calls": [{"id": "c1", "function": {"name": "Bash", "arguments": "{}"}}]}, "finish_reason": "tool_calls"}], "usage": {}})
     assert a["stop_reason"] == "tool_use"
     assert any(c["type"] == "tool_use" for c in a["content"])
+
+
+def _load_nvidia_main():
+    for k in list(sys.modules):
+        if k == "src" or k.startswith("src."):
+            del sys.modules[k]
+    sys.path = [p for p in sys.path if "opencode" not in p and "blackbox" not in p]
+    sys.path.insert(0, str(ROOT / "nvidia-python"))
+    import src.main as nv  # type: ignore
+
+    return nv
+
+
+def test_nvidia_transient_unavailable_probe_does_not_block_explicit_model():
+    nv = _load_nvidia_main()
+    nv._unavailable_models.add("moonshotai/kimi-k2.6")
+    try:
+        assert nv.is_model_unavailable("moonshotai/kimi-k2.6") is False
+        nv._retired_models.add("moonshotai/kimi-k2.6")
+        assert nv.is_model_unavailable("moonshotai/kimi-k2.6") is True
+    finally:
+        nv._unavailable_models.discard("moonshotai/kimi-k2.6")
+        nv._retired_models.discard("moonshotai/kimi-k2.6")
+
+
+def test_nvidia_kimi_clamps_max_tokens_to_build_nvidia_cap():
+    nv = _load_nvidia_main()
+    body = {"model": "moonshotai/kimi-k2.6", "max_tokens": 200000, "max_completion_tokens": 200000}
+    nv.clamp_max_tokens_for_model(body, "moonshotai/kimi-k2.6")
+    assert body["max_tokens"] == 16384
+    assert body["max_completion_tokens"] == 16384
+
+
+def test_nvidia_kimi_skips_reasoning_effort_injection_for_claude_code_thinking():
+    nv = _load_nvidia_main()
+    body = {"model": "moonshotai/kimi-k2.6", "messages": []}
+    nv.translate_thinking_to_nim(body, "moonshotai/kimi-k2.6", {"type": "enabled", "budget_tokens": 1024})
+    assert "reasoning_effort" not in body
+    assert "chat_template_kwargs" not in body

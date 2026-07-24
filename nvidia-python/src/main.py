@@ -469,6 +469,8 @@ def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking
     if anthropic_thinking is None:
         return
     enabled = anthropic_thinking is True or (isinstance(anthropic_thinking, dict) and anthropic_thinking.get('type') != 'disabled')
+    if _is_reasoning_injection_disabled(nim_model):
+        return
     cfg = find_reasoning_config(nim_model)
     if not cfg:
         if not hasattr(translate_thinking_to_nim, '_unknown_logged'):
@@ -500,6 +502,8 @@ def apply_default_reasoning(body: dict, model_id: str) -> None:
     has_explicit = bool(body.get('chat_template_kwargs') or body.get('reasoning_effort') or
                         (isinstance(body.get('extra_body'), dict) and (body['extra_body'].get('chat_template_kwargs') or body['extra_body'].get('reasoning_effort') or body['extra_body'].get('reasoning_budget'))))
     if has_explicit:
+        return
+    if _is_reasoning_injection_disabled(model_id):
         return
     cfg = find_reasoning_config(model_id)
     if not cfg or not cfg.get('requires_reasoning'):
@@ -723,8 +727,83 @@ def resolve_target_model(requested_model: str) -> str:
     return m
 
 
+def _csv_patterns(env_name: str, default: str = '') -> list:
+    raw = os.environ.get(env_name, default) or ''
+    return [x.strip().lower() for x in raw.split(',') if x.strip()]
+
+
 def is_model_unavailable(model_id: str) -> bool:
-    return model_id in _unavailable_models
+    """Return True only for models that should be hard-blocked before upstream.
+
+    Verification sweeps can produce transient false negatives (429, probe shape,
+    slow model warmup, temporary provider capacity). A concrete client-selected
+    model must not be rejected just because a background probe failed. Hard block
+    only retired/404/410 models by default; optionally restore strict behavior
+    with STRICT_BLOCK_UNAVAILABLE_MODELS=true.
+    """
+    if model_id in _retired_models:
+        return True
+    if os.environ.get('STRICT_BLOCK_UNAVAILABLE_MODELS', 'false').lower() in ('1', 'true', 'yes', 'on'):
+        return model_id in _unavailable_models
+    return False
+
+
+def _is_reasoning_injection_disabled(model_id: str) -> bool:
+    m = (model_id or '').lower()
+    # NVIDIA build examples for moonshotai/kimi-k2.6 omit reasoning_effort and
+    # the model may reject extra reasoning controls. Keep this provider-specific
+    # skip configurable for future catalog changes.
+    for pat in _csv_patterns('DISABLE_REASONING_INJECTION_PATTERNS', 'moonshotai/kimi-k2.6,kimi-k2.6'):
+        if pat in m:
+            return True
+    return False
+
+
+def _model_output_cap(model_id: str) -> Optional[int]:
+    """Provider-specific max output cap to avoid upstream max_tokens errors.
+
+    Format override: MODEL_MAX_TOKENS_CAPS='pattern:cap,other-pattern:cap'.
+    Defaults include known NVIDIA build example caps.
+    """
+    caps = {
+        'moonshotai/kimi-k2.6': 16384,
+        'kimi-k2.6': 16384,
+    }
+    raw = os.environ.get('MODEL_MAX_TOKENS_CAPS', '') or ''
+    for item in raw.split(','):
+        if ':' not in item:
+            continue
+        pat, val = item.rsplit(':', 1)
+        pat = pat.strip().lower()
+        try:
+            cap = int(val.strip())
+        except (TypeError, ValueError):
+            continue
+        if pat and cap > 0:
+            caps[pat] = cap
+    m = (model_id or '').lower()
+    for pat, cap in sorted(caps.items(), key=lambda kv: len(kv[0]), reverse=True):
+        if pat in m:
+            return cap
+    return None
+
+
+def clamp_max_tokens_for_model(body: dict, model_id: str) -> None:
+    if not isinstance(body, dict):
+        return
+    cap = _model_output_cap(model_id)
+    if not cap:
+        return
+    for key in ('max_tokens', 'max_completion_tokens'):
+        if body.get(key) is None:
+            continue
+        try:
+            val = int(body[key])
+        except (TypeError, ValueError):
+            continue
+        if val > cap:
+            logger.info(f'[model-cap] clamping {key} for {model_id}: {val} -> {cap}')
+            body[key] = cap
 
 
 def route_upstream(path: str) -> str:
@@ -1440,6 +1519,7 @@ class Server:
         if stream_guard:
             return JSONResponse(status_code=stream_guard['status'], content=stream_guard['data'])
 
+        clamp_max_tokens_for_model(body, model_id)
         result = await self.proxy_openai(body, forward_headers(request), model_id, request)
 
         if result.get('stream'):
@@ -1556,6 +1636,7 @@ class Server:
         if body.get('thinking') and isinstance(body['thinking'], dict):
             translate_thinking_to_nim(openai_body, model_id, body['thinking'])
 
+        clamp_max_tokens_for_model(openai_body, model_id)
         result = await self.proxy_openai(openai_body, forward_headers(request), model_id, request, metric_path='/v1/messages')
 
         expect_thinking = bool(
@@ -1626,6 +1707,8 @@ class Server:
             if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
                 body['max_tokens'] = body['max_completion_tokens']
                 del body['max_completion_tokens']
+
+            clamp_max_tokens_for_model(body, model_id)
 
             if body.get('stream'):
                 body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}

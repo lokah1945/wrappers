@@ -592,3 +592,46 @@ install.sh syntax: pass
 ## Verdict
 
 The monorepo now has explicit performance/reliability instrumentation and tests. The hot path avoids per-request client sessions, successful streams are not pre-buffered, health is not upstream-dependent, and concurrency tests assert no key-pool in-flight leaks under parallel usage.
+
+---
+
+# NVIDIA Claude Code Kimi Incident Fix
+
+Observed terminal error in Claude Code:
+
+```text
+There's an issue with the selected model (moonshotai/kimi-k2.6). It may not exist or you may not have access to it.
+```
+
+Direct NVIDIA Build prototype shows the model is valid when called as:
+
+```text
+model=moonshotai/kimi-k2.6
+max_tokens=16384
+```
+
+Root causes identified in wrapper-side guardrails:
+
+1. Background verification failures could place a concrete model into
+   `_unavailable_models`, and `is_model_unavailable()` then returned 404 before
+   the explicit client request reached upstream. A transient probe failure should
+   never equal whole-model unavailability for a user-selected concrete model.
+2. Anthropic/Claude-style requests can ask for very large `max_tokens` and/or
+   `thinking`; NVIDIA's Kimi K2.6 Build sample uses max output `16384` and no
+   `reasoning_effort` field.
+
+Fixes:
+
+- `is_model_unavailable()` now hard-blocks only retired models by default.
+- `STRICT_BLOCK_UNAVAILABLE_MODELS=true` can restore strict unavailable blocking.
+- Added model-specific max-token caps with default `moonshotai/kimi-k2.6:16384`.
+- Disabled automatic reasoning injection for `moonshotai/kimi-k2.6` by default.
+- Added regression tests for transient unavailable handling, max-token clamping,
+  and reasoning injection skip.
+
+Similar wrapper patterns were checked:
+
+- Nous/OpenCode/Blackbox do not hard-block explicit models based on background
+  verification state.
+- Existing model-capacity classifiers avoid cooling down API keys for model-only
+  deployment/capacity failures.
