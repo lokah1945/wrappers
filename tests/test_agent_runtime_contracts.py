@@ -407,6 +407,11 @@ def test_nvidia_kimi_skips_reasoning_effort_injection_for_claude_code_thinking()
     assert "chat_template_kwargs" not in body
 
 
+def test_nvidia_model_normalization_preserves_bracketed_provider_id():
+    nv = _load_nvidia_main()
+    assert nv._strip_context_suffix("provider/model[128k]") == "provider/model[128k]"
+
+
 def test_nvidia_account_scoped_404_does_not_enter_retired_set():
     nv = _load_nvidia_main()
 

@@ -687,9 +687,12 @@ def get_deprecated_redirect_info(model_id: str) -> Optional[dict]:
 
 
 def _strip_context_suffix(model_id: str) -> str:
-    if not model_id:
-        return model_id
-    return re_module.sub(r'\[[0-9]+[mk]?\]$', '', model_id).strip()
+    """Preserve provider model IDs exactly; context annotations are adapter-specific.
+
+    This function remains for compatibility with callers but must not mutate a
+    concrete model identity in the transparent wrapper.
+    """
+    return model_id
 
 ALIAS_TO_NIM = {}  # kept for metrics/debug: maps alias -> last dynamic target (informational)
 DISCOVERY_TO_NIM = {}
