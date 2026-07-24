@@ -860,8 +860,9 @@ async def lifespan(app: FastAPI):
     pool.load_from_env()
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
-    if seed:
+    if seed and not is_alias_name(seed):
         set_dynamic_alias_target(seed, force=True)
+        MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="opencode")
     logger.info(f"wrapper-opencode starting on {BIND_HOST}:{LISTEN_PORT} base={OPENCODE_BASE} alias_target={get_dynamic_alias_target() or 'none'}")
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())

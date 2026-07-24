@@ -1446,8 +1446,9 @@ async def model_catalog_refresh_loop():
 async def lifespan(app: FastAPI):
     global _MODEL_REFRESH_TASK
     seed = (os.environ.get("DYNAMIC_ALIAS_TARGET") or "").strip()
-    if seed:
+    if seed and not is_alias_name(seed):
         set_dynamic_alias_target(seed, force=True)
+        MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="nous")
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
     start_env_watcher()
     # Load API keys from environment before the daily catalog task starts.

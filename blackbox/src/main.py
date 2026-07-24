@@ -740,8 +740,9 @@ async def lifespan(app: FastAPI):
     global _session, _MODEL_REFRESH_TASK
     pool.load_from_env()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
-    if seed:
+    if seed and not is_alias_name(seed):
         set_dynamic_alias_target(seed, force=True)
+        MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="blackbox")
     start_env_watcher()
     logger.info(f'wrapper-blackbox starting on {BIND_HOST}:{LISTEN_PORT} base={BLACKBOX_BASE} free_only={free_only_enabled()} alias_target={get_dynamic_alias_target() or None}')
     await MODEL_REGISTRY_CLIENT.start()

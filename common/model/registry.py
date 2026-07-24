@@ -65,6 +65,21 @@ class LocalModelRegistry:
         if self.profile_store:
             self.profile_store.save_alias(binding, self.provider)
 
+    def bind_explicit_aliases(self, target: str, aliases: Iterable[str],
+                              scope_type: str = "wrapper", scope_id: str | None = None,
+                              revision: str = "env") -> None:
+        target = str(target or "").strip()
+        canonical = target if target.startswith(f"{self.provider}/") else f"{self.provider}/{target}"
+        for alias in aliases:
+            self.bind_alias(AliasBinding(
+                scope_type=scope_type,
+                scope_id=scope_id or self.provider,
+                alias=str(alias),
+                canonical_target=canonical,
+                revision=revision,
+                source="explicit_config",
+            ))
+
     def register_profile(self, profile: ModelProfile) -> None:
         if profile.provider != self.provider:
             raise ValueError(f"profile provider {profile.provider!r} != registry {self.provider!r}")

@@ -785,6 +785,7 @@ def load_alias_config(pool: KeyPool = None):
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or os.environ.get('ALIAS_DYNAMIC_TARGET') or '').strip()
     if seed and not is_alias_name(seed):
         set_dynamic_alias_target(seed, force=True)
+        MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="nvidia")
     else:
         tgt = get_dynamic_alias_target()
         ALIAS_TO_NIM = {a: tgt for a in _ALIAS_NAME_SET} if tgt else {}
