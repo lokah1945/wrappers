@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from contextlib import suppress
 from typing import Any
 
@@ -31,6 +32,10 @@ class ModelRegistryClient:
         self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=self.queue_limit)
         self.dropped_observations = 0
         self.failed_posts = 0
+        self.consecutive_failures = 0
+        self.circuit_open_until = 0.0
+        self.circuit_threshold = int(os.environ.get("MODEL_REGISTRY_CIRCUIT_THRESHOLD", "3"))
+        self.circuit_cooldown_sec = int(os.environ.get("MODEL_REGISTRY_CIRCUIT_COOLDOWN_SEC", "30"))
 
     @property
     def enabled(self) -> bool:
@@ -81,6 +86,8 @@ class ModelRegistryClient:
         self._session = None
 
     async def _post(self, path: str, payload: dict[str, Any]) -> bool:
+        if time.time() < self.circuit_open_until:
+            return False
         session = await self._ensure_session()
         if session is None:
             return False
@@ -89,11 +96,20 @@ class ModelRegistryClient:
                 f"{self.base_url}{path}", json=payload, headers=self._headers()
             ) as response:
                 ok = 200 <= response.status < 300
-                if not ok:
+                if ok:
+                    self.consecutive_failures = 0
+                    self.circuit_open_until = 0.0
+                else:
                     self.failed_posts += 1
+                    self.consecutive_failures += 1
+                if self.consecutive_failures >= self.circuit_threshold:
+                    self.circuit_open_until = time.time() + self.circuit_cooldown_sec
                 return ok
         except Exception:
             self.failed_posts += 1
+            self.consecutive_failures += 1
+            if self.consecutive_failures >= self.circuit_threshold:
+                self.circuit_open_until = time.time() + self.circuit_cooldown_sec
             return False
 
     def stats(self) -> dict[str, Any]:
@@ -103,6 +119,8 @@ class ModelRegistryClient:
             "queue_limit": self.queue_limit,
             "dropped_observations": self.dropped_observations,
             "failed_posts": self.failed_posts,
+            "consecutive_failures": self.consecutive_failures,
+            "circuit_open": time.time() < self.circuit_open_until,
             "worker_running": bool(self._worker and not self._worker.done()),
         }
 

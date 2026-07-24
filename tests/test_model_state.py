@@ -7,6 +7,16 @@ from common.model_state import ModelStateStore, classify_upstream_error, credent
 from common.model.errors import classify_provider_error, load_provider_error_manifest
 
 
+def test_account_hint_precedes_credential_scope(tmp_path: Path):
+    store = ModelStateStore("nvidia", tmp_path / "state.db")
+    state = store.record_error(
+        "provider/model-a", "key-a", 404,
+        {"detail": "Function fn: Not found for account acct-123"},
+    )
+    assert state["account_scope"] == credential_fingerprint("acct-123")
+    assert state["account_scope"] != credential_fingerprint("key-a")
+
+
 def test_provider_manifest_rule_is_used_for_account_scoped_error():
     manifest = load_provider_error_manifest("nvidia")
     result = classify_provider_error("nvidia", 404, "Function fn not found for account acct", manifest)
@@ -52,7 +62,7 @@ def test_catalog_and_account_status_persist_across_store_instances(tmp_path: Pat
     state = second.status_for("vendor/model-a")
     assert state["state"] == "account_unavailable"
     assert state["reason_code"] == "NOT_DEPLOYED_FOR_ACCOUNT"
-    assert state["account_scope"] == credential_fingerprint("secret-key-a")
+    assert state["account_scope"] == credential_fingerprint("acct-a")
 
 
 def test_catalog_does_not_delete_last_good_snapshot_on_empty_refresh(tmp_path: Path):

@@ -151,10 +151,7 @@ class LocalModelRegistry:
                     provider_model_id=raw_id,
                     profile_revision=revision,
                     catalog_revision=revision,
-                    capabilities=CapabilityProfile(
-                        input_modalities=("text",),
-                        output_modalities=("text",),
-                    ),
+                capabilities=CapabilityProfile(),
                     limits=LimitProfile(),
                     protocols=self._default_protocols(),
                     provenance={"source": "provider_catalog", "metadata": metadata},

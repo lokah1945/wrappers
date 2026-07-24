@@ -21,6 +21,7 @@ from .contracts import (
 from .errors import (
     ErrorState,
     classify_provider_error,
+    provider_account_hint,
     classify_upstream_error,
     error_text,
     load_provider_error_manifest,
@@ -50,6 +51,7 @@ __all__ = [
     "build_call_plan",
     "classify_provider_error",
     "classify_upstream_error",
+    "provider_account_hint",
     "error_text",
     "load_provider_error_manifest",
     "normalize_model_syntax",

@@ -21,6 +21,7 @@ def test_local_registry_loads_provider_manifest_and_registers_catalog():
     assert plan.model.provider_model_id == "provider/model-a"
     assert plan.model_substitution_allowed is False
     assert plan.key_rotation_allowed is True
+    assert registry.profiles["nvidia/provider/model-a"].capabilities.input_modalities == ()
     responses_plan = registry.call_plan("provider/model-a", "openai_responses")
     assert responses_plan.upstream_surface == "openai_chat"
     assert responses_plan.path == "/v1/chat/completions"

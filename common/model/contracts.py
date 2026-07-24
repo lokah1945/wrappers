@@ -53,8 +53,10 @@ class ModelRef:
 
 @dataclass(frozen=True)
 class CapabilityProfile:
-    input_modalities: tuple[str, ...] = ("text",)
-    output_modalities: tuple[str, ...] = ("text",)
+    # Empty means unknown; never infer text-only merely because a provider
+    # catalog omitted capability metadata.
+    input_modalities: tuple[str, ...] = ()
+    output_modalities: tuple[str, ...] = ()
     streaming: bool | None = None
     openai_chat: bool | None = None
     openai_responses: bool | None = None

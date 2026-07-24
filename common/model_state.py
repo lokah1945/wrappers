@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 from typing import Any, Iterable, Optional
 
-from .model.errors import classify_provider_error, classify_upstream_error, error_text, load_provider_error_manifest
+from .model.errors import classify_provider_error, classify_upstream_error, error_text, load_provider_error_manifest, provider_account_hint
 from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
@@ -384,7 +384,8 @@ class ModelStateStore:
                      status_code: int, payload: Any, endpoint: str = "") -> dict[str, Any]:
         classification = classify_provider_error(self.provider, status_code, payload, self.provider_error_manifest)
         detail = sanitize_error_detail(payload)
-        scope = credential_fingerprint(account_credential)
+        account_hint = provider_account_hint(payload)
+        scope = credential_fingerprint(account_hint) if account_hint else credential_fingerprint(account_credential)
         return self.record_status(
             model_id=model_id,
             account_scope=scope,

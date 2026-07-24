@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,13 @@ def error_text(payload: Any) -> str:
         return json.dumps(payload, ensure_ascii=False, default=str)[:4000]
     except Exception:
         return str(payload)[:4000]
+
+
+def provider_account_hint(payload: Any) -> str:
+    """Extract a provider account identifier hint without returning raw text."""
+    text = error_text(payload)
+    match = re.search(r"(?i)(?:account|tenant|project)[^A-Za-z0-9]+([A-Za-z0-9._:-]{3,128})", text)
+    return match.group(1) if match else ""
 
 
 def classify_provider_error(provider: str, status: int, payload: Any = "", manifest: dict[str, Any] | None = None) -> ErrorClassification:
