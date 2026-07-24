@@ -599,6 +599,7 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
     expose_headers=['*'],
+    allow_credentials=True,
 )
 
 def _auth_check(request: Request):
@@ -723,14 +724,20 @@ async def capabilities(request: Request):
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
     _auth_check(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}})
     return {"input_tokens": max(1, len(json.dumps(body)) // 4)}
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     if requested is not None:
         body["model"] = _normalize_model(requested)
@@ -738,6 +745,10 @@ async def chat_completions(request: Request):
         return _jr(400, free_only_error(requested))
     if free_only_enabled() and body.get("model") and not model_allowed(body["model"]):
         return _jr(400, free_only_error(requested or body["model"]))
+
+    for m in body.get('messages', []) or []:
+        if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
+            return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)"}})
     is_stream = bool(body.get("stream", False))
 
     key_result = await pool.acquire()
@@ -783,7 +794,10 @@ async def responses(request: Request):
     For chat-family models, translate Responses→Chat→Responses.
     """
     _auth_check(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     model = _normalize_model(requested) if requested else ""
     if requested is not None:
@@ -935,9 +949,18 @@ async def responses(request: Request):
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     _auth_check(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        return _jr(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
     if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
         return _jr(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'max_tokens is required and must be a positive integer'}})
+    sys_field = body.get('system')
+    if sys_field is not None and not isinstance(sys_field, (str, list)):
+        return _jr(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '"system" must be a string or array of content blocks'}})
+    for t in body.get('tools', []) or []:
+        if not isinstance(t.get('input_schema'), dict):
+            return _jr(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'tool.input_schema must be an object'}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     model = _normalize_model(requested) if requested else ""
     if requested is not None:

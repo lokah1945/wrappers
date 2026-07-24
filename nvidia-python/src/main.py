@@ -739,7 +739,16 @@ class Server:
                 api_key_header = (request.headers.get('x-api-key') or '').strip()
                 token = auth_header.replace('Bearer ', '', 1) if auth_header.lower().startswith('bearer ') else auth_header or api_key_header
                 if token != BEARER_TOKEN:
-                    # Consistent error format for all SDK clients
+                    # D11: unknown paths return 404, not 401 (don't leak route info)
+                    known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
+                                   '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
+                                   '/v1/moderations', '/v1/responses', '/v1/files',
+                                   '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
+                                   '/v1/messages', '/v1/messages/count_tokens',
+                                   '/v1/capabilities', '/v1/capabilities/params',
+                                   '/v2/', '/api/', '/v1/complete')
+                    if path != '/' and not any(path == s.rstrip('/') or path.startswith(s) for s in known_stems):
+                        return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
                     return JSONResponse(status_code=401, content={'error': {'message': 'Unauthorized', 'type': 'authentication_error'}})
 
             return await call_next(request)
@@ -1069,6 +1078,10 @@ class Server:
             if dep:
                 return JSONResponse(status_code=410, content={'error': {'message': f'Model "{dep["from"]}" has been renamed to "{dep["to"]}" in the NVIDIA NIM catalog. Update your request to use "{dep["to"]}".', 'type': 'invalid_request_error'}})
 
+            for m in body.get('messages', []) or []:
+                if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
+                    return JSONResponse(status_code=400, content={'error': {'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)", 'type': 'invalid_request_error'}})
+
             body['model'] = resolve_target_model(body.get('model', ''))
             return await self._handle_chat_completions(body, request, raw)
 
@@ -1310,6 +1323,14 @@ class Server:
             return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', f'Invalid JSON: {e}')})
         if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
             return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer')})
+
+        sys_field = body.get('system')
+        if sys_field is not None and not isinstance(sys_field, (str, list)):
+            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', '"system" must be a string or array of content blocks')})
+
+        for t in body.get('tools', []) or []:
+            if not isinstance(t.get('input_schema'), dict):
+                return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'tool.input_schema must be an object')})
 
         model_id = resolve_target_model(body.get('model', ''))
         body['model'] = model_id
@@ -1690,6 +1711,18 @@ class Server:
         method = request.method
         is_post = method in ('POST', 'PUT', 'PATCH')
 
+        # D11: return 404 for paths that don't match any known API endpoint
+        known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
+                       '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
+                       '/v1/moderations', '/v1/responses', '/v1/files',
+                       '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
+                       '/v1/messages', '/v1/messages/count_tokens',
+                       '/v1/capabilities', '/v1/capabilities/params',
+                       '/v2/', '/api/', '/v1/complete')
+        normalized = path if path.startswith('/') else '/' + path
+        if path != '/' and not any(normalized == s.rstrip('/') or normalized.startswith(s) for s in known_stems):
+            return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
+
         body = {}
         raw = b''
         if is_post:
@@ -1855,6 +1888,7 @@ def create_app() -> FastAPI:
         allow_methods=['*'],
         allow_headers=['*'],
         expose_headers=['*'],
+        allow_credentials=True,
     )
 
     server = Server(app)

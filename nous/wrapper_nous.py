@@ -946,6 +946,7 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
     expose_headers=['*'],
+    allow_credentials=True,
 )
 
 async def _auth_check(request: Request):
@@ -1127,7 +1128,10 @@ async def count_tokens(req: Request):
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     await _auth_check(request)
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
     client_ip = request.client.host
     if not check_rate_limit(client_ip):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
@@ -1141,6 +1145,9 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400, content=free_only_error(requested))
     if free_only_enabled() and model and not model_allowed(model):
         return JSONResponse(status_code=400, content=free_only_error(requested or model))
+    for m in body.get('messages', []) or []:
+        if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
+            return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)"}})
     for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
         body.pop(bad, None)
     # Drop name:null tools (Codex/Hermes) before upstream
@@ -1241,6 +1248,12 @@ async def messages(request: Request):
     body = await request.json()
     if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'max_tokens is required and must be a positive integer'}})
+    sys_field = body.get('system')
+    if sys_field is not None and not isinstance(sys_field, (str, list)):
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '"system" must be a string or array of content blocks'}})
+    for t in body.get('tools', []) or []:
+        if not isinstance(t.get('input_schema'), dict):
+            return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'tool.input_schema must be an object'}})
     requested = body.get("model")
     if free_only_enabled() and requested:
         resolved = resolve_model(requested)
