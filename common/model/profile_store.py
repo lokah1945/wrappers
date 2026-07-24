@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from .contracts import CapabilityProfile, LimitProfile, ModelProfile, ProtocolProfile
+from .contracts import AliasBinding, CapabilityProfile, LimitProfile, ModelProfile, ProtocolProfile
 
 
 class ModelProfileStore:
@@ -41,6 +41,17 @@ class ModelProfileStore:
                 version INTEGER PRIMARY KEY,
                 applied_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS model_alias_bindings (
+                provider TEXT NOT NULL,
+                scope_type TEXT NOT NULL,
+                scope_id TEXT NOT NULL,
+                alias TEXT NOT NULL,
+                canonical_target TEXT NOT NULL,
+                revision TEXT NOT NULL DEFAULT '',
+                source TEXT NOT NULL DEFAULT 'manifest',
+                updated_at REAL NOT NULL,
+                PRIMARY KEY(provider, scope_type, scope_id, alias)
+            );
         """)
         conn.execute(
             "INSERT OR IGNORE INTO model_profile_schema(version, applied_at) VALUES(?,?)",
@@ -68,6 +79,41 @@ class ModelProfileStore:
                 ),
             )
             conn.commit()
+        finally:
+            conn.close()
+
+    def save_alias(self, binding: AliasBinding, provider: str) -> None:
+        conn = self._connect()
+        try:
+            conn.execute(
+                """INSERT INTO model_alias_bindings
+                   (provider,scope_type,scope_id,alias,canonical_target,revision,source,updated_at)
+                   VALUES(?,?,?,?,?,?,?,?)
+                   ON CONFLICT(provider,scope_type,scope_id,alias) DO UPDATE SET
+                     canonical_target=excluded.canonical_target,
+                     revision=excluded.revision,
+                     source=excluded.source,
+                     updated_at=excluded.updated_at""",
+                (provider, binding.scope_type, binding.scope_id, binding.alias,
+                 binding.canonical_target, binding.revision, binding.source, time.time()),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+    def load_aliases(self, provider: str) -> list[AliasBinding]:
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT scope_type,scope_id,alias,canonical_target,revision,source
+                   FROM model_alias_bindings WHERE provider=?""",
+                (provider,),
+            ).fetchall()
+            return [AliasBinding(
+                scope_type=row["scope_type"], scope_id=row["scope_id"],
+                alias=row["alias"], canonical_target=row["canonical_target"],
+                revision=row["revision"], source=row["source"],
+            ) for row in rows]
         finally:
             conn.close()
 

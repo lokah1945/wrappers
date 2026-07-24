@@ -38,6 +38,8 @@ class LocalModelRegistry:
         if self.profile_store:
             for profile in self.profile_store.load(self.provider):
                 self.profiles[profile.canonical_id] = profile
+            for binding in self.profile_store.load_aliases(self.provider):
+                self.aliases.bind(binding)
 
     def _load_provider_manifest(self) -> dict[str, Any]:
         path = self.manifest_root / "manifests" / "providers" / f"{self.provider}.json"
@@ -56,7 +58,11 @@ class LocalModelRegistry:
             return {}
 
     def bind_alias(self, binding: AliasBinding) -> None:
+        if not binding.canonical_target.startswith(f"{self.provider}/"):
+            raise ValueError("alias target must belong to the registry provider")
         self.aliases.bind(binding)
+        if self.profile_store:
+            self.profile_store.save_alias(binding, self.provider)
 
     def register_profile(self, profile: ModelProfile) -> None:
         if profile.provider != self.provider:

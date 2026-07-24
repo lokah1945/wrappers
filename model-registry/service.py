@@ -20,7 +20,7 @@ if str(ROOT) not in sys.path:
 from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
-from common.model import LocalModelRegistry  # noqa: E402
+from common.model import AliasBinding, LocalModelRegistry  # noqa: E402
 from common.model_state import ModelStateStore  # noqa: E402
 from common.model.validation import validate_catalog_entries, validate_observation  # noqa: E402
 
@@ -174,6 +174,34 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     ids = central.register_catalog(provider, models_data, str(body.get("revision") or "catalog"))
     return {"provider": provider, "registered": len(ids), "ids": ids}
+
+
+@app.post("/internal/aliases")
+async def ingest_aliases(request: Request) -> dict[str, Any]:
+    _require_internal(request)
+    body = await request.json()
+    provider = _provider(body)
+    bindings = body.get("bindings") or []
+    if not isinstance(bindings, list) or len(bindings) > 1000:
+        raise HTTPException(status_code=400, detail="bindings must be a list of at most 1000 items")
+    registered = []
+    try:
+        for item in bindings:
+            if not isinstance(item, dict):
+                raise ValueError("alias binding must be an object")
+            binding = AliasBinding(
+                scope_type=str(item.get("scope_type") or "wrapper"),
+                scope_id=str(item.get("scope_id") or provider),
+                alias=str(item.get("alias") or ""),
+                canonical_target=str(item.get("canonical_target") or ""),
+                revision=str(item.get("revision") or ""),
+                source=str(item.get("source") or "central"),
+            )
+            central.registry(provider).bind_alias(binding)
+            registered.append(binding.to_dict())
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"provider": provider, "registered": len(registered), "bindings": registered}
 
 
 @app.post("/internal/observations")

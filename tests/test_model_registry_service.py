@@ -33,6 +33,36 @@ def test_registry_service_resolves_exact_model_without_fallback(tmp_path):
     assert body["model_substitution"] is False
 
 
+def test_registry_service_ingests_scoped_alias(tmp_path):
+    service = load_service(tmp_path)
+    client = TestClient(service.app)
+    response = client.post(
+        "/internal/aliases",
+        json={
+            "provider": "nvidia",
+            "bindings": [{
+                "scope_type": "client",
+                "scope_id": "claude-a",
+                "alias": "sonnet",
+                "canonical_target": "nvidia/provider/model-a",
+                "revision": "r1",
+            }],
+        },
+        headers={"Authorization": "Bearer test-token"},
+    )
+    assert response.status_code == 200
+    resolved = client.post(
+        "/v1/resolve",
+        json={
+            "provider": "nvidia",
+            "requested_model": "sonnet",
+            "scope_chain": [["client", "claude-a"]],
+        },
+    )
+    assert resolved.status_code == 200
+    assert resolved.json()["resolved"]["provider_model_id"] == "provider/model-a"
+
+
 def test_registry_service_ingests_catalog_and_returns_call_plan(tmp_path):
     service = load_service(tmp_path)
     client = TestClient(service.app)

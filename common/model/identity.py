@@ -58,7 +58,10 @@ class AliasResolver:
         # Caller supplies the most specific scope first. Global is last.
         seen = set()
         ordered = []
-        for item in scope_chain + [("global", "*")]:
+        for raw_item in scope_chain + [("global", "*")]:
+            if not isinstance(raw_item, (list, tuple)) or len(raw_item) != 2:
+                raise AliasResolutionError("scope entries must contain type and id")
+            item = (str(raw_item[0]), str(raw_item[1]))
             if item not in seen:
                 ordered.append(item)
                 seen.add(item)

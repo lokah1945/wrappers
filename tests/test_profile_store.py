@@ -1,6 +1,6 @@
 from pathlib import Path
 
-from common.model import CapabilityProfile, LimitProfile, ModelProfile, ModelProfileStore, ProtocolProfile
+from common.model import AliasBinding, CapabilityProfile, LimitProfile, ModelProfile, ModelProfileStore, ProtocolProfile
 
 
 def test_profile_store_persists_authoritative_profile(tmp_path: Path):
