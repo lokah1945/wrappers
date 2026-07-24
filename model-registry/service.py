@@ -21,8 +21,8 @@ from fastapi import FastAPI, HTTPException, Request  # noqa: E402
 from fastapi.responses import JSONResponse  # noqa: E402
 
 from common.model import LocalModelRegistry  # noqa: E402
-from common.model.contracts import ErrorState  # noqa: E402
 from common.model_state import ModelStateStore  # noqa: E402
+from common.model.validation import validate_catalog_entries, validate_observation  # noqa: E402
 
 MODEL_REGISTRY_DB = os.environ.get(
     "MODEL_REGISTRY_DB", str(Path(__file__).resolve().parent / "registry-state.db")
@@ -168,6 +168,10 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
     models_data = body.get("models") or body.get("data") or []
     if not isinstance(models_data, list):
         raise HTTPException(status_code=400, detail="models must be a list")
+    try:
+        models_data = validate_catalog_entries(models_data)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     ids = central.register_catalog(provider, models_data, str(body.get("revision") or "catalog"))
     return {"provider": provider, "registered": len(ids), "ids": ids}
 
@@ -182,17 +186,25 @@ async def observation(request: Request) -> dict[str, Any]:
     if not model_id:
         raise HTTPException(status_code=400, detail="canonical_model_id is required")
     state = str(body.get("state") or "unknown")
-    allowed = {item.value for item in ErrorState}
-    if state not in allowed:
-        raise HTTPException(status_code=400, detail=f"unknown model state: {state}")
+    try:
+        validated = validate_observation(
+            model_id,
+            account_scope,
+            state,
+            body.get("reason_code"),
+            body.get("reason_detail"),
+            body.get("endpoint"),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     result = central.state(provider).record_status(
-        model_id=model_id,
-        account_scope=account_scope,
-        state=state,
+        model_id=validated["model_id"],
+        account_scope=validated["account_scope"],
+        state=validated["state"],
         status_code=int(body.get("http_status") or 0),
-        reason_code=str(body.get("reason_code") or ""),
-        reason_detail=str(body.get("reason_detail") or "")[:4000],
-        endpoint=str(body.get("endpoint") or ""),
+        reason_code=validated["reason_code"],
+        reason_detail=validated["reason_detail"],
+        endpoint=validated["endpoint"],
     )
     return {"provider": provider, "model": model_id, "observation": result}
 

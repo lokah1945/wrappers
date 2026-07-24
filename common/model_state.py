@@ -24,6 +24,7 @@ from typing import Any, Iterable, Optional
 
 from .model.errors import classify_upstream_error, error_text
 from .model.sanitize import sanitize_error_detail
+from .model.validation import validate_catalog_entries, validate_observation
 
 SCHEMA_VERSION = 1
 
@@ -124,10 +125,11 @@ class ModelStateStore:
                        ttl_sec: int | None = None) -> list[str]:
         now = time.time()
         ttl = int(ttl_sec or self.catalog_ttl_sec)
+        entries = validate_catalog_entries(models)
         conn = self._connect()
         ids: list[str] = []
         try:
-            for entry in models or []:
+            for entry in entries:
                 mid = self._model_id(entry)
                 if not mid:
                     continue
@@ -201,9 +203,14 @@ class ModelStateStore:
                       status_code: int = 0, reason_code: str = "",
                       reason_detail: str = "", endpoint: str = "",
                       retry_after_sec: int = 0) -> dict[str, Any]:
+        validated = validate_observation(model_id, account_scope, state, reason_code, reason_detail, endpoint)
+        model_id = validated["model_id"]
+        account_scope = validated["account_scope"]
+        state = validated["state"]
+        reason_code = validated["reason_code"]
+        endpoint = validated["endpoint"]
         now = time.time()
-        account_scope = account_scope or "unknown"
-        reason_detail = sanitize_error_detail(reason_detail)
+        reason_detail = sanitize_error_detail(validated["reason_detail"])
         write_key = (account_scope, model_id, endpoint)
         cached_write = self._last_status_write.get(write_key)
         if cached_write:

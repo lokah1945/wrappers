@@ -22,6 +22,7 @@ from .errors import ErrorState, classify_upstream_error, error_text
 from .identity import AliasResolver, normalize_model_syntax
 from .registry import LocalModelRegistry
 from .sanitize import sanitize_error_detail
+from .validation import validate_catalog_entries, validate_model_id, validate_observation
 
 __all__ = [
     "AliasBinding",
@@ -43,4 +44,7 @@ __all__ = [
     "error_text",
     "normalize_model_syntax",
     "sanitize_error_detail",
+    "validate_catalog_entries",
+    "validate_model_id",
+    "validate_observation",
 ]
