@@ -191,7 +191,7 @@ All wrappers achieved **100/100** production readiness score:
 | Streaming SSE | ✅ | ✅ | ✅ | ✅ |
 | Tool calls | ✅ | ✅ | ✅ | ✅ |
 | Multi-turn | ✅ | ✅ | ✅ | ✅ |
-| FREE_ONLY | N/A | ✅ | ✅ | ✅ (default yes) |
+| FREE_ONLY | N/A | Optional | Optional | Optional (default no) |
 | Error format | ✅ | ✅ | ✅ | ✅ |
 
 ## License

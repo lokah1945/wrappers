@@ -5,7 +5,7 @@ OpenAI- and Anthropic-compatible FastAPI proxy for the BLACKBOX AI public API.
 - Upstream base: `https://api.blackbox.ai`
 - OpenAI-compatible upstream path: `/chat/completions`
 - Local default port: `9104`
-- Default policy: `FREE_ONLY=yes`
+- Optional policy: `FREE_ONLY=yes`; default is transparent `FREE_ONLY=no`
 
 ## Features
 
@@ -31,7 +31,7 @@ python -m uvicorn src.main:app --host 0.0.0.0 --port 9104
 
 ## FREE_ONLY
 
-`FREE_ONLY=yes` is the default. Requests for non-free model ids are rejected unless:
+`FREE_ONLY=yes` is an explicit restriction. The transparent default is `FREE_ONLY=no`; when enabled, requests for non-free model ids are rejected unless:
 
 - the id contains `free`, or
 - the id is listed in `FREE_MODEL_ALLOWLIST`, or

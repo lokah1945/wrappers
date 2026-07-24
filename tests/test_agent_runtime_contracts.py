@@ -284,12 +284,15 @@ def _load_blackbox():
     return bb
 
 
-def test_blackbox_free_only_defaults_true_and_blocks_non_free_model():
+def test_blackbox_free_only_is_explicit_and_transparent_by_default():
     bb = _load_blackbox()
     old = os.environ.pop("FREE_ONLY", None)
     try:
-        assert bb.free_only_enabled() is True
+        assert bb.free_only_enabled() is False
         assert bb.model_allowed("blackboxai/nvidia/nemotron-3-super-120b-a12b:free")
+        assert bb.model_allowed("blackboxai/openai/gpt-5.5")
+        os.environ["FREE_ONLY"] = "yes"
+        assert bb.free_only_enabled() is True
         assert not bb.model_allowed("blackboxai/openai/gpt-5.5")
     finally:
         if old is not None:

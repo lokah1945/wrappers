@@ -102,7 +102,7 @@ _session = None
 
 
 def free_only_enabled() -> bool:
-    return (os.environ.get('FREE_ONLY') or 'yes').strip().lower() in ('yes', 'true', '1', 'on', 'y')
+    return (os.environ.get('FREE_ONLY') or 'no').strip().lower() in ('yes', 'true', '1', 'on', 'y')
 
 
 def _allowlist() -> set[str]:

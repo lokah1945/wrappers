@@ -119,7 +119,7 @@ BLACKBOX AI exposes an OpenAI-compatible public API (`/chat/completions`) with a
 Provider-specific code is allowed for:
 
 - BLACKBOX base URL and model id policy
-- FREE_ONLY defaulting to `yes`
+- optional `FREE_ONLY` policy; transparent default is `no`
 - curated discovery manifest and free allowlist
 - translating Responses and Anthropic Messages into BLACKBOX chat completions
 
@@ -128,7 +128,7 @@ Current status:
 - `KeyPool` uses effective-load selection and per-key cooldowns.
 - `proxy_request_with_pool()` retries all available BLACKBOX keys for retriable statuses before surfacing errors.
 - Chat, Responses, Anthropic Messages, model discovery, and capabilities use unified retry semantics.
-- FREE_ONLY is enabled by default; aliases should be seeded to a free concrete model.
+- FREE_ONLY may be enabled explicitly; when enabled, aliases must be seeded to a permitted concrete model.
 
 ## Retriable Status Semantics
 
