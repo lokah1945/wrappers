@@ -934,11 +934,10 @@ async def responses(request: Request):
 
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
-    """Anthropic Messages — Zen native path is /messages for Claude* & some Qwen.
-    For other families, translate A→O chat→A.
-    """
     _auth_check(request)
     body = await request.json()
+    if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
+        return _jr(400, {'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'max_tokens is required and must be a positive integer'}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     model = _normalize_model(requested) if requested else ""
     if requested is not None:

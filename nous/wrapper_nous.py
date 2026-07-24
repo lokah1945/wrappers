@@ -1239,6 +1239,8 @@ async def responses(request: Request):
 async def messages(request: Request):
     await _auth_check(request)
     body = await request.json()
+    if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'max_tokens is required and must be a positive integer'}})
     requested = body.get("model")
     if free_only_enabled() and requested:
         resolved = resolve_model(requested)

@@ -1308,6 +1308,8 @@ class Server:
             body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', f'Invalid JSON: {e}')})
+        if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
+            return JSONResponse(status_code=400, content={'error': anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer')})
 
         model_id = resolve_target_model(body.get('model', ''))
         body['model'] = model_id
