@@ -155,10 +155,32 @@ def _run_load(audit, repo, base_url, model, api_key, requests, concurrency) -> N
                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                               timeout=3600)
         out = proc.stdout or ""
-        # Keep the metrics section (p50/p95/p99/TTFT/success) visible in report.
-        audit.log("PASS" if proc.returncode == 0 else "FAIL", "bounded load", out[-6000:])
+        # Parse load metrics: ok=X/Y error=Z and error_class=...
+        import re as _re
+        m = _re.search(r"ok=(\d+)/(\d+)\s+error=(\d+)", out)
+        ok_count = int(m.group(1)) if m else 0
+        total = int(m.group(2)) if m else 0
+        err_count = int(m.group(3)) if m else 0
+        cls = "unknown"
+        cm = _re.search(r"error_class=(\w+)", out)
+        if cm:
+            cls = cm.group(1)
+        # SLA thresholds (M-04 / agent finding #4)
+        MAX_ERROR_RATE = 0.0  # load is PASS only if zero errors
+        if total and err_count == 0:
+            level = "PASS"
+            detail = out[-6000:]
+        elif cls == "external_outage":
+            # upstream 503/502 majority => external, not wrapper defect
+            level = "BLOCKED"
+            detail = f"external provider outage ({err_count}/{total} errored): {out[-4000:]}"
+        else:
+            # provider/runtime reliability error => real FAIL
+            level = "FAIL"
+            detail = f"load reliability error ({err_count}/{total}): {out[-4000:]}"
+        audit.log(level, f"bounded load [{base_url} {model}]", detail)
     except subprocess.TimeoutExpired:
-        audit.log("FAIL", "bounded load", "timed out")
+        audit.log("FAIL", f"bounded load [{base_url} {model}]", "timed out")
 
 
 def main() -> int:

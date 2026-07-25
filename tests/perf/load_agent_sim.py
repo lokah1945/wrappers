@@ -115,7 +115,16 @@ def main():
     if ttfts:
         print(f'ttft_ms p50={percentile(ttfts,50):.1f} p95={percentile(ttfts,95):.1f} p99={percentile(ttfts,99):.1f}')
     if bad:
-        print('sample_error=', bad[0])
+        # Classify errors: 503/502 = upstream external outage; 5xx other / 4xx = provider/runtime reliability.
+        statuses = [st for st, _ in bad]
+        n_503 = sum(1 for st in statuses if st in (503, 502))
+        n_other = len(bad) - n_503
+        external = n_503 >= n_other  # majority upstream outage
+        sample = bad[0]
+        kind = "external_outage" if external else "provider_error"
+        print(f'error_class={kind} external={n_503} other={n_other} sample_status={sample[0]} sample_err={sample[1][:200]}')
+        # Non-zero exit so the audit runner can FAIL/BLOCKED honestly.
+        raise SystemExit(2)
 
 
 if __name__ == '__main__':
