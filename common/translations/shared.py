@@ -139,6 +139,10 @@ def normalize_upstream_error(status: int, text_or_data: Any) -> dict:
     Unwraps nested JSON string messages (some providers double-encode errors)
     and maps HTTP status codes to SDK-compatible error types.
     """
+    # BUG-ECB2 fix: handle None payload gracefully
+    if text_or_data is None:
+        text_or_data = ""
+
     msg: Any = text_or_data
     etype = "api_error"
 
@@ -171,6 +175,10 @@ def normalize_upstream_error(status: int, text_or_data: Any) -> dict:
                     msg = inner.get("message")
         except Exception:
             pass
+
+    # BUG-ECB2 fix: provide meaningful default message when empty
+    if not msg:
+        msg = f"HTTP {status}" if status else "Unknown upstream error"
 
     if status == 429:
         etype = "rate_limit_error"

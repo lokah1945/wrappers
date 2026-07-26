@@ -106,7 +106,17 @@ class CircuitBreaker:
     async def before_request(self) -> None:
         """Check if the request is allowed through the circuit."""
         async with self._lock:
-            current = self.state
+            # BUG-ECB1 fix: transition _state to HALF_OPEN when timeout elapses.
+            # Previously `state` property returned HALF_OPEN without updating
+            # `_state`, causing record_success/failure to never see HALF_OPEN.
+            if self._state == CircuitState.OPEN:
+                elapsed = time.monotonic() - self._last_failure_time
+                if elapsed >= self.recovery_timeout:
+                    self._state = CircuitState.HALF_OPEN
+                    self._success_count = 0
+                    logger.info(f"[circuit-breaker:{self.name}] transitioning to half-open")
+
+            current = self._state
             if current == CircuitState.CLOSED:
                 return
             elif current == CircuitState.HALF_OPEN:
