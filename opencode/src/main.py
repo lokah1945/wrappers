@@ -902,8 +902,8 @@ async def ready(request: Request):
 
 @app.get("/v1/models")
 async def models(request: Request):
-    """Proxy Zen GET /models with the same multi-key retry semantics as runtime calls."""
-    _auth_check(request)
+    """Proxy Zen GET /models — public endpoint for model discovery (no auth required)."""
+    # /v1/models is intentionally public: agents need model discovery before auth
     tgt = get_dynamic_alias_target()
     fallback_all = [
         {"id": "gpt-5.4-mini", "object": "model", "owned_by": "opencode-zen"},

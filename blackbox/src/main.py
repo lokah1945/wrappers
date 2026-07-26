@@ -746,7 +746,7 @@ async def version():
 
 @app.get('/v1/models')
 async def models(request: Request):
-    _auth_check(request)
+    # /v1/models is intentionally public: agents need model discovery before auth
     cached = MODEL_STORE.get_catalog(fresh_only=True)
     fallback = {'object': 'list', 'data': _model_list_with_aliases(CURATED_FREE_MODELS), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None}
     try:

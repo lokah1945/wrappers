@@ -3,7 +3,7 @@
 wrapper-nous v2.0.1 — PRODUCTION-GRADE (FastAPI + async) + Hermes/Codex/Claude Code fixes
 Standard OpenAI + Anthropic + Responses compatible proxy for Nous Research.
 
-Achieves 100/100 production readiness (re-audited 2026-07-23):
+Production-hardened (audited 2026-07-27):
 - Async FastAPI + Uvicorn
 - Full streaming with proxy-side heartbeat (anti-silence)
 - Proper Responses API streaming (event: response.created / output_text.delta / completed)
@@ -46,11 +46,13 @@ except ImportError:
 
 import aiohttp
 
-def _sanitize_header_value(value):
-    """Strip newlines/control chars to prevent header injection (BUG-SEC2)."""
-    if not value:
-        return value
-    return value.replace('\r', '').replace('\n', '').strip()
+# Shared header sanitization (BUG-SEC2 fix — deduplicated from common/middleware)
+try:
+    from common.middleware import sanitize_header_value as _sanitize_header_value
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+    from common.middleware import sanitize_header_value as _sanitize_header_value
 
 
 # Shared translation utilities from common/translations (deduplication).
