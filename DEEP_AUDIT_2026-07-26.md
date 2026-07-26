@@ -597,16 +597,34 @@ While each wrapper gets its own DB (correct), the path resolution methods differ
 
 ---
 
-## 8. Conclusion
+## 8. Fix Status (2026-07-26 Patch)
 
-The wrapper monorepo demonstrates solid architectural design with a well-documented contract. The transparency model is correctly implemented in 3 of 4 wrappers. The primary concerns are:
+All bugs identified in this audit have been patched and verified:
 
-1. **wrapper-opencode** has a critical routing bug that breaks `qwen3-coder`
-2. **Session management** has a race condition in 3 wrappers
-3. **Code duplication** creates maintenance risk for long-term sustainability
+| Bug ID | Severity | Status | Fix Description |
+|--------|----------|--------|-----------------|
+| BUG-C1 | CRITICAL | ✅ Fixed | `_zen_family` now correctly routes `qwen3-coder` to `chat/completions` |
+| BUG-H1 | HIGH | ✅ Fixed | `get_session()` now uses `asyncio.Lock` in nous, opencode, blackbox |
+| BUG-H2 | HIGH | ✅ Fixed | `resolve_deprecated_redirect` only matches exact or hyphen-variants, not version dots |
+| BUG-H3 | HIGH | ✅ Fixed | `credential_fingerprint` moved to module-level import in blackbox + opencode |
+| BUG-M1 | MEDIUM | ✅ Fixed | OAuth retry-after context preserved in final error message |
+| BUG-M2 | MEDIUM | ✅ Fixed | opencode `requirements.txt` now has pinned minimum versions |
+| BUG-M3 | MEDIUM | ✅ Fixed | `find_reasoning_config` now excludes `qwen-image`, `qwen-vl`, `qwen2-vl` |
+| BUG-L1 | LOW | ✅ Fixed | `MODEL_STATE_DB` path uses `.resolve()` consistently in nvidia |
+| BUG-L2 | LOW | 📝 Noted | Metrics persistence left as future work (no new files policy) |
+| BUG-L3 | LOW | ✅ Fixed | Nous `load_dotenv` handles quotes and inline comments correctly |
 
-No data loss, credential leakage, or silent model substitution issues were found. The wrappers correctly implement the non-negotiable runtime contract documented in `WRAPPER_CONTRACT.md`.
+### Additional Consistency Fixes Applied:
+- `credential_fingerprint` moved to module-level import in **nous** (matching nvidia pattern)
+- All four wrappers now use identical import structure for `common.model_state`
+- All four wrappers now use `asyncio.Lock` for session management
 
-**Ready for production after fixing:** BUG-C1, BUG-H1.  
-**Recommended fixes before next release:** All HIGH items.  
-**Nice-to-have:** All MEDIUM and LOW items.
+---
+
+## 9. Conclusion
+
+The wrapper monorepo demonstrates solid architectural design with a well-documented contract. The transparency model is correctly implemented across all 4 wrappers after the patch.
+
+No data loss, credential leakage, or silent model substitution issues remain. The wrappers correctly implement the non-negotiable runtime contract documented in `WRAPPER_CONTRACT.md`.
+
+**Production readiness:** All wrappers are now production-ready after the 2026-07-26 patch.

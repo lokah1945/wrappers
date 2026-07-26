@@ -20,12 +20,12 @@ from contextlib import asynccontextmanager
 
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
-    from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 
 import aiohttp
@@ -126,6 +126,15 @@ _known_models = {m['id'] for m in CURATED_FREE_MODELS}
 pool = KeyPool()
 metrics = Metrics()
 _session = None
+_session_lock = None
+
+
+def _get_session_lock():
+    """Lazy-init the session lock on the running event loop (BUG-H1 fix)."""
+    global _session_lock
+    if _session_lock is None:
+        _session_lock = asyncio.Lock()
+    return _session_lock
 
 
 def free_only_enabled() -> bool:
@@ -204,24 +213,30 @@ def model_allowed(model_id: str) -> bool:
 
 
 async def get_session():
+    """Reuse one aiohttp session with lock protection (BUG-H1 fix)."""
     global _session
-    need_new = _session is None or _session.closed
-    if not need_new:
-        try:
-            loop = asyncio.get_running_loop()
-            sess_loop = getattr(_session, '_loop', None)
-            if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
-                need_new = True
-        except Exception:
-            need_new = True
-    if need_new:
-        if _session is not None and not _session.closed:
+    lock = _get_session_lock()
+    async with lock:
+        need_new = _session is None or _session.closed
+        if not need_new:
             try:
-                await _session.close()
+                loop = asyncio.get_running_loop()
+                sess_loop = getattr(_session, '_loop', None)
+                if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
+                    need_new = True
             except Exception:
-                pass
-        _session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC), connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True))
-    return _session
+                need_new = True
+        if need_new:
+            if _session is not None and not _session.closed:
+                try:
+                    await _session.close()
+                except Exception:
+                    pass
+            _session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC),
+                connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True),
+            )
+        return _session
 
 
 def _auth_headers(api_key: str, request: Request = None) -> dict:
@@ -351,10 +366,8 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         if model_id:
             try:
                 if status == 200:
-                    from common.model_state import credential_fingerprint
                     stored = await MODEL_STORE.record_status_async(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
                 else:
-                    from common.model_state import credential_fingerprint
                     stored = await MODEL_STORE.record_error_async(model_id, key.api_key, status, data, endpoint=url)
                 MODEL_REGISTRY_CLIENT.schedule_observation(
                     'blackbox', model_id, stored.get('account_scope', credential_fingerprint(key.api_key)),

@@ -485,7 +485,7 @@ BASE_LLM = (os.environ.get('NVIDIA_BASE_URL') or NVIDIA_BASE_URL).rstrip('/')
 BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/')
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
-MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).parent.parent / 'model-state.db'))
+MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().parent.parent / 'model-state.db'))
 MODEL_REGISTRY = LocalModelRegistry('nvidia', profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 MAX_RETRIES = int(os.environ.get('QUIET_RETRIED_429', '3'))
@@ -547,7 +547,10 @@ REASONING_CONFIGS = [
     {'patterns': ['deepseek-coder'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
     {'patterns': ['-reasoning', 'reason'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True, 'thinking': True}, 'requires_reasoning': True},
     {'patterns': ['thinkingmachines', 'inkling'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
-    {'patterns': ['qwen'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
+    # BUG-M3 fix: exclude non-chat qwen models (image, VL) from reasoning injection.
+    # find_reasoning_config matches by longest pattern; the exclude patterns below are
+    # checked after the match to skip non-chat models.
+    {'patterns': ['qwen'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False, 'exclude': ['qwen-image', 'qwen-vl', 'qwen2-vl']},
     {'patterns': ['glm'], 'mechanism': 'chat_template_kwargs', 'params': {'thinking': True}, 'requires_reasoning': False},
     {'patterns': ['phi-4'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
     {'patterns': ['yi-'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
@@ -601,6 +604,11 @@ def find_reasoning_config(model_id: str) -> Optional[dict]:
             if p in m:
                 max_len = max(max_len, len(p))
         if max_len > best_len:
+            # BUG-M3 fix: skip configs whose exclude patterns match this model
+            # (e.g. qwen-image, qwen-vl should not receive reasoning params)
+            excludes = cfg.get('exclude') or []
+            if any(exc in m for exc in excludes):
+                continue
             best_len = max_len
             best = cfg
     return best
@@ -703,8 +711,12 @@ def resolve_deprecated_redirect(requested_id: str) -> Optional[str]:
     for dep, cur in DEPRECATED_MODEL_REDIRECTS.items():
         stem = dep.split('/')[1]
         got = str(requested_id).lower().split('/')[1] if '/' in str(requested_id).lower() else ''
-        if stem and got and got != cur.split('/')[1] and got.startswith(stem):
-            return cur
+        # BUG-H2 fix: require exact match or hyphen-separated variant match.
+        # Dot-separated extensions are version numbers (e.g. glm-5.3 is newer
+        # than deprecated glm-5); they must NOT redirect to an older target.
+        if stem and got and got != cur.split('/')[1]:
+            if got == stem or got.startswith(stem + '-'):
+                return cur
     return None
 
 

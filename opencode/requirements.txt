@@ -1,6 +1,6 @@
-fastapi
-uvicorn[standard]
-aiohttp
-python-dotenv
-pydantic
+fastapi>=0.115
+uvicorn[standard]>=0.30
+aiohttp>=3.10
+python-dotenv>=1.0
+pydantic>=2.0
 watchdog>=4.0.0

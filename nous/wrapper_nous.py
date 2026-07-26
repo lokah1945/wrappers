@@ -32,7 +32,7 @@ import sys
 
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
-    from common.model_state import ModelStateStore
+    from common.model_state import ModelStateStore, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id, classify_upstream_error
 except ImportError:
     # Audit/transparency tooling may load a temporary copy of this file; the
@@ -41,7 +41,7 @@ except ImportError:
         if (_root / 'common').is_dir():
             sys.path.insert(0, str(_root))
             break
-    from common.model_state import ModelStateStore
+    from common.model_state import ModelStateStore, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id, classify_upstream_error
 
 import aiohttp
@@ -204,13 +204,33 @@ from fastapi.middleware.cors import CORSMiddleware
 # CONFIG
 # --------------------------------------------------------------------------
 def load_dotenv():
+    """Parse .env files with basic support for quotes and inline comments.
+
+    BUG-L3 fix: handle quoted values correctly, strip inline comments outside
+    quotes, and skip blank/comment lines.
+    """
     for p in [".env", os.path.expanduser("~/.env")]:
         if os.path.exists(p):
             with open(p) as f:
                 for line in f:
-                    if "=" in line and not line.strip().startswith("#"):
-                        k, v = line.strip().split("=", 1)
-                        os.environ.setdefault(k.strip(), v.strip().strip('"').strip("'"))
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        continue
+                    if "=" not in stripped:
+                        continue
+                    k, v = stripped.split("=", 1)
+                    k = k.strip()
+                    v = v.strip()
+                    # Handle quoted values: strip matching outer quotes
+                    if len(v) >= 2:
+                        if (v[0] == '"' and v[-1] == '"') or (v[0] == "'" and v[-1] == "'"):
+                            v = v[1:-1]
+                        else:
+                            # Unquoted: strip inline comment (# not inside quotes)
+                            comment_idx = v.find(" #")
+                            if comment_idx >= 0:
+                                v = v[:comment_idx].rstrip()
+                    os.environ.setdefault(k, v)
 
 
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
@@ -601,6 +621,8 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     last_status = 503
     last_result = {"error": {"message": "No capacity", "type": "server_error"}}
     tried = 0
+    # BUG-M1 fix: preserve OAuth retry-after so it's not lost if static keys also fail
+    oauth_retry_after = 0
 
     oauth_token = _read_token_from_auth_path()
     if oauth_token:
@@ -609,6 +631,8 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
         tried += 1
         last_status, last_result = status, result
+        if status == 429:
+            oauth_retry_after = _retry_after_seconds(result)
         if not _is_retriable_upstream_status(status, result):
             return status, result, None
 
@@ -635,7 +659,9 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
 
     if tried >= max(1, KEY_POOL.total_keys + (1 if oauth_token else 0)) and isinstance(last_result, dict) and isinstance(last_result.get("error"), dict):
         msg = last_result["error"].get("message", "")
-        last_result = {"error": {**last_result["error"], "message": f"All configured Nous credentials failed or are rate-limited. Last error: {msg}"[:2000]}}
+        # BUG-M1 fix: include OAuth retry-after context if it was the first failure
+        oauth_hint = f" (OAuth rate-limited, retry-after={oauth_retry_after}s)" if oauth_retry_after else ""
+        last_result = {"error": {**last_result["error"], "message": f"All configured Nous credentials failed or are rate-limited{oauth_hint}. Last error: {msg}"[:2000]}}
     return last_status, last_result, None
 
 
@@ -1411,7 +1437,6 @@ async def record_model_result(model_id: str, key_entry, status: int, payload, en
     """Persist account-scoped upstream outcome without hard-blocking models."""
     try:
         credential = getattr(key_entry, "api_key", None)
-        from common.model_state import credential_fingerprint
         if status == 200:
             stored = await MODEL_STORE.record_status_async(
                 model_id=model_id or "unknown",
@@ -1574,6 +1599,14 @@ CURATED_FREE_MODELS = [
 ]
 
 _SESSION = None
+_SESSION_LOCK: Optional[asyncio.Lock] = None
+
+def _get_session_lock() -> asyncio.Lock:
+    """Lazy-init the session lock on the running event loop."""
+    global _SESSION_LOCK
+    if _SESSION_LOCK is None:
+        _SESSION_LOCK = asyncio.Lock()
+    return _SESSION_LOCK
 
 def _read_token_from_auth_path():
     """Read OAuth access token from AUTH_PATH (Hermes profile format)."""
@@ -1603,10 +1636,16 @@ async def get_token():
     return ""
 
 async def get_session():
+    """Reuse one aiohttp session with lock protection (BUG-H1 fix)."""
     global _SESSION
-    if _SESSION is None or _SESSION.closed:
-        _SESSION = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC), connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True))
-    return _SESSION
+    lock = _get_session_lock()
+    async with lock:
+        if _SESSION is None or _SESSION.closed:
+            _SESSION = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC),
+                connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True),
+            )
+        return _SESSION
 
 @app.get("/v1/models")
 async def models():

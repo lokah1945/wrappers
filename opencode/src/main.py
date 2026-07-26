@@ -18,18 +18,18 @@ import time
 import threading
 import asyncio
 import logging
-from typing import Set
+from typing import Optional, Set
 from pathlib import Path
 from contextlib import asynccontextmanager
 
 # Shared persistent catalog/state layer; bootstrap repo root for systemd launches.
 try:
-    from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 except ImportError:
     import sys
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from common.model_state import ModelStateStore, classify_upstream_error
+    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 
 from fastapi import FastAPI, Request, HTTPException
@@ -228,31 +228,45 @@ pool = KeyPool()
 metrics = Metrics()
 
 _session = None
+_session_lock: Optional[asyncio.Lock] = None
+
+def _get_session_lock() -> asyncio.Lock:
+    """Lazy-init the session lock on the running event loop."""
+    global _session_lock
+    if _session_lock is None:
+        _session_lock = asyncio.Lock()
+    return _session_lock
 
 async def get_session():
-    """Reuse one aiohttp session (fix per-request ClientSession leak)."""
+    """Reuse one aiohttp session (fix per-request ClientSession leak).
+
+    Protected by an asyncio.Lock so concurrent calls during session recovery
+    never create multiple sessions (BUG-H1 fix).
+    """
     global _session
     import aiohttp
-    need_new = _session is None or _session.closed
-    if not need_new:
-        try:
-            loop = asyncio.get_running_loop()
-            sess_loop = getattr(_session, '_loop', None)
-            if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
-                need_new = True
-        except Exception:
-            need_new = True
-    if need_new:
-        if _session is not None and not _session.closed:
+    lock = _get_session_lock()
+    async with lock:
+        need_new = _session is None or _session.closed
+        if not need_new:
             try:
-                await _session.close()
+                loop = asyncio.get_running_loop()
+                sess_loop = getattr(_session, '_loop', None)
+                if sess_loop is not None and (sess_loop.is_closed() or sess_loop is not loop):
+                    need_new = True
             except Exception:
-                pass
-        _session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC),
-            connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True),
-        )
-    return _session
+                need_new = True
+        if need_new:
+            if _session is not None and not _session.closed:
+                try:
+                    await _session.close()
+                except Exception:
+                    pass
+            _session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC),
+                connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True),
+            )
+        return _session
 
 def _zen_family(model: str) -> str:
     """Map model id → Zen endpoint family per https://opencode.ai/docs/zen/"""
@@ -271,8 +285,15 @@ def _zen_family(model: str) -> str:
         return 'messages'
     if m.startswith('gemini-'):
         return 'google'
-    if m.startswith('qwen3.') or m.startswith('qwen3-') or m.startswith('qwen3'):
+    # qwen3.5-plus uses /messages (Anthropic-format); qwen3-coder and other
+    # qwen3 variants use /chat/completions (OpenAI-compatible).
+    # Per https://opencode.ai/docs/zen/ (verified 2026-07-26).
+    if m.startswith('qwen3.'):
         return 'messages'
+    if m.startswith('qwen3') and not m.startswith('qwen3-coder'):
+        return 'chat'
+    if m.startswith('qwen3-coder'):
+        return 'chat'
     # Free models (OpenAI-compatible per Zen docs) → chat/completions
     if is_free_model(m):
         return 'chat'
@@ -452,7 +473,6 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
                 return 400, {'error': {'type': 'invalid_request_error', 'message': str(exc), 'code': 'MODEL_CALL_PLAN_INVALID'}}, None
         if model_id:
             try:
-                from common.model_state import credential_fingerprint
                 if status == 200:
                     stored = await MODEL_STORE.record_status_async(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
                 else:
