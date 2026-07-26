@@ -18,6 +18,9 @@ metrics.db.*
 # Backups (managed by backup.sh)
 backups/*
 
+# Local audit reports (ILMA) — not part of source
+audit_report/
+
 # Cache
 node_modules/
 .npm/
