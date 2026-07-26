@@ -616,7 +616,11 @@ REASONING_CONFIGS = [
     # find_reasoning_config matches by longest pattern; the exclude patterns below are
     # checked after the match to skip non-chat models.
     {'patterns': ['qwen'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False, 'exclude': ['qwen-image', 'qwen-vl', 'qwen2-vl']},
-    {'patterns': ['glm'], 'mechanism': 'chat_template_kwargs', 'params': {'thinking': True}, 'requires_reasoning': False},
+    # GLM: do NOT auto-inject thinking. GLM reasoning adds 4-5s latency and
+    # the client/curl default is no-thinking (fast). Only enable thinking when
+    # the client explicitly requests it (Anthropic thinking:enabled path).
+    # This keeps wrapper latency on par with direct curl for GLM.
+    {'patterns': ['glm'], 'mechanism': 'chat_template_kwargs', 'params': {'thinking': False}, 'requires_reasoning': False, 'opt_out_default_thinking': True},
     {'patterns': ['phi-4'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
     {'patterns': ['yi-'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
     {'patterns': ['llama-4', 'llama-3.3-nemotron', 'llama-3.1-nemotron'], 'mechanism': 'chat_template_kwargs', 'params': {'enable_thinking': True}, 'requires_reasoning': False},
@@ -1098,7 +1102,11 @@ def ensure_nonempty_content(data: dict) -> None:
         if not msg.get('content') and not msg.get('tool_calls'):
             nr = extract_internal_reasoning(msg)
             if nr.get('reasoning'):
-                msg['content'] = '[No text response; the model returned reasoning only.]'
+                # BUG-FIX (ILMA audit 2026-07-27): instead of a dead-end
+                # placeholder, surface the model's own reasoning as the content so
+                # clients (e.g. Claude Code) receive usable text instead of
+                # "[No text response; the model returned reasoning only.]".
+                msg['content'] = nr['reasoning']
             else:
                 msg['content'] = ''
 
