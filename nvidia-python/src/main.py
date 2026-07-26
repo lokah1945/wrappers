@@ -57,6 +57,12 @@ import aiohttp
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from common.middleware import RequestSizeLimiter
+    _HAS_SIZE_LIMITER = True
+except ImportError:
+    _HAS_SIZE_LIMITER = False
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
@@ -2068,9 +2074,7 @@ class Server:
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id)
             if not key_result:
-                if attempt < max_attempts - 1:
-                    attempt += 1
-                    continue
+                # D8 fix: break immediately — retrying an exhausted pool wastes cycles
                 return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted — no capacity available for model {model_id}', 'type': 'server_error'}}}
 
             key = key_result['key']
@@ -2500,6 +2504,9 @@ def create_app() -> FastAPI:
         expose_headers=['*'],
         allow_credentials=True,
     )
+
+    if _HAS_SIZE_LIMITER:
+        app.add_middleware(RequestSizeLimiter)
 
     server = Server(app)
     server._register_routes()

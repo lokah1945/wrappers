@@ -32,6 +32,12 @@ import aiohttp
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from common.middleware import RequestSizeLimiter
+    _HAS_SIZE_LIMITER = True
+except ImportError:
+    _HAS_SIZE_LIMITER = False
 from dotenv import load_dotenv
 
 try:
@@ -43,6 +49,18 @@ except ImportError:
 
 from .key_pool import KeyPool
 from .metrics import Metrics
+
+# ── Shared translations from common/translations (P0 deduplication) ──
+try:
+    from common.translations import (
+        AnthropicStreamState as _SharedAnthropicStreamState,
+        normalize_upstream_error as _shared_normalize_error,
+        strip_cache_control as _shared_strip_cache,
+        repair_orphan_tool_messages as _shared_repair_orphan,
+    )
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
 
 # Shared translation utilities from common/translations (deduplication).
 try:
@@ -63,13 +81,19 @@ if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/blackbox/blackbox.log')
 try:
-    os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
-    _log_file_handler = logging.FileHandler(LOG_FILE)
-except Exception:
-    LOG_FILE = '/tmp/wrapper-blackbox.log'
-    _log_file_handler = logging.FileHandler(LOG_FILE)
-logger = logging.getLogger('wrapper-blackbox')
-logging.basicConfig(level=logging.INFO, format='%(asctime)s [blackbox] %(message)s', handlers=[_log_file_handler, logging.StreamHandler()])
+    from common.logging_utils import setup_logging
+    logger = setup_logging('wrapper-blackbox', log_file=LOG_FILE, default_log_file='/tmp/wrapper-blackbox.log',
+                           log_format='%(asctime)s [blackbox] %(message)s')
+except ImportError:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
+        _log_file_handler = logging.FileHandler(LOG_FILE)
+    except Exception:
+        LOG_FILE = '/tmp/wrapper-blackbox.log'
+        _log_file_handler = logging.FileHandler(LOG_FILE)
+    logger = logging.getLogger('wrapper-blackbox')
+    logging.basicConfig(level=logging.INFO, format='%(asctime)s [blackbox] %(message)s',
+                        handlers=[_log_file_handler, logging.StreamHandler()])
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9104'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
@@ -824,6 +848,9 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 
 
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$', allow_methods=['*'], allow_headers=['*'], expose_headers=['*'], allow_credentials=True)
+
+if _HAS_SIZE_LIMITER:
+    app.add_middleware(RequestSizeLimiter)
 
 
 def _auth_check(request: Request):

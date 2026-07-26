@@ -35,6 +35,12 @@ except ImportError:
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+
+try:
+    from common.middleware import RequestSizeLimiter
+    _HAS_SIZE_LIMITER = True
+except ImportError:
+    _HAS_SIZE_LIMITER = False
 from dotenv import load_dotenv
 
 try:
@@ -46,6 +52,22 @@ except ImportError:
 
 from .key_pool import KeyPool
 from .metrics import Metrics
+
+# ── Shared translations from common/translations (P0 deduplication) ──
+# Canonical implementations live in common/translations/. Local definitions
+# below are SUPERSEDED — the shared versions override them at module load time.
+# To remove local definitions safely: verify all tests pass after each removal.
+try:
+    from common.translations import (
+        AnthropicStreamState as _SharedAnthropicStreamState,
+        parse_dsml_from_text as _shared_parse_dsml,
+        normalize_upstream_error as _shared_normalize_error,
+        strip_cache_control as _shared_strip_cache,
+        repair_orphan_tool_messages as _shared_repair_orphan,
+    )
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
 
 # Shared translation utilities from common/translations (deduplication).
 # The local definitions below remain as fallback; shared imports are preferred.
@@ -74,20 +96,22 @@ if not os.environ.get('OPENCODE_BASE_URL'):
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/opencode/opencode.log')
 try:
-    os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
-    _log_file_handler = logging.FileHandler(LOG_FILE)
-except Exception:
-    LOG_FILE = '/tmp/wrapper-opencode.log'
-    _log_file_handler = logging.FileHandler(LOG_FILE)
-logger = logging.getLogger('wrapper-opencode')
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [opencode] %(message)s',
-    handlers=[
-        _log_file_handler,
-        logging.StreamHandler(),
-    ],
-)
+    from common.logging_utils import setup_logging
+    logger = setup_logging('wrapper-opencode', log_file=LOG_FILE, default_log_file='/tmp/wrapper-opencode.log',
+                           log_format='%(asctime)s [opencode] %(message)s')
+except ImportError:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE) or '.', exist_ok=True)
+        _log_file_handler = logging.FileHandler(LOG_FILE)
+    except Exception:
+        LOG_FILE = '/tmp/wrapper-opencode.log'
+        _log_file_handler = logging.FileHandler(LOG_FILE)
+    logger = logging.getLogger('wrapper-opencode')
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [opencode] %(message)s',
+        handlers=[_log_file_handler, logging.StreamHandler()],
+    )
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9103'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
@@ -340,6 +364,7 @@ def _normalize_model(model: str) -> str:
     return m
 
 
+# SUPERSEDED: use common.translations.normalize_upstream_error
 def _normalize_upstream_error(status: int, text_or_data) -> dict:
     """Single OpenAI-shaped error; unwrap nested JSON string messages."""
     msg = text_or_data
@@ -560,6 +585,7 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
     return h
 
 # --- minimal Anthropic <-> OpenAI helpers (surgical, local) ---
+# SUPERSEDED: use common.translations.strip_cache_control
 def _strip_cache(obj):
     if isinstance(obj, dict):
         obj.pop('cache_control', None)
@@ -632,6 +658,7 @@ def anthropic_to_openai(body: dict) -> dict:
     return out
 
 
+# SUPERSEDED: use common.translations.parse_dsml_from_text
 def _parse_dsml_from_text(text: str) -> tuple:
     """If upstream leaked MiniMax DSML tool markup into content, split to (clean_text, tool_use blocks)."""
     if not text or 'DSML' not in text.replace('\uff5c', '|'):
@@ -721,6 +748,7 @@ _RESPONSE_STORE: dict = {}
 
 
 
+# SUPERSEDED: use common.translations.repair_orphan_tool_messages
 def _repair_orphan_tool_messages(messages):
     seen = set()
     out = []
@@ -961,6 +989,9 @@ app.add_middleware(
     expose_headers=['*'],
     allow_credentials=True,
 )
+
+if _HAS_SIZE_LIMITER:
+    app.add_middleware(RequestSizeLimiter)
 
 def _auth_check(request: Request):
     if request.method == 'OPTIONS':
@@ -1345,6 +1376,7 @@ async def responses(request: Request):
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})
 
 
+# SUPERSEDED: use common.translations.AnthropicStreamState
 class AnthropicStreamState:
     """OpenAI chat SSE chunks → Anthropic Messages SSE (Claude Code native)."""
 

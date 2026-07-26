@@ -214,6 +214,12 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
+try:
+    from common.middleware import RequestSizeLimiter
+    _HAS_SIZE_LIMITER = True
+except ImportError:
+    _HAS_SIZE_LIMITER = False
+
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
@@ -382,12 +388,17 @@ def free_only_anthropic_error(model_id: str) -> dict:
 
 LOG_FILE = os.environ.get("LOG_FILE", "/root/wrapper/nous/wrapper_nous.log")
 try:
-    os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
-except Exception:
-    LOG_FILE = "/tmp/wrapper-nous.log"
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s",
-                    handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
-logger = logging.getLogger("wrapper-nous")
+    from common.logging_utils import setup_logging
+    logger = setup_logging("wrapper-nous", log_file=LOG_FILE, default_log_file="/tmp/wrapper-nous.log",
+                           log_format="%(asctime)s [nous] %(message)s")
+except ImportError:
+    try:
+        os.makedirs(os.path.dirname(LOG_FILE), exist_ok=True)
+    except Exception:
+        LOG_FILE = "/tmp/wrapper-nous.log"
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [nous] %(message)s",
+                        handlers=[logging.FileHandler(LOG_FILE), logging.StreamHandler()])
+    logger = logging.getLogger("wrapper-nous")
 
 # --------------------------------------------------------------------------
 # DYNAMIC ALIASES — no hardcoded model targets
@@ -1556,6 +1567,9 @@ app.add_middleware(
     expose_headers=['*'],
     allow_credentials=True,
 )
+
+if _HAS_SIZE_LIMITER:
+    app.add_middleware(RequestSizeLimiter)
 
 async def _auth_check(request: Request):
     if request.method == 'OPTIONS':
