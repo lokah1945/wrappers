@@ -46,6 +46,20 @@ except ImportError:
 
 import aiohttp
 
+# Shared translation utilities from common/translations (deduplication).
+# Note: Nous uses a dict-based AnthropicStreamState (for stream_with_heartbeat),
+# so we only import the string-agnostic utilities here.
+try:
+    from common.translations import (
+        parse_dsml_from_text as _shared_parse_dsml,
+        repair_orphan_tool_messages as _shared_repair_orphan,
+        normalize_upstream_error as _shared_normalize_error,
+        strip_cache_control as _shared_strip_cache,
+    )
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
+
 
 # ============================================================================
 # KeyPool for multi-key rotation (parity with opencode/nvidia-python)
@@ -1813,7 +1827,7 @@ async def chat_completions(request: Request):
             body.pop("tools", None)
 
     is_stream = body.get("stream", False)
-    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta"] if request.headers.get(h)}
+    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
     await record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
@@ -1851,8 +1865,9 @@ async def responses(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
+    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
-    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="openai_responses")
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
     if status != 200:
         return JSONResponse(status_code=status, content=result)
@@ -1909,8 +1924,9 @@ async def messages(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
+    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
-    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, client_surface="anthropic_messages")
+    status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
@@ -1952,6 +1968,15 @@ async def model_status():
 
 @app.get("/healthz")
 async def healthz(): return await health()
+
+# ── Shared translations override (deduplication) ──────────────────────
+# After all local definitions, override with canonical shared implementations.
+# Note: Nous keeps its own dict-based AnthropicStreamState (different pattern).
+if _USING_SHARED_TRANSLATIONS:
+    _parse_dsml_from_text = _shared_parse_dsml
+    _repair_orphan_tool_messages = _shared_repair_orphan
+    _normalize_upstream_error = _shared_normalize_error
+    strip_cache_control = _shared_strip_cache
 
 # catch-all
 @app.api_route("/{path:path}", methods=["GET", "POST"])

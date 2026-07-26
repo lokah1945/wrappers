@@ -261,6 +261,17 @@ def start_env_watcher():
         logger.warning(f'[env] Failed to start watcher: {e}')
 
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
+
+# Shared translation utilities from common/translations (deduplication).
+try:
+    from common.translations import (
+        AnthropicStreamState as _SharedAnthropicStreamState,
+        parse_dsml_from_text as _shared_parse_dsml,
+    )
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
+
 from .anthropic_compat import (
     anthropic_to_openai,
     openai_to_anthropic as _openai_to_anthropic_impl,
@@ -470,14 +481,37 @@ except Exception:
     LOG_FILE = '/tmp/wrapper-nvidia-python.log'
     _log_file_handler = logging.FileHandler(LOG_FILE)
 logger = logging.getLogger('wrapper-nvidia')
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s [%(name)s] %(message)s',
-    handlers=[
-        _log_file_handler,
-        logging.StreamHandler(sys.stdout),
-    ],
-)
+
+
+class JsonFormatter(logging.Formatter):
+    """Structured JSON log formatter (P2: enabled via WRAPPER_JSON_LOG=true)."""
+    def format(self, record):
+        return json.dumps({
+            'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(record.created)),
+            'level': record.levelname,
+            'logger': record.name,
+            'msg': record.getMessage(),
+        }, ensure_ascii=False)
+
+
+if os.environ.get('WRAPPER_JSON_LOG', '').lower() in ('1', 'true', 'yes'):
+    _log_format = JsonFormatter()
+    _log_file_handler.setFormatter(_log_format)
+    logging.basicConfig(
+        level=logging.INFO,
+        handlers=[_log_file_handler, logging.StreamHandler(sys.stdout)],
+    )
+    for h in logging.root.handlers:
+        h.setFormatter(_log_format)
+else:
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(name)s] %(message)s',
+        handlers=[
+            _log_file_handler,
+            logging.StreamHandler(sys.stdout),
+        ],
+    )
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9101'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
@@ -1940,6 +1974,30 @@ class Server:
         anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
         return JSONResponse(status_code=200, content=anthropic_resp)
 
+    def _select_timeout(self, is_streaming: bool, metric_path: str) -> int:
+        """Select timeout based on request type (P2: extracted from proxy_openai)."""
+        is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', metric_path or ''))
+        if is_streaming:
+            return max(STREAM_REQUEST_TIMEOUT_SEC, ANTI_SILENCE_TIMEOUT_MS // 1000)
+        elif is_gen:
+            return GEN_TIMEOUT_SEC
+        return REQUEST_TIMEOUT_SEC
+
+    def _classify_retry(self, status: int, classification: dict) -> bool:
+        """Determine if a failed request should be retried with another key."""
+        return classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+
+    async def _prepare_proxy_body(self, body: dict, model_id: str) -> dict:
+        """Prepare request body for upstream (P2: extracted from proxy_openai)."""
+        body = json.loads(json.dumps(body))  # deep copy
+        if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
+            body['max_tokens'] = body['max_completion_tokens']
+            del body['max_completion_tokens']
+        clamp_max_tokens_for_model(body, model_id)
+        if body.get('stream'):
+            body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
+        return body
+
     async def proxy_openai(self, body: dict, req_headers: dict, model: str, req: Request = None, metric_path: str = '/v1/chat/completions'):
         sanitize_nvidia_payload(body)
         model_id = body.get('model') or model or ''
@@ -1960,20 +2018,11 @@ class Server:
 
         # Transparent contract: exactly one requested model.  Retries below
         # rotate credentials only; they never construct model candidates.
-        primary_body = json.loads(json.dumps(body))
+        primary_body = await self._prepare_proxy_body(body, model_id)
         cand_model = model_id
         body = json.loads(json.dumps(primary_body))
         body['model'] = cand_model
         model_id = cand_model
-
-        if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
-            body['max_tokens'] = body['max_completion_tokens']
-            del body['max_completion_tokens']
-
-        clamp_max_tokens_for_model(body, model_id)
-
-        if body.get('stream'):
-            body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
 
         headers = dict(req_headers)
 
@@ -2034,14 +2083,7 @@ class Server:
                 }
 
                 is_streaming = bool(body.get('stream'))
-                is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', metric_path or ''))
-                # Production-grade timeout selection (parity with Node audit)
-                if is_streaming:
-                    timeout_sec = max(STREAM_REQUEST_TIMEOUT_SEC, ANTI_SILENCE_TIMEOUT_MS // 1000)
-                elif is_gen:
-                    timeout_sec = GEN_TIMEOUT_SEC
-                else:
-                    timeout_sec = REQUEST_TIMEOUT_SEC
+                timeout_sec = self._select_timeout(is_streaming, metric_path)
 
                 if body.get('stream'):
                     resp = await self._session.post(
@@ -2069,7 +2111,7 @@ class Server:
                         # Retry only failures that may change with time/key.
                         # Account-scoped deployment, capability and route
                         # errors must not be retried across identical keys.
-                        retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                        retryable = self._classify_retry(status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
@@ -2126,7 +2168,7 @@ class Server:
                     key.decrement_in_flight()
 
                     if norm_status >= 400:
-                        retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                        retryable = self._classify_retry(status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
@@ -2182,8 +2224,8 @@ class Server:
                     'Content-Type': 'application/json',
                 }
 
-                is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', path or ''))
-                timeout_sec = STREAM_REQUEST_TIMEOUT_SEC if is_streaming else (GEN_TIMEOUT_SEC if is_gen else REQUEST_TIMEOUT_SEC)
+                # P2: use extracted timeout helper
+                timeout_sec = self._select_timeout(is_streaming, path)
 
                 resp = await self._session.post(
                     target_url, json=body, headers=fwd_headers,
@@ -2226,7 +2268,7 @@ class Server:
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     await self._record_model_response(model_id, key, resp.status, err_data, path)
                     classification = classify_upstream_error(resp.status, err_data)
-                    retryable = classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+                    retryable = self._classify_retry(status, classification)
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
@@ -2324,8 +2366,8 @@ class Server:
                 if is_post:
                     fwd_headers['Content-Type'] = 'application/json'
 
-                is_gen = bool(re_module.search(r'images|genai|infer|audio|video|ranking', path or ''))
-                timeout_sec = STREAM_REQUEST_TIMEOUT_SEC if is_streaming else (GEN_TIMEOUT_SEC if is_gen else REQUEST_TIMEOUT_SEC)
+                # P2: use extracted timeout helper
+                timeout_sec = self._select_timeout(is_streaming, path)
 
                 resp = await self._session.request(
                     method, target_url,
@@ -2486,6 +2528,13 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
     return app
+
+
+# ── Shared translations override (deduplication) ──────────────────────
+# After all local definitions, override with canonical shared implementations.
+if _USING_SHARED_TRANSLATIONS:
+    AnthropicStreamState = _SharedAnthropicStreamState
+    _parse_dsml_from_text = _shared_parse_dsml
 
 
 app = create_app()

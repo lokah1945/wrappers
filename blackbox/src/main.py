@@ -44,6 +44,18 @@ except ImportError:
 from .key_pool import KeyPool
 from .metrics import Metrics
 
+# Shared translation utilities from common/translations (deduplication).
+try:
+    from common.translations import (
+        AnthropicStreamState as _SharedAnthropicStreamState,
+        normalize_upstream_error as _shared_normalize_error,
+        strip_cache_control as _shared_strip_cache,
+        repair_orphan_tool_messages as _shared_repair_orphan,
+    )
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
+
 ROOT = Path(__file__).resolve().parents[1]
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
     load_dotenv(ROOT / '.env')
@@ -1227,6 +1239,13 @@ async def model_status():
 @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 async def catch_all(path: str, request: Request):
     return JSONResponse(status_code=404, content={'error': {'message': f'Unsupported: /{path}', 'type': 'not_found_error'}})
+
+# ── Shared translations override (deduplication) ──────────────────────
+if _USING_SHARED_TRANSLATIONS:
+    AnthropicStreamState = _SharedAnthropicStreamState
+    _normalize_upstream_error = _shared_normalize_error
+    _strip_cache = _shared_strip_cache
+    _repair_orphan_tool_messages = _shared_repair_orphan
 
 
 def main():

@@ -47,6 +47,24 @@ except ImportError:
 from .key_pool import KeyPool
 from .metrics import Metrics
 
+# Shared translation utilities from common/translations (deduplication).
+# The local definitions below remain as fallback; shared imports are preferred.
+try:
+    from common.translations import (
+        AnthropicStreamState as _SharedAnthropicStreamState,
+        parse_dsml_from_text as _shared_parse_dsml,
+        normalize_upstream_error as _shared_normalize_error,
+        strip_cache_control as _shared_strip_cache,
+    )
+    # Override local definitions with shared canonical implementations
+    AnthropicStreamState = _SharedAnthropicStreamState
+    _parse_dsml_from_text = _shared_parse_dsml
+    _normalize_upstream_error = _shared_normalize_error
+    _strip_cache = _shared_strip_cache
+    _USING_SHARED_TRANSLATIONS = True
+except ImportError:
+    _USING_SHARED_TRANSLATIONS = False
+
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 # Fallback: also try cwd-relative .env (for direct uvicorn launches)
@@ -535,7 +553,7 @@ def _jr(status: int, content: dict):
 def _auth_headers(api_key: str, request: Request = None) -> dict:
     h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json", "Accept-Encoding": "identity"}
     if request is not None:
-        for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key"):
+        for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key", "x-request-id"):
             v = request.headers.get(k)
             if v:
                 h[k] = v
@@ -1582,6 +1600,16 @@ async def model_status():
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
     return _jr(404, {"error": {"message": f"Unsupported: /{path}", "type": "not_found_error"}})
+
+# ── Shared translations override (deduplication) ──────────────────────
+# After all local definitions, override with canonical shared implementations.
+# This ensures route handlers use the shared versions while keeping local code
+# as a verified fallback if the shared module is unavailable.
+if _USING_SHARED_TRANSLATIONS:
+    AnthropicStreamState = _SharedAnthropicStreamState
+    _parse_dsml_from_text = _shared_parse_dsml
+    _normalize_upstream_error = _shared_normalize_error
+    _strip_cache = _shared_strip_cache
 
 def main():
     import uvicorn
