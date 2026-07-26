@@ -1043,7 +1043,13 @@ def forward_headers(request: Request) -> dict:
                 'x-request-id']:  # P2: correlation ID passthrough
         val = request.headers.get(key)
         if val:
-            headers[key] = val
+            # BUG-SEC2 fix: strip newlines and control chars to prevent
+            # header injection / log injection / request smuggling.
+            sanitized = val.replace('\r', '').replace('\n', '').strip()
+            # Remove any remaining control characters (0x00-0x1F, 0x7F)
+            sanitized = re_module.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+            if sanitized:
+                headers[key] = sanitized
     # Generate a request ID if the client didn't provide one
     if 'x-request-id' not in headers:
         headers['x-request-id'] = generate_request_id()
@@ -1649,6 +1655,17 @@ class Server:
             if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
                 return JSONResponse(status_code=400, content={'error': {'message': 'max_tokens must be a positive integer', 'type': 'invalid_request_error'}})
 
+            # BUG-SEC3 fix: cap max_tokens to prevent integer overflow / abuse.
+            # 1M tokens is far beyond any model's context window.
+            _MAX_TOKENS_LIMIT = 1_000_000
+            for _mt_key in ('max_tokens', 'max_completion_tokens'):
+                _mt_val = body.get(_mt_key)
+                if _mt_val is not None and isinstance(_mt_val, int) and _mt_val > _MAX_TOKENS_LIMIT:
+                    return JSONResponse(status_code=400, content={'error': {
+                        'message': f'{_mt_key} exceeds maximum allowed value of {_MAX_TOKENS_LIMIT}',
+                        'type': 'invalid_request_error',
+                    }})
+
             for m in body.get('messages', []) or []:
                 if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
                     return JSONResponse(status_code=400, content={'error': {'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)", 'type': 'invalid_request_error'}})
@@ -1902,6 +1919,10 @@ class Server:
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f'Invalid JSON: {e}'))
         if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer'))
+
+        # BUG-SEC3 fix: cap max_tokens to prevent integer overflow / abuse
+        if body['max_tokens'] > 1_000_000:
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'max_tokens exceeds maximum allowed value of 1000000'))
 
         sys_field = body.get('system')
         if sys_field is not None and not isinstance(sys_field, (str, list)):

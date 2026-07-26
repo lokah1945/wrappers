@@ -518,7 +518,10 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
         for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key", "x-request-id"):
             v = request.headers.get(k)
             if v:
-                h[k] = v
+                # BUG-SEC2 fix: strip newlines/control chars to prevent header injection
+                v = v.replace('\r', '').replace('\n', '').strip()
+                if v:
+                    h[k] = v
     return h
 
 # --- minimal Anthropic <-> OpenAI helpers (surgical, local) ---
@@ -1021,6 +1024,9 @@ async def chat_completions(request: Request):
         return _jr(400, {"error": {"type": "invalid_request_error", "message": f"Invalid JSON: {e}"}})
     if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
         return _jr(400, {"error": {"type": "invalid_request_error", "message": "max_tokens must be a positive integer"}})
+    # BUG-SEC3 fix: cap max_tokens to prevent overflow
+    if isinstance(body.get("max_tokens"), int) and body["max_tokens"] > 1000000:
+        return _jr(400, {"error": {"type": "invalid_request_error", "message": "max_tokens exceeds maximum allowed value of 1000000"}})
     requested = body.get("model")  # transparent: never inject DEFAULT_MODEL
     if requested is not None:
         body["model"] = _normalize_model(requested)

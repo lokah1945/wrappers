@@ -83,3 +83,21 @@ def setup_graceful_shutdown(shutdown_callback=None):
 
     signal.signal(signal.SIGTERM, _handler)
     signal.signal(signal.SIGINT, _handler)
+
+
+def sanitize_header_value(value: str) -> str:
+    """Remove newlines, carriage returns, and control characters from header values.
+
+    Prevents header injection, log injection, and request smuggling attacks
+    where malicious clients embed CRLF sequences in header values.
+
+    BUG-SEC2: Applied across all wrappers to sanitize forwarded headers.
+    """
+    if not value:
+        return value
+    import re as _re
+    # Strip CR/LF first (most common injection vectors)
+    sanitized = value.replace('\r', '').replace('\n', '')
+    # Remove all remaining control characters (0x00-0x1F, 0x7F)
+    sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+    return sanitized.strip()

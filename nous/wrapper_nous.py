@@ -46,6 +46,13 @@ except ImportError:
 
 import aiohttp
 
+def _sanitize_header_value(value):
+    """Strip newlines/control chars to prevent header injection (BUG-SEC2)."""
+    if not value:
+        return value
+    return value.replace('\r', '').replace('\n', '').strip()
+
+
 # Shared translation utilities from common/translations (deduplication).
 # Note: Nous uses a dict-based AnthropicStreamState (for stream_with_heartbeat),
 # so we only import the string-agnostic utilities here.
@@ -1729,6 +1736,9 @@ async def chat_completions(request: Request):
 
     if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': 'max_tokens must be a positive integer'}})
+    # BUG-SEC3 fix: cap max_tokens to prevent overflow
+    if isinstance(body.get('max_tokens'), int) and body['max_tokens'] > 1000000:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': 'max_tokens exceeds maximum allowed value of 1000000'}})
 
     requested = body.get("model")
     # Transparent: only alias-map; do not inject DEFAULT_MODEL
@@ -1763,7 +1773,7 @@ async def chat_completions(request: Request):
             body.pop("tools", None)
 
     is_stream = body.get("stream", False)
-    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
     await record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
@@ -1801,7 +1811,7 @@ async def responses(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
-    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
@@ -1860,7 +1870,7 @@ async def messages(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
-    extra_h = {h: request.headers.get(h) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")

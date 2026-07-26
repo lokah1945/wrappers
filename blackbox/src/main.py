@@ -269,7 +269,10 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
         for k in ('anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent'):
             v = request.headers.get(k)
             if v:
-                headers[k] = v
+                # BUG-SEC2 fix: strip newlines/control chars to prevent header injection
+                v = v.replace('\r', '').replace('\n', '').strip()
+                if v:
+                    headers[k] = v
     return headers
 
 
@@ -824,6 +827,9 @@ async def count_tokens(request: Request):
 def _validate_chat_body(body: dict):
     if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
         return {'error': {'type': 'invalid_request_error', 'message': 'max_tokens must be a positive integer'}}
+    # BUG-SEC3 fix: cap max_tokens to prevent overflow
+    if isinstance(body.get('max_tokens'), int) and body['max_tokens'] > 1000000:
+        return {'error': {'type': 'invalid_request_error', 'message': 'max_tokens exceeds maximum allowed value of 1000000'}}
     for m in body.get('messages', []) or []:
         if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
             return {'error': {'type': 'invalid_request_error', 'message': f"Invalid role: {m.get('role')!r}"}}
