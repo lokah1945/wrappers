@@ -21,7 +21,11 @@ from .sanitize import sanitize_error_detail
 class ModelRegistryClient:
     def __init__(self, base_url: str | None = None, token: str | None = None,
                  timeout_sec: float = 3.0):
-        self.base_url = (base_url or os.environ.get("MODEL_REGISTRY_URL", "")).rstrip("/")
+        # BUG-F1 fix: use 'is not None' check instead of truthy check.
+        # Previously: base_url or os.environ.get(...) would fall through to env
+        # when explicit "" was passed, because empty string is falsy.
+        # Now: explicit "" is respected, env fallback only when base_url is None.
+        self.base_url = (base_url if base_url is not None else os.environ.get("MODEL_REGISTRY_URL", "")).rstrip("/")
         self.token = token if token is not None else os.environ.get("MODEL_REGISTRY_ADMIN_TOKEN", "")
         self.timeout = aiohttp.ClientTimeout(total=timeout_sec)
         self.queue_limit = int(os.environ.get("MODEL_REGISTRY_OBSERVATION_QUEUE", "1000"))
