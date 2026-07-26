@@ -824,6 +824,7 @@ async def lifespan(app: FastAPI):
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
+    logger.info('[lifecycle] wrapper-blackbox shutting down gracefully...')
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
         try:
@@ -832,6 +833,7 @@ async def lifespan(app: FastAPI):
             pass
         _MODEL_REFRESH_TASK = None
     await MODEL_REGISTRY_CLIENT.stop()
+    await metrics.close()  # Persist metrics snapshot to disk
     if _session is not None and not _session.closed:
         await _session.close()
 

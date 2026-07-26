@@ -1534,6 +1534,7 @@ async def lifespan(app: FastAPI):
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
+    logger.info('[lifecycle] wrapper-nous shutting down gracefully...')
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
         try:

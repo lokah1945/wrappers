@@ -2518,10 +2518,12 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        logger.info(f'[lifecycle] wrapper-nvidia starting (v{VERSION}, commit={GIT_COMMIT})')
         await server.init()
         try:
             yield
         finally:
+            logger.info('[lifecycle] wrapper-nvidia shutting down gracefully...')
             if server:
                 if server._session:
                     await server._session.close()
