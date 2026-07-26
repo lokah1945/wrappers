@@ -34,7 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    from common.middleware import RequestSizeLimiter
+    from common.middleware import RequestSizeLimiter, sanitize_header_value
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
@@ -48,6 +48,14 @@ except ImportError:
     HAS_WATCHDOG = False
 
 from .key_pool import KeyPool
+
+# Circuit breaker for upstream protection
+try:
+    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
+    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="blackbox-upstream")
+    _HAS_CIRCUIT_BREAKER = True
+except ImportError:
+    _HAS_CIRCUIT_BREAKER = False
 from .metrics import Metrics
 
 # ── Shared translations from common/translations (P0 deduplication) ──
@@ -94,6 +102,24 @@ MODEL_REGISTRY = LocalModelRegistry('blackbox', profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
+
+# ── Per-IP Rate Limiting ──
+from collections import defaultdict
+_rate_limit_store = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+
+def check_rate_limit(client_ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    with _rate_limit_lock:
+        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < 60]
+        if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_RPM:
+            return False
+        _rate_limit_store[client_ip].append(now)
+    return True
+
+
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 MAX_CONNECTIONS_PER_HOST = int(os.environ.get('MAX_CONNECTIONS_PER_HOST', '100'))
@@ -269,8 +295,8 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
         for k in ('anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent'):
             v = request.headers.get(k)
             if v:
-                # BUG-SEC2 fix: strip newlines/control chars to prevent header injection
-                v = v.replace('\r', '').replace('\n', '').strip()
+                # BUG-SEC2 fix: use shared sanitization function
+                v = sanitize_header_value(v)
                 if v:
                     headers[k] = v
     return headers
@@ -279,6 +305,13 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
 
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
+    # Circuit breaker: reject if upstream is failing
+    if _HAS_CIRCUIT_BREAKER:
+        try:
+            await _UPSTREAM_BREAKER.before_request()
+        except CircuitBreakerError as cb_err:
+            return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
+
     import aiohttp as _aiohttp
     sess = await get_session()
     headers = headers or {}
@@ -857,6 +890,9 @@ def _clean_tools(body: dict):
 @app.post('/v1/chat/completions')
 async def chat_completions(request: Request):
     _auth_check(request)
+    _client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    if not check_rate_limit(_client_ip):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception as e:
@@ -1035,6 +1071,9 @@ def _store_response(rid: str, messages: list):
 @app.post('/v1/messages')
 async def anthropic_messages(request: Request):
     _auth_check(request)
+    _client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    if not check_rate_limit(_client_ip):
+        return JSONResponse(status_code=429, content={"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception as e:

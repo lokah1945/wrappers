@@ -37,7 +37,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    from common.middleware import RequestSizeLimiter
+    from common.middleware import RequestSizeLimiter, sanitize_header_value
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
@@ -51,6 +51,14 @@ except ImportError:
     HAS_WATCHDOG = False
 
 from .key_pool import KeyPool
+
+# Circuit breaker for upstream protection
+try:
+    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
+    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="opencode-upstream")
+    _HAS_CIRCUIT_BREAKER = True
+except ImportError:
+    _HAS_CIRCUIT_BREAKER = False
 from .metrics import Metrics
 
 # ── Shared translations from common/translations (P0 deduplication) ──
@@ -244,6 +252,24 @@ def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
         _dynamic_alias_target = mid
 
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
+
+# ── Per-IP Rate Limiting ──
+from collections import defaultdict
+_rate_limit_store = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+
+def check_rate_limit(client_ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    with _rate_limit_lock:
+        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < 60]
+        if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_RPM:
+            return False
+        _rate_limit_store[client_ip].append(now)
+    return True
+
+
 ANTI_SILENCE = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
 INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
 
@@ -347,6 +373,13 @@ def _normalize_model(model: str) -> str:
 
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
+    # Circuit breaker: reject if upstream is failing
+    if _HAS_CIRCUIT_BREAKER:
+        try:
+            await _UPSTREAM_BREAKER.before_request()
+        except CircuitBreakerError as cb_err:
+            return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
+
     import aiohttp
     sess = await get_session()
     headers = headers or {}
@@ -518,8 +551,8 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
         for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key", "x-request-id"):
             v = request.headers.get(k)
             if v:
-                # BUG-SEC2 fix: strip newlines/control chars to prevent header injection
-                v = v.replace('\r', '').replace('\n', '').strip()
+                # BUG-SEC2 fix: use shared sanitization function
+                v = sanitize_header_value(v)
                 if v:
                     h[k] = v
     return h
@@ -1262,6 +1295,9 @@ async def responses(request: Request):
 @app.post("/v1/messages")
 async def anthropic_messages(request: Request):
     _auth_check(request)
+    _client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
+    if not check_rate_limit(_client_ip):
+        return _jr(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception as e:
@@ -1392,6 +1428,11 @@ async def dashboard():
         html = html.replace('<head>', '<head>\n' + meta_tag, 1)
     from fastapi.responses import HTMLResponse
     return HTMLResponse(content=html)
+
+
+@app.get("/version")
+async def version():
+    return {"version": VERSION, "git_commit": GIT_COMMIT, "source_root": SOURCE_ROOT, "pid": os.getpid()}
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):

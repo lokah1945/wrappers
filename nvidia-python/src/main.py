@@ -59,7 +59,7 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
-    from common.middleware import RequestSizeLimiter
+    from common.middleware import RequestSizeLimiter, sanitize_header_value
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
@@ -267,6 +267,24 @@ def start_env_watcher():
         logger.warning(f'[env] Failed to start watcher: {e}')
 
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
+
+# ── Per-IP Rate Limiting ──
+from collections import defaultdict
+_rate_limit_store = defaultdict(list)
+_rate_limit_lock = threading.Lock()
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+
+def check_rate_limit(client_ip: str) -> bool:
+    """Return True if request is allowed, False if rate-limited."""
+    now = time.time()
+    with _rate_limit_lock:
+        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < 60]
+        if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_RPM:
+            return False
+        _rate_limit_store[client_ip].append(now)
+    return True
+
+
 
 try:
     from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
@@ -1043,11 +1061,8 @@ def forward_headers(request: Request) -> dict:
                 'x-request-id']:  # P2: correlation ID passthrough
         val = request.headers.get(key)
         if val:
-            # BUG-SEC2 fix: strip newlines and control chars to prevent
-            # header injection / log injection / request smuggling.
-            sanitized = val.replace('\r', '').replace('\n', '').strip()
-            # Remove any remaining control characters (0x00-0x1F, 0x7F)
-            sanitized = re_module.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+            # BUG-SEC2 fix: use shared sanitization function
+            sanitized = sanitize_header_value(val)
             if sanitized:
                 headers[key] = sanitized
     # Generate a request ID if the client didn't provide one
@@ -1291,6 +1306,11 @@ class Server:
                          or (method == 'GET' and path in ('/props', '/v1/props'))
                          or (method == 'GET' and path == '/v1/capabilities')
                          or (method == 'GET' and path == '/v1/capabilities/params'))
+
+            # Per-IP rate limiting
+            _client_ip = client_ip(request)
+            if not check_rate_limit(_client_ip):
+                return JSONResponse(status_code=429, content={'error': {'message': 'Too many requests', 'type': 'rate_limit_error'}})
 
             if BEARER_TOKEN and not is_public:
                 auth_header = (request.headers.get('authorization') or '').strip()

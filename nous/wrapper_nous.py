@@ -46,6 +46,14 @@ except ImportError:
 
 import aiohttp
 
+# Circuit breaker for upstream protection
+try:
+    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
+    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="nous-upstream")
+    _HAS_CIRCUIT_BREAKER = True
+except ImportError:
+    _HAS_CIRCUIT_BREAKER = False
+
 # Shared header sanitization (BUG-SEC2 fix — deduplicated from common/middleware)
 try:
     from common.middleware import sanitize_header_value as _sanitize_header_value
@@ -537,6 +545,13 @@ def get_model_meta(mid):
 
 
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
+    # Circuit breaker: reject if upstream is failing
+    if _HAS_CIRCUIT_BREAKER:
+        try:
+            await _UPSTREAM_BREAKER.before_request()
+        except CircuitBreakerError as cb_err:
+            return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
+
     url = f"{NOUS_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
     if stream:
