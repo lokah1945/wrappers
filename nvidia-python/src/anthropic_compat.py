@@ -502,9 +502,12 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     for tc in (msg.get('tool_calls') or []):
         fn = tc.get('function', {})
         try:
-            args = json.loads(fn.get('arguments', '{}'))
+            args = json.loads(fn.get('arguments') or '{}')
+            if not isinstance(args, dict):
+                args = {'value': args}
         except Exception:
-            args = {}
+            # BUG-D2 fix: preserve raw arguments instead of silently dropping
+            args = {'raw': fn.get('arguments', '')}
         content.append({'type': 'tool_use', 'id': tc.get('id', ''), 'name': fn.get('name', ''), 'input': args})
 
     if expect_thinking and not any(c.get('type') == 'thinking' for c in content) and content:

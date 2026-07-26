@@ -146,10 +146,20 @@ class Metrics:
     async def record_request(self, **kwargs):
         await self._ready.wait()
         try:
-            prompt_tokens = kwargs.get('promptTokens', 0) or 0
-            completion_tokens = kwargs.get('completionTokens', 0) or 0
-            total_tokens = kwargs.get('totalTokens') or (prompt_tokens + completion_tokens)
-            ttft = kwargs.get('ttftMs', 0) or 0
+            # BUG-D1 fix: accept both snake_case (callers) and camelCase (legacy).
+            # All callers in main.py pass snake_case; the original Node.js migration
+            # used camelCase, creating a silent mismatch where every metric recorded
+            # default values (key_label='', status=200, latency=0, tokens=0).
+            def _g(snake, camel, default=0):
+                v = kwargs.get(snake)
+                if v is not None:
+                    return v
+                return kwargs.get(camel, default)
+
+            prompt_tokens = _g('prompt_tokens', 'promptTokens', 0) or 0
+            completion_tokens = _g('completion_tokens', 'completionTokens', 0) or 0
+            total_tokens = _g('total_tokens', 'totalTokens', 0) or (prompt_tokens + completion_tokens)
+            ttft = _g('ttft_ms', 'ttftMs', 0) or 0
 
             await self._db.execute(
                 '''INSERT INTO requests
@@ -159,12 +169,12 @@ class Metrics:
                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)''',
                 [
                     time.time(), kwargs.get('method', 'POST'), kwargs.get('path', ''),
-                    kwargs.get('model', ''), kwargs.get('keyLabel', ''),
-                    1 if kwargs.get('streaming') else 0, kwargs.get('statusCode', 200),
-                    kwargs.get('latencyMs', 0), prompt_tokens, completion_tokens,
-                    kwargs.get('cachedTokens', 0), total_tokens,
-                    1 if kwargs.get('wasRateLimited') else 0, kwargs.get('retries', 0),
-                    kwargs.get('requestBytes', 0), kwargs.get('pacingMs', 0), ttft,
+                    kwargs.get('model', ''), _g('key_label', 'keyLabel', ''),
+                    1 if _g('streaming', 'streaming', 0) else 0, _g('status', 'statusCode', 200),
+                    _g('latency_ms', 'latencyMs', 0), prompt_tokens, completion_tokens,
+                    _g('cached_tokens', 'cachedTokens', 0), total_tokens,
+                    1 if _g('was_rate_limited', 'wasRateLimited', 0) else 0, _g('retries', 'retries', 0),
+                    _g('request_bytes', 'requestBytes', 0), _g('pacing_ms', 'pacingMs', 0), ttft,
                 ]
             )
             self._maybe_save()
@@ -174,19 +184,19 @@ class Metrics:
                     'method': kwargs.get('method', 'POST'),
                     'path': kwargs.get('path', ''),
                     'model': kwargs.get('model', ''),
-                    'key_label': kwargs.get('keyLabel', ''),
-                    'streaming': 1 if kwargs.get('streaming') else 0,
-                    'status_code': kwargs.get('statusCode', 200),
-                    'latency_ms': kwargs.get('latencyMs', 0),
+                    'key_label': _g('key_label', 'keyLabel', ''),
+                    'streaming': 1 if _g('streaming', 'streaming', 0) else 0,
+                    'status_code': _g('status', 'statusCode', 200),
+                    'latency_ms': _g('latency_ms', 'latencyMs', 0),
                     'ttft_ms': ttft,
                     'prompt_tokens': prompt_tokens,
                     'completion_tokens': completion_tokens,
-                    'cached_tokens': kwargs.get('cachedTokens', 0),
+                    'cached_tokens': _g('cached_tokens', 'cachedTokens', 0),
                     'total_tokens': total_tokens,
-                    'was_rate_limited': 1 if kwargs.get('wasRateLimited') else 0,
-                    'retries': kwargs.get('retries', 0),
-                    'request_bytes': kwargs.get('requestBytes', 0),
-                    'pacing_ms': kwargs.get('pacingMs', 0),
+                    'was_rate_limited': 1 if _g('was_rate_limited', 'wasRateLimited', 0) else 0,
+                    'retries': _g('retries', 'retries', 0),
+                    'request_bytes': _g('request_bytes', 'requestBytes', 0),
+                    'pacing_ms': _g('pacing_ms', 'pacingMs', 0),
                 })
         except Exception as e:
             logger.error(f'[metrics] recordRequest error: {e}')
@@ -194,28 +204,35 @@ class Metrics:
     async def record_rate_limit_event(self, **kwargs):
         await self._ready.wait()
         try:
+            # BUG-D1 fix: accept both snake_case (callers) and camelCase (legacy).
+            def _g(snake, camel, default=0):
+                v = kwargs.get(snake)
+                if v is not None:
+                    return v
+                return kwargs.get(camel, default)
+
             await self._db.execute(
                 '''INSERT INTO rate_limit_events
                    (ts, key_label, model, retry_after_s, detected_limit, rotated_to, scope, observed_rpm)
                    VALUES (?,?,?,?,?,?,?,?)''',
                 [
-                    time.time(), kwargs.get('keyLabel', ''), kwargs.get('model', ''),
-                    kwargs.get('retryAfterS', 0), kwargs.get('detectedLimit'),
-                    kwargs.get('rotatedTo'), kwargs.get('scope', 'key'),
-                    kwargs.get('observedRpm'),
+                    time.time(), _g('key_label', 'keyLabel', ''), kwargs.get('model', ''),
+                    _g('retry_after_s', 'retryAfterS', 0), _g('detected_limit', 'detectedLimit'),
+                    _g('rotated_to', 'rotatedTo'), _g('scope', 'scope', 'key'),
+                    _g('observed_rpm', 'observedRpm'),
                 ]
             )
             self._maybe_save()
             if self._on_rate_limit:
                 self._on_rate_limit({
                     'ts': time.time(),
-                    'key_label': kwargs.get('keyLabel', ''),
+                    'key_label': _g('key_label', 'keyLabel', ''),
                     'model': kwargs.get('model', ''),
-                    'retry_after_s': kwargs.get('retryAfterS', 0),
-                    'detected_limit': kwargs.get('detectedLimit'),
-                    'rotated_to': kwargs.get('rotatedTo'),
-                    'scope': kwargs.get('scope', 'key'),
-                    'observed_rpm': kwargs.get('observedRpm'),
+                    'retry_after_s': _g('retry_after_s', 'retryAfterS', 0),
+                    'detected_limit': _g('detected_limit', 'detectedLimit'),
+                    'rotated_to': _g('rotated_to', 'rotatedTo'),
+                    'scope': _g('scope', 'scope', 'key'),
+                    'observed_rpm': _g('observed_rpm', 'observedRpm'),
                 })
         except Exception as e:
             logger.error(f'[metrics] recordRateLimitEvent error: {e}')
