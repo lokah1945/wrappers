@@ -7,7 +7,7 @@ import re
 from typing import Any
 
 _SECRET_VALUE = re.compile(
-    r"(?i)(bearer\s+|(?:nvapi|sk|ghp|github_pat)-)[A-Za-z0-9_\-\.]+"
+    r"(?i)(bearer\s+|(?:nvapi|sk|ghp|github_pat)[_\-])[A-Za-z0-9_\-\.]+"
 )
 _SENSITIVE_KEY = re.compile(
     r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|credential|prompt|messages?|request[_-]?body|input|content)"
@@ -30,9 +30,16 @@ def _scrub(value: Any, top_level: bool = False) -> Any:
         return result
     if isinstance(value, list):
         return [_scrub(child, False) for child in value[:32]]
+    if isinstance(value, float):
+        # BUG-ECB3 fix: NaN/Infinity are not valid JSON (RFC 7159).
+        # Replace with None to ensure strict JSON parsers can handle output.
+        import math
+        if math.isnan(value) or math.isinf(value):
+            return None
+        return value
     if isinstance(value, str):
         return _SECRET_VALUE.sub(r"\1[REDACTED]", value[:4000])
-    if isinstance(value, (int, float, bool)) or value is None:
+    if isinstance(value, (int, bool)) or value is None:
         return value
     return str(value)[:4000]
 
