@@ -1914,6 +1914,25 @@ async def model_status():
         "states": MODEL_STORE.status_map(),
     }
 
+
+@app.get("/dashboard")
+@app.get("/dashboard.html")
+async def dashboard():
+    """Serve the wrapper dashboard HTML."""
+    from pathlib import Path
+    dashboard_path = Path(__file__).parent / "dashboard.html"
+    if not dashboard_path.exists():
+        from fastapi.responses import HTMLResponse
+        return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
+    html = dashboard_path.read_text()
+    # Inject bearer token if auth is enabled
+    token = (BEARER_TOKEN or "").strip()
+    if token:
+        meta_tag = '<meta name="wrapper-bearer-token" content="' + token.replace('"', '&quot;') + '">'
+        html = html.replace('<head>', '<head>\n' + meta_tag, 1)
+    from fastapi.responses import HTMLResponse
+    return HTMLResponse(content=html)
+
 @app.get("/healthz")
 async def healthz(): return await health()
 

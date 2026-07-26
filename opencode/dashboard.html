@@ -1,0 +1,440 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>wrapper-opencode · Dashboard</title>
+<style>
+  :root, :root[data-theme="dark"] {
+    --bg: #0c0d14; --surface: #12131f; --card: #181929;
+    --border: #1e2038; --border2: #252640;
+    --text: #e2e4f0; --muted: #6b7280;
+    --accent: #6366f1; --accent2: #818cf8;
+    --green: #34d399; --yellow: #fbbf24; --red: #f87171; --blue: #60a5fa;
+    --pill-ok-bg: #14532d; --pill-ok-fg: #34d399;
+    --pill-warn-bg: #78350f; --pill-warn-fg: #fbbf24;
+    --pill-err-bg: #450a0a; --pill-err-fg: #f87171;
+    --pill-info-bg: #1e3a5f; --pill-info-fg: #60a5fa;
+    --shadow: none;
+  }
+  :root[data-theme="light"] {
+    --bg: #f5f6f8; --surface: #ffffff; --card: #ffffff;
+    --border: #e5e7eb; --border2: #d1d5db;
+    --text: #1e2330; --muted: #6b7280;
+    --accent: #6366f1; --accent2: #4f46e5;
+    --green: #059669; --yellow: #d97706; --red: #dc2626; --blue: #2563eb;
+    --pill-ok-bg: #d1fae5; --pill-ok-fg: #047857;
+    --pill-warn-bg: #fef3c7; --pill-warn-fg: #b45309;
+    --pill-err-bg: #fee2e2; --pill-err-fg: #b91c1c;
+    --pill-info-bg: #dbeafe; --pill-info-fg: #1d4ed8;
+    --shadow: 0 1px 3px rgba(0,0,0,.06);
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg); color: var(--text);
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    font-size: 13px; line-height: 1.5; min-height: 100vh;
+  }
+  .header {
+    background: var(--surface); border-bottom: 1px solid var(--border);
+    padding: 0 24px; display: flex; align-items: center; justify-content: space-between;
+    height: 52px; position: sticky; top: 0; z-index: 100;
+  }
+  .logo { display: flex; align-items: center; gap: 10px; }
+  .logo-icon { width: 28px; height: 28px; background: var(--accent);
+    border-radius: 6px; display: flex; align-items: center;
+    justify-content: center; font-size: 14px; }
+  .logo-text { font-size: 15px; font-weight: 700; }
+  .logo-sub { font-size: 11px; color: var(--muted); }
+  .header-right { display: flex; align-items: center; gap: 12px; }
+  .live-badge {
+    display: flex; align-items: center; gap: 5px;
+    background: #0d2a1a; border: 1px solid #1a4d2e;
+    border-radius: 20px; padding: 3px 10px;
+    font-size: 11px; color: var(--green);
+  }
+  .live-dot {
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--green); animation: pulse 2s infinite;
+  }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: .4; } }
+  .refresh-label { font-size: 11px; color: var(--muted); }
+  .theme-switch {
+    display: flex; gap: 2px; background: var(--surface);
+    border: 1px solid var(--border2); border-radius: 8px; padding: 2px;
+  }
+  .theme-switch button {
+    border: none; background: transparent; color: var(--muted);
+    cursor: pointer; border-radius: 6px; padding: 4px 8px;
+    font-size: 13px; transition: all .15s;
+  }
+  .theme-switch button.active {
+    background: var(--card); color: var(--accent2); box-shadow: var(--shadow);
+  }
+  .toolbar {
+    padding: 12px 24px; background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; gap: 16px;
+  }
+  .window-group { display: flex; gap: 4px; }
+  .wbtn {
+    padding: 4px 12px; border-radius: 5px; border: 1px solid var(--border2);
+    background: var(--card); color: var(--muted); font-size: 11px;
+    font-weight: 600; cursor: pointer; transition: all .15s;
+  }
+  .wbtn.active { background: #1e1b4b; border-color: var(--accent); color: var(--accent2); }
+  .main { padding: 20px 24px; max-width: 1400px; }
+  .grid4 { display: grid; grid-template-columns: repeat(4,1fr); gap: 12px; margin-bottom: 16px; }
+  .grid3 { display: grid; grid-template-columns: repeat(3,1fr); gap: 12px; margin-bottom: 16px; }
+  .grid2 { display: grid; grid-template-columns: repeat(2,1fr); gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 1100px) { .grid4 { grid-template-columns: repeat(2,1fr); } }
+  @media (max-width: 700px) { .grid4, .grid3, .grid2 { grid-template-columns: 1fr; } }
+  .card {
+    background: var(--card); border: 1px solid var(--border);
+    border-radius: 10px; padding: 16px; box-shadow: var(--shadow);
+  }
+  .card.accent { border-color: #312e81; }
+  .card-label {
+    font-size: 10px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .07em; color: var(--muted); margin-bottom: 6px;
+  }
+  .card-val {
+    font-size: 26px; font-weight: 800; color: var(--accent2); line-height: 1.1;
+  }
+  .card-val.green { color: var(--green); }
+  .card-val.yellow { color: var(--yellow); }
+  .card-val.red { color: var(--red); }
+  .card-val.blue { color: var(--blue); }
+  .card-sub { font-size: 11px; color: var(--muted); margin-top: 4px; }
+  .sec { font-size: 11px; font-weight: 700; text-transform: uppercase;
+    letter-spacing: .08em; color: var(--muted);
+    margin: 16px 0 10px; padding-bottom: 6px;
+    border-bottom: 1px solid var(--border); }
+  .tbl-wrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    background: var(--surface); font-size: 10px; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .06em; color: var(--muted);
+    padding: 10px 12px; text-align: left; border-bottom: 1px solid var(--border);
+  }
+  td { padding: 9px 12px; border-bottom: 1px solid var(--border);
+    font-size: 12px; vertical-align: middle; }
+  tr:last-child td { border-bottom: none; }
+  .mono { font-family: monospace; font-size: 11px; }
+  .pill {
+    display: inline-block; padding: 1px 7px; border-radius: 3px;
+    font-size: 10px; font-weight: 700;
+  }
+  .pill.ok { background: var(--pill-ok-bg); color: var(--pill-ok-fg); }
+  .pill.warn { background: var(--pill-warn-bg); color: var(--pill-warn-fg); }
+  .pill.err { background: var(--pill-err-bg); color: var(--pill-err-fg); }
+  .pill.info { background: var(--pill-info-bg); color: var(--pill-info-fg); }
+  .empty { padding: 40px; text-align: center; color: var(--muted); font-size: 12px; }
+  .key-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px,1fr)); gap: 12px; }
+  .key-card { background: var(--card); border: 1px solid var(--border); border-radius: 10px; padding: 14px; }
+  .key-card.ok { border-color: #14532d; }
+  .key-card.warn { border-color: #78350f; }
+  .key-card.blocked { border-color: #7c2d12; }
+  .key-name { font-size: 13px; font-weight: 700; color: var(--accent2); margin-bottom: 8px; }
+  .key-stats { display: grid; grid-template-columns: repeat(3,1fr); gap: 4px; margin-top: 8px; }
+  .key-stat { text-align: center; }
+  .key-stat-val { font-size: 15px; font-weight: 700; }
+  .key-stat-lbl { font-size: 9px; color: var(--muted); }
+  .rpm-track { background: var(--border); border-radius: 4px; height: 8px; overflow: hidden; margin: 8px 0; }
+  .rpm-fill { height: 100%; border-radius: 4px; transition: width .4s; }
+</style>
+<script>
+(function () {
+  try {
+    var choice = localStorage.getItem('wrapper-theme') || 'system';
+    var dark = window.matchMedia('(prefers-color-scheme: dark)').matches;
+    var resolved = choice === 'system' ? (dark ? 'dark' : 'light') : choice;
+    document.documentElement.setAttribute('data-theme', resolved);
+  } catch (e) {
+    document.documentElement.setAttribute('data-theme', 'dark');
+  }
+})();
+</script>
+</head>
+<body>
+
+<div class="header">
+  <div class="logo">
+    <div class="logo-icon">⚡</div>
+    <div>
+      <div class="logo-text">wrapper-opencode</div>
+      <div class="logo-sub">OpenCode Zen API Proxy · Dashboard</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="theme-switch" id="theme-switch">
+      <button data-theme-opt="light" title="Light">☀️</button>
+      <button data-theme-opt="dark" title="Dark">🌙</button>
+      <button data-theme-opt="system" title="System">🖥️</button>
+    </div>
+    <span class="live-badge"><span class="live-dot"></span>Live</span>
+    <span class="refresh-label" id="refresh-label">–</span>
+  </div>
+</div>
+
+<div class="toolbar">
+  <span style="font-size:11px;color:var(--muted)">Time window:</span>
+  <div class="window-group">
+    <button class="wbtn" data-w="1h">1h</button>
+    <button class="wbtn active" data-w="24h">24h</button>
+    <button class="wbtn" data-w="7d">7d</button>
+  </div>
+  <span style="font-size:10px;color:var(--muted);margin-left:auto" id="last-updated">–</span>
+</div>
+
+<div class="main">
+  <!-- Overview Stats -->
+  <div class="grid4" id="stat-cards">
+    <div class="card accent">
+      <div class="card-label">Total Requests</div>
+      <div class="card-val" id="total-req">–</div>
+      <div class="card-sub" id="req-rates">–</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Total Tokens</div>
+      <div class="card-val blue" id="total-tok">–</div>
+      <div class="card-sub" id="tok-detail">–</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Avg Latency</div>
+      <div class="card-val green" id="avg-latency">–</div>
+      <div class="card-sub" id="latency-sub">–</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Status</div>
+      <div class="card-val green" id="health-status">–</div>
+      <div class="card-sub" id="health-sub">–</div>
+    </div>
+  </div>
+
+  <!-- All-time stats -->
+  <div class="grid3">
+    <div class="card">
+      <div class="card-label">Uptime</div>
+      <div class="card-val" id="uptime">–</div>
+      <div class="card-sub">since start</div>
+    </div>
+    <div class="card">
+      <div class="card-label">API Keys</div>
+      <div class="card-val blue" id="key-count">–</div>
+      <div class="card-sub" id="key-sub">–</div>
+    </div>
+    <div class="card">
+      <div class="card-label">Available Models</div>
+      <div class="card-val" id="model-count">–</div>
+      <div class="card-sub">from upstream catalog</div>
+    </div>
+  </div>
+
+  <!-- Key Status -->
+  <div class="sec">Live Key Status</div>
+  <div class="key-grid" id="keys-container"></div>
+
+  <!-- Recent Activity -->
+  <div class="sec">Recent Requests</div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Time</th>
+          <th>Model</th>
+          <th>Key</th>
+          <th>Status</th>
+          <th>Latency</th>
+          <th>Tokens</th>
+        </tr>
+      </thead>
+      <tbody id="activity-body">
+        <tr><td colspan="6" class="empty">No activity yet.</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Model Status -->
+  <div class="sec">Model Availability</div>
+  <div class="tbl-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Model</th>
+          <th>State</th>
+          <th>Status Code</th>
+          <th>Checked</th>
+        </tr>
+      </thead>
+      <tbody id="model-status-body">
+        <tr><td colspan="4" class="empty">No model status data.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+// ── Configuration ──
+const WRAPPER_NAME = 'wrapper-opencode';
+let WINDOW = '24h';
+
+// ── Theme ──
+const THEME_KEY = 'wrapper-theme';
+const _mq = window.matchMedia('(prefers-color-scheme: dark)');
+let _themeChoice = localStorage.getItem(THEME_KEY) || 'system';
+
+function resolveTheme(c) { return c === 'system' ? (_mq.matches ? 'dark' : 'light') : c; }
+function applyTheme(choice) {
+  _themeChoice = choice;
+  document.documentElement.setAttribute('data-theme', resolveTheme(choice));
+  document.querySelectorAll('#theme-switch button').forEach(b =>
+    b.classList.toggle('active', b.dataset.themeOpt === choice));
+}
+
+document.querySelectorAll('#theme-switch button').forEach(b => {
+  b.addEventListener('click', () => {
+    localStorage.setItem(THEME_KEY, b.dataset.themeOpt);
+    applyTheme(b.dataset.themeOpt);
+  });
+});
+_mq.addEventListener('change', () => { if (_themeChoice === 'system') applyTheme('system'); });
+applyTheme(_themeChoice);
+
+// ── Helpers ──
+const $ = id => document.getElementById(id);
+const fmt = n => {
+  if (n == null || n === '') return '–';
+  n = Number(n);
+  if (!isFinite(n)) return '–';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'K';
+  return String(Math.round(n));
+};
+const fmtMs = ms => {
+  ms = Number(ms);
+  if (!isFinite(ms) || ms <= 0) return '–';
+  if (ms >= 1000) return (ms / 1000).toFixed(1) + 's';
+  return Math.round(ms) + 'ms';
+};
+const fmtTime = ts => {
+  if (!ts) return '–';
+  const diff = Math.floor((Date.now() - ts * 1000) / 1000);
+  if (diff < 60) return diff + 's ago';
+  if (diff < 3600) return Math.floor(diff / 60) + 'm ago';
+  if (diff < 86400) return Math.floor(diff / 3600) + 'h ago';
+  return new Date(ts * 1000).toLocaleDateString();
+};
+
+function getAuthHeaders() {
+  const meta = document.querySelector('meta[name="wrapper-bearer-token"]');
+  if (meta && meta.content) return { 'Authorization': 'Bearer ' + meta.content };
+  return {};
+}
+
+async function apiFetch(url, options = {}) {
+  const headers = { ...getAuthHeaders(), ...(options.headers || {}) };
+  const r = await fetch(url, { ...options, headers });
+  if (!r.ok) throw new Error(r.status);
+  return r.json();
+}
+
+// ── Window buttons ──
+document.querySelectorAll('.wbtn').forEach(b => {
+  b.addEventListener('click', () => {
+    document.querySelectorAll('.wbtn').forEach(x => x.classList.remove('active'));
+    b.classList.add('active');
+    WINDOW = b.dataset.w;
+    refresh();
+  });
+});
+
+// ── Load data ──
+async function refresh() {
+  const t = new Date().toLocaleTimeString();
+  $('last-updated').textContent = 'Updated: ' + t;
+  try {
+    const [metrics, health, modelStatus] = await Promise.all([
+      apiFetch('/metrics?window=' + WINDOW),
+      apiFetch('/health'),
+      apiFetch('/metrics/model-status').catch(() => ({states: {}})),
+    ]);
+
+    // Overview stats
+    $('total-req').textContent = fmt(metrics.total_requests);
+    $('total-tok').textContent = fmt(metrics.total_tokens);
+    $('tok-detail').textContent = 'in:' + fmt(metrics.input_tokens) + ' out:' + fmt(metrics.output_tokens);
+    $('avg-latency').textContent = '–'; // in-memory metrics don't track latency
+    $('health-status').textContent = health.status || 'ok';
+    $('health-status').className = 'card-val ' + (health.status === 'ok' ? 'green' : 'yellow');
+    $('health-sub').textContent = 'v' + (health.version || '?');
+
+    // All-time stats
+    $('uptime').textContent = fmt(metrics.uptime_seconds) + 's';
+    $('key-count').textContent = health.keys || health.available || '–';
+    $('key-sub').textContent = (health.available || 0) + ' available';
+    $('model-count').textContent = health.models_cached || '–';
+
+    // Key status
+    const keys = health.live_keys || health.keys_list || [];
+    if (keys.length) {
+      $('keys-container').innerHTML = keys.map(k => {
+        const rpm = k.current_rpm || 0;
+        const hard = k.hard_rpm || k.hard_limit || 40;
+        const blocked = k.hard_blocked || false;
+        const util = Math.min(100, Math.round(rpm / hard * 100));
+        const color = blocked ? 'var(--red)' : (rpm >= (k.soft_rpm || 30) ? 'var(--yellow)' : 'var(--green)');
+        const badgeClass = blocked ? 'blocked' : (rpm >= (k.soft_rpm || 30) ? 'warn' : 'ok');
+        return '<div class="key-card ' + badgeClass + '">' +
+          '<div class="key-name">' + (k.label || '?') + '</div>' +
+          '<div style="display:flex;justify-content:space-between;font-size:10px;color:var(--muted)">' +
+            '<span>RPM: <strong style="color:' + color + '">' + rpm + '</strong> / ' + hard + '</span>' +
+            '<span>' + util + '% util</span>' +
+          '</div>' +
+          '<div class="rpm-track"><div class="rpm-fill" style="width:' + util + '%;background:' + color + '"></div></div>' +
+          '<div class="key-stats">' +
+            '<div class="key-stat"><div class="key-stat-val">' + fmt(k.total_requests) + '</div><div class="key-stat-lbl">Requests</div></div>' +
+            '<div class="key-stat"><div class="key-stat-val" style="color:var(--yellow)">' + (k.total_429s || 0) + '</div><div class="key-stat-lbl">429s</div></div>' +
+            '<div class="key-stat"><div class="key-stat-val">' + (k.in_flight || 0) + '</div><div class="key-stat-lbl">In-flight</div></div>' +
+          '</div>' +
+        '</div>';
+      }).join('');
+    } else {
+      $('keys-container').innerHTML = '<div class="empty">No key data available.</div>';
+    }
+
+    // Model status
+    const states = modelStatus.states || {};
+    const stateKeys = Object.keys(states);
+    if (stateKeys.length) {
+      $('model-status-body').innerHTML = stateKeys.slice(0, 50).map(mid => {
+        const s = states[mid];
+        const stateStr = s.state || s.availability_state || 'unknown';
+        const stateClass = stateStr === 'available' ? 'ok' : (stateStr === 'unknown' ? 'info' : 'warn');
+        return '<tr>' +
+          '<td class="mono" style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">' + mid + '</td>' +
+          '<td><span class="pill ' + stateClass + '">' + stateStr + '</span></td>' +
+          '<td>' + (s.http_status || s.last_status || '–') + '</td>' +
+          '<td>' + fmtTime(s.checked_at) + '</td>' +
+        '</tr>';
+      }).join('');
+    }
+
+    $('refresh-label').textContent = 'LIVE';
+    $('refresh-label').style.color = 'var(--green)';
+  } catch (e) {
+    console.error('Refresh error:', e);
+    $('refresh-label').textContent = 'ERROR';
+    $('refresh-label').style.color = 'var(--red)';
+  }
+}
+
+// ── Init ──
+(async () => {
+  await refresh();
+  setInterval(refresh, 10000); // Refresh every 10s
+})();
+</script>
+</body>
+</html>
