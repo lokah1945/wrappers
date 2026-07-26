@@ -28,6 +28,20 @@ TLS_VERIFY = os.environ.get('LOKI_TLS_VERIFY', '0') == '1'
 
 _batch = []
 _last_flush = time.time()
+_session = None  # BUG-D6 fix: reuse one aiohttp session for all pushes
+
+
+async def _get_session():
+    """Reuse one aiohttp session for Loki pushes (BUG-D6 fix)."""
+    global _session
+    if _session is not None and not _session.closed:
+        return _session
+    if aiohttp is None:
+        return None
+    _session = aiohttp.ClientSession(
+        timeout=aiohttp.ClientTimeout(total=10),
+    )
+    return _session
 
 
 async def push_chunk() -> None:
@@ -56,19 +70,18 @@ async def push_chunk() -> None:
         return
 
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.post(
-                LOKI_URL,
-                data=payload,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=10),
-                ssl=TLS_VERIFY if TLS_VERIFY else False,
-            ) as resp:
-                if 200 <= resp.status < 300:
-                    _batch = _batch[len(snapshot):]
-                    print(f"[loki_push] flushed {len(snapshot)} records")
-                else:
-                    print(f"[loki_push] HTTP {resp.status}", file=sys.stderr)
+        session = await _get_session()
+        async with session.post(
+            LOKI_URL,
+            data=payload,
+            headers=headers,
+            ssl=TLS_VERIFY if TLS_VERIFY else False,
+        ) as resp:
+            if 200 <= resp.status < 300:
+                _batch = _batch[len(snapshot):]
+                print(f"[loki_push] flushed {len(snapshot)} records")
+            else:
+                print(f"[loki_push] HTTP {resp.status}", file=sys.stderr)
     except Exception as e:
         print(f"[loki_push] error: {e}", file=sys.stderr)
 

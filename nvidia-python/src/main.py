@@ -967,7 +967,23 @@ def route_upstream(path: str) -> str:
 
 
 def model_from_path(path: str) -> str:
+    """Extract model ID from a URL path, preserving org/model-name structure.
+
+    BUG-D7 fix: the original implementation returned only the last path segment,
+    which dropped the org prefix (e.g., /v1/models/meta/llama-3.1-8b-instruct
+    returned 'llama-3.1-8b-instruct' instead of 'meta/llama-3.1-8b-instruct').
+
+    Known path patterns with model at end:
+      /v1/models/<org>/<model>       -> org/model
+      /v1/models/<model>             -> model
+      /v1/engines/<org>/<model>      -> org/model
+      /chat/completions              -> '' (model in body)
+    """
     parts = path.strip('/').split('/')
+    # Find the model start: after /v1/models/ or /v1/engines/
+    for i, part in enumerate(parts):
+        if part in ('models', 'engines') and i + 1 < len(parts):
+            return '/'.join(parts[i + 1:])
     if len(parts) >= 2:
         return parts[-1]
     return ''
