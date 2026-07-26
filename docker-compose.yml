@@ -1,0 +1,133 @@
+# Docker Compose for local development and testing
+# Usage:
+#   docker compose up nvidia        # Start just NVIDIA wrapper
+#   docker compose up               # Start all wrappers
+#   docker compose up -d            # Start all in background
+#   docker compose logs -f nvidia   # Follow logs
+#
+# Environment variables:
+#   Copy .env.example to .env and fill in API keys before starting.
+
+version: "3.9"
+
+services:
+  nvidia:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9101:9101"
+    environment:
+      - LISTEN_PORT=9101
+      - LISTEN_HOST=0.0.0.0
+      - WRAPPER_SKIP_DOTENV=false
+      - WRAPPER_JSON_LOG=true
+    env_file:
+      - nvidia-python/.env
+    command: ["src.main:app", "--host", "0.0.0.0", "--port", "9101"]
+    volumes:
+      - ./common:/app/common:ro
+      - ./nvidia-python:/app/nvidia-python:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9101/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  nous:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9102:9102"
+    environment:
+      - LISTEN_PORT=9102
+      - LISTEN_HOST=0.0.0.0
+      - WRAPPER_SKIP_DOTENV=false
+      - WRAPPER_JSON_LOG=true
+    env_file:
+      - nous/.env
+    command: ["wrapper_nous:app", "--host", "0.0.0.0", "--port", "9102"]
+    volumes:
+      - ./common:/app/common:ro
+      - ./nous:/app/nous:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9102/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  opencode:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9103:9103"
+    environment:
+      - LISTEN_PORT=9103
+      - LISTEN_HOST=0.0.0.0
+      - WRAPPER_SKIP_DOTENV=false
+      - WRAPPER_JSON_LOG=true
+    env_file:
+      - opencode/.env
+    command: ["src.main:app", "--host", "0.0.0.0", "--port", "9103"]
+    volumes:
+      - ./common:/app/common:ro
+      - ./opencode:/app/opencode:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9103/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  blackbox:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9104:9104"
+    environment:
+      - LISTEN_PORT=9104
+      - LISTEN_HOST=0.0.0.0
+      - WRAPPER_SKIP_DOTENV=false
+      - WRAPPER_JSON_LOG=true
+    env_file:
+      - blackbox/.env
+    command: ["src.main:app", "--host", "0.0.0.0", "--port", "9104"]
+    volumes:
+      - ./common:/app/common:ro
+      - ./blackbox:/app/blackbox:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9104/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped
+
+  model-registry:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    ports:
+      - "9200:9200"
+    environment:
+      - MODEL_REGISTRY_PORT=9200
+      - MODEL_REGISTRY_HOST=0.0.0.0
+    command: ["service:app", "--host", "0.0.0.0", "--port", "9200"]
+    volumes:
+      - ./common:/app/common:ro
+      - ./model-registry:/app/model-registry:ro
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9200/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    restart: unless-stopped

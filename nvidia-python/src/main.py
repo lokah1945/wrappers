@@ -268,6 +268,13 @@ def start_env_watcher():
 
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
 
+try:
+    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
+    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="nvidia-upstream")
+    _HAS_CIRCUIT_BREAKER = True
+except ImportError:
+    _HAS_CIRCUIT_BREAKER = False
+
 # Shared translation utilities from common/translations (deduplication).
 try:
     from common.translations import (
@@ -1301,6 +1308,7 @@ class Server:
         @app.get('/health')
         async def health():
             snap = await self.metrics.summary('24h') if self.metrics else {}
+            cb_stats = _UPSTREAM_BREAKER.stats() if _HAS_CIRCUIT_BREAKER else {}
             return {
                 'status': 'ok' if self.pool.available_keys > 0 else 'degraded',
                 'version': VERSION,
@@ -1311,6 +1319,7 @@ class Server:
                 'available': self.pool.available_keys,
                 'models_cached': len(self.pool.models_cached),
                 'model_registry': MODEL_REGISTRY_CLIENT.stats(),
+                'circuit_breaker': cb_stats,
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
             }
@@ -2071,10 +2080,21 @@ class Server:
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
+        # Circuit breaker: reject immediately if upstream is failing
+        if _HAS_CIRCUIT_BREAKER:
+            try:
+                await _UPSTREAM_BREAKER.before_request()
+            except CircuitBreakerError as cb_err:
+                return {'status': 503, 'data': {'error': {
+                    'message': str(cb_err), 'type': 'service_unavailable',
+                }}}
+
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id)
             if not key_result:
                 # D8 fix: break immediately — retrying an exhausted pool wastes cycles
+                if _HAS_CIRCUIT_BREAKER:
+                    await _UPSTREAM_BREAKER.record_failure()
                 return {'status': 503, 'data': {'error': {'message': f'All API keys exhausted — no capacity available for model {model_id}', 'type': 'server_error'}}}
 
             key = key_result['key']
@@ -2186,6 +2206,8 @@ class Server:
                             completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
                             path=metric_path,
                         )
+                    if _HAS_CIRCUIT_BREAKER:
+                        await _UPSTREAM_BREAKER.record_success()
                     return {'status': resp.status, 'data': resp_data}
 
             except asyncio.TimeoutError:

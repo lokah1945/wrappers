@@ -51,10 +51,10 @@ import aiohttp
 # so we only import the string-agnostic utilities here.
 try:
     from common.translations import (
-        parse_dsml_from_text as _shared_parse_dsml,
-        repair_orphan_tool_messages as _shared_repair_orphan,
-        normalize_upstream_error as _shared_normalize_error,
-        strip_cache_control as _shared_strip_cache,
+        parse_dsml_from_text as _parse_dsml_from_text,
+        repair_orphan_tool_messages as _repair_orphan_tool_messages,
+        normalize_upstream_error as _normalize_upstream_error,
+        strip_cache_control as strip_cache_control,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -526,43 +526,6 @@ def get_model_meta(mid):
 
 
 
-def _normalize_upstream_error(status: int, text: str) -> dict:
-    """Parse upstream error body into a single OpenAI-shaped error (no double-encode)."""
-    msg = (text or "").strip()
-    etype = "api_error"
-    parsed = None
-    try:
-        parsed = json.loads(msg) if msg else None
-    except Exception:
-        parsed = None
-    if isinstance(parsed, dict):
-        if isinstance(parsed.get("error"), dict):
-            err = parsed["error"]
-            msg = err.get("message") or err.get("msg") or msg
-            etype = err.get("type") or etype
-            if isinstance(msg, str):
-                try:
-                    inner = json.loads(msg)
-                    if isinstance(inner, dict):
-                        if isinstance(inner.get("error"), dict):
-                            msg = inner["error"].get("message", msg)
-                            etype = inner["error"].get("type") or etype
-                        elif inner.get("message"):
-                            msg = inner.get("message")
-                except Exception:
-                    pass
-        elif parsed.get("message"):
-            msg = parsed.get("message")
-            etype = parsed.get("type") or etype
-    if status == 429:
-        etype = "rate_limit_error"
-    elif status in (401, 403):
-        etype = "authentication_error"
-    elif status == 404:
-        etype = "not_found_error"
-    elif status >= 500:
-        etype = "server_error"
-    return {"error": {"message": str(msg)[:2000], "type": etype, "code": status}}
 
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
     url = f"{NOUS_BASE}/v1/chat/completions"
@@ -755,13 +718,6 @@ def normalize_schema(s):
         out["required"] = []
     return out
 
-def strip_cache_control(obj):
-    if isinstance(obj, dict):
-        obj.pop("cache_control", None)
-        for v in obj.values():
-            strip_cache_control(v)
-    elif isinstance(obj, list):
-        for x in obj: strip_cache_control(x)
 
 
 
@@ -938,41 +894,6 @@ def anthropic_to_openai(req: dict) -> dict:
     return out
 
 
-def _parse_dsml_from_text(text: str):
-    """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use list)."""
-    if not text or "DSML" not in str(text).replace("\uff5c", "|"):
-        return text or "", []
-    normalized = str(text).replace("\uff5c", "|").replace("<|DSML|", "|DSML|")
-    if "|DSML|tool_calls>" not in normalized:
-        return text, []
-    import re as _re
-    tools = []
-    clean_parts = []
-    OPEN = "|DSML|tool_calls>"
-    CLOSE = "</|DSML|tool_calls>"
-    cursor = 0
-    while True:
-        s_idx = normalized.find(OPEN, cursor)
-        if s_idx == -1:
-            clean_parts.append(normalized[cursor:])
-            break
-        if s_idx > cursor:
-            clean_parts.append(normalized[cursor:s_idx])
-        e_idx = normalized.find(CLOSE, s_idx)
-        if e_idx == -1:
-            clean_parts.append(normalized[s_idx:])
-            break
-        segment = normalized[s_idx:e_idx + len(CLOSE)]
-        for name, inner in _re.findall(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|invoke>', segment):
-            params = dict(_re.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
-            tools.append({
-                "type": "tool_use",
-                "id": f"toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}",
-                "name": name,
-                "input": params,
-            })
-        cursor = e_idx + len(CLOSE)
-    return "".join(clean_parts).strip(), tools
 
 
 def openai_to_anthropic(model: str, chat: dict) -> dict:
@@ -1983,15 +1904,6 @@ async def model_status():
 
 @app.get("/healthz")
 async def healthz(): return await health()
-
-# ── Shared translations override (deduplication) ──────────────────────
-# After all local definitions, override with canonical shared implementations.
-# Note: Nous keeps its own dict-based AnthropicStreamState (different pattern).
-if _USING_SHARED_TRANSLATIONS:
-    _parse_dsml_from_text = _shared_parse_dsml
-    _repair_orphan_tool_messages = _shared_repair_orphan
-    _normalize_upstream_error = _shared_normalize_error
-    strip_cache_control = _shared_strip_cache
 
 # catch-all
 @app.api_route("/{path:path}", methods=["GET", "POST"])

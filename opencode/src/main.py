@@ -55,34 +55,15 @@ from .metrics import Metrics
 
 # ── Shared translations from common/translations (P0 deduplication) ──
 # Canonical implementations live in common/translations/. Local definitions
-# below are SUPERSEDED — the shared versions override them at module load time.
-# To remove local definitions safely: verify all tests pass after each removal.
+# have been removed — shared versions are imported directly.
 try:
     from common.translations import (
-        AnthropicStreamState as _SharedAnthropicStreamState,
-        parse_dsml_from_text as _shared_parse_dsml,
-        normalize_upstream_error as _shared_normalize_error,
-        strip_cache_control as _shared_strip_cache,
-        repair_orphan_tool_messages as _shared_repair_orphan,
+        AnthropicStreamState,
+        parse_dsml_from_text as _parse_dsml_from_text,
+        normalize_upstream_error as _normalize_upstream_error,
+        strip_cache_control as _strip_cache,
+        repair_orphan_tool_messages as _repair_orphan_tool_messages,
     )
-    _USING_SHARED_TRANSLATIONS = True
-except ImportError:
-    _USING_SHARED_TRANSLATIONS = False
-
-# Shared translation utilities from common/translations (deduplication).
-# The local definitions below remain as fallback; shared imports are preferred.
-try:
-    from common.translations import (
-        AnthropicStreamState as _SharedAnthropicStreamState,
-        parse_dsml_from_text as _shared_parse_dsml,
-        normalize_upstream_error as _shared_normalize_error,
-        strip_cache_control as _shared_strip_cache,
-    )
-    # Override local definitions with shared canonical implementations
-    AnthropicStreamState = _SharedAnthropicStreamState
-    _parse_dsml_from_text = _shared_parse_dsml
-    _normalize_upstream_error = _shared_normalize_error
-    _strip_cache = _shared_strip_cache
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
@@ -364,50 +345,6 @@ def _normalize_model(model: str) -> str:
     return m
 
 
-# SUPERSEDED: use common.translations.normalize_upstream_error
-def _normalize_upstream_error(status: int, text_or_data) -> dict:
-    """Single OpenAI-shaped error; unwrap nested JSON string messages."""
-    msg = text_or_data
-    etype = "api_error"
-    if isinstance(text_or_data, dict):
-        if isinstance(text_or_data.get("error"), dict):
-            err = text_or_data["error"]
-            msg = err.get("message") or err.get("msg") or str(err)
-            etype = err.get("type") or etype
-        elif text_or_data.get("message"):
-            msg = text_or_data.get("message")
-            etype = text_or_data.get("type") or etype
-        else:
-            msg = json.dumps(text_or_data)[:2000]
-    else:
-        msg = str(text_or_data or "")
-        try:
-            parsed = json.loads(msg)
-            return _normalize_upstream_error(status, parsed)
-        except Exception:
-            pass
-    if isinstance(msg, str):
-        try:
-            inner = json.loads(msg)
-            if isinstance(inner, dict):
-                if isinstance(inner.get("error"), dict):
-                    msg = inner["error"].get("message") or msg
-                    etype = inner["error"].get("type") or etype
-                elif inner.get("message"):
-                    msg = inner.get("message")
-        except Exception:
-            pass
-    if status == 429:
-        etype = "rate_limit_error"
-    elif status in (401, 403):
-        etype = "authentication_error"
-    elif status == 402 or (isinstance(etype, str) and "credit" in etype.lower()):
-        etype = "authentication_error"
-    elif status == 404:
-        etype = "not_found_error"
-    elif status >= 500:
-        etype = "server_error"
-    return {"error": {"message": str(msg)[:2000], "type": etype, "code": status}}
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
     import aiohttp
@@ -585,15 +522,6 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
     return h
 
 # --- minimal Anthropic <-> OpenAI helpers (surgical, local) ---
-# SUPERSEDED: use common.translations.strip_cache_control
-def _strip_cache(obj):
-    if isinstance(obj, dict):
-        obj.pop('cache_control', None)
-        for v in list(obj.values()):
-            _strip_cache(v)
-    elif isinstance(obj, list):
-        for x in obj:
-            _strip_cache(x)
 
 def anthropic_to_openai(body: dict) -> dict:
     _strip_cache(body)
@@ -658,43 +586,6 @@ def anthropic_to_openai(body: dict) -> dict:
     return out
 
 
-# SUPERSEDED: use common.translations.parse_dsml_from_text
-def _parse_dsml_from_text(text: str) -> tuple:
-    """If upstream leaked MiniMax DSML tool markup into content, split to (clean_text, tool_use blocks)."""
-    if not text or 'DSML' not in text.replace('\uff5c', '|'):
-        return text or '', []
-    normalized = text.replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
-    if '|DSML|tool_calls>' not in normalized:
-        return text, []
-    tools = []
-    clean_parts = []
-    OPEN = '|DSML|tool_calls>'
-    CLOSE = '</|DSML|tool_calls>'
-    cursor = 0
-    while True:
-        s_idx = normalized.find(OPEN, cursor)
-        if s_idx == -1:
-            clean_parts.append(normalized[cursor:])
-            break
-        if s_idx > cursor:
-            clean_parts.append(normalized[cursor:s_idx])
-        e_idx = normalized.find(CLOSE, s_idx)
-        if e_idx == -1:
-            clean_parts.append(normalized[s_idx:])
-            break
-        segment = normalized[s_idx:e_idx + len(CLOSE)]
-        inv = re.findall(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|invoke>', segment)
-        for name, inner in inv:
-            params = dict(re.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
-            tools.append({
-                "type": "tool_use",
-                "id": f"toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}",
-                "name": name,
-                "input": params,
-            })
-        cursor = e_idx + len(CLOSE)
-    clean = ''.join(clean_parts).strip()
-    return clean, tools
 
 
 def openai_to_anthropic(model: str, data: dict) -> dict:
@@ -748,24 +639,6 @@ _RESPONSE_STORE: dict = {}
 
 
 
-# SUPERSEDED: use common.translations.repair_orphan_tool_messages
-def _repair_orphan_tool_messages(messages):
-    seen = set()
-    out = []
-    for m in messages:
-        if not isinstance(m, dict):
-            continue
-        if m.get("role") == "assistant":
-            for tc in m.get("tool_calls") or []:
-                if isinstance(tc, dict) and tc.get("id"):
-                    seen.add(tc["id"])
-            out.append(m)
-        elif m.get("role") == "tool" and (m.get("tool_call_id") not in seen):
-            tcid = m.get("tool_call_id") or ""
-            out.append({"role": "user", "content": f"Tool result{(' for ' + tcid) if tcid else ''}: {m.get('content', '')}"})
-        else:
-            out.append(m)
-    return out
 def responses_to_chat(body: dict) -> dict:
     model = _normalize_model(body.get('model') or '')
     msgs = []
@@ -1378,141 +1251,6 @@ async def responses(request: Request):
         return _jr(502, {"error": {"message": str(e), "type": "api_error"}})
 
 
-# SUPERSEDED: use common.translations.AnthropicStreamState
-class AnthropicStreamState:
-    """OpenAI chat SSE chunks → Anthropic Messages SSE (Claude Code native)."""
-
-    def __init__(self, model: str):
-        self.model = model
-        self.index = -1
-        self.message_started = False
-        self.current_block = None  # thinking | text | tool_use
-        self.tool_map = {}
-        self.finished = False
-        self.msg_id = f"msg_{int(time.time()*1000)}"
-
-    def _sse(self, event: str, data: dict) -> str:
-        payload = dict(data)
-        if "type" not in payload:
-            payload["type"] = event
-        return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n"
-
-    def start_events(self):
-        if self.message_started:
-            return []
-        self.message_started = True
-        return [self._sse("message_start", {
-            "type": "message_start",
-            "message": {
-                "id": self.msg_id, "type": "message", "role": "assistant",
-                "model": self.model, "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": {"input_tokens": 0, "output_tokens": 0,
-                          "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
-            },
-        })]
-
-    def _close_block(self):
-        if self.current_block is None:
-            return []
-        ev = [self._sse("content_block_stop", {"type": "content_block_stop", "index": self.index})]
-        self.current_block = None
-        return ev
-
-    def translate_chunk(self, chunk: dict):
-        events = self.start_events()
-        if not chunk or "choices" not in chunk:
-            return events
-        ch = (chunk.get("choices") or [{}])[0]
-        delta = ch.get("delta") or {}
-
-        reason = delta.get("reasoning_content") or delta.get("reasoning")
-        if isinstance(reason, str) and reason:
-            if self.current_block != "thinking":
-                events.extend(self._close_block())
-                self.index += 1
-                events.append(self._sse("content_block_start", {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "thinking", "thinking": ""},
-                }))
-                self.current_block = "thinking"
-            events.append(self._sse("content_block_delta", {
-                "type": "content_block_delta", "index": self.index,
-                "delta": {"type": "thinking_delta", "thinking": reason},
-            }))
-
-        if delta.get("content"):
-            if self.current_block != "text":
-                events.extend(self._close_block())
-                self.index += 1
-                events.append(self._sse("content_block_start", {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "text", "text": ""},
-                }))
-                self.current_block = "text"
-            events.append(self._sse("content_block_delta", {
-                "type": "content_block_delta", "index": self.index,
-                "delta": {"type": "text_delta", "text": delta["content"]},
-            }))
-
-        for tc in delta.get("tool_calls") or []:
-            oi = tc.get("index", 0)
-            fn = tc.get("function") or {}
-            if oi not in self.tool_map:
-                events.extend(self._close_block())
-                self.index += 1
-                self.tool_map[oi] = self.index
-                tid = tc.get("id") or f"toolu_{self.index}"
-                events.append(self._sse("content_block_start", {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {
-                        "type": "tool_use", "id": tid,
-                        "name": fn.get("name") or "", "input": {},
-                    },
-                }))
-                self.current_block = "tool_use"
-            tidx = self.tool_map[oi]
-            if fn.get("arguments"):
-                events.append(self._sse("content_block_delta", {
-                    "type": "content_block_delta", "index": tidx,
-                    "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]},
-                }))
-
-        fr = ch.get("finish_reason")
-        if fr and not self.finished:
-            self.finished = True
-            events.extend(self._close_block())
-            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
-                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
-            )
-            usage = chunk.get("usage") or {}
-            events.append(self._sse("message_delta", {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": {
-                    "input_tokens": usage.get("prompt_tokens", 0) or 0,
-                    "output_tokens": usage.get("completion_tokens", 0) or 0,
-                    "cache_creation_input_tokens": 0,
-                    "cache_read_input_tokens": 0,
-                },
-            }))
-            events.append(self._sse("message_stop", {"type": "message_stop"}))
-        return events
-
-    def force_done(self, stop="end_turn"):
-        if self.finished:
-            return []
-        self.finished = True
-        events = self._close_block()
-        if not self.message_started:
-            events.extend(self.start_events())
-        events.append(self._sse("message_delta", {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop, "stop_sequence": None},
-            "usage": {"input_tokens": 0, "output_tokens": 0,
-                      "cache_creation_input_tokens": 0, "cache_read_input_tokens": 0},
-        }))
-        events.append(self._sse("message_stop", {"type": "message_stop"}))
-        return events
 
 
 @app.post("/v1/messages")
@@ -1634,16 +1372,6 @@ async def model_status():
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
     return _jr(404, {"error": {"message": f"Unsupported: /{path}", "type": "not_found_error"}})
-
-# ── Shared translations override (deduplication) ──────────────────────
-# After all local definitions, override with canonical shared implementations.
-# This ensures route handlers use the shared versions while keeping local code
-# as a verified fallback if the shared module is unavailable.
-if _USING_SHARED_TRANSLATIONS:
-    AnthropicStreamState = _SharedAnthropicStreamState
-    _parse_dsml_from_text = _shared_parse_dsml
-    _normalize_upstream_error = _shared_normalize_error
-    _strip_cache = _shared_strip_cache
 
 def main():
     import uvicorn
