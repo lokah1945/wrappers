@@ -51,6 +51,8 @@ class ModelStateStore:
         self.db_path = Path(db_path or os.environ.get("MODEL_STATE_DB") or default_path)
         self.catalog_ttl_sec = int(catalog_ttl_sec or os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
         self.status_write_interval_sec = int(os.environ.get("MODEL_STATUS_WRITE_INTERVAL_SEC", "60"))
+        self.max_events_rows = int(os.environ.get("MODEL_STATE_MAX_EVENTS", "10000"))
+        self.max_status_cache_keys = int(os.environ.get("MODEL_STATE_MAX_CACHE_KEYS", "5000"))
         self._initialized = False
         self._write_lock = threading.RLock()
         self._last_status_write: dict[tuple[str, str, str], tuple[float, dict[str, Any]]] = {}
@@ -386,7 +388,7 @@ class ModelStateStore:
         detail = sanitize_error_detail(payload)
         account_hint = provider_account_hint(payload)
         scope = credential_fingerprint(account_hint) if account_hint else credential_fingerprint(account_credential)
-        return self.record_status(
+        result = self.record_status(
             model_id=model_id,
             account_scope=scope,
             state=classification["state"],
@@ -395,6 +397,59 @@ class ModelStateStore:
             reason_detail=detail,
             endpoint=endpoint,
         )
+        # Periodic pruning to prevent unbounded growth
+        self._maybe_prune()
+        return result
+
+    def _maybe_prune(self) -> None:
+        """Prune events table and status cache to prevent unbounded growth.
+
+        Called after each record_error() to keep resources bounded.
+        Events table is capped at max_events_rows (default 10000).
+        Status cache is capped at max_status_cache_keys (default 5000).
+        """
+        # Prune in-memory status cache (keep most recent entries)
+        if len(self._last_status_write) > self.max_status_cache_keys:
+            # Sort by timestamp, keep most recent
+            sorted_items = sorted(
+                self._last_status_write.items(),
+                key=lambda item: item[1][0],  # timestamp
+                reverse=True,
+            )
+            self._last_status_write = dict(sorted_items[:self.max_status_cache_keys])
+
+        # Prune events table periodically (every 100 writes to avoid overhead)
+        if not hasattr(self, '_prune_counter'):
+            self._prune_counter = 0
+        self._prune_counter += 1
+        if self._prune_counter >= 100:
+            self._prune_counter = 0
+            self.prune_events()
+
+    def prune_events(self, max_rows: int | None = None) -> int:
+        """Remove oldest events beyond max_rows. Returns number of rows removed."""
+        limit = max_rows or self.max_events_rows
+        conn = self._connect()
+        try:
+            # Count current rows
+            count = conn.execute("SELECT COUNT(*) FROM model_state_events").fetchone()[0]
+            if count <= limit:
+                return 0
+            # Delete oldest rows beyond limit
+            to_delete = count - limit
+            conn.execute(
+                "DELETE FROM model_state_events WHERE id IN "
+                "(SELECT id FROM model_state_events ORDER BY created_at ASC LIMIT ?)",
+                (to_delete,),
+            )
+            conn.commit()
+            logger.info(f"[model-state] pruned {to_delete} old events (kept {limit})")
+            return to_delete
+        except Exception as e:
+            logger.warning(f"[model-state] prune_events failed: {e}")
+            return 0
+        finally:
+            conn.close()
 
 
 
