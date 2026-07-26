@@ -2156,7 +2156,7 @@ class Server:
                         # Retry only failures that may change with time/key.
                         # Account-scoped deployment, capability and route
                         # errors must not be retried across identical keys.
-                        retryable = self._classify_retry(status, classification)
+                        retryable = self._classify_retry(resp.status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
@@ -2213,7 +2213,7 @@ class Server:
                     key.decrement_in_flight()
 
                     if norm_status >= 400:
-                        retryable = self._classify_retry(status, classification)
+                        retryable = self._classify_retry(resp.status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
@@ -2315,7 +2315,7 @@ class Server:
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     await self._record_model_response(model_id, key, resp.status, err_data, path)
                     classification = classify_upstream_error(resp.status, err_data)
-                    retryable = self._classify_retry(status, classification)
+                    retryable = self._classify_retry(resp.status, classification)
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
