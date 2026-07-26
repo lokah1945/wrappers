@@ -991,10 +991,15 @@ def model_from_path(path: str) -> str:
 
 def forward_headers(request: Request) -> dict:
     headers = {}
-    for key in ['x-forwarded-for', 'x-real-ip', 'user-agent', 'accept', 'anthropic-version', 'anthropic-beta', 'openai-beta']:
+    for key in ['x-forwarded-for', 'x-real-ip', 'user-agent', 'accept',
+                'anthropic-version', 'anthropic-beta', 'openai-beta',
+                'x-request-id']:  # P2: correlation ID passthrough
         val = request.headers.get(key)
         if val:
             headers[key] = val
+    # Generate a request ID if the client didn't provide one
+    if 'x-request-id' not in headers:
+        headers['x-request-id'] = generate_request_id()
     return headers
 
 
