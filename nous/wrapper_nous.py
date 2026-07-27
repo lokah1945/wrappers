@@ -90,6 +90,32 @@ except ImportError:
 # ============================================================================
 # KeyPool for multi-key rotation (parity with opencode/nvidia-python)
 # ============================================================================
+
+def validate_config():
+    """Validate required configuration at startup."""
+    import os
+    import sys
+    
+    missing = []
+    for var in ['NOUS_API_KEY_1', 'BEARER_TOKEN']:
+        if not os.environ.get(var):
+            missing.append(var)
+    
+    if missing:
+        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    
+    # Validate port range
+    try:
+        port = int(os.environ.get('LISTEN_PORT', '9102'))
+        if not (1024 <= port <= 65535):
+            print(f"❌ ERROR: Invalid port {port}")
+            sys.exit(1)
+    except ValueError:
+        print(f"❌ ERROR: LISTEN_PORT must be an integer")
+        sys.exit(1)
+
+
 class KeyEntry:
     """State for one Nous credential."""
 
@@ -187,7 +213,7 @@ class KeyPool:
 
     def __init__(self):
         self.keys: List[KeyEntry] = []
-        self._lock = threading.Lock()
+        self._lock = asyncio.Lock()
         self._rr = 0
         self.hard_limit = int(os.environ.get("NOUS_HARD_LIMIT_RPM", os.environ.get("HARD_LIMIT_RPM", "60")))
 
@@ -531,7 +557,7 @@ _ALIAS_NAME_SET = {
     "claude-sonnet", "claude-opus", "claude-haiku",
 }
 _dynamic_alias_target: str = ""
-_dynamic_alias_lock = threading.Lock()
+_dynamic_alias_lock = asyncio.Lock()
 _known_models: Set[str] = set()
 
 # Optional static metadata for known upstream free models (display only)
@@ -1033,7 +1059,7 @@ async def store_conversation(principal: str, rid: str, msgs: list):
         # message dicts cannot corrupt the stored replay history.
         try:
             msgs = copy.deepcopy(msgs)
-        except Exception:
+        except (TypeError, ValueError, RecursionError):
             msgs = list(msgs)
         key = _response_store_key(principal, rid)
         _RESPONSE_STORE[key] = (time.time(), msgs)
@@ -1052,7 +1078,7 @@ def get_stored_conversation(principal: str, rid: str) -> Optional[list]:
         return None
     try:
         return copy.deepcopy(stored[1])
-    except Exception:
+    except (TypeError, ValueError, RecursionError):
         return list(stored[1])
 
 
@@ -1856,6 +1882,17 @@ async def lifespan(app: FastAPI):
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     _HEAL_TASK = asyncio.create_task(_heal_in_flight_loop())
     yield
+
+    # Graceful shutdown: wait for in-flight requests
+    logger.info(f"[{wrapper_name}] Starting graceful shutdown...")
+    shutdown_start = time.time()
+    max_wait = 30
+    while shutdown_start + max_wait > time.time():
+        total = sum(k.in_flight for k in KEY_POOL.keys)
+        if total == 0:
+            logger.info(f"[nous] All requests drained")
+            break
+        await asyncio.sleep(0.1)
     logger.info('[lifecycle] wrapper-nous shutting down gracefully...')
     for _task in (_MODEL_REFRESH_TASK, _HEAL_TASK):
         if _task:
@@ -2180,6 +2217,10 @@ async def count_tokens(req: Request):
 # --- OPENAI CHAT ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    import uuid
+    import time
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    start_time = time.time()
     await _auth_check(request)
     try:
         body = await request.json()

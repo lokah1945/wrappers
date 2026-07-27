@@ -139,6 +139,32 @@ STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '9
 VERSION = '1.0.5-anthropic-tools'
 
 # Build identity (H-04/H-02): resolve git root + source root from __file__, portable
+
+def validate_config():
+    """Validate required configuration at startup."""
+    import os
+    import sys
+    
+    missing = []
+    for var in ['OPENCODE_API_KEY_1', 'BEARER_TOKEN']:
+        if not os.environ.get(var):
+            missing.append(var)
+    
+    if missing:
+        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    
+    # Validate port range
+    try:
+        port = int(os.environ.get('LISTEN_PORT', '9103'))
+        if not (1024 <= port <= 65535):
+            print(f"❌ ERROR: Invalid port {port}")
+            sys.exit(1)
+    except ValueError:
+        print(f"❌ ERROR: LISTEN_PORT must be an integer")
+        sys.exit(1)
+
+
 def _resolve_git_root():
     try:
         import subprocess
@@ -460,7 +486,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                 resp.release()
                 try:
                     data = json.loads(text)
-                except Exception:
+                except (json.JSONDecodeError, ValueError):
                     data = text
                 # NB-2: only 5xx (or transport exceptions) count as breaker
                 # failures — client 4xx must not open the breaker (mirror blackbox).
@@ -1137,6 +1163,17 @@ async def lifespan(app: FastAPI):
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     _METRICS_PERSIST_TASK = asyncio.create_task(_metrics_persist_loop())  # OC-14
     yield
+
+    # Graceful shutdown: wait for in-flight requests
+    logger.info(f"[{wrapper_name}] Starting graceful shutdown...")
+    shutdown_start = time.time()
+    max_wait = 30
+    while shutdown_start + max_wait > time.time():
+        total = sum(k.in_flight for k in pool.keys)
+        if total == 0:
+            logger.info(f"[opencode] All requests drained")
+            break
+        await asyncio.sleep(0.1)
     logger.info('[lifecycle] wrapper-opencode shutting down gracefully...')
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
@@ -1343,6 +1380,10 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    import uuid
+    import time
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    start_time = time.time()
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
     _ip = _client_ip(request)
@@ -1507,7 +1548,7 @@ async def responses(request: Request):
                         return
                     try:
                         c = json.loads(payload)
-                    except Exception:
+                    except (json.JSONDecodeError, ValueError):
                         return
                     if c.get("usage"):
                         u = c["usage"]
@@ -1689,7 +1730,7 @@ async def anthropic_messages(request: Request):
                                 return
                             try:
                                 c = json.loads(payload)
-                            except Exception:
+                            except (json.JSONDecodeError, ValueError):
                                 continue
                             for ev in state.translate_chunk(c):
                                 yield ev

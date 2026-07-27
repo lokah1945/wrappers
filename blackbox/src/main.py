@@ -121,6 +121,32 @@ _MODEL_REFRESH_TASK = None
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 
 
+
+def validate_config():
+    """Validate required configuration at startup."""
+    import os
+    import sys
+    
+    missing = []
+    for var in ['BLACKBOX_API_KEY_1', 'BEARER_TOKEN']:
+        if not os.environ.get(var):
+            missing.append(var)
+    
+    if missing:
+        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    
+    # Validate port range
+    try:
+        port = int(os.environ.get('LISTEN_PORT', '9104'))
+        if not (1024 <= port <= 65535):
+            print(f"❌ ERROR: Invalid port {port}")
+            sys.exit(1)
+    except ValueError:
+        print(f"❌ ERROR: LISTEN_PORT must be an integer")
+        sys.exit(1)
+
+
 def _bearer_token() -> str:
     """Re-read BEARER_TOKEN from the environment on every call so .env
     hot-reloads (watchdog) take effect without a restart (opencode parity)."""
@@ -446,7 +472,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                 resp.release()
                 try:
                     data = json.loads(text)
-                except Exception:
+                except (json.JSONDecodeError, ValueError):
                     data = text
                 await _breaker_record(resp.status < 500)
                 return resp.status, _upstream_error_body(resp.status, data)
@@ -1000,6 +1026,17 @@ async def lifespan(app: FastAPI):
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
+
+    # Graceful shutdown: wait for in-flight requests
+    logger.info(f"[{wrapper_name}] Starting graceful shutdown...")
+    shutdown_start = time.time()
+    max_wait = 30
+    while shutdown_start + max_wait > time.time():
+        total = sum(k.in_flight for k in pool.keys)
+        if total == 0:
+            logger.info(f"[blackbox] All requests drained")
+            break
+        await asyncio.sleep(0.1)
     logger.info('[lifecycle] wrapper-blackbox shutting down gracefully...')
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
@@ -1200,6 +1237,10 @@ def _clean_tools(body: dict):
 
 @app.post('/v1/chat/completions')
 async def chat_completions(request: Request):
+    import uuid
+    import time
+    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+    start_time = time.time()
     _auth_check(request)
     if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
@@ -1331,7 +1372,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
             return
         try:
             c = json.loads(payload)
-        except Exception:
+        except (json.JSONDecodeError, ValueError):
             return
         if c.get('usage'):
             u = c['usage']
@@ -1493,7 +1534,7 @@ async def anthropic_messages(request: Request):
                                 return
                             try:
                                 c = json.loads(payload)
-                            except Exception:
+                            except (json.JSONDecodeError, ValueError):
                                 continue
                             for ev in state.translate_chunk(c):
                                 yield ev
