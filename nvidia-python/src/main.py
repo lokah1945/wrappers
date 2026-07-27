@@ -1544,6 +1544,29 @@ class Server:
     def _register_routes(self):
         app = self.app
 
+        
+        # Latency tracking middleware
+        @app.middleware("http")
+        async def add_latency_tracking(request: Request, call_next):
+            import time
+            import uuid
+            start_time = time.time()
+            request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
+            
+            response = await call_next(request)
+            
+            latency_ms = (time.time() - start_time) * 1000
+            
+            logger.info(
+                f"[{app.title}] request_id={request_id} "
+                f"method={request.method} path={request.url.path} "
+                f"latency={latency_ms:.2f}ms status={response.status_code}"
+            )
+            
+            response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
+            response.headers["X-Request-ID"] = request_id
+            return response
+
         @app.middleware('http')
         async def auth_middleware(request: Request, call_next):
             path = request.url.path
