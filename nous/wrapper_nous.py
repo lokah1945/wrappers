@@ -990,6 +990,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
     Handles normal [DONE], upstream EOF without [DONE], and a final partial SSE
     block without a trailing blank line. Terminal events are emitted exactly once
     so Codex/OpenAI SDK and Claude Code do not hang mid-run.
+
+    BUG-FIX: heartbeat now fires even when upstream is idle (e.g., reasoning
+    models taking 10+ seconds). Previously, heartbeat only fired when upstream
+    was sending data, causing Codex to time out during long reasoning steps.
     """
     last_hb = time.time()
     buffer = b""
@@ -1028,8 +1032,30 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
         except Exception:
             yield f"data: {data.decode(errors='replace')}\n\n"
 
+    # BUG-FIX: Use asyncio.wait_for with timeout to yield heartbeats even when
+    # upstream is idle. This prevents Codex from timing out during long reasoning
+    # steps where upstream takes 10+ seconds to send the next chunk.
     try:
-        async for chunk in upstream_resp.content.iter_any():
+        # Get an async iterator over chunks
+        chunk_iter = upstream_resp.content.iter_any().__aiter__()
+        while True:
+            try:
+                # Wait for next chunk with heartbeat interval as timeout
+                chunk = await asyncio.wait_for(
+                    chunk_iter.__anext__(),
+                    timeout=HEARTBEAT_MS / 1000
+                )
+            except asyncio.TimeoutError:
+                # No chunk received within heartbeat interval, yield heartbeat
+                now = time.time()
+                if now - last_hb > (HEARTBEAT_MS / 1000):
+                    yield ": heartbeat\n\n"
+                    last_hb = now
+                continue
+            except StopAsyncIteration:
+                # Stream ended normally
+                break
+
             buffer += chunk
             while b"\n\n" in buffer:
                 block, buffer = buffer.split(b"\n\n", 1)
@@ -1842,10 +1868,18 @@ async def responses(request: Request):
             # Codex requires output_item.added BEFORE first delta.
             for ev in state.start():
                 yield ev
-            async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
-                yield line
-            # Store full conversation for the next previous_response_id turn.
-            await store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
+            try:
+                async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
+                    yield line
+            finally:
+                # BUG-FIX: store conversation in background to avoid blocking
+                # stream finalization. If store_conversation hangs or is slow,
+                # the generator would not finish and Codex would hang waiting
+                # for the stream to close.
+                try:
+                    await store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
+                except Exception as e:
+                    logger.warning(f"[responses] store_conversation failed: {e}")
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)
