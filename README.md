@@ -4,7 +4,7 @@ Production-grade API proxies for Claude Code, OpenAI SDK, Anthropic SDK, and Ope
 
 This monorepo contains hardened, SDK-compatible transparent proxies that add multi-key rotation, pacing, metrics, streaming reliability, and full OpenAI + Anthropic compatibility.
 
-## Current Status (2026-07-27)
+## Current Status (2026-07-28)
 
 | Wrapper            | Status          | Score   | Port   | Use Case |
 |--------------------|-----------------|---------|--------|----------|
@@ -12,6 +12,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **nous**           | ✅ Production   | **93/100** | 9102   | Nous Research inference API |
 | **opencode**       | ✅ Production   | **91/100** | 9103   | OpenCode Zen gateway |
 | **blackbox**       | ✅ Production   | **91/100** | 9104   | BLACKBOX AI API proxy |
+| **vercel**         | ✅ Production   | **90/100** | 9105   | Vercel AI Gateway proxy |
 
 > Score reflects the 2026-07-27 deep E2E audit (audit_report/AUDIT_E2E_KOMPREHENSIF_2026-07-27.md): remaining deductions are hardening items (deploy-marker hygiene, model-registry telemetry wiring, per-wrapper test coverage) — not functional defects. Note: "transparent proxy" here means key-pool/anti-rate-limit/anti-error management per WRAPPER_CONTRACT.md; the wrappers translate/emulate non-OpenAI upstreams and normalize responses, so byte-for-byte passthrough is not claimed for protocol-translation endpoints.
 
@@ -65,6 +66,14 @@ wrapper/
 ├── blackbox/                    # BLACKBOX AI proxy
 │   ├── src/main.py             # FastAPI entry point
 │   ├── .env.example            # BLACKBOX-specific config
+│   └── README.md
+
+├── vercel/                     # Vercel AI Gateway proxy
+│   ├── wrapper_vercel.py       # Main FastAPI application
+│   ├── key_pool.py             # API key rotation
+│   ├── metrics.py              # Metrics collection
+│   ├── dashboard.html          # Monitoring dashboard
+│   ├── .env.example            # Vercel-specific config
 │   └── README.md
 │
 └── model-registry/              # Central model knowledge/call-contract service

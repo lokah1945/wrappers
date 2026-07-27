@@ -55,6 +55,19 @@
       "systemd": "wrapper-blackbox.service"
     },
     {
+      "name": "vercel",
+      "port": 9105,
+      "upstream": "vercel-ai-gateway",
+      "type": "python",
+      "source": "vercel/wrapper_vercel.py",
+      "enabled": true,
+      "health": "/health",
+      "capabilities": "/v1/capabilities",
+      "auth": "BEARER_TOKEN",
+      "log_file": "vercel.log",
+      "systemd": "wrapper-vercel.service"
+    },
+    {
       "name": "model-registry",
       "port": 9200,
       "upstream": "model-intelligence-control-plane",
