@@ -1266,10 +1266,19 @@ def _parse_retry_after(value, default: int = 65) -> int:
     return default
 
 
+# F2 round-2 fix: the event loop only keeps WEAK references to tasks, so a
+# fire-and-forget task with no other reference can be garbage-collected
+# mid-flight, silently dropping a pending metrics/DB write. Keep a strong
+# reference here until the task completes.
+_BG_TASKS: set = set()
+
+
 def _fire_and_forget(coro, label: str = 'bg') -> None:
     """F2 fix (latency audit 2026-07-27): run metrics/DB writes off the hot
-    path. Exceptions are logged instead of being silently dropped."""
+    path. The task is retained in _BG_TASKS so it cannot be GC'd mid-flight,
+    and exceptions are logged instead of being silently dropped."""
     def _done(task: 'asyncio.Task'):
+        _BG_TASKS.discard(task)
         try:
             exc = task.exception()
         except asyncio.CancelledError:
@@ -1277,10 +1286,13 @@ def _fire_and_forget(coro, label: str = 'bg') -> None:
         if exc:
             logger.warning(f'[{label}] background task failed: {exc}')
     try:
-        asyncio.create_task(coro).add_done_callback(_done)
+        task = asyncio.create_task(coro)
     except RuntimeError:
         # No running event loop (import-time/test context) — close the coroutine.
         coro.close()
+        return
+    _BG_TASKS.add(task)
+    task.add_done_callback(_done)
 
 
 async def _safe_response_body(resp) -> dict:
@@ -1369,8 +1381,11 @@ class Server:
             # V-11 fix: blocking file I/O runs in a worker thread, not on the loop.
             await asyncio.to_thread(_write_event_sync, ev)
 
-        self.metrics.on_request(lambda ev: asyncio.create_task(_write_event(ev)))
-        self.metrics.on_rate_limit(lambda ev: asyncio.create_task(_write_event(ev)))
+        # F2 round-2 fix: bare create_task kept no strong reference (loop holds
+        # weak refs) — a pending event write could be GC'd mid-flight. Route
+        # through _fire_and_forget which retains the task and logs failures.
+        self.metrics.on_request(lambda ev: _fire_and_forget(_write_event(ev), 'event-write'))
+        self.metrics.on_rate_limit(lambda ev: _fire_and_forget(_write_event(ev), 'event-write'))
 
         alert_history.SOURCE = EVENTS_FILE
         loki_push.SOURCE = EVENTS_FILE
@@ -1508,7 +1523,10 @@ class Server:
             # CORS preflight must pass without auth so browser SDKs work
             if method == 'OPTIONS':
                 return await call_next(request)
-            public_paths = ['/health', '/ready', '/metrics/prom', '/', '/dashboard.html', '/dashboard', '/favicon.ico', '/events']
+            # V-06 round-2 fix: /dashboard and /dashboard.html are no longer
+            # public — the page requires the bearer token (nous N-03 pattern);
+            # the browser supplies it client-side via a sessionStorage prompt.
+            public_paths = ['/health', '/ready', '/metrics/prom', '/', '/favicon.ico', '/events']
             is_public = (path in public_paths
                          or path == '/metrics/prom'
                          or (method == 'GET' and path == '/v1/models')
@@ -1547,7 +1565,8 @@ class Server:
                                    '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
                                    '/v1/messages', '/v1/messages/count_tokens',
                                    '/v1/capabilities', '/v1/capabilities/params',
-                                   '/v2/', '/api/', '/v1/complete')
+                                   '/v2/', '/api/', '/v1/complete',
+                                   '/dashboard', '/dashboard.html')
                     if path != '/' and not any(path == s.rstrip('/') or path.startswith(s) for s in known_stems):
                         return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
                     return JSONResponse(status_code=401, content={'error': {'message': 'Unauthorized', 'type': 'authentication_error'}})
@@ -1853,27 +1872,19 @@ class Server:
             return Response(status_code=204)
 
         def _serve_dashboard_html() -> HTMLResponse:
-            """Serve dashboard.html, injecting the bearer token as a <meta> tag
-            when auth is enabled (Node.js parity: index.js dashboard handler,
-            lines ~3111-3113). The browser reads this meta tag via
-            getAuthHeaders() and sends it on every /metrics API call, so the
-            dashboard works behind auth WITHOUT a manual token entry.
+            """Serve dashboard.html WITHOUT embedding any secret.
 
-            Without this injection the dashboard loads (it's in public_paths)
-            but every /metrics* fetch returns 401 and all cards render '–'.
+            V-06 round-2 fix (mirrors nous N-03): the bearer token is never
+            injected into the HTML — a client that can reach the port must not
+            be able to read the proxy credential out of the page. The route
+            itself now requires auth (removed from public_paths), and the page
+            obtains the token client-side via a sessionStorage prompt.
             """
             dashboard_path = Path(__file__).parent.parent / 'dashboard.html'
             if not dashboard_path.exists():
                 return HTMLResponse(content='<html><body><h1>wrapper-nvidia</h1>'
                                             '<p>See /metrics, /metrics/prom, /v1/models</p></body></html>')
-            html = dashboard_path.read_text()
-            token = (BEARER_TOKEN or '').strip()
-            if token:
-                meta_tag = '<meta name="wrapper-bearer-token" content="' \
-                    + token.replace('"', '&quot;') + '">'
-                # Inject after the first <head> only (matches Node html.replace).
-                html = html.replace('<head>', '<head>\n' + meta_tag, 1)
-            return HTMLResponse(content=html)
+            return HTMLResponse(content=dashboard_path.read_text())
 
         @app.get('/dashboard')
         async def dashboard():

@@ -129,8 +129,20 @@ def _require_internal(request: Request) -> None:
     token = auth[7:] if auth.lower().startswith("bearer ") else auth
     # SEC-5 fix: constant-time comparison to avoid timing side-channels.
     import hmac as _hmac
-    if not _hmac.compare_digest(token, ADMIN_TOKEN):
+    # NB-11 class fix: compare bytes so non-ASCII tokens 401 instead of 500.
+    if not _hmac.compare_digest(token.encode("utf-8"), ADMIN_TOKEN.encode("utf-8")):
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+async def _read_json_body(request: Request) -> dict[str, Any]:
+    """F6-class guard: malformed JSON returns 400, not an unhandled 500."""
+    try:
+        body = await request.json()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid JSON body: {exc}")
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="request body must be a JSON object")
+    return body
 
 
 def _provider(body: dict[str, Any]) -> str:
@@ -187,7 +199,7 @@ def model_info(canonical_id: str) -> dict[str, Any]:
 
 @app.post("/v1/resolve")
 async def resolve(request: Request) -> dict[str, Any]:
-    body = await request.json()
+    body = await _read_json_body(request)
     provider = _provider(body)
     requested = str(body.get("requested_model") or body.get("model") or "").strip()
     if not requested:
@@ -205,7 +217,7 @@ async def resolve(request: Request) -> dict[str, Any]:
 
 @app.post("/v1/call-plan")
 async def call_plan(request: Request) -> dict[str, Any]:
-    body = await request.json()
+    body = await _read_json_body(request)
     provider = _provider(body)
     requested = str(body.get("requested_model") or body.get("model") or "").strip()
     surface = str(body.get("client_surface") or "").strip()
@@ -225,7 +237,7 @@ async def call_plan(request: Request) -> dict[str, Any]:
 @app.post("/internal/catalog")
 async def ingest_catalog(request: Request) -> dict[str, Any]:
     _require_internal(request)
-    body = await request.json()
+    body = await _read_json_body(request)
     provider = _provider(body)
     models_data = body.get("models") or body.get("data") or []
     if not isinstance(models_data, list):
@@ -245,7 +257,7 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
 @app.post("/internal/aliases")
 async def ingest_aliases(request: Request) -> dict[str, Any]:
     _require_internal(request)
-    body = await request.json()
+    body = await _read_json_body(request)
     provider = _provider(body)
     bindings = body.get("bindings") or []
     if not isinstance(bindings, list) or len(bindings) > 1000:
@@ -273,7 +285,7 @@ async def ingest_aliases(request: Request) -> dict[str, Any]:
 @app.post("/internal/observations")
 async def observation(request: Request) -> dict[str, Any]:
     _require_internal(request)
-    body = await request.json()
+    body = await _read_json_body(request)
     provider = _provider(body)
     model_id = str(body.get("canonical_model_id") or body.get("model") or "").strip()
     account_scope = str(body.get("account_scope_hash") or "unknown")

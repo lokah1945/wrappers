@@ -80,6 +80,11 @@ class CircuitBreaker:
         # CM-2 fix: gate HALF_OPEN to a single in-flight probe to avoid a
         # thundering herd hitting a sick upstream at the recovery moment.
         self._half_open_probe_in_flight = False
+        # NB-1 fix: timestamp the probe admission so a probe that never
+        # records an outcome (client disconnect / CancelledError between
+        # before_request and record_*) auto-expires instead of latching the
+        # breaker into permanent rejection.
+        self._probe_admitted_at: float = 0.0
 
     @property
     def _lock(self) -> asyncio.Lock:
@@ -133,10 +138,20 @@ class CircuitBreaker:
                 return
             elif current == CircuitState.HALF_OPEN:
                 # CM-2 fix: only one probe may be in flight during HALF_OPEN.
+                # NB-1 fix: auto-expire a stale probe slot (probe cancelled /
+                # died without recording an outcome) after recovery_timeout,
+                # so the breaker can never latch into permanent rejection.
                 if self._half_open_probe_in_flight:
-                    remaining = self.remaining_recovery_seconds
-                    raise CircuitBreakerError(CircuitState.HALF_OPEN, remaining)
+                    probe_age = time.monotonic() - self._probe_admitted_at
+                    if probe_age < self.recovery_timeout:
+                        remaining = self.remaining_recovery_seconds
+                        raise CircuitBreakerError(CircuitState.HALF_OPEN, remaining)
+                    logger.warning(
+                        f"[circuit-breaker:{self.name}] stale half-open probe "
+                        f"({probe_age:.0f}s) expired; admitting a new probe"
+                    )
                 self._half_open_probe_in_flight = True
+                self._probe_admitted_at = time.monotonic()
                 logger.info(f"[circuit-breaker:{self.name}] half-open: allowing probe request")
                 return
             else:  # OPEN

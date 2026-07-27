@@ -73,8 +73,11 @@ class Metrics:
     def record_error(self, status_code: int = 0, **kwargs):
         # OC-14: synchronous error counter so _jr (and other sync call sites) can
         # record failures without awaiting on the request coroutine.
+        # NB-12: error responses are requests too — increment both so
+        # error_rate (errors/requests) can never exceed 1.0.
         with self._lock:
             self.errors += 1
+            self.requests += 1
 
     async def summary(self, window: str = "24h") -> Dict:
         uptime = time.time() - self.start
@@ -85,7 +88,9 @@ class Metrics:
                 "total_tokens": self.tokens_in + self.tokens_out,
                 "input_tokens": self.tokens_in,
                 "output_tokens": self.tokens_out,
-                "error_rate": round(self.errors / max(1, self.requests), 4),
+                # NB-12: clamp defensively (legacy persisted counters may still
+                # have errors > requests from before the accounting fix).
+                "error_rate": min(1.0, round(self.errors / max(1, self.requests), 4)),
             }
 
     async def close(self):

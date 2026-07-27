@@ -36,6 +36,30 @@ _session = None  # BUG-D6 fix: reuse one aiohttp session for all pushes
 _auth_failures = 0
 _disabled = False  # set after repeated 401/403 — pushes permanently disabled
 
+# F2 round-2 fix: the event loop holds only weak task references; a bare
+# create_task(push_chunk()) could be GC'd mid-flight and silently drop a
+# batch. Retain a strong reference until the task completes.
+_BG_TASKS = set()
+
+
+def _fire_and_forget(coro, label='bg'):
+    """Schedule a background task with a retained reference and error logging."""
+    def _done(task):
+        _BG_TASKS.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc:
+            print(f"[loki_push] [{label}] background task failed: {exc}", file=sys.stderr)
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        # No running event loop — close the coroutine to avoid a warning.
+        coro.close()
+        return
+    _BG_TASKS.add(task)
+    task.add_done_callback(_done)
+
 
 async def _get_session():
     """Reuse one aiohttp session for Loki pushes (BUG-D6 fix)."""
@@ -134,7 +158,8 @@ def process_line(line: str) -> None:
     if len(_batch) > MAX_BUFFER:
         _batch = _batch[len(_batch) - MAX_BUFFER:]
     if len(_batch) >= BATCH_SIZE:
-        asyncio.create_task(push_chunk())
+        # F2 round-2 fix: retained reference + exception logging.
+        _fire_and_forget(push_chunk(), label='push_chunk')
 
 
 async def tail() -> None:

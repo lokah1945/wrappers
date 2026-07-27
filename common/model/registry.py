@@ -182,7 +182,15 @@ class LocalModelRegistry:
         return sorted(set(ids))
 
     def resolve(self, requested: str, scope_chain: list[tuple[str, str]] | None = None) -> ModelRef:
-        return self.aliases.resolve(requested, self.provider, scope_chain, revision="local")
+        # CM-1 caller fix: wrappers bind aliases under ("wrapper", provider)
+        # via bind_explicit_aliases but historically called resolve() with an
+        # empty chain, making those bindings unreachable. Inject the wrapper
+        # scope by default; explicit chains still take precedence order.
+        chain = list(scope_chain or [])
+        wrapper_scope = ("wrapper", self.provider)
+        if wrapper_scope not in chain:
+            chain.append(wrapper_scope)
+        return self.aliases.resolve(requested, self.provider, chain, revision="local")
 
     def call_plan(self, requested: str, client_surface: str,
                   scope_chain: list[tuple[str, str]] | None = None):

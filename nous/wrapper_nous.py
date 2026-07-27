@@ -775,6 +775,10 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
         tried += 1
         last_status, last_result = status, result
+        if status in (401, 403):
+            # F8 fix: upstream rejected the cached OAuth token — drop the
+            # cache so the next request re-reads AUTH_PATH from disk.
+            _invalidate_auth_token_cache()
         if status == 429:
             oauth_retry_after = _retry_after_seconds(result)
         if not _is_retriable_upstream_status(status, result):
@@ -846,6 +850,9 @@ async def get_nous_json_with_retries(path: str) -> tuple:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 if r.status == 200:
                     return r.status, data
+                if r.status in (401, 403):
+                    # F8 fix: cached OAuth token rejected — force re-read.
+                    _invalidate_auth_token_cache()
                 last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
                 if not _is_retriable_upstream_status(r.status, last_data):
                     return last_status, last_data
@@ -1682,6 +1689,34 @@ async def record_model_result(model_id: str, key_entry, status: int, payload, en
     except Exception as e:
         logger.warning(f"[model-state] Nous result record failed: {e}")
 
+
+# N-07/F3 round-2 fix: the event loop keeps only WEAK references to tasks, so
+# a bare create_task with no retained handle can be garbage-collected
+# mid-flight (silently dropping e.g. Codex previous_response_id history or a
+# model-state write). Keep a strong reference until the task completes.
+_BG_TASKS: set = set()
+
+
+def _fire_and_forget(coro, label: str = "bg") -> None:
+    """Schedule a background task with a retained reference and exception
+    logging (N-07/F3 fix: _BG_TASKS pattern, nvidia parity)."""
+    def _done(task: "asyncio.Task"):
+        _BG_TASKS.discard(task)
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.warning(f"[{label}] background task failed: {exc}")
+    try:
+        task = asyncio.get_running_loop().create_task(coro)
+    except RuntimeError:
+        # No running event loop (import-time/test context) — close the coroutine.
+        coro.close()
+        return
+    _BG_TASKS.add(task)
+    task.add_done_callback(_done)
+
 # --------------------------------------------------------------------------
 # RATE LIMIT
 # --------------------------------------------------------------------------
@@ -1696,9 +1731,12 @@ def check_rate_limit(ip: str):
         if len(rate_limits[ip]) >= RATE_LIMIT_RPM:
             return False
         rate_limits[ip].append(now)
-        # N-14 fix: sweep empty per-IP lists so the defaultdict cannot grow
-        # unboundedly over long uptimes with many distinct client addresses.
-        stale = [k for k, v in rate_limits.items() if not v and k != ip]
+        # N-14 round-2 fix: prune keys whose timestamps are ALL older than the
+        # 60s TTL (not just already-empty lists) — a one-shot client IP
+        # previously kept its stale non-empty list forever, so the defaultdict
+        # grew unboundedly over long uptimes with many distinct addresses.
+        stale = [k for k, v in rate_limits.items()
+                 if k != ip and (not v or all(now - t >= 60 for t in v))]
         for k in stale:
             del rate_limits[k]
     return True
@@ -1918,16 +1956,39 @@ def _get_session_lock() -> asyncio.Lock:
         _SESSION_LOCK = asyncio.Lock()
     return _SESSION_LOCK
 
+# F8 round-2 fix: the AUTH_PATH token file was opened and JSON-parsed on every
+# request. Cache the token in memory; refresh when the file mtime changes or
+# after an upstream auth failure (_invalidate_auth_token_cache()).
+_AUTH_TOKEN_CACHE = {"token": None, "mtime": None}
+
+
+def _invalidate_auth_token_cache():
+    """Force the next _read_token_from_auth_path() to re-read AUTH_PATH
+    (called when upstream rejects the cached OAuth token)."""
+    _AUTH_TOKEN_CACHE["token"] = None
+    _AUTH_TOKEN_CACHE["mtime"] = None
+
+
 def _read_token_from_auth_path():
-    """Read OAuth access token from AUTH_PATH (Hermes profile format)."""
+    """Read OAuth access token from AUTH_PATH (Hermes profile format).
+
+    F8 fix: cached in memory; re-read only on file-mtime change or after
+    _invalidate_auth_token_cache() (auth failure).
+    """
     if not AUTH_PATH or not os.path.exists(AUTH_PATH):
         return None
     try:
+        mtime = os.path.getmtime(AUTH_PATH)
+        if _AUTH_TOKEN_CACHE["token"] is not None and _AUTH_TOKEN_CACHE["mtime"] == mtime:
+            return _AUTH_TOKEN_CACHE["token"]
         with open(AUTH_PATH) as f:
             data = json.load(f)
         # Extract token from hermes profile format
         token = data.get("providers", {}).get("nous", {}).get("access_token")
-        return token if token else None
+        token = token if token else None
+        _AUTH_TOKEN_CACHE["token"] = token
+        _AUTH_TOKEN_CACHE["mtime"] = mtime
+        return token
     except Exception as e:
         logger.warning(f"[auth] Failed to read token from AUTH_PATH: {e}")
         return None
@@ -2093,7 +2154,9 @@ async def chat_completions(request: Request):
         body = await request.json()
     except Exception as e:
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
-    client_ip = request.client.host
+    # INFO parity fix: request.client can be None (e.g. some test clients /
+    # unix sockets) — guard instead of raising AttributeError.
+    client_ip = request.client.host if request.client else "unknown"
     if not check_rate_limit(client_ip):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
@@ -2138,7 +2201,9 @@ async def chat_completions(request: Request):
     extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
-    await record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions")
+    # F3 round-2 fix: model-state persistence must not delay the response;
+    # fire-and-forget with a retained reference (_BG_TASKS pattern).
+    _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
     metrics.record(error=(status != 200))
 
     if status != 200:
@@ -2169,7 +2234,8 @@ async def responses(request: Request):
     except Exception as e:
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
     # N-11 fix: per-IP rate limiting on this endpoint too (SEC sibling gap).
-    if not check_rate_limit(request.client.host):
+    # INFO parity fix: request.client can be None — guard with "unknown".
+    if not check_rate_limit(request.client.host if request.client else "unknown"):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     # N-11 fix: type-guard + cap max_output_tokens (int("abc") previously → 500).
     mot_err = validate_max_tokens_field(body.get("max_output_tokens"), "max_output_tokens")
@@ -2187,7 +2253,8 @@ async def responses(request: Request):
     extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
-    await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
+    # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
+    _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
     metrics.record(error=(status != 200))
     if status != 200:
@@ -2211,10 +2278,13 @@ async def responses(request: Request):
                 # ignored GeneratorExit) and can skip persistence entirely.
                 # A background task persists the history either way, so the
                 # next turn's previous_response_id still finds the assistant
-                # tool_calls.
+                # tool_calls. N-07 round-2 fix: retain the task reference via
+                # _fire_and_forget (_BG_TASKS) so the loop's weak ref cannot
+                # let it be GC'd mid-flight, and log its exceptions.
                 try:
-                    asyncio.get_running_loop().create_task(
-                        store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
+                    _fire_and_forget(
+                        store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()]),
+                        "store-conversation",
                     )
                 except Exception as e:
                     logger.warning(f"[responses] store_conversation scheduling failed: {e}")
@@ -2245,7 +2315,8 @@ async def messages(request: Request):
     except Exception as e:
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
     # N-11 fix: per-IP rate limiting on this endpoint too (SEC sibling gap).
-    if not check_rate_limit(request.client.host):
+    # INFO parity fix: request.client can be None — guard with "unknown".
+    if not check_rate_limit(request.client.host if request.client else "unknown"):
         raise HTTPException(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
     # N-11 fix: apply the shared SEC3 cap+validation (upper bound was missing).
     mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens', required=True)
@@ -2271,7 +2342,8 @@ async def messages(request: Request):
     extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
-    await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
+    # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
+    _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
     metrics.record(error=(status != 200))
     if status != 200:
@@ -2324,12 +2396,12 @@ async def model_status(request: Request):
 async def dashboard(request: Request):
     """Serve the wrapper dashboard HTML.
 
-    N-03 fix: requires auth and never injects the raw BEARER_TOKEN into the
-    HTML. The dashboard page prompts for the token client-side instead, so a
-    client that can merely reach the port can no longer read the proxy
-    credential out of an unauthenticated page.
+    N-03 round-2 fix: the HTML shell is secret-free (the BEARER_TOKEN is never
+    injected), so it is served WITHOUT auth — a browser cannot attach a bearer
+    header on plain navigation, which made the auth-gated page unreachable.
+    Auth stays enforced on every API endpoint the page calls; the token is
+    entered client-side via the existing sessionStorage prompt.
     """
-    await _auth_check(request)
     from pathlib import Path
     from fastapi.responses import HTMLResponse
     dashboard_path = Path(__file__).parent / "dashboard.html"

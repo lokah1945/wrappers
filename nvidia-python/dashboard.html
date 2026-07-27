@@ -803,35 +803,39 @@ const fmtFull = ts => {
 const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
 const pct = (v, total) => total ? Math.round(v / total * 100) : 0;
 
-// Auth token for API calls. Sources (in priority order):
-//   1. <meta name="wrapper-bearer-token"> — injected server-side by the wrapper
-//   2. ?token=... URL query param — for manual override / bookmark
-//   3. sessionStorage('wn-bearer') — persisted from previous source
-// Falls back to no-auth (bare fetch) when no token is set anywhere.
+// Auth token for API calls. V-06 round-2 fix: the server no longer injects
+// the bearer token into this page (no <meta> tag). Sources (priority order):
+//   1. ?token=... URL query param — for manual override / bookmark
+//   2. sessionStorage('wn-bearer') — persisted from a previous source
+//   3. one-time prompt (nous N-03 pattern) — stored in sessionStorage only
 function getAuthHeaders() {
-  // 1. Meta tag (injected server-side — most reliable)
-  const meta = document.querySelector('meta[name="wrapper-bearer-token"]');
-  if (meta && meta.content) {
-    return { 'Authorization': 'Bearer ' + meta.content };
-  }
-  // 2. URL query param
+  // 1. URL query param
   const params = new URLSearchParams(window.location.search);
   const urlToken = params.get('token');
   if (urlToken) {
     try { sessionStorage.setItem('wn-bearer', urlToken); } catch {}
     return { 'Authorization': 'Bearer ' + urlToken };
   }
-  // 3. sessionStorage
+  // 2. sessionStorage
   try {
     const stored = sessionStorage.getItem('wn-bearer');
     if (stored) return { 'Authorization': 'Bearer ' + stored };
   } catch {}
+  // 3. One-time client-side prompt; kept in sessionStorage only.
+  let token = '';
+  try {
+    token = window.prompt('Enter wrapper bearer token (leave empty if auth is disabled):') || '';
+    sessionStorage.setItem('wn-bearer', token);
+  } catch {}
+  if (token) return { 'Authorization': 'Bearer ' + token };
   return {};
 }
 
 async function apiFetch(url, options = {}) {
   const headers = { ...getAuthHeaders(), ...(options.headers || {}) };
   const r = await fetch(url, { ...options, headers });
+  // Wrong token → drop it so the next call re-prompts.
+  if (r.status === 401) { try { sessionStorage.removeItem('wn-bearer'); } catch {} }
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }

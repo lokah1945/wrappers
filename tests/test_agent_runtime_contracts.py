@@ -63,7 +63,7 @@ def test_nvidia_responses_stream_eof_completed_before_done_and_no_late_delta():
     ResponsesHandler, _STORE = _load_nvidia_responses()
     _STORE.clear()
 
-    async def fake_proxy(chat_body, headers, model, request):
+    async def fake_proxy(chat_body, headers, model, request, metric_path=None):
         async def upstream():
             yield ("data: " + json.dumps({"choices": [{"delta": {"content": "hello"}}]}) + "\n\n").encode()
             yield (
@@ -105,7 +105,7 @@ def test_nvidia_responses_nonstream_stores_assistant_tool_calls_for_next_turn():
     _STORE.clear()
     captured = []
 
-    async def fake_proxy(chat_body, headers, model, request):
+    async def fake_proxy(chat_body, headers, model, request, metric_path=None):
         captured.append(chat_body)
         return {
             "status": 200,
@@ -244,7 +244,7 @@ def test_opencode_proxy_retries_next_key_before_returning_upstream_error():
     os.environ["OPENCODE_API_KEY_2"] = "sk-test-key-good222"
     calls = []
 
-    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False):
+    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False, metric_path=None):
         token = (headers or {}).get("Authorization", "").replace("Bearer ", "")
         calls.append(token)
         if token == "sk-test-key-bad111":
@@ -318,7 +318,7 @@ def test_blackbox_proxy_retries_next_key_before_error():
     os.environ["BLACKBOX_API_KEY_2"] = "sk-blackbox-good222"
     calls = []
 
-    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False):
+    async def fake_proxy(method, url, json_body=None, headers=None, is_stream=False, metric_path=None):
         token = (headers or {}).get("Authorization", "").replace("Bearer ", "")
         calls.append(token)
         if token == "sk-blackbox-bad111":

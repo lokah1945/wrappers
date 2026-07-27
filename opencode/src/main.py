@@ -453,7 +453,9 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                     data = json.loads(text)
                 except Exception:
                     data = text
-                await _breaker_outcome(True)  # OC-6 / DR-2
+                # NB-2: only 5xx (or transport exceptions) count as breaker
+                # failures — client 4xx must not open the breaker (mirror blackbox).
+                await _breaker_outcome(resp.status >= 500)
                 return resp.status, _normalize_upstream_error(resp.status, data)
             await _breaker_outcome(False)  # OC-6 / DR-2
             return 200, resp
@@ -467,7 +469,8 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             except Exception:
                 data = text
             if resp.status >= 400:
-                await _breaker_outcome(True)  # OC-6 / DR-2
+                # NB-2: failure only for status >= 500 (mirror blackbox).
+                await _breaker_outcome(resp.status >= 500)
                 return resp.status, _normalize_upstream_error(resp.status, data)
             if not isinstance(data, dict):
                 data = {"error": {"message": str(data)[:2000], "type": "api_error"}}
@@ -512,6 +515,19 @@ def _should_cooldown_key(status: int, data) -> bool:
     if status == 404 and _looks_model_capacity_error(data):
         return False
     return status in (401, 402, 403, 408, 409, 429) or status >= 500
+
+
+# NB-8: strong references for fire-and-forget tasks — asyncio only keeps a weak
+# reference to tasks, so an unreferenced create_task() result can be GC'd
+# mid-flight. Store here; discard on completion.
+_BG_TASKS: Set[asyncio.Task] = set()
+
+
+def _spawn_bg_task(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _BG_TASKS.add(task)
+    task.add_done_callback(_BG_TASKS.discard)
+    return task
 
 
 async def _record_model_result(model_id, key, status, data, url):
@@ -569,7 +585,7 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             # F3: record model-state/observation off the hot path (fire-and-forget
             # task) instead of awaiting SQLite commits before returning the
             # response — keeps TTFB off the DB write.
-            asyncio.create_task(_record_model_result(model_id, key, status, data, url))
+            _spawn_bg_task(_record_model_result(model_id, key, status, data, url))  # NB-8
         if status == 200:
             if is_stream:
                 return status, data, key
@@ -579,7 +595,10 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         last_status, last_data = status, data
         classification = classify_upstream_error(status, data)
         if _is_retriable_upstream_status(status, data) and classification['retry_same_model']:
-            avail = len([k for k in pool.keys if not k.is_hard_blocked()])
+            # NB-6 (OC-13): count OTHER ready keys — the key being marked failed
+            # must be excluded, otherwise avail >= 1 always and the
+            # available_keys<=0 short-cooldown branch in mark_failure is dead.
+            avail = len([k for k in pool.keys if k is not key and not k.is_hard_blocked()])
             if _should_cooldown_key(status, data):
                 pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream', available_keys=avail)
             pool.release(key)
@@ -696,7 +715,9 @@ def anthropic_to_openai(body: dict) -> dict:
             final = parts
         elif parts:
             p0 = parts[0]
-            final = p0['text'] if p0.get('type') == 'text' else p0
+            # NB-7 (DR-5): a single non-text part (e.g. one image block) must be
+            # wrapped in a list — a bare part dict as `content` 400s upstream.
+            final = p0['text'] if p0.get('type') == 'text' else [p0]
         else:
             final = '' if tools else None
         if role == 'user' and not parts and not tools:
@@ -776,23 +797,40 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
 _RESPONSE_STORE: dict = {}  # namespaced key -> {"ts": float, "data": list}
 _RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSE_STORE_TTL_SEC', '3600'))
 _RESPONSE_STORE_MAX_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_CHARS', '4000000'))
+_RESPONSE_STORE_MAX_ENTRY_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_ENTRY_CHARS', '500000'))
 
 
 def _store_response(principal: str, key: str, data) -> None:
     """OC-11: namespace conversation history by auth principal so a guessed
     `previous_response_id` cannot read another tenant's turns; bound per-entry
-    size and expire stale entries on a TTL."""
+    size and expire stale entries on a TTL.
+
+    NB-10: trim without repeatedly re-serializing the whole payload on the
+    event loop (the old drop-one/re-dumps loop was O(n^2) over multi-MB JSON
+    → multi-second stalls). Each entry is serialized exactly once; huge
+    single-turn entries are truncated before storage; trimming drops oldest
+    turns using the precomputed per-entry sizes.
+    """
     global _RESPONSE_STORE
-    try:
-        serialized = json.dumps(data, ensure_ascii=False)
-    except Exception:
-        serialized = str(data)
-    if len(serialized) > _RESPONSE_STORE_MAX_CHARS:
-        # Trim to fit: keep the most recent turns under the cap.
-        trimmed = list(data)
-        while trimmed and len(json.dumps(trimmed, ensure_ascii=False)) > _RESPONSE_STORE_MAX_CHARS:
-            trimmed = trimmed[1:]
-        data = trimmed
+    if isinstance(data, list):
+        entries, sizes = [], []
+        for item in data:
+            try:
+                s_len = len(json.dumps(item, ensure_ascii=False))
+            except Exception:
+                s_len = len(str(item))
+            if s_len > _RESPONSE_STORE_MAX_ENTRY_CHARS:
+                role = item.get('role', 'user') if isinstance(item, dict) else 'user'
+                item = {"role": role, "content": f"[truncated by wrapper: entry of {s_len} chars exceeded RESPONSE_STORE_MAX_ENTRY_CHARS]"}
+                s_len = len(json.dumps(item, ensure_ascii=False))
+            entries.append(item)
+            sizes.append(s_len + 2)  # +2 ≈ JSON list separator overhead
+        total = sum(sizes)
+        start = 0
+        while start < len(entries) and total > _RESPONSE_STORE_MAX_CHARS:
+            total -= sizes[start]
+            start += 1
+        data = entries[start:]
     store_key = f"{principal}\x00{key}"
     _RESPONSE_STORE[store_key] = {"ts": time.time(), "data": data}
     # Evict expired entries and bound total size to 200.
@@ -938,7 +976,6 @@ async def _chunk_stream(resp):
     30-120s) — not only after a chunk arrives (BUG-CODEX2). Cancels the pending
     read task on exit so a client disconnect never leaks a dangling awaiter.
     """
-    import aiohttp
     chunk_iter = resp.content.iter_any().__aiter__()
     chunk_task = None
     try:
@@ -954,8 +991,11 @@ async def _chunk_stream(resp):
                 chunk = finished.result()
             except StopAsyncIteration:
                 break
-            except (asyncio.TimeoutError, aiohttp.ClientError):
-                break
+            # NB-4: TimeoutError/ClientError are NOT swallowed here — an upstream
+            # mid-stream failure must propagate so callers (stream_passthrough /
+            # responses gen) surface an error instead of synthesizing a clean
+            # [DONE]/response.completed with truncated text (mirror blackbox
+            # _iter_chunks_with_idle, which propagates errors).
             yield (False, chunk)
     finally:
         if chunk_task is not None:
@@ -1075,7 +1115,16 @@ async def lifespan(app: FastAPI):
     # OC-17: refresh the model catalog at boot instead of serving stale/fallback
     # data for up to MODEL_CATALOG_REFRESH_SEC (default 1 day) before the first
     # background refresh.
-    await refresh_model_catalog_once()
+    # NB-14: bound the boot refresh — previously awaited unbounded (up to the
+    # 600s request timeout) before the app started serving. On timeout the
+    # periodic loop / next /v1/models call picks it up.
+    try:
+        _boot_refresh_timeout = float(os.environ.get('BOOT_CATALOG_REFRESH_TIMEOUT_SEC', '15'))
+        await asyncio.wait_for(refresh_model_catalog_once(), timeout=_boot_refresh_timeout)
+    except asyncio.TimeoutError:
+        logger.warning('[model-catalog] boot refresh timed out; serving with cached/fallback catalog')
+    except Exception as _boot_exc:
+        logger.warning(f'[model-catalog] boot refresh failed: {_boot_exc}')
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     _METRICS_PERSIST_TASK = asyncio.create_task(_metrics_persist_loop())  # OC-14
     yield
@@ -1145,7 +1194,10 @@ def _auth_check(request: Request):
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     client_token = auth.replace("Bearer ", "", 1).strip()
     # SEC-5: constant-time comparison to avoid timing side-channels on the token.
-    if not client_token or not hmac.compare_digest(client_token, token):
+    # NB-11: compare as bytes — compare_digest raises TypeError (→ 500) on
+    # non-ASCII str input; encoding both sides makes it a clean 401 instead.
+    if not client_token or not hmac.compare_digest(
+            client_token.encode('utf-8'), token.encode('utf-8')):
         raise HTTPException(401, {"error": {"type": "authentication_error", "message": "Unauthorized"}})
 
 @app.get("/health")

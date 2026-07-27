@@ -328,9 +328,16 @@ const fmtTime = ts => {
 };
 
 function getAuthHeaders() {
+  // OC-3/NB-3: the server no longer embeds the bearer token in this page.
+  // Prompt once and keep it in localStorage (ported from blackbox dashboard).
   const meta = document.querySelector('meta[name="wrapper-bearer-token"]');
   if (meta && meta.content) return { 'Authorization': 'Bearer ' + meta.content };
-  return {};
+  let tok = localStorage.getItem('wrapper-bearer-token');
+  if (tok === null) {
+    tok = window.prompt('Enter wrapper BEARER_TOKEN (leave blank if auth is disabled):') || '';
+    localStorage.setItem('wrapper-bearer-token', tok);
+  }
+  return tok ? { 'Authorization': 'Bearer ' + tok } : {};
 }
 
 async function apiFetch(url, options = {}) {
