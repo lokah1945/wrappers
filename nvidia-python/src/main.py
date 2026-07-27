@@ -59,10 +59,21 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
+    # Ensure /root/wrapper (where the shared `common` package lives) is on the
+    # path, since the systemd service sets PYTHONPATH=.../nvidia-python only.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.middleware import RequestSizeLimiter, sanitize_header_value
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
+
+    def sanitize_header_value(value):
+        # Fallback sanitizer: upstream common.middleware is missing from the
+        # repo, so provide the BUG-SEC2 header-injection guard inline.
+        # Strip control chars that could be used for header injection (CRLF etc.)
+        if not isinstance(value, str):
+            value = str(value)
+        return re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
