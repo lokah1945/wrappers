@@ -1915,6 +1915,28 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)
 
+
+# Request latency tracking middleware
+@app.middleware("http")
+async def add_latency_tracking(request: Request, call_next):
+    import time
+    start_time = time.time()
+    
+    response = await call_next(request)
+    
+    latency_ms = (time.time() - start_time) * 1000
+    request_id = request.headers.get("x-request-id", "N/A")
+    
+    logger.info(
+        f"[{wrapper}] request_id={request_id} "
+        f"method={request.method} path={request.url.path} "
+        f"latency={latency_ms:.2f}ms status={response.status_code}"
+    )
+    
+    response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
+    return response
+
+
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException):
     detail = exc.detail

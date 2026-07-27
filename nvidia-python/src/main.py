@@ -274,6 +274,34 @@ async def verify_loop(pool):
 # ----------------------------------------------------------------------
 # .env HOT RELOAD WATCHER (full Node parity)
 # ----------------------------------------------------------------------
+
+def validate_config():
+    """Validate required configuration at startup."""
+    import os
+    import sys
+    
+    missing = []
+    for var in ['NVIDIA_API_KEY_1', 'BEARER_TOKEN']:
+        if not os.environ.get(var):
+            missing.append(var)
+    
+    if missing:
+        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
+    
+    # Validate port range
+    try:
+        port = int(os.environ.get('LISTEN_PORT', '9101'))
+        if not (1024 <= port <= 65535):
+            print(f"❌ ERROR: Invalid port {port}")
+            sys.exit(1)
+    except ValueError:
+        print(f"❌ ERROR: LISTEN_PORT must be an integer")
+        sys.exit(1)
+    
+    print(f"✅ Configuration validated successfully")
+
+
 def start_env_watcher():
     """Start .env hot-reload watcher (exact parity with Node reloadDotenv + fs.watch)."""
     if not HAS_WATCHDOG:
@@ -2882,6 +2910,7 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
+        validate_config()
         logger.info(f'[lifecycle] wrapper-nvidia starting (v{VERSION}, commit={GIT_COMMIT})')
         await server.init()
         try:
