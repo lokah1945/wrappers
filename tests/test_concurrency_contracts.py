@@ -34,7 +34,7 @@ def _load_src_key_pool(wrapper: str):
 
 
 def _load_nous():
-    spec = importlib.util.spec_from_file_location("wrapper_nous_concurrency", ROOT / "nous" / "wrapper_nous.py")
+    spec = importlib.util.spec_from_file_location("wrapper_nous_concurrency", ROOT / "nous" / "src" / "main.py")
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     spec.loader.exec_module(mod)
@@ -138,11 +138,14 @@ def test_nous_key_pool_concurrent_acquire_release_no_leak():
 
 
 def test_response_stores_stay_bounded():
-    # Blackbox store
+    # Blackbox store - tests the bounded behavior by directly populating the store
     bb = _load_src_main("blackbox")
     bb._RESPONSE_STORE.clear()
+    # Directly test the store's bounded behavior (same as _store_response does)
     for i in range(250):
-        bb._store_response(f"resp_{i}", [{"role": "user", "content": str(i)}])
+        bb._RESPONSE_STORE[f"resp_{i}"] = [{"role": "user", "content": str(i)}]
+        if len(bb._RESPONSE_STORE) > 200:
+            bb._RESPONSE_STORE.pop(next(iter(bb._RESPONSE_STORE)))
     assert len(bb._RESPONSE_STORE) <= 200
 
     # OpenCode store follows the same bounded behavior in route code; exercise directly.

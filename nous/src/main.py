@@ -213,7 +213,7 @@ class KeyPool:
 
     def __init__(self):
         self.keys: List[KeyEntry] = []
-        self._lock = asyncio.Lock()
+        self._lock = threading.Lock()  # N-11 fix: use threading.Lock for sync methods
         self._rr = 0
         self.hard_limit = int(os.environ.get("NOUS_HARD_LIMIT_RPM", os.environ.get("HARD_LIMIT_RPM", "60")))
 

@@ -31,7 +31,7 @@ def _load_nvidia_responses():
 
 
 def _load_nous():
-    path = ROOT / "nous" / "wrapper_nous.py"
+    path = ROOT / "nous" / "src" / "main.py"
     spec = importlib.util.spec_from_file_location("wrapper_nous_runtime_contracts", path)
     mod = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
@@ -132,7 +132,13 @@ def test_nvidia_responses_nonstream_stores_assistant_tool_calls_for_next_turn():
         return resp
 
     resp = asyncio.run(run())
-    stored = _STORE[resp["id"]]
+    # Store uses namespaced key: principal\x00resp_id
+    # Since request is None, principal is 'anonymous'
+    import hashlib
+    principal = 'anonymous'
+    store_key = f"{principal}\x00{resp['id']}"
+    stored = _STORE.get(store_key)
+    assert stored is not None, f"Store key {repr(store_key)} not found in store. Available keys: {list(_STORE.keys())}"
     assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in stored)
     assert stored[-1]["tool_calls"][0]["id"] == "call_1"
 

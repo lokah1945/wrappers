@@ -18,14 +18,14 @@ def test_nvidia_has_no_inference_model_fallback_path():
 
 def test_transparency_contract_is_explicit_in_docs():
     contract = (ROOT / "WRAPPER_CONTRACT.md").read_text()
-    assert "must never select another model" in contract
-    assert "model substitution" in contract.lower()
+    assert "Transparent model choice" in contract
+    assert "silently substitute client-selected models" in contract
 
 
 def test_all_wrappers_have_no_alternative_model_execution_markers():
     sources = [
         ROOT / "nvidia-python" / "src" / "main.py",
-        ROOT / "nous" / "wrapper_nous.py",
+        ROOT / "nous" / "src" / "main.py",
         ROOT / "opencode" / "src" / "main.py",
         ROOT / "blackbox" / "src" / "main.py",
     ]
@@ -39,7 +39,7 @@ def test_all_wrappers_have_no_alternative_model_execution_markers():
 def test_concrete_requests_do_not_mutate_dynamic_alias_state():
     for path in (
         ROOT / "nvidia-python" / "src" / "main.py",
-        ROOT / "nous" / "wrapper_nous.py",
+        ROOT / "nous" / "src" / "main.py",
         ROOT / "opencode" / "src" / "main.py",
         ROOT / "blackbox" / "src" / "main.py",
     ):

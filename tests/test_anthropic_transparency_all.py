@@ -24,7 +24,7 @@ os.environ.setdefault("FREE_ONLY", "no")
 
 
 def _load_nous():
-    src = (ROOT / "nous" / "wrapper_nous.py").read_text()
+    src = (ROOT / "nous" / "src" / "main.py").read_text()
     src = src.replace('"/root/wrapper/nous/wrapper_nous.log"', '"/tmp/wrapper-audit-logs/nous.log"')
     path = Path("/tmp/wrapper-audit-logs/wrapper_nous_audit.py")
     path.parent.mkdir(parents=True, exist_ok=True)
