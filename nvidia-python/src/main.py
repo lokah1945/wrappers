@@ -2352,9 +2352,9 @@ class Server:
         'key_rate_limited' / 'model_rate_limited', so 429 responses were never
         retried across keys — defeating multi-key rotation entirely.
         """
-        state = classification.get('state', '')
+        state = classification['state']
         # Prefer the explicit retry flag from the classification when available
-        if classification.get('retry_same_model'):
+        if classification['retry_same_model']:
             return True
         return state in (
             'key_rate_limited', 'model_rate_limited',
