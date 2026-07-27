@@ -56,11 +56,18 @@ except ImportError:
 
 # Shared header sanitization (BUG-SEC2 fix — deduplicated from common/middleware)
 try:
+    # Ensure /root/wrapper (where the shared `common` package lives) is on the
+    # path, since the systemd service sets PYTHONPATH=.../nous only.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common.middleware import sanitize_header_value as _sanitize_header_value
 except ImportError:
-    import sys as _sys
-    _sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-    from common.middleware import sanitize_header_value as _sanitize_header_value
+    # Fallback sanitizer: upstream common.middleware is missing from the
+    # repo, so provide the BUG-SEC2 header-injection guard inline.
+    def _sanitize_header_value(value):
+        if not isinstance(value, str):
+            value = str(value)
+        import re as _re
+        return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
 
 
 # Shared translation utilities from common/translations (deduplication).

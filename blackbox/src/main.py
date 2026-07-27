@@ -8,6 +8,7 @@ structured tools, dynamic aliases, and strict stream finalization.
 """
 
 from __future__ import annotations
+import sys
 
 import os
 import json
@@ -34,10 +35,21 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
+    # Ensure /root/wrapper (where the shared `common` package lives) is on the
+    # path, since the systemd service sets PYTHONPATH=.../blackbox only.
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.middleware import RequestSizeLimiter, sanitize_header_value
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
+
+    def sanitize_header_value(value):
+        # Fallback sanitizer: upstream common.middleware is missing from the
+        # repo, so provide the BUG-SEC2 header-injection guard inline.
+        if not isinstance(value, str):
+            value = str(value)
+        import re as _re
+        return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
 from dotenv import load_dotenv
 
 try:
