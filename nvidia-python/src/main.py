@@ -2011,7 +2011,10 @@ class Server:
             body['model'] = model_id
             if is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
-            return await self._proxy_post(request, body, raw, model_id, '/v1/embeddings', lambda key: f"{resolve_base(model_id)}/v1/embeddings")
+            # BUG-ROUTE1 fix: /v1/embeddings routes to BASE_GENAI, not BASE_LLM.
+            # resolve_base(model_id) always returned BASE_LLM because a model_id
+            # never starts with '/v1/embeddings'. Use route_upstream directly.
+            return await self._proxy_post(request, body, raw, model_id, '/v1/embeddings', lambda key: f"{route_upstream('/v1/embeddings')}/v1/embeddings")
 
         @app.post('/v1/ranking')
         async def ranking(request: Request):
