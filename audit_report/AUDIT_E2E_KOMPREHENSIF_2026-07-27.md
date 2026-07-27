@@ -64,6 +64,14 @@ Infrastruktur dasarnya sehat: session aiohttp shared + pooled, streaming chunk-b
 | OC-2/BB-2 | HIGH | Leak koneksi streaming saat call-plan rejection (tanpa `resp.release()`) |
 | CM-1 | HIGH | `AliasResolver.resolve` bug scope-skip — binding registry tak pernah ketemu |
 | MR-1 | HIGH | Registry DB path drift: DB 2,5 MB orphan di root repo; service pakai path kosong |
+| V-02 | HIGH | nvidia `key_pool.py:928-933`: `km.split('/')` ValueError karena model ID mengandung `/` → per-key model limit TAK PERNAH expired → key di-skip selamanya untuk model itu setelah satu 429 (terkonfirmasi via eksekusi pola) |
+| V-03 | HIGH | nvidia `_acquire_slot`: ghost ticket menumpuk di `_waiting` saat client cancel → backpressure `max_queue_size=500` akhirnya menolak SEMUA traffic + starvasi rank pacing |
+| N-01 | HIGH | nous `post_nous`: network error tidak dibungkus → leak in-flight slot key permanen + 500 mentah ke client |
+| N-02 | HIGH | nous `_RESPONSE_STORE` unbounded (sibling bug yang SUDAH difix di nvidia `responses_compat._bounded_store`) — memory leak percakapan |
+| V-04 | HIGH | **Loki 401 retry storm SEDANG BERLANGSUNG** di `nvidia_py.log` — batch tak dibatasi, auth Loki gagal terus |
+| V-05 | HIGH | nvidia `_stream_proxy` tanpa `resp.release()` (fix-nya sudah ada di `stream_wrapper` — sibling instance terlewat) |
+
+**Verifikasi fix terbaru (parts/nous_nvidia §0):** `f5bfeea` (Codex hang), `68c1d47` & `21d0f79` (sanitize NameError) — ketiganya **PRESENT & complete** di HEAD. Risiko residual adalah sibling-pattern di atas, bukan regresi fix-nya.
 
 ### 4. Status runtime vs repo
 
