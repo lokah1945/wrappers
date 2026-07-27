@@ -412,14 +412,14 @@ def start_env_watcher():
                         logger.warning(f'[env] key pool reload failed: {e}')
                     logger.info('[env] .env reloaded (hot, override)')
         obs = Observer()
-        obs.schedule(EnvWatcher(), path=str(Path(__file__).parent), recursive=False)
+        obs.schedule(EnvWatcher(), path=str(Path(__file__).parent.parent), recursive=False)
         obs.start()
         logger.info('[env] Watching .env for hot reload')
     except Exception as e:
         logger.warning(f'[env] watcher failed: {e}')
 
 NOUS_BASE = os.environ.get("NOUS_BASE_URL", "https://inference-api.nousresearch.com").rstrip("/")
-MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().parent / "model-state.db"))
+MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().parent.parent / "model-state.db"))
 MODEL_CATALOG_TTL_SEC = int(os.environ.get("MODEL_CATALOG_TTL_SEC", "21600"))
 MODEL_CATALOG_REFRESH_SEC = int(os.environ.get("MODEL_CATALOG_REFRESH_SEC", "86400"))
 MODEL_STORE = ModelStateStore("nous", MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
@@ -2500,7 +2500,7 @@ async def dashboard(request: Request):
     """
     from pathlib import Path
     from fastapi.responses import HTMLResponse
-    dashboard_path = Path(__file__).parent / "dashboard.html"
+    dashboard_path = Path(__file__).parent.parent / "dashboard.html"
     if not dashboard_path.exists():
         return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
     return HTMLResponse(content=dashboard_path.read_text())
