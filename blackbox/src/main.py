@@ -1028,7 +1028,7 @@ async def lifespan(app: FastAPI):
     yield
 
     # Graceful shutdown: wait for in-flight requests
-    logger.info(f"[{wrapper_name}] Starting graceful shutdown...")
+    logger.info(f"[blackbox] Starting graceful shutdown...")
     shutdown_start = time.time()
     max_wait = 30
     while shutdown_start + max_wait > time.time():
