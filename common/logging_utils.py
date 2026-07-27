@@ -51,11 +51,18 @@ def setup_logging(
         Configured logger instance
     """
     log_file = log_file or os.environ.get('LOG_FILE', default_log_file)
+    # CM-7 fix: use RotatingFileHandler so log files are bounded on disk
+    # (previously a plain FileHandler grew without limit).
+    from logging.handlers import RotatingFileHandler
+    max_bytes = int(os.environ.get('LOG_MAX_BYTES', str(50 * 1024 * 1024)))
+    backup_count = int(os.environ.get('LOG_BACKUP_COUNT', '3'))
     try:
         os.makedirs(os.path.dirname(log_file) or '.', exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
+        file_handler = RotatingFileHandler(
+            log_file, maxBytes=max_bytes, backupCount=backup_count)
     except Exception:
-        file_handler = logging.FileHandler(default_log_file)
+        file_handler = RotatingFileHandler(
+            default_log_file, maxBytes=max_bytes, backupCount=backup_count)
 
     logger = logging.getLogger(name)
 

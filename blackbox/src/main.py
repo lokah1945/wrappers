@@ -11,6 +11,7 @@ from __future__ import annotations
 import sys
 
 import os
+import hmac
 import json
 import time
 import threading
@@ -71,16 +72,17 @@ except ImportError:
 from .metrics import Metrics
 
 # ── Shared translations from common/translations (P0 deduplication) ──
-try:
-    from common.translations import (
-        AnthropicStreamState as _SharedAnthropicStreamState,
-        normalize_upstream_error as _normalize_upstream_error,
-        strip_cache_control as _strip_cache,
-        repair_orphan_tool_messages as _repair_orphan_tool_messages,
-    )
-    _USING_SHARED_TRANSLATIONS = True
-except ImportError:
-    _USING_SHARED_TRANSLATIONS = False
+# BB-8/DR-8: fail HARD at import time if the shared translation layer is
+# missing. Previously a broken PYTHONPATH/partial deploy booted "fine" and
+# then raised NameError on the first request that touched
+# _normalize_upstream_error / AnthropicStreamState / _strip_cache.
+from common.translations import (
+    AnthropicStreamState,
+    normalize_upstream_error as _normalize_upstream_error,
+    strip_cache_control as _strip_cache,
+    repair_orphan_tool_messages as _repair_orphan_tool_messages,
+    parse_dsml_from_text as _parse_dsml_from_text,  # BB-14/DR-6
+)
 
 ROOT = Path(__file__).resolve().parents[1]
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
@@ -104,7 +106,10 @@ except ImportError:
                         handlers=[_log_file_handler, logging.StreamHandler()])
 
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9104'))
-BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
+# BB-10/F4: default to loopback. Binding to 0.0.0.0 must be an explicit,
+# deliberate LISTEN_HOST override — a manual `python -m src.main` run must
+# never silently expose the proxy to the network.
+BIND_HOST = os.environ.get('LISTEN_HOST', '127.0.0.1')
 BLACKBOX_BASE = os.environ.get('BLACKBOX_BASE_URL', 'https://api.blackbox.ai').rstrip('/')
 MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().parents[1] / 'model-state.db'))
 MODEL_CATALOG_TTL_SEC = int(os.environ.get('MODEL_CATALOG_TTL_SEC', '21600'))
@@ -115,16 +120,70 @@ MODEL_REGISTRY_CLIENT = ModelRegistryClient()
 _MODEL_REFRESH_TASK = None
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 
+
+def _bearer_token() -> str:
+    """Re-read BEARER_TOKEN from the environment on every call so .env
+    hot-reloads (watchdog) take effect without a restart (opencode parity)."""
+    return (os.environ.get('BEARER_TOKEN') or '').strip()
+
+
+def _env_flag(name: str, default: str = 'yes') -> bool:
+    return (os.environ.get(name) or default).strip().lower() in ('yes', 'true', '1', 'on', 'y')
+
+
+# ── Transparency gates (documented in .env.example) ──
+# B11: fill `content: null → ""` / zero-usage defaults in chat responses
+# (SDK-compat mutation; disable for verbatim upstream bodies).
+def _compat_fill_defaults() -> bool:
+    return _env_flag('COMPAT_FILL_DEFAULTS', 'yes')
+
+
+# B12: drop nameless tools from /v1/chat/completions requests (upstream-4xx
+# avoidance mutation; disable to forward `tools` verbatim).
+def _clean_tools_enabled() -> bool:
+    return _env_flag('CLEAN_TOOLS', 'yes')
+
+
+# B7 (opt-in): pass upstream error bodies through verbatim instead of
+# normalizing them to OpenAI error shape.
+def _raw_upstream_errors() -> bool:
+    return _env_flag('RAW_UPSTREAM_ERRORS', 'no')
+
+
+def _client_ip(request: Request) -> str:
+    """BB-11/DR-7: key rate limiting by the real peer, not the client-supplied
+    X-Forwarded-For header (spoofable → limiter bypass + unbounded store
+    growth). XFF is only a fallback when no direct peer host is available."""
+    host = getattr(request.client, 'host', None) if request.client else None
+    if host:
+        return host
+    xff = request.headers.get('x-forwarded-for')
+    if xff:
+        return xff.split(',')[0].strip()
+    return 'unknown'
+
+
 # ── Per-IP Rate Limiting ──
 from collections import defaultdict
 _rate_limit_store = defaultdict(list)
 _rate_limit_lock = threading.Lock()
+_rate_limit_last_sweep = 0.0
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
 
 def check_rate_limit(client_ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
+    global _rate_limit_last_sweep
     now = time.time()
     with _rate_limit_lock:
+        # BB-11: periodic global sweep so stale keys cannot grow unbounded.
+        if now - _rate_limit_last_sweep > 300:
+            _rate_limit_last_sweep = now
+            for k in list(_rate_limit_store.keys()):
+                pruned = [t for t in _rate_limit_store[k] if now - t < 60]
+                if pruned:
+                    _rate_limit_store[k] = pruned
+                else:
+                    del _rate_limit_store[k]
         _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < 60]
         if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_RPM:
             return False
@@ -301,10 +360,32 @@ async def get_session():
         return _session
 
 
+_FORWARD_HEADER_ALLOWLIST = ('anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent')
+# Headers that must never be forwarded verbatim (credentials / hop-by-hop).
+_FORWARD_HEADER_DENYLIST = {'authorization', 'x-api-key', 'host', 'content-length', 'content-type',
+                            'connection', 'transfer-encoding', 'accept-encoding', 'cookie'}
+
+
+def _forward_extra_headers() -> tuple:
+    """B3 (transparency, opt-in): FORWARD_EXTRA_HEADERS is a comma-separated
+    list of additional client header names to forward upstream (sanitized).
+    Default empty keeps the conservative allowlist."""
+    raw = os.environ.get('FORWARD_EXTRA_HEADERS') or ''
+    return tuple(h.strip().lower() for h in raw.split(',')
+                 if h.strip() and h.strip().lower() not in _FORWARD_HEADER_DENYLIST)
+
+
 def _auth_headers(api_key: str, request: Request = None) -> dict:
-    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json', 'Accept-Encoding': 'identity'}
+    headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
+    # F5/B2: do NOT force `Accept-Encoding: identity` anymore — let aiohttp
+    # negotiate gzip/deflate (it decompresses transparently), so large
+    # responses no longer travel uncompressed. Operators can still pin a
+    # value via UPSTREAM_ACCEPT_ENCODING (documented in .env.example).
+    accept_encoding = (os.environ.get('UPSTREAM_ACCEPT_ENCODING') or '').strip()
+    if accept_encoding:
+        headers['Accept-Encoding'] = accept_encoding
     if request is not None:
-        for k in ('anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent'):
+        for k in _FORWARD_HEADER_ALLOWLIST + _forward_extra_headers():
             v = request.headers.get(k)
             if v:
                 # BUG-SEC2 fix: use shared sanitization function
@@ -327,6 +408,27 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
     import aiohttp as _aiohttp
     sess = await get_session()
     headers = headers or {}
+
+    async def _breaker_record(ok: bool):
+        # BB-7/DR-2: actually record outcomes so the breaker can trip/recover
+        # (previously only before_request() was ever called — dead code).
+        if not _HAS_CIRCUIT_BREAKER:
+            return
+        try:
+            if ok:
+                await _UPSTREAM_BREAKER.record_success()
+            else:
+                await _UPSTREAM_BREAKER.record_failure()
+        except Exception:
+            pass
+
+    def _upstream_error_body(status: int, data):
+        # B7 (opt-in transparency): RAW_UPSTREAM_ERRORS=yes passes upstream
+        # error bodies through verbatim instead of normalizing shape.
+        if _raw_upstream_errors() and isinstance(data, dict):
+            return data
+        return _normalize_upstream_error(status, data)
+
     try:
         if is_stream:
             resp = await sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=STREAM_REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC))
@@ -337,7 +439,9 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                     data = json.loads(text)
                 except Exception:
                     data = text
-                return resp.status, _normalize_upstream_error(resp.status, data)
+                await _breaker_record(resp.status < 500)
+                return resp.status, _upstream_error_body(resp.status, data)
+            await _breaker_record(True)
             return 200, resp
         async with sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC)) as resp:
             text = await resp.text()
@@ -346,12 +450,16 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             except Exception:
                 data = text
             if resp.status >= 400:
-                return resp.status, _normalize_upstream_error(resp.status, data)
+                await _breaker_record(resp.status < 500)
+                return resp.status, _upstream_error_body(resp.status, data)
+            await _breaker_record(True)
             if not isinstance(data, dict):
                 data = {'error': {'message': str(data)[:2000], 'type': 'api_error'}}
             return resp.status, data
     except Exception as e:
-        return 502, {'error': {'message': str(e), 'type': 'api_error'}}
+        await _breaker_record(False)
+        # SEC-6: truncate transport exception text in client-facing 502s.
+        return 502, {'error': {'message': str(e)[:2000], 'type': 'api_error'}}
 
 
 def _retry_after_seconds(data, default=65) -> int:
@@ -384,42 +492,62 @@ def _should_cooldown_key(status: int, data) -> bool:
     return status in (401, 402, 403, 408, 409, 429) or status >= 500
 
 
+_BACKGROUND_TASKS: set = set()
+
+
+def _spawn_background(coro):
+    """Fire-and-forget with a strong reference so the task is not GC'd."""
+    task = asyncio.create_task(coro)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_BACKGROUND_TASKS.discard)
+    return task
+
+
+async def _record_model_result(model_id: str, api_key: str, status: int, data, url: str):
+    """F3 (latency): model-state persistence runs as a background task so the
+    SQLite commit is never awaited on the TTFB path."""
+    try:
+        if status == 200:
+            stored = await MODEL_STORE.record_status_async(model_id, credential_fingerprint(api_key), 'available', status, 'OK', endpoint=url)
+        else:
+            stored = await MODEL_STORE.record_error_async(model_id, api_key, status, data, endpoint=url)
+        MODEL_REGISTRY_CLIENT.schedule_observation(
+            'blackbox', model_id, stored.get('account_scope', credential_fingerprint(api_key)),
+            stored.get('state', 'unknown'), status, stored.get('reason_code', ''),
+            stored.get('reason_detail', ''), url,
+        )
+    except Exception as e:
+        logger.warning(f'[model-state] Blackbox result record failed: {e}')
+
+
 async def proxy_request_with_pool(method: str, url: str, json_body: dict, request: Request, is_stream: bool = False):
     attempts = max(1, pool.total_keys)
     last_status = 503
     last_data = {'error': {'message': 'No capacity', 'type': 'server_error'}}
     tried = 0
+    model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
+    # BB-2/DR-13/B9: validate the call plan BEFORE any upstream request.
+    # Previously this ran after the call, which (a) leaked the live streaming
+    # response on rejection (connection-pool exhaustion) and (b) burned
+    # upstream quota, then voided an already-successful response.
+    if model_id:
+        surface = 'anthropic_messages' if '/messages' in url else ('openai_responses' if '/responses' in url else 'openai_chat')
+        try:
+            call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
+            if not same_provider_model_id('blackbox', call_plan.model.provider_model_id, model_id):
+                return 500, {'error': {'type': 'server_error', 'message': 'Model identity changed during call-plan resolution', 'code': 'MODEL_ID_MUTATION'}}, None
+        except ValueError as exc:
+            return 400, {'error': {'type': 'invalid_request_error', 'message': str(exc), 'code': 'MODEL_CALL_PLAN_INVALID'}}, None
     for _ in range(attempts):
-        key_result = await pool.acquire(json_body.get('model', '') if isinstance(json_body, dict) else '')
+        key_result = await pool.acquire(model_id)
         if not key_result:
             break
         key = key_result['key']
         headers = _auth_headers(key.api_key, request)
         status, data = await proxy_request(method, url, json_body, headers, is_stream=is_stream)
-        model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
         if model_id:
-            surface = 'anthropic_messages' if '/messages' in url else ('openai_responses' if '/responses' in url else 'openai_chat')
-            try:
-                call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
-                if not same_provider_model_id('blackbox', call_plan.model.provider_model_id, model_id):
-                    pool.release(key)
-                    return 500, {'error': {'type': 'server_error', 'message': 'Model identity changed during call-plan resolution', 'code': 'MODEL_ID_MUTATION'}}, None
-            except ValueError as exc:
-                pool.release(key)
-                return 400, {'error': {'type': 'invalid_request_error', 'message': str(exc), 'code': 'MODEL_CALL_PLAN_INVALID'}}, None
-        if model_id:
-            try:
-                if status == 200:
-                    stored = await MODEL_STORE.record_status_async(model_id, credential_fingerprint(key.api_key), 'available', status, 'OK', endpoint=url)
-                else:
-                    stored = await MODEL_STORE.record_error_async(model_id, key.api_key, status, data, endpoint=url)
-                MODEL_REGISTRY_CLIENT.schedule_observation(
-                    'blackbox', model_id, stored.get('account_scope', credential_fingerprint(key.api_key)),
-                    stored.get('state', 'unknown'), status, stored.get('reason_code', ''),
-                    stored.get('reason_detail', ''), url,
-                )
-            except Exception as e:
-                logger.warning(f'[model-state] Blackbox result record failed: {e}')
+            # F3: fire-and-forget; never await SQLite on the response path.
+            _spawn_background(_record_model_result(model_id, key.api_key, status, None if status == 200 or not isinstance(data, (dict, str)) else data, url))
         if status == 200:
             if is_stream:
                 return status, data, key
@@ -441,6 +569,11 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
 
 
 def _ensure_chat_message(data: dict) -> dict:
+    # B11 (transparency): SDK-compat fill (`content: null → ""`, zero-usage
+    # default) is gated behind COMPAT_FILL_DEFAULTS (default yes, documented).
+    # Set COMPAT_FILL_DEFAULTS=no to forward the upstream body verbatim.
+    if not _compat_fill_defaults():
+        return data
     if not isinstance(data, dict):
         return data
     try:
@@ -514,7 +647,33 @@ def anthropic_to_openai(body: dict) -> dict:
         if reasoning:
             am['reasoning_content'] = '\n'.join(reasoning)
         msgs.append(am)
-    out = {'model': model, 'messages': _repair_orphan_tool_messages(msgs), 'stream': bool(body.get('stream')), 'max_tokens': max(int(body.get('max_tokens') or 4096), 1)}
+    out = {'model': model, 'messages': _repair_orphan_tool_messages(msgs), 'stream': bool(body.get('stream'))}
+    # B21 (transparency): never override an explicit client max_tokens.
+    # The default (4096) applies only when the client omitted/invalidated it
+    # (the endpoint already validates it is a positive int).
+    mt = body.get('max_tokens')
+    out['max_tokens'] = mt if isinstance(mt, int) and mt > 0 else 4096
+    # B21 (transparency, severe): forward client sampling parameters verbatim
+    # instead of silently dropping them.
+    for k in ('temperature', 'top_p', 'top_k'):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get('stop_sequences') is not None:
+        out['stop'] = body['stop_sequences']  # required rename for OpenAI shape
+    tc = body.get('tool_choice')
+    if tc is not None:
+        if isinstance(tc, dict):
+            t = tc.get('type')
+            if t == 'auto':
+                out['tool_choice'] = 'auto'
+            elif t == 'any':
+                out['tool_choice'] = 'required'
+            elif t == 'tool' and tc.get('name'):
+                out['tool_choice'] = {'type': 'function', 'function': {'name': tc['name']}}
+            else:
+                out['tool_choice'] = tc
+        else:
+            out['tool_choice'] = tc
     if body.get('tools'):
         tools = []
         for t in body.get('tools') or []:
@@ -542,15 +701,22 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     if reasoning:
         content.append({'type': 'thinking', 'thinking': reasoning})
     tool_calls = list(msg.get('tool_calls') or [])
-    if text or not tool_calls:
+    # BB-14/DR-6: parse MiniMax DSML tool markup leaked into visible content
+    # into structured tool_use blocks instead of passing it to clients raw
+    # (opencode parity via shared common.translations helper).
+    dsml_tools = []
+    if isinstance(text, str) and 'DSML' in text.replace('｜', '|'):
+        text, dsml_tools = _parse_dsml_from_text(text)
+    if text or (not tool_calls and not dsml_tools):
         content.append({'type': 'text', 'text': text if isinstance(text, str) else str(text)})
+    content.extend(dsml_tools)
     for tc in tool_calls:
         fn = tc.get('function') or {}
         content.append({'type': 'tool_use', 'id': tc.get('id') or f"toolu_{int(time.time()*1000)}", 'name': fn.get('name', '') or '', 'input': _parse_tool_args(fn.get('arguments', ''))})
     if not content:
         content.append({'type': 'text', 'text': ''})
     fr = (data.get('choices') or [{}])[0].get('finish_reason')
-    stop = 'tool_use' if tool_calls else {'tool_calls': 'tool_use', 'stop': 'end_turn', 'length': 'max_tokens', 'content_filter': 'refusal'}.get(fr, 'end_turn')
+    stop = 'tool_use' if (tool_calls or dsml_tools) else {'tool_calls': 'tool_use', 'stop': 'end_turn', 'length': 'max_tokens', 'content_filter': 'refusal'}.get(fr, 'end_turn')
     u = data.get('usage') or {}
     return {'id': data.get('id') or f"msg_{int(time.time()*1000)}", 'type': 'message', 'role': 'assistant', 'model': model, 'content': content, 'stop_reason': stop, 'stop_sequence': None, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0}}
 
@@ -600,13 +766,22 @@ def responses_to_chat(body: dict) -> dict:
             msgs.insert(0, {'role': 'system', 'content': body['instructions']})
     msgs = _repair_orphan_tool_messages(msgs)
     out = {'model': model, 'messages': msgs, 'stream': bool(body.get('stream', False))}
+    # BB-12/DR-9/B16: forward the client value verbatim — no bare int() cast
+    # (a non-numeric value now yields a shaped 400 via _validate_chat_body in
+    # the endpoint instead of an unhandled ValueError → raw 500), and the
+    # client's explicit value is never overridden.
     if body.get('max_output_tokens') is not None:
-        out['max_tokens'] = int(body['max_output_tokens'])
+        out['max_tokens'] = body['max_output_tokens']
     elif body.get('max_tokens') is not None:
-        out['max_tokens'] = int(body['max_tokens'])
-    for k in ('temperature', 'top_p', 'tool_choice'):
+        out['max_tokens'] = body['max_tokens']
+    # B16 (transparency): forward client params verbatim (no float() casts,
+    # no silent drops of stop/seed/parallel_tool_calls/…).
+    for k in ('temperature', 'top_p', 'tool_choice', 'stop', 'seed',
+              'parallel_tool_calls', 'stream_options', 'user', 'metadata',
+              'frequency_penalty', 'presence_penalty', 'logit_bias',
+              'logprobs', 'top_logprobs', 'response_format', 'service_tier'):
         if body.get(k) is not None:
-            out[k] = float(body[k]) if k in ('temperature', 'top_p') else body[k]
+            out[k] = body[k]
     if body.get('tools'):
         tools = []
         for t in body['tools']:
@@ -626,6 +801,11 @@ def chat_to_responses(model: str, data: dict) -> dict:
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
     text = msg.get('content') or ''
     output = []
+    # B18 (transparency): surface upstream reasoning_content as a reasoning
+    # output item (opencode parity) instead of silently discarding it.
+    reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    if reasoning:
+        output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning', 'status': 'completed', 'text': reasoning})
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call', 'status': 'completed', 'call_id': tc.get('id'), 'name': fn.get('name', '') or '', 'arguments': fn.get('arguments', '') or ''})
@@ -648,16 +828,64 @@ def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs=
     return out
 
 
+_IDLE = object()  # sentinel yielded by _iter_chunks_with_idle when upstream is silent
+
+
+async def _iter_chunks_with_idle(resp, idle_sec: float):
+    """BB-5/DR-1 (BUG-CODEX2): yield upstream chunks as they arrive, and yield
+    the _IDLE sentinel whenever the upstream has been silent for `idle_sec`,
+    so callers can emit heartbeats even while the model is thinking.
+
+    Port of the nous `wrapper_nous.py` pattern (sentinel task + asyncio.wait
+    instead of asyncio.wait_for, so a genuine upstream read timeout surfaces
+    as an error instead of being mistaken for an idle tick)."""
+    chunk_iter = resp.content.iter_any().__aiter__()
+    chunk_task = None
+    try:
+        while True:
+            if chunk_task is None:
+                chunk_task = asyncio.ensure_future(chunk_iter.__anext__())
+            done_set, _pending = await asyncio.wait({chunk_task}, timeout=idle_sec)
+            if not done_set:
+                yield _IDLE
+                continue
+            finished, chunk_task = chunk_task, None
+            try:
+                chunk = finished.result()
+            except StopAsyncIteration:
+                return
+            yield chunk
+    finally:
+        if chunk_task is not None:
+            chunk_task.cancel()
+
+
 async def stream_passthrough(resp, key, heartbeat=True):
     last_hb = time.time()
     saw_done = False
+    # BB-6: iter_any() chunks are NOT SSE-line aligned; a heartbeat comment
+    # injected mid-line corrupts the SSE frame. Only heartbeat when the last
+    # forwarded byte ended a line.
+    at_line_boundary = True
     try:
-        async for chunk in resp.content.iter_any():
+        async for chunk in _iter_chunks_with_idle(resp, HEARTBEAT_MS / 1000.0):
+            now = time.time()
+            if chunk is _IDLE:
+                # BB-5/DR-1: upstream silent (reasoning model) — heartbeat so
+                # client/LB idle timeouts do not kill the stream.
+                if heartbeat and at_line_boundary and (now - last_hb) > (HEARTBEAT_MS / 1000.0):
+                    yield b': heartbeat\n\n'
+                    last_hb = now
+                continue
             chunk_text = chunk.decode('utf-8', errors='replace') if isinstance(chunk, (bytes, bytearray)) else str(chunk)
             if 'data: [DONE]' in chunk_text or 'data:[DONE]' in chunk_text:
                 saw_done = True
             yield chunk
-            if heartbeat and (time.time() - last_hb) > (HEARTBEAT_MS / 1000.0):
+            if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                at_line_boundary = chunk.endswith(b'\n')
+            elif chunk_text:
+                at_line_boundary = chunk_text.endswith('\n')
+            if heartbeat and at_line_boundary and (time.time() - last_hb) > (HEARTBEAT_MS / 1000.0):
                 yield b': heartbeat\n\n'
                 last_hb = time.time()
         if not saw_done:
@@ -724,6 +952,10 @@ async def lifespan(app: FastAPI):
         MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="blackbox")
     start_env_watcher()
     logger.info(f'wrapper-blackbox starting on {BIND_HOST}:{LISTEN_PORT} base={BLACKBOX_BASE} free_only={free_only_enabled()} alias_target={get_dynamic_alias_target() or None}')
+    # BB-3/DR-10/SEC-2: loud startup warning when running with auth disabled.
+    if not _bearer_token():
+        logger.warning('[auth] SECURITY WARNING: BEARER_TOKEN is empty — ALL endpoints are UNAUTHENTICATED. '
+                       'Any local process can use the paid upstream keys. Set BEARER_TOKEN in blackbox/.env.')
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     yield
@@ -761,11 +993,16 @@ if _HAS_SIZE_LIMITER:
 def _auth_check(request: Request):
     if request.method == 'OPTIONS':
         return
-    if not BEARER_TOKEN:
+    token = _bearer_token()  # re-read so .env rotation takes effect
+    if not token:
+        # BB-3/DR-10: never fail silently open — log loudly (opencode parity).
+        if request.headers.get('authorization') or request.headers.get('x-api-key'):
+            logger.warning('[auth] BEARER_TOKEN unset but client sent credentials — accepting open (insecure)')
         return
     auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
-    token = auth.replace('Bearer ', '', 1).strip()
-    if token != BEARER_TOKEN:
+    client_token = auth.replace('Bearer ', '', 1).strip()
+    # SEC-5: constant-time comparison to avoid timing side-channels.
+    if not client_token or not hmac.compare_digest(client_token, token):
         raise HTTPException(401, {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}})
 
 
@@ -792,8 +1029,18 @@ async def version():
 @app.get('/v1/models')
 async def models(request: Request):
     # /v1/models is intentionally public: agents need model discovery before auth
-    cached = MODEL_STORE.get_catalog(fresh_only=True)
-    fallback = {'object': 'list', 'data': _model_list_with_aliases(CURATED_FREE_MODELS), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None}
+    # BB-9/DR-12: fetch the status map ONCE per request (opencode parity —
+    # previously status_for() ran a full-table SQLite scan per model), and run
+    # the synchronous SQLite calls off the event loop.
+    try:
+        status_map = await asyncio.to_thread(MODEL_STORE.status_map)
+    except Exception:
+        status_map = {}
+    try:
+        cached = await asyncio.to_thread(MODEL_STORE.get_catalog, True)
+    except Exception:
+        cached = []
+    fallback = {'object': 'list', 'data': _model_list_with_aliases(CURATED_FREE_MODELS, status_map), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None}
     try:
         if cached:
             upstream = cached
@@ -805,7 +1052,7 @@ async def models(request: Request):
                 MODEL_REGISTRY.register_catalog(upstream, revision='runtime-catalog')
                 MODEL_REGISTRY_CLIENT.schedule_catalog('blackbox', upstream, 'runtime-catalog')
             else:
-                upstream = MODEL_STORE.get_catalog(fresh_only=False)
+                upstream = await asyncio.to_thread(MODEL_STORE.get_catalog, False)
         normalized = []
         for m in upstream:
             entry = m if isinstance(m, dict) else {'id': str(m), 'object': 'model', 'owned_by': 'blackbox'}
@@ -815,13 +1062,16 @@ async def models(request: Request):
                     normalized.append(entry)
         if not normalized:
             normalized = fallback['data']
-        return {'object': 'list', 'data': _model_list_with_aliases(normalized), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'catalog_cached': bool(cached)}
+        return {'object': 'list', 'data': _model_list_with_aliases(normalized, status_map), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'catalog_cached': bool(cached)}
     except Exception as e:
         logger.warning(f'models fallback: {e}')
         return fallback
 
 
-def _model_list_with_aliases(models_in: list) -> list:
+def _model_list_with_aliases(models_in: list, status_map: dict | None = None) -> list:
+    # BB-9/DR-12: index one pre-fetched status_map() instead of running a
+    # full-table scan per model on the event loop.
+    status_map = status_map or {}
     data = []
     seen = set()
     for m in models_in:
@@ -833,7 +1083,7 @@ def _model_list_with_aliases(models_in: list) -> list:
         if free_only_enabled() and not model_allowed(mid):
             continue
         seen.add(mid)
-        state = MODEL_STORE.status_for(mid) or {}
+        state = status_map.get(mid) or {}
         data.append({
             **m,
             'object': m.get('object', 'model'),
@@ -855,6 +1105,9 @@ def _model_list_with_aliases(models_in: list) -> list:
 
 @app.get('/v1/capabilities')
 async def capabilities(request: Request):
+    # BB-13/DR-11: require auth (opencode parity) — account-scoped
+    # availability must not be enumerable without credentials.
+    _auth_check(request)
     model_data = (await models(request)).get('data', [])
     return {'object': 'list', 'models': [{'id': m.get('id'), 'capabilities': ['chat', 'completion'], 'streaming': True} for m in model_data if isinstance(m, dict)], 'summary': {'total': len(model_data), 'by_type': {'chat': len(model_data)}}, 'dynamic_alias_target': get_dynamic_alias_target() or None}
 
@@ -884,6 +1137,11 @@ def _validate_chat_body(body: dict):
 
 
 def _clean_tools(body: dict):
+    # B12 (transparency): dropping nameless tools / deleting an empty `tools`
+    # key is a request mutation — gated behind CLEAN_TOOLS (default yes,
+    # documented). Set CLEAN_TOOLS=no to forward `tools` verbatim.
+    if not _clean_tools_enabled():
+        return
     if isinstance(body.get('tools'), list):
         cleaned = []
         for tool in body['tools']:
@@ -902,8 +1160,7 @@ def _clean_tools(body: dict):
 @app.post('/v1/chat/completions')
 async def chat_completions(request: Request):
     _auth_check(request)
-    _client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
-    if not check_rate_limit(_client_ip):
+    if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
@@ -929,41 +1186,66 @@ async def chat_completions(request: Request):
         return StreamingResponse(stream_passthrough(resp, key), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
     status, data, _ = await proxy_request_with_pool('POST', url, body, request)
     if status != 200:
+        # BB-15: record errors too so the error_rate metric can move.
+        await metrics.record_request(model=body.get('model'), path='/v1/chat/completions', status_code=status)
         return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
-    await metrics.record_request(model=body.get('model'), path='/v1/chat/completions', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0))
+    await metrics.record_request(model=body.get('model'), path='/v1/chat/completions', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0), status_code=status)
     return JSONResponse(_ensure_chat_message(data))
 
 
 @app.post('/v1/responses')
 async def responses(request: Request):
     _auth_check(request)
+    # BB-11/DR-7: /v1/responses was the only POST inference endpoint without
+    # the per-IP limiter.
+    if not check_rate_limit(_client_ip(request)):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception as e:
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
-    requested = body.get('model')
-    model = _normalize_model(requested) if requested else ''
-    if requested is not None:
-        body['model'] = model
-    if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(model):
-        return JSONResponse(status_code=400, content=free_only_error(requested))
-    if free_only_enabled() and model and not model_allowed(model):
-        return JSONResponse(status_code=400, content=free_only_error(requested or model))
-    chat_body = responses_to_chat(body)
-    chat_body['stream'] = bool(body.get('stream', False))
-    url = f'{BLACKBOX_BASE}/chat/completions'
-    if chat_body['stream']:
-        status, resp, key = await proxy_request_with_pool('POST', url, chat_body, request, is_stream=True)
+    # BB-12/DR-8: contain all handler exceptions — return shaped 400/502
+    # instead of a raw ASGI 500 (e.g. non-numeric max_output_tokens).
+    try:
+        requested = body.get('model')
+        model = _normalize_model(requested) if requested else ''
+        if requested is not None:
+            body['model'] = model
+        if free_only_enabled() and requested and not model_allowed(requested) and not model_allowed(model):
+            return JSONResponse(status_code=400, content=free_only_error(requested))
+        if free_only_enabled() and model and not model_allowed(model):
+            return JSONResponse(status_code=400, content=free_only_error(requested or model))
+        chat_body = responses_to_chat(body)
+        chat_body['stream'] = bool(body.get('stream', False))
+        # BB-12/DR-9 (BUG-SEC3): validate the translated body — positive-int
+        # check and the 1,000,000 max_tokens overflow cap now cover
+        # /v1/responses, not just the chat endpoints.
+        err = _validate_chat_body(chat_body)
+        if err:
+            return JSONResponse(status_code=400, content=err)
+        url = f'{BLACKBOX_BASE}/chat/completions'
+        if chat_body['stream']:
+            status, resp, key = await proxy_request_with_pool('POST', url, chat_body, request, is_stream=True)
+            if status != 200:
+                await metrics.record_request(model=model, path='/v1/responses', status_code=status)
+                return JSONResponse(status_code=status, content=resp if isinstance(resp, dict) else {'error': {'message': str(resp), 'type': 'api_error'}})
+            rid = f"resp_{int(time.time()*1000)}"
+            return StreamingResponse(_responses_stream(resp, key, rid, model, chat_body), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        status, data, _ = await proxy_request_with_pool('POST', url, chat_body, request)
         if status != 200:
-            return JSONResponse(status_code=status, content=resp if isinstance(resp, dict) else {'error': {'message': str(resp), 'type': 'api_error'}})
-        rid = f"resp_{int(time.time()*1000)}"
-        return StreamingResponse(_responses_stream(resp, key, rid, model, chat_body), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
-    status, data, _ = await proxy_request_with_pool('POST', url, chat_body, request)
-    if status != 200:
-        return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
-    resp_obj = chat_to_responses(model, data)
-    _store_response(resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
-    return JSONResponse(resp_obj)
+            await metrics.record_request(model=model, path='/v1/responses', status_code=status)
+            return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
+        await metrics.record_request(model=model, path='/v1/responses', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0), status_code=status)
+        resp_obj = chat_to_responses(model, data)
+        _store_response(resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
+        return JSONResponse(resp_obj)
+    except HTTPException:
+        raise
+    except (ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid request: {e}'}})
+    except Exception as e:
+        logger.error(f'[responses] unhandled error: {e}')
+        return JSONResponse(status_code=502, content={'error': {'type': 'api_error', 'message': f'Proxy error: {str(e)[:2000]}'}})
 
 
 def _emit_response_event(seq_ref, etype, payload):
@@ -1028,12 +1310,22 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict):
                 acc['args'] += fn['arguments']
                 yield emit('response.function_call.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['arguments']})
 
+    failed = False
+    last_hb = time.time()
     try:
         yield emit('response.created', {'response': {'id': rid, 'model': model, 'status': 'in_progress'}})
         yield emit('response.in_progress', {'response': {'id': rid, 'status': 'in_progress'}})
         yield emit('response.output_item.added', {'output_index': 0, 'item': {'id': msg_id, 'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []}})
         yield emit('response.content_part.added', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})
-        async for chunk in resp.content.iter_any():
+        # BB-5/DR-1: heartbeat while upstream is idle (this generator emits
+        # whole SSE events, so comments are always line-aligned here).
+        async for chunk in _iter_chunks_with_idle(resp, HEARTBEAT_MS / 1000.0):
+            if chunk is _IDLE:
+                now = time.time()
+                if now - last_hb > (HEARTBEAT_MS / 1000.0):
+                    yield ': heartbeat\n\n'
+                    last_hb = now
+                continue
             buffer += chunk
             while b'\n' in buffer:
                 line, buffer = buffer.split(b'\n', 1)
@@ -1046,10 +1338,14 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict):
             async for out in process_payload(tail[5:].strip()):
                 yield out
     except Exception as e:
+        # B20 (transparency, severe): never fabricate model output text from a
+        # transport error. Emit a proper response.failed terminal event so
+        # clients treat it as an error (and can retry) instead of persisting
+        # "[upstream stream error: …]" as a successful assistant answer.
         logger.error(f'[responses stream] {e}')
-        if not acc_text and not any(tool_accs):
-            acc_text = f'[upstream stream error: {e}]'
-            yield emit('response.output_text.delta', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': acc_text})
+        failed = True
+        yield emit('response.failed', {'response': {'id': rid, 'object': 'response', 'model': model, 'status': 'failed', 'error': {'code': 'upstream_error', 'message': f'upstream stream error: {str(e)[:2000]}'}}})
+        yield 'data: [DONE]\n\n'
     finally:
         try:
             resp.release()
@@ -1057,6 +1353,8 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict):
             pass
         pool.release(key)
 
+    if failed:
+        return
     msg_item = {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
     yield emit('response.output_text.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': acc_text})
     yield emit('response.content_part.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': acc_text, 'annotations': []}})
@@ -1083,8 +1381,7 @@ def _store_response(rid: str, messages: list):
 @app.post('/v1/messages')
 async def anthropic_messages(request: Request):
     _auth_check(request)
-    _client_ip = request.headers.get("x-forwarded-for", request.client.host if request.client else "unknown").split(",")[0].strip()
-    if not check_rate_limit(_client_ip):
+    if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
@@ -1106,55 +1403,82 @@ async def anthropic_messages(request: Request):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(requested))
     if free_only_enabled() and model and not model_allowed(model):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or model))
-    openai_body = anthropic_to_openai(body)
-    openai_body['stream'] = bool(body.get('stream', False))
-    url = f'{BLACKBOX_BASE}/chat/completions'
-    if openai_body['stream']:
-        status, resp, key = await proxy_request_with_pool('POST', url, openai_body, request, is_stream=True)
-        if status != 200:
-            return JSONResponse(status_code=status, content={'type': 'error', 'error': {'type': 'api_error', 'message': str(resp)}})
-        state = AnthropicStreamState(model)
-        async def gen():
-            try:
-                for ev in state.start_events():
-                    yield ev
-                buf = b''
-                async for chunk in resp.content.iter_any():
-                    buf += chunk
-                    while b'\n' in buf:
-                        line, buf = buf.split(b'\n', 1)
-                        line = line.strip()
-                        if not line.startswith(b'data:'):
-                            continue
-                        payload = line[5:].strip()
-                        if payload in (b'[DONE]', b'', b'"[DONE]"'):
-                            for ev in state.force_done():
-                                yield ev
-                            return
-                        try:
-                            c = json.loads(payload)
-                        except Exception:
-                            continue
-                        for ev in state.translate_chunk(c):
-                            yield ev
-                for ev in state.force_done():
-                    yield ev
-            except Exception as e:
-                logger.error(f'[anthropic stream] {e}')
-                for ev in state.force_done():
-                    yield ev
-            finally:
+    # DR-8: contain handler exceptions — return a shaped Anthropic error
+    # envelope instead of a raw ASGI 500.
+    try:
+        openai_body = anthropic_to_openai(body)
+        openai_body['stream'] = bool(body.get('stream', False))
+        # DR-9 parity (BUG-SEC3): apply the shared validation (incl. the
+        # 1,000,000 max_tokens overflow cap) to the translated body.
+        verr = _validate_chat_body(openai_body)
+        if verr:
+            return JSONResponse(status_code=400, content={'type': 'error', 'error': verr['error']})
+        url = f'{BLACKBOX_BASE}/chat/completions'
+        if openai_body['stream']:
+            status, resp, key = await proxy_request_with_pool('POST', url, openai_body, request, is_stream=True)
+            if status != 200:
+                await metrics.record_request(model=model, path='/v1/messages', status_code=status)
+                return JSONResponse(status_code=status, content={'type': 'error', 'error': {'type': 'api_error', 'message': str(resp)}})
+            state = AnthropicStreamState(model)
+            async def gen():
+                last_hb = time.time()
                 try:
-                    resp.release()
-                except Exception:
-                    pass
-                pool.release(key)
-        return StreamingResponse(gen(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
-    status, data, _ = await proxy_request_with_pool('POST', url, openai_body, request)
-    if status != 200:
-        err = data.get('error', {}) if isinstance(data, dict) else {'message': str(data), 'type': 'api_error'}
-        return JSONResponse(status_code=status, content={'type': 'error', 'error': {'type': err.get('type', 'api_error'), 'message': err.get('message', 'Unknown error')}})
-    return JSONResponse(openai_to_anthropic(model, data))
+                    for ev in state.start_events():
+                        yield ev
+                    buf = b''
+                    # BB-5/DR-1: heartbeat while upstream is idle; this
+                    # generator emits whole SSE events (line-aligned).
+                    async for chunk in _iter_chunks_with_idle(resp, HEARTBEAT_MS / 1000.0):
+                        if chunk is _IDLE:
+                            now = time.time()
+                            if now - last_hb > (HEARTBEAT_MS / 1000.0):
+                                yield ': heartbeat\n\n'
+                                last_hb = now
+                            continue
+                        buf += chunk
+                        while b'\n' in buf:
+                            line, buf = buf.split(b'\n', 1)
+                            line = line.strip()
+                            if not line.startswith(b'data:'):
+                                continue
+                            payload = line[5:].strip()
+                            if payload in (b'[DONE]', b'', b'"[DONE]"'):
+                                for ev in state.force_done():
+                                    yield ev
+                                return
+                            try:
+                                c = json.loads(payload)
+                            except Exception:
+                                continue
+                            for ev in state.translate_chunk(c):
+                                yield ev
+                    for ev in state.force_done():
+                        yield ev
+                except Exception as e:
+                    logger.error(f'[anthropic stream] {e}')
+                    for ev in state.force_done():
+                        yield ev
+                finally:
+                    try:
+                        resp.release()
+                    except Exception:
+                        pass
+                    pool.release(key)
+            return StreamingResponse(gen(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        status, data, _ = await proxy_request_with_pool('POST', url, openai_body, request)
+        if status != 200:
+            await metrics.record_request(model=model, path='/v1/messages', status_code=status)
+            err = data.get('error', {}) if isinstance(data, dict) else {'message': str(data), 'type': 'api_error'}
+            return JSONResponse(status_code=status, content={'type': 'error', 'error': {'type': err.get('type', 'api_error'), 'message': err.get('message', 'Unknown error')}})
+        await metrics.record_request(model=model, path='/v1/messages', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0), status_code=status)
+        return JSONResponse(openai_to_anthropic(model, data))
+    except HTTPException:
+        raise
+    except (ValueError, TypeError) as e:
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid request: {e}'}})
+    except Exception as e:
+        logger.error(f'[messages] unhandled error: {e}')
+        return JSONResponse(status_code=502, content={'type': 'error', 'error': {'type': 'api_error', 'message': f'Proxy error: {str(e)[:2000]}'}})
 
 
 @app.get('/metrics')
@@ -1170,38 +1494,34 @@ async def prom():
 
 @app.get('/metrics/model-status')
 async def model_status():
+    # BB-9 companion: keep the synchronous SQLite scan off the event loop.
     return {
         'provider': 'blackbox',
-        'catalog_age_sec': MODEL_STORE.catalog_age_sec(),
-        'states': MODEL_STORE.status_map(),
+        'catalog_age_sec': await asyncio.to_thread(MODEL_STORE.catalog_age_sec),
+        'states': await asyncio.to_thread(MODEL_STORE.status_map),
     }
 
 
 
 @app.get('/dashboard')
 @app.get('/dashboard.html')
-async def dashboard():
-    """Serve the wrapper dashboard HTML."""
-    from pathlib import Path
+async def dashboard(request: Request):
+    """Serve the wrapper dashboard HTML.
+
+    BB-4/SEC-1: requires auth and never embeds the plaintext BEARER_TOKEN in
+    the returned HTML (any local page/process could previously read the token
+    via GET /dashboard and gain full authenticated proxy access). The
+    dashboard must prompt the operator for the token instead."""
+    _auth_check(request)
+    from fastapi.responses import HTMLResponse
     dashboard_path = Path(__file__).parent.parent / "dashboard.html"
     if not dashboard_path.exists():
-        from fastapi.responses import HTMLResponse
         return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
-    html = dashboard_path.read_text()
-    token = (BEARER_TOKEN or "").strip()
-    if token:
-        meta_tag = '<meta name="wrapper-bearer-token" content="' + token.replace('"', '&quot;') + '">'
-        html = html.replace('<head>', '<head>\n' + meta_tag, 1)
-    from fastapi.responses import HTMLResponse
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=dashboard_path.read_text())
 
 @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
 async def catch_all(path: str, request: Request):
     return JSONResponse(status_code=404, content={'error': {'message': f'Unsupported: /{path}', 'type': 'not_found_error'}})
-
-# ── Shared translations override (deduplication) ──────────────────────
-if _USING_SHARED_TRANSLATIONS:
-    AnthropicStreamState = _SharedAnthropicStreamState
 
 
 def main():

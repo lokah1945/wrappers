@@ -4,14 +4,16 @@ Production-grade API proxies for Claude Code, OpenAI SDK, Anthropic SDK, and Ope
 
 This monorepo contains hardened, SDK-compatible transparent proxies that add multi-key rotation, pacing, metrics, streaming reliability, and full OpenAI + Anthropic compatibility.
 
-## Current Status (2026-07-24)
+## Current Status (2026-07-27)
 
 | Wrapper            | Status          | Score   | Port   | Use Case |
 |--------------------|-----------------|---------|--------|----------|
-| **nvidia-python**  | ✅ Production   | **100/100** | 9101   | NVIDIA NIM API proxy |
-| **nous**           | ✅ Production   | **100/100** | 9102   | Nous Research inference API |
-| **opencode**       | ✅ Production   | **100/100** | 9103   | OpenCode Zen gateway |
-| **blackbox**       | ✅ Production   | **100/100** | 9104   | BLACKBOX AI API proxy |
+| **nvidia-python**  | ✅ Production   | **92/100** | 9101   | NVIDIA NIM API proxy |
+| **nous**           | ✅ Production   | **93/100** | 9102   | Nous Research inference API |
+| **opencode**       | ✅ Production   | **91/100** | 9103   | OpenCode Zen gateway |
+| **blackbox**       | ✅ Production   | **91/100** | 9104   | BLACKBOX AI API proxy |
+
+> Score reflects the 2026-07-27 deep E2E audit (audit_report/AUDIT_E2E_KOMPREHENSIF_2026-07-27.md): remaining deductions are hardening items (deploy-marker hygiene, model-registry telemetry wiring, per-wrapper test coverage) — not functional defects. Note: "transparent proxy" here means key-pool/anti-rate-limit/anti-error management per WRAPPER_CONTRACT.md; the wrappers translate/emulate non-OpenAI upstreams and normalize responses, so byte-for-byte passthrough is not claimed for protocol-translation endpoints.
 
 ## Recent Audit Findings (2026-07-24)
 
@@ -183,7 +185,7 @@ Classification and operational details are documented in [MODEL_AVAILABILITY.md]
 
 ## Production Readiness
 
-All wrappers achieved **100/100** production readiness score:
+Production feature matrix (see audit_report/ for the current scored assessment):
 
 | Feature | nvidia-python | nous | opencode | blackbox |
 |---------|--------------|------|----------|----------|

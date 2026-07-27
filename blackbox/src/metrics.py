@@ -23,6 +23,10 @@ class Metrics:
         self.errors = 0
         self._db_path = db_path
         self._lock = threading.Lock()
+        # BB-15/OC-14: persist periodically, not only on graceful shutdown,
+        # so counters survive SIGKILL/OOM.
+        self._persist_interval = float(os.environ.get('METRICS_PERSIST_SEC', '60'))
+        self._last_persist = time.time()
         self._load_persisted()
 
     def _persist_path(self) -> str:
@@ -69,6 +73,11 @@ class Metrics:
             self.tokens_out += completion_tokens
             if kwargs.get('status_code', 200) >= 400:
                 self.errors += 1
+            # BB-15/OC-14: periodic persistence (cheap small-file JSON dump).
+            now = time.time()
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
 
     async def summary(self, window: str = "24h") -> Dict:
         uptime = time.time() - self.start

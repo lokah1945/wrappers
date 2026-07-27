@@ -40,6 +40,9 @@ class AnthropicStreamState:
         self.current_block: Optional[str] = None  # 'thinking' | 'text' | 'tool_use'
         self.tool_map: dict[int, int] = {}
         self.finished: bool = False
+        # CM-6: retain the last usage seen so force_done can report real
+        # numbers instead of zeros on abnormal termination.
+        self.last_usage: dict = {}
         self.msg_id: str = f"msg_{int(time.time() * 1000)}"
 
     def _sse(self, event: str, data: dict) -> str:
@@ -85,10 +88,22 @@ class AnthropicStreamState:
 
     def translate_chunk(self, chunk: dict) -> List[str]:
         """Translate one OpenAI chat SSE chunk into Anthropic events."""
+        # CM-6 fix: some providers send trailing chunks (usage-only or
+        # content) after finish_reason. Emitting new content_block events
+        # after message_stop violates the Anthropic protocol — but still
+        # retain any late usage for observability before dropping.
+        if self.finished:
+            if isinstance(chunk, dict) and chunk.get("usage"):
+                self.last_usage = chunk.get("usage") or {}
+            return []
         events = self.start_events()
         if not isinstance(chunk, dict) or "choices" not in chunk:
+            if isinstance(chunk, dict) and chunk.get("usage"):
+                self.last_usage = chunk.get("usage") or {}
             return events
 
+        if chunk.get("usage"):
+            self.last_usage = chunk.get("usage") or {}
         ch = (chunk.get("choices") or [{}])[0]
         delta = ch.get("delta") or {}
 
@@ -163,7 +178,7 @@ class AnthropicStreamState:
             stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
                 {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
             )
-            usage = chunk.get("usage") or {}
+            usage = chunk.get("usage") or self.last_usage or {}
             events.append(self._sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -189,12 +204,13 @@ class AnthropicStreamState:
         events.extend(self._close_block())
         if self.tool_map and stop == "end_turn":
             stop = "tool_use"
+        usage = self.last_usage or {}
         events.append(self._sse("message_delta", {
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
             "usage": {
-                "input_tokens": 0,
-                "output_tokens": 0,
+                "input_tokens": usage.get("prompt_tokens", 0) or 0,
+                "output_tokens": usage.get("completion_tokens", 0) or 0,
                 "cache_creation_input_tokens": 0,
                 "cache_read_input_tokens": 0,
             },

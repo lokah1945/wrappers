@@ -70,6 +70,12 @@ class Metrics:
             if kwargs.get('status_code', 200) >= 400:
                 self.errors += 1
 
+    def record_error(self, status_code: int = 0, **kwargs):
+        # OC-14: synchronous error counter so _jr (and other sync call sites) can
+        # record failures without awaiting on the request coroutine.
+        with self._lock:
+            self.errors += 1
+
     async def summary(self, window: str = "24h") -> Dict:
         uptime = time.time() - self.start
         with self._lock:

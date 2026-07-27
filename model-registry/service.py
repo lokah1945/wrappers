@@ -18,6 +18,31 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 
+def _load_local_dotenv() -> None:
+    """INF-F1 fix: self-load model-registry/.env so MODEL_REGISTRY_ADMIN_TOKEN
+    (and other settings) are available even when the systemd unit lacks an
+    EnvironmentFile= line. Existing environment variables always win."""
+    env_path = Path(__file__).resolve().parent / ".env"
+    try:
+        if not env_path.exists():
+            return
+        for raw in env_path.read_text().splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, _, value = line.partition("=")
+            key = key.strip()
+            value = value.strip().strip('"').strip("'")
+            if key and key not in os.environ:
+                os.environ[key] = value
+    except Exception:
+        # Never block startup on dotenv parsing.
+        pass
+
+
+_load_local_dotenv()
+
+
 def _resolve_git_commit() -> str:
     try:
         import subprocess
@@ -49,20 +74,25 @@ class CentralRegistry:
     def __init__(self) -> None:
         self.registries: dict[str, LocalModelRegistry] = {}
         self.states: dict[str, ModelStateStore] = {}
+        # MR-2 fix: plain-def handlers run in the threadpool while async
+        # handlers run on the loop; guard shared dict mutation with a lock.
+        import threading
+        self._guard = threading.RLock()
 
     def registry(self, provider: str) -> LocalModelRegistry:
         provider = str(provider).strip().lower()
         if not provider:
             raise ValueError("provider is required")
-        if provider not in self.registries:
-            registry = LocalModelRegistry(provider, ROOT / "model-registry", MODEL_REGISTRY_DB)
-            state = ModelStateStore(provider, MODEL_REGISTRY_DB)
-            cached = state.get_catalog(fresh_only=False)
-            if cached:
-                registry.register_catalog(cached, revision="cached-catalog")
-            self.registries[provider] = registry
-            self.states[provider] = state
-        return self.registries[provider]
+        with self._guard:
+            if provider not in self.registries:
+                registry = LocalModelRegistry(provider, ROOT / "model-registry", MODEL_REGISTRY_DB)
+                state = ModelStateStore(provider, MODEL_REGISTRY_DB)
+                cached = state.get_catalog(fresh_only=False)
+                if cached:
+                    registry.register_catalog(cached, revision="cached-catalog")
+                self.registries[provider] = registry
+                self.states[provider] = state
+            return self.registries[provider]
 
     def state(self, provider: str) -> ModelStateStore:
         self.registry(provider)
@@ -70,11 +100,16 @@ class CentralRegistry:
 
     def list_models(self, provider: str) -> list[dict[str, Any]]:
         registry = self.registry(provider)
-        return [profile.to_dict() for profile in registry.profiles.values()]
+        # MR-2 fix: snapshot under the guard to avoid "dict changed size
+        # during iteration" when register_catalog inserts concurrently.
+        with self._guard:
+            profiles = list(registry.profiles.values())
+        return [profile.to_dict() for profile in profiles]
 
     def register_catalog(self, provider: str, models: list[Any], revision: str) -> list[str]:
         registry = self.registry(provider)
-        ids = registry.register_catalog(models, revision=revision or "catalog")
+        with self._guard:
+            ids = registry.register_catalog(models, revision=revision or "catalog")
         self.state(provider).upsert_catalog(models, source=f"central:{provider}")
         return ids
 
@@ -92,7 +127,9 @@ def _require_internal(request: Request) -> None:
         )
     auth = (request.headers.get("authorization") or "").strip()
     token = auth[7:] if auth.lower().startswith("bearer ") else auth
-    if token != ADMIN_TOKEN:
+    # SEC-5 fix: constant-time comparison to avoid timing side-channels.
+    import hmac as _hmac
+    if not _hmac.compare_digest(token, ADMIN_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -197,7 +234,11 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
         models_data = validate_catalog_entries(models_data)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    ids = central.register_catalog(provider, models_data, str(body.get("revision") or "catalog"))
+    # MR-2 fix: run sync SQLite work off the event loop.
+    import asyncio as _asyncio
+    ids = await _asyncio.to_thread(
+        central.register_catalog, provider, models_data,
+        str(body.get("revision") or "catalog"))
     return {"provider": provider, "registered": len(ids), "ids": ids}
 
 
@@ -250,7 +291,10 @@ async def observation(request: Request) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
-    result = central.state(provider).record_status(
+    # MR-2 fix: run sync SQLite work off the event loop.
+    import asyncio as _asyncio
+    result = await _asyncio.to_thread(
+        central.state(provider).record_status,
         model_id=validated["model_id"],
         account_scope=validated["account_scope"],
         state=validated["state"],
@@ -265,7 +309,12 @@ async def observation(request: Request) -> dict[str, Any]:
 @app.get("/internal/status")
 def status(provider: str, request: Request) -> dict[str, Any]:
     _require_internal(request)
-    provider = provider.strip().lower()
+    # MR-4 fix: validate the provider like every other endpoint instead of
+    # letting garbage raise an unhandled ValueError (500).
+    try:
+        provider = validate_provider_name(provider)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"invalid provider: {exc}")
     return {"provider": provider, "states": central.state(provider).status_map()}
 
 

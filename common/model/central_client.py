@@ -62,7 +62,13 @@ class ModelRegistryClient:
         if self._session_lock is None:
             self._session_lock = asyncio.Lock()
         async with self._session_lock:
+            # CM-4 fix: re-check inside the lock. Previously the second
+            # coroutine closed the healthy session the first one had just
+            # created (possibly with in-flight requests) and built another.
             if self._session is not None and not self._session.closed:
+                owner_loop = getattr(self._session, "_loop", None)
+                if owner_loop is loop:
+                    return self._session
                 await self._session.close()
             self._session = aiohttp.ClientSession(timeout=self.timeout)
         return self._session

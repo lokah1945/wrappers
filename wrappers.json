@@ -1,6 +1,6 @@
 {
   "version": "1.1.0",
-  "updated": "2026-07-24",
+  "updated": "2026-07-27",
   "wrappers": [
     {
       "name": "nvidia",
@@ -25,7 +25,7 @@
       "health": "/health",
       "capabilities": "/v1/capabilities",
       "auth": "BEARER_TOKEN",
-      "log_file": null,
+      "log_file": "nous/wrapper_nous.log",
       "systemd": "wrapper-nous.service"
     },
     {

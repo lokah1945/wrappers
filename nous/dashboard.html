@@ -327,15 +327,22 @@ const fmtTime = ts => {
   return new Date(ts * 1000).toLocaleDateString();
 };
 
+// N-03 fix: the server no longer injects the bearer token into this page.
+// The token is entered once by the operator and kept in sessionStorage only.
 function getAuthHeaders() {
-  const meta = document.querySelector('meta[name="wrapper-bearer-token"]');
-  if (meta && meta.content) return { 'Authorization': 'Bearer ' + meta.content };
+  let token = sessionStorage.getItem('wrapper-bearer-token') || '';
+  if (!token) {
+    token = window.prompt('Enter wrapper bearer token (leave empty if auth is disabled):') || '';
+    sessionStorage.setItem('wrapper-bearer-token', token);
+  }
+  if (token) return { 'Authorization': 'Bearer ' + token };
   return {};
 }
 
 async function apiFetch(url, options = {}) {
   const headers = { ...getAuthHeaders(), ...(options.headers || {}) };
   const r = await fetch(url, { ...options, headers });
+  if (r.status === 401) sessionStorage.removeItem('wrapper-bearer-token');
   if (!r.ok) throw new Error(r.status);
   return r.json();
 }

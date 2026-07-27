@@ -46,9 +46,27 @@ class LocalModelRegistry:
         path = self.manifest_root / "manifests" / "providers" / f"{self.provider}.json"
         try:
             data = json.loads(path.read_text())
-            return data if isinstance(data, dict) else {}
+            data = data if isinstance(data, dict) else {}
         except (OSError, json.JSONDecodeError):
-            return {}
+            data = {}
+        # MR-5 fix: an empty/corrupt manifest previously produced zero
+        # protocols, turning every request into a CallPlanError (total
+        # outage discovered per-request, after the upstream call). Fall
+        # back to the universal openai_chat adapter and log loudly.
+        if not data.get("adapters"):
+            import logging
+            logging.getLogger("model-registry").error(
+                "provider manifest missing/empty for %r (%s); "
+                "falling back to openai_chat passthrough adapters",
+                self.provider, path,
+            )
+            data = dict(data)
+            data["adapters"] = {
+                "openai_chat": "chat_passthrough",
+                "openai_responses": "chat_translate",
+                "anthropic_messages": "chat_translate",
+            }
+        return data
 
     def _load_error_manifest(self) -> dict[str, Any]:
         path = self.manifest_root / "manifests" / "errors" / f"{self.provider}.json"

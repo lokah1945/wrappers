@@ -17,6 +17,7 @@ agents stop mid-run.
 
 from __future__ import annotations
 
+import os
 import json
 import time
 import random
@@ -30,6 +31,9 @@ from .anthropic_compat import extract_internal_reasoning
 # tool_calls. Without that assistant message a later role=tool result is orphaned
 # and upstream rejects it, which makes agents stop mid-process.
 _RESPONSE_STORE: Dict[str, list] = {}
+_RESPONSE_STORE_SIZES: Dict[str, int] = {}
+# V-22 fix: also bound the store by total bytes, not just entry count.
+_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(64 * 1024 * 1024)))
 
 
 def _rand(suffix: str) -> str:
@@ -46,9 +50,18 @@ def _zero_usage() -> dict:
 def _bounded_store(resp_id: str, messages: list) -> None:
     if not resp_id:
         return
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except Exception:
+        size = 0
     _RESPONSE_STORE[resp_id] = messages
-    while len(_RESPONSE_STORE) > 200:
-        _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
+    _RESPONSE_STORE_SIZES[resp_id] = size
+    # V-22 fix: evict oldest entries by count (200) AND by total byte budget.
+    while len(_RESPONSE_STORE) > 200 or (
+            len(_RESPONSE_STORE) > 1 and sum(_RESPONSE_STORE_SIZES.values()) > _STORE_MAX_BYTES):
+        oldest = next(iter(_RESPONSE_STORE))
+        _RESPONSE_STORE.pop(oldest, None)
+        _RESPONSE_STORE_SIZES.pop(oldest, None)
 
 
 def http_status_from_error(err: dict) -> int:
@@ -432,7 +445,10 @@ class ResponsesHandler:
 
     async def translate_to_nim(self, request: Any, body: dict, model: str) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]]]:
         chat_body = build_chat_body(body, model, self.translate_thinking_to_nim)
-        result = await self.proxy_openai(chat_body, self.forward_headers(request), model, request)
+        # V7 fix: metric_path marks this as a translated path, where the wrapper
+        # itself needs stream usage (and metrics are attributed correctly).
+        result = await self.proxy_openai(chat_body, self.forward_headers(request), model, request,
+                                         metric_path='/v1/responses')
 
         if not result.get('stream') and result.get('status') and result['status'] != 200:
             data = result.get('data', {})
@@ -579,12 +595,37 @@ class ResponsesHandler:
                                         'delta': fn['arguments'],
                                     })
                                 has_tool = True
-                # Process a final single-line data payload if the upstream closed
-                # without a trailing newline.
-                if buffer.strip().startswith('data:'):
-                    # Recursion would complicate generator state; the worst case is
-                    # a final usage chunk, so ignore malformed tail rather than leak.
-                    pass
+                # V-16 fix: parse a final single-line data payload (upstream closed
+                # without a trailing newline) like a normal line — the common case
+                # is a last usage chunk or terminal text delta.
+                tail = buffer.strip()
+                if tail.startswith('data:'):
+                    payload = tail[5:].strip()
+                    if payload not in ('[DONE]', '"[DONE]"', ''):
+                        try:
+                            c = json.loads(payload)
+                        except (json.JSONDecodeError, ValueError):
+                            c = None
+                        if isinstance(c, dict):
+                            if c.get('usage'):
+                                usage = convert_usage(c['usage'])
+                            ch = (c.get('choices') or [{}])[0]
+                            d = ch.get('delta') or {}
+                            if isinstance(d.get('content'), str) and d['content']:
+                                acc_text += d['content']
+                                yield emit({
+                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
+                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
+                                    'content_index': 0, 'delta': d['content'],
+                                })
+                            reason_tail = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
+                            if reason_tail and rsn_started:
+                                acc_reason += reason_tail
+                                yield emit({
+                                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
+                                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
+                                    'delta': reason_tail,
+                                })
             except Exception as e:
                 stream_error = e
                 import logging

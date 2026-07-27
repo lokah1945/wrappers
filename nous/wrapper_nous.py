@@ -22,6 +22,8 @@ Upstream: https://inference-api.nousresearch.com/v1/chat/completions
 import os
 import json
 import time
+import copy
+import random
 import asyncio
 import threading
 import logging
@@ -102,6 +104,9 @@ class KeyEntry:
         self.total_429s = 0
         self.total_failures = 0
         self.last_used = 0.0
+        # N-12 fix: per-model cooldowns so one broken model does not take the
+        # whole key out of rotation for healthy models.
+        self.model_blocked_until: Dict[str, float] = {}
 
     def current_rpm(self, window: int = 60) -> int:
         now = time.time()
@@ -140,7 +145,28 @@ class KeyEntry:
             self.total_429s += 1
         logger.warning(f"[key_pool] Nous key {self.label} cooled down for {seconds}s ({reason})")
 
+    def block_model(self, model_id: str, seconds: int, reason: str):
+        """N-12 fix: cool down only this key+model pair (model-scoped failure)."""
+        if not model_id:
+            return
+        seconds = max(1, min(int(seconds or 1), int(os.environ.get("KEY_COOLDOWN_MAX_SEC", "300"))))
+        self.model_blocked_until[model_id] = max(self.model_blocked_until.get(model_id, 0.0), time.time() + seconds)
+        self.total_failures += 1
+        logger.warning(f"[key_pool] Nous key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})")
+
+    def is_model_blocked(self, model_id: str) -> bool:
+        if not model_id:
+            return False
+        until = self.model_blocked_until.get(model_id, 0.0)
+        if not until:
+            return False
+        if time.time() < until:
+            return True
+        self.model_blocked_until.pop(model_id, None)
+        return False
+
     def stats(self) -> dict:
+        now = time.time()
         return {
             "label": self.label,
             "current_rpm": self.current_rpm(),
@@ -149,6 +175,7 @@ class KeyEntry:
             "hard_blocked": self.is_blocked(),
             "hard_blocked_remaining_s": max(0, round(self.hard_blocked_until - time.time(), 1)),
             "block_reason": self.block_reason or None,
+            "model_blocks": {m: round(u - now, 1) for m, u in self.model_blocked_until.items() if u > now},
             "total_requests": self.total_requests,
             "total_429s": self.total_429s,
             "total_failures": self.total_failures,
@@ -183,9 +210,20 @@ class KeyPool:
         logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s) hard={self.hard_limit}rpm")
         return self
 
-    def acquire(self) -> Optional[KeyEntry]:
+    def acquire(self, model_id: str = None, exclude: Optional[Set[str]] = None) -> Optional[KeyEntry]:
+        """Least-loaded selection.
+
+        N-10 fix: `exclude` lets retry loops skip labels already tried for the
+        same client request. N-12 fix: keys cooled down for `model_id` only are
+        skipped for that model but stay usable for other models.
+        """
         with self._lock:
-            candidates = [k for k in self.keys if not k.is_blocked() and k.current_rpm() < self.hard_limit]
+            candidates = [
+                k for k in self.keys
+                if not k.is_blocked() and k.current_rpm() < self.hard_limit
+                and (not exclude or k.label not in exclude)
+                and not (model_id and k.is_model_blocked(model_id))
+            ]
             if not candidates:
                 return None
             min_load = min(k.effective_load for k in candidates)
@@ -201,15 +239,53 @@ class KeyPool:
         with self._lock:
             entry.release()
 
-    def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None):
+    def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None, model_id: str = None, model_scoped: bool = False):
         if entry is None:
+            return
+        # N-12 fix: model-specific failures (capacity / broken model 5xx) cool
+        # down only the key+model pair instead of the whole key so healthy
+        # models keep rotating.
+        if model_scoped and model_id:
+            if status_code == 429:
+                entry.block_model(model_id, retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "model_rate_limit")
+            else:
+                entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
             return
         if status_code == 429:
             entry.block(retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "rate_limit")
         elif status_code in (401, 402, 403):
             entry.block(retry_after or int(os.environ.get("AUTH_KEY_COOLDOWN_SEC", "300")), "auth_or_quota")
         elif status_code >= 500 or status_code in (408, 409):
-            entry.block(retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "transient")
+            if model_id and status_code >= 500:
+                # 5xx tied to a specific model → per-model block (N-12).
+                entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
+            else:
+                entry.block(retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "transient")
+
+    def heal_in_flight(self) -> int:
+        """N-01 fix: reset in_flight counters stuck by leaked release paths.
+
+        Mirrors nvidia-python's KeyPool.heal_in_flight — a key whose in_flight
+        is non-zero but which has not been used for HEAL_INFLIGHT_THRESHOLD_SEC
+        is assumed to have leaked its slot (e.g. an exception path that skipped
+        release) and is reset so effective_load stays honest.
+        """
+        threshold = int(os.environ.get("HEAL_INFLIGHT_THRESHOLD_SEC", "600"))
+        now = time.time()
+        fixed = 0
+        with self._lock:
+            for k in self.keys:
+                if k.in_flight > 0 and k.last_used > 0 and (now - k.last_used) > threshold:
+                    logger.warning(f"[key_pool] heal_in_flight: {k.label} in_flight {k.in_flight} stuck since last_used {round(now - k.last_used)}s ago -> 0")
+                    k.in_flight = 0
+                    fixed += 1
+                elif k.in_flight > 0 and k.last_used == 0:
+                    logger.warning(f"[key_pool] heal_in_flight: {k.label} in_flight {k.in_flight} with no last_used -> 0")
+                    k.in_flight = 0
+                    fixed += 1
+        if fixed:
+            logger.info(f"[key_pool] heal_in_flight: {fixed} key(s) corrected")
+        return fixed
 
     def peek(self) -> Optional[KeyEntry]:
         with self._lock:
@@ -247,11 +323,14 @@ except ImportError:
 # --------------------------------------------------------------------------
 # CONFIG
 # --------------------------------------------------------------------------
-def load_dotenv():
+def load_dotenv(override: bool = False):
     """Parse .env files with basic support for quotes and inline comments.
 
     BUG-L3 fix: handle quoted values correctly, strip inline comments outside
     quotes, and skip blank/comment lines.
+
+    N-13 fix: `override=True` replaces existing os.environ values (hot reload
+    must pick up rotated keys); default keeps setdefault semantics for boot.
     """
     for p in [".env", os.path.expanduser("~/.env")]:
         if os.path.exists(p):
@@ -274,7 +353,10 @@ def load_dotenv():
                             comment_idx = v.find(" #")
                             if comment_idx >= 0:
                                 v = v[:comment_idx].rstrip()
-                    os.environ.setdefault(k, v)
+                    if override:
+                        os.environ[k] = v
+                    else:
+                        os.environ.setdefault(k, v)
 
 
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
@@ -295,8 +377,14 @@ def start_env_watcher():
         class EnvWatcher(FileSystemEventHandler):
             def on_modified(self, event):
                 if '.env' in event.src_path:
-                    load_dotenv()
-                    logger.info('[env] .env reloaded (hot)')
+                    # N-13 fix: reload with override so changed values (e.g.
+                    # rotated keys) actually take effect, then rebuild the pool.
+                    load_dotenv(override=True)
+                    try:
+                        KEY_POOL.load_from_env()
+                    except Exception as e:
+                        logger.warning(f'[env] key pool reload failed: {e}')
+                    logger.info('[env] .env reloaded (hot, override)')
         obs = Observer()
         obs.schedule(EnvWatcher(), path=str(Path(__file__).parent), recursive=False)
         obs.start()
@@ -324,8 +412,12 @@ MAX_CONNECTIONS_PER_HOST = int(os.environ.get("MAX_CONNECTIONS_PER_HOST", "100")
 CONNECT_TIMEOUT_SEC = int(os.environ.get("CONNECT_TIMEOUT_SEC", "30"))
 REQUEST_TIMEOUT_SEC = int(os.environ.get("REQUEST_TIMEOUT_SEC", "600"))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get("STREAM_REQUEST_TIMEOUT_SEC", "900"))
+# N-06 fix: streams use a read-idle timeout instead of a hard total timeout,
+# so long generations are not killed at STREAM_REQUEST_TIMEOUT_SEC and a dead
+# upstream connection is detected within STREAM_SOCK_READ_TIMEOUT_SEC.
+STREAM_SOCK_READ_TIMEOUT_SEC = int(os.environ.get("STREAM_SOCK_READ_TIMEOUT_SEC", "300"))
 RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
-VERSION = "2.0.6-anthropic-tools"
+VERSION = "2.0.7-audit-hardening"
 
 # Build identity (H-04/H-02): resolve git root + source root from __file__, portable
 def _resolve_git_root():
@@ -568,24 +660,57 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
         headers.update({k: v for k, v in extra_headers.items() if v})
 
     sess = await get_session()
-    if stream:
-        # IMPORTANT: Do NOT use async with for streaming — caller must release
-        resp = await sess.post(url, json=payload, headers=headers)
-        if resp.status != 200:
-            text = await resp.text()
-            resp.release()
-            return resp.status, _normalize_upstream_error(resp.status, text)
-        return 200, resp
-    else:
-        async with sess.post(url, json=payload, headers=headers) as resp:
-            text = await resp.text()
+    # N-01 fix: any aiohttp/network error (DNS failure, connection reset,
+    # client-side timeout) is converted to a shaped 502 instead of propagating
+    # out of post_nous_with_retries after KEY_POOL.acquire() incremented
+    # in_flight (which permanently leaked the slot). Callers release the key
+    # entry in their own finally/error paths on non-200.
+    try:
+        if stream:
+            # IMPORTANT: Do NOT use async with for streaming — caller must release
+            # N-06 fix: no hard total timeout on streams (long generations were
+            # killed at 15 min); instead a sock_read idle timeout detects a
+            # silently dead upstream connection quickly.
+            stream_timeout = aiohttp.ClientTimeout(
+                total=None,
+                sock_connect=CONNECT_TIMEOUT_SEC,
+                sock_read=max(30, STREAM_SOCK_READ_TIMEOUT_SEC),
+            )
+            resp = await sess.post(url, json=payload, headers=headers, timeout=stream_timeout)
             if resp.status != 200:
+                text = await resp.text()
+                resp.release()
+                if _HAS_CIRCUIT_BREAKER:
+                    await _UPSTREAM_BREAKER.record_failure()
                 return resp.status, _normalize_upstream_error(resp.status, text)
+            if _HAS_CIRCUIT_BREAKER:
+                await _UPSTREAM_BREAKER.record_success()
+            return 200, resp
+        else:
+            async with sess.post(url, json=payload, headers=headers) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    if _HAS_CIRCUIT_BREAKER:
+                        await _UPSTREAM_BREAKER.record_failure()
+                    return resp.status, _normalize_upstream_error(resp.status, text)
+                try:
+                    data = json.loads(text) if text else {}
+                except Exception:
+                    data = {"error": {"message": text[:2000], "type": "api_error"}}
+                if _HAS_CIRCUIT_BREAKER:
+                    await _UPSTREAM_BREAKER.record_success()
+                return resp.status, data
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        # N-15 fix: circuit breaker now actually records upstream failures.
+        if _HAS_CIRCUIT_BREAKER:
             try:
-                data = json.loads(text) if text else {}
+                await _UPSTREAM_BREAKER.record_failure()
             except Exception:
-                data = {"error": {"message": text[:2000], "type": "api_error"}}
-            return resp.status, data
+                pass
+        logger.warning(f"[upstream] post_nous network error: {type(e).__name__}: {e}")
+        return 502, {"error": {"type": "api_error", "message": f"Upstream connection error: {type(e).__name__}: {str(e)[:500]}", "code": "upstream_connection_error"}}
 
 
 def _retry_after_seconds(data, default=65) -> int:
@@ -656,25 +781,44 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
 
     attempts = max(1, KEY_POOL.total_keys)
-    for _ in range(attempts):
-        entry = KEY_POOL.acquire()
+    # N-10 fix: skip labels already tried for this request so acquire() cannot
+    # re-select the same key every iteration, and back off with jitter between
+    # attempts instead of hammering upstream back-to-back.
+    tried_labels: Set[str] = set()
+    retry_backoff_base = float(os.environ.get("RETRY_BACKOFF_BASE_SEC", "0.25"))
+    for attempt_i in range(attempts):
+        entry = KEY_POOL.acquire(model_id=model_id, exclude=tried_labels)
         if not entry:
             break
-        status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers)
-        if status == 200:
-            if stream:
-                return status, result, entry
-            KEY_POOL.release(entry)
+        tried_labels.add(entry.label)
+        if attempt_i > 0:
+            # N-10 fix: small jittered backoff between retry attempts so a down
+            # model does not receive N back-to-back upstream hits per request.
+            await asyncio.sleep(retry_backoff_base * attempt_i + random.uniform(0, retry_backoff_base))
+        released = False
+        try:
+            # N-01 fix: the key's in_flight slot is always released via finally
+            # (except the successful-stream case where the stream generator owns
+            # the release). post_nous itself shapes network errors into a 502.
+            status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers)
+            if status == 200:
+                if stream:
+                    released = True  # ownership transferred to the stream generator
+                    return status, result, entry
+                return status, result, None
+            tried += 1
+            last_status, last_result = status, result
+            if _is_retriable_upstream_status(status, result):
+                if _should_cooldown_key(status, result):
+                    KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result), model_id=model_id)
+                elif _looks_model_capacity_error(result) and model_id:
+                    # N-12 fix: model-capacity failure blocks only this key+model.
+                    KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result, default=15), model_id=model_id, model_scoped=True)
+                continue
             return status, result, None
-        tried += 1
-        last_status, last_result = status, result
-        if _is_retriable_upstream_status(status, result):
-            if _should_cooldown_key(status, result):
-                KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result))
-            KEY_POOL.release(entry)
-            continue
-        KEY_POOL.release(entry)
-        return status, result, None
+        finally:
+            if not released:
+                KEY_POOL.release(entry)
 
     if tried >= max(1, KEY_POOL.total_keys + (1 if oauth_token else 0)) and isinstance(last_result, dict) and isinstance(last_result.get("error"), dict):
         msg = last_result["error"].get("message", "")
@@ -773,8 +917,10 @@ def responses_to_chat(body: dict) -> dict:
     model = resolve_model(body.get("model"))
     msgs = []
     prev = body.get("previous_response_id")
-    if prev and prev in _RESPONSE_STORE:
-        msgs.extend(_RESPONSE_STORE[prev][1])
+    if prev:
+        stored_msgs = get_stored_conversation(prev)
+        if stored_msgs:
+            msgs.extend(stored_msgs)
 
     raw = body.get("input")
     if isinstance(raw, str):
@@ -828,10 +974,49 @@ def responses_to_chat(body: dict) -> dict:
 
 _RESPONSE_STORE: Dict[str, tuple] = {}
 _STORE_LOCK = asyncio.Lock()
+# N-02 fix: bound the previous_response_id store exactly like
+# nvidia-python/src/responses_compat.py — FIFO cap (200 entries) plus a TTL
+# prune using the stored timestamp, so long-running Codex sessions cannot leak
+# memory monotonically.
+_RESPONSE_STORE_MAX = int(os.environ.get("RESPONSES_STORE_MAX_ENTRIES", "200"))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get("RESPONSES_STORE_TTL_SEC", "86400"))
+
+def _prune_response_store_locked():
+    """Evict expired then oldest entries. Caller must hold _STORE_LOCK."""
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        expired = [rid for rid, (ts, _msgs) in _RESPONSE_STORE.items() if now - ts > _RESPONSE_STORE_TTL_SEC]
+        for rid in expired:
+            _RESPONSE_STORE.pop(rid, None)
+    # dict preserves insertion order → first key is the oldest (FIFO evict)
+    while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX:
+        oldest = next(iter(_RESPONSE_STORE))
+        _RESPONSE_STORE.pop(oldest, None)
 
 async def store_conversation(rid: str, msgs: list):
     async with _STORE_LOCK:
+        # N-19 fix: store a deep copy so later in-place mutation of the live
+        # message dicts cannot corrupt the stored replay history.
+        try:
+            msgs = copy.deepcopy(msgs)
+        except Exception:
+            msgs = list(msgs)
         _RESPONSE_STORE[rid] = (time.time(), msgs)
+        _prune_response_store_locked()
+
+def get_stored_conversation(rid: str) -> Optional[list]:
+    """N-19 fix: return a deep copy of stored history (no shared aliasing).
+
+    Runs synchronously on the single event loop; there is no await point
+    between lookup and copy, so the read is consistent without the lock.
+    """
+    stored = _RESPONSE_STORE.get(rid)
+    if not stored:
+        return None
+    try:
+        return copy.deepcopy(stored[1])
+    except Exception:
+        return list(stored[1])
 
 
 def _ensure_chat_content(data: dict) -> dict:
@@ -1019,7 +1204,11 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
 
     async def handle_payload(data: bytes):
         nonlocal terminated
-        if data in (b"[DONE]", b"", b'"[DONE]"'):
+        # N-09 fix: an empty data: payload is a valid (empty) SSE event /
+        # keep-alive, NOT end-of-stream. Only literal [DONE] terminates.
+        if data == b"":
+            return
+        if data in (b"[DONE]", b'"[DONE]"'):
             async for ev in emit_state_done():
                 yield ev
             if state is None or getattr(state, "__class__", type(None)).__name__ == "ResponsesStreamState":
@@ -1039,31 +1228,53 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
         except Exception:
             yield f"data: {data.decode(errors='replace')}\n\n"
 
-    # BUG-FIX: Use asyncio.wait_for with timeout to yield heartbeats even when
-    # upstream is idle. This prevents Codex from timing out during long reasoning
-    # steps where upstream takes 10+ seconds to send the next chunk.
+    # BUG-FIX: heartbeats fire even when upstream is idle. N-05 fix: instead of
+    # asyncio.wait_for (whose TimeoutError is indistinguishable from a genuine
+    # aiohttp read/total timeout raised by __anext__), wait on a sentinel task:
+    # an un-finished task after the wait window means "idle → heartbeat", while
+    # a real upstream TimeoutError surfaces from task.result() and is handled
+    # as an upstream error (logged, stream finalized) instead of being
+    # swallowed as an idle tick.
+    chunk_task = None
+    client_disconnected = False
+    upstream_error = None
     try:
         # Get an async iterator over chunks
         chunk_iter = upstream_resp.content.iter_any().__aiter__()
         while True:
-            try:
-                # Wait for next chunk with heartbeat interval as timeout
-                chunk = await asyncio.wait_for(
-                    chunk_iter.__anext__(),
-                    timeout=HEARTBEAT_MS / 1000
-                )
-            except asyncio.TimeoutError:
-                # No chunk received within heartbeat interval, yield heartbeat
+            if chunk_task is None:
+                chunk_task = asyncio.ensure_future(chunk_iter.__anext__())
+            done_set, _pending = await asyncio.wait({chunk_task}, timeout=HEARTBEAT_MS / 1000)
+            if not done_set:
+                # No chunk within the heartbeat interval → upstream is idle.
                 now = time.time()
                 if now - last_hb > (HEARTBEAT_MS / 1000):
                     yield ": heartbeat\n\n"
                     last_hb = now
                 continue
+            finished, chunk_task = chunk_task, None
+            try:
+                chunk = finished.result()
             except StopAsyncIteration:
                 # Stream ended normally
                 break
+            except asyncio.TimeoutError as e:
+                # N-05 fix: genuine upstream read/total timeout — do not keep
+                # heartbeating; record the cause and finalize the stream.
+                upstream_error = e
+                logger.warning(f"[stream] upstream timed out mid-stream ({e!r}); finalizing with synthetic terminal events")
+                break
+            except aiohttp.ClientError as e:
+                upstream_error = e
+                logger.warning(f"[stream] upstream connection error mid-stream ({type(e).__name__}: {e}); finalizing")
+                break
 
             buffer += chunk
+            # N-08 fix: tolerate CRLF SSE framing — normalize \r\n → \n before
+            # splitting so a CRLF upstream still streams incrementally instead
+            # of accumulating the whole response until EOF.
+            if b"\r" in buffer:
+                buffer = buffer.replace(b"\r\n", b"\n")
             while b"\n\n" in buffer:
                 block, buffer = buffer.split(b"\n\n", 1)
                 for line in block.split(b"\n"):
@@ -1079,11 +1290,19 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
             if now - last_hb > (HEARTBEAT_MS / 1000):
                 yield ": heartbeat\n\n"
                 last_hb = now
+    except (GeneratorExit, asyncio.CancelledError):
+        # N-07 fix: client disconnected — async-generator finalization must not
+        # yield anything after GeneratorExit. Flag it so the finally block does
+        # cleanup only.
+        client_disconnected = True
+        raise
     finally:
+        if chunk_task is not None:
+            chunk_task.cancel()
         try:
-            if not terminated:
+            if not terminated and not client_disconnected:
                 # Flush a final partial SSE block if upstream omitted the blank line.
-                tail = buffer.strip()
+                tail = buffer.replace(b"\r\n", b"\n").strip()
                 if tail:
                     for line in tail.split(b"\n"):
                         line = line.strip()
@@ -1093,6 +1312,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                             if terminated:
                                 break
                 if not terminated:
+                    if upstream_error is not None:
+                        # N-05 fix: surface the timeout/error cause to the client
+                        # instead of a silent synthetic completion.
+                        yield f": upstream-error {type(upstream_error).__name__}\n\n"
                     async for ev in emit_state_done():
                         yield ev
                     if state is None or getattr(state, "__class__", type(None)).__name__ != "AnthropicStreamState":
@@ -1473,7 +1696,32 @@ def check_rate_limit(ip: str):
         if len(rate_limits[ip]) >= RATE_LIMIT_RPM:
             return False
         rate_limits[ip].append(now)
+        # N-14 fix: sweep empty per-IP lists so the defaultdict cannot grow
+        # unboundedly over long uptimes with many distinct client addresses.
+        stale = [k for k, v in rate_limits.items() if not v and k != ip]
+        for k in stale:
+            del rate_limits[k]
     return True
+
+
+# N-11 fix (BUG-SEC3 sibling-gap): shared max-tokens validation used by all
+# three inference endpoints, not only /v1/chat/completions.
+MAX_TOKENS_CAP = 1000000
+
+def validate_max_tokens_field(value, field_name: str, required: bool = False):
+    """Return an error message (str) or None if the field is acceptable."""
+    if value is None:
+        if required:
+            return f"{field_name} is required and must be a positive integer"
+        return None
+    if isinstance(value, bool) or not isinstance(value, int):
+        # N-11 fix: type guard — int("abc")-style crashes previously produced 500s.
+        return f"{field_name} must be a positive integer"
+    if value <= 0:
+        return f"{field_name} must be a positive integer"
+    if value > MAX_TOKENS_CAP:
+        return f"{field_name} exceeds maximum allowed value of {MAX_TOKENS_CAP}"
+    return None
 
 
 async def refresh_model_catalog_once():
@@ -1498,9 +1746,22 @@ async def model_catalog_refresh_loop():
 # --------------------------------------------------------------------------
 # FASTAPI APP
 # --------------------------------------------------------------------------
+async def _heal_in_flight_loop():
+    """N-01 fix: periodic heal of leaked in_flight slots (nvidia parity)."""
+    interval = int(os.environ.get("HEAL_INFLIGHT_INTERVAL_SEC", "300"))
+    while True:
+        await asyncio.sleep(max(30, interval))
+        try:
+            KEY_POOL.heal_in_flight()
+        except Exception as e:
+            logger.warning(f"[key_pool] heal_in_flight loop error: {e}")
+
+
+_HEAL_TASK = None
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _MODEL_REFRESH_TASK
+    global _MODEL_REFRESH_TASK, _HEAL_TASK, _known_models
     seed = (os.environ.get("DYNAMIC_ALIAS_TARGET") or "").strip()
     if seed and not is_alias_name(seed):
         set_dynamic_alias_target(seed, force=True)
@@ -1509,17 +1770,34 @@ async def lifespan(app: FastAPI):
     start_env_watcher()
     # Load API keys from environment before the daily catalog task starts.
     KEY_POOL.load_from_env()
+    # N-17 fix: populate _known_models at startup from the persisted catalog so
+    # dynamic alias binding works before the first /v1/models discovery call.
+    try:
+        boot_known: Set[str] = set()
+        for m in (MODEL_STORE.get_catalog(fresh_only=False) or []):
+            mid = m.get("id") if isinstance(m, dict) else None
+            if mid:
+                boot_known.add(mid)
+        for m in CURATED_FREE_MODELS:
+            boot_known.add(m["id"])
+        _known_models = boot_known
+        logger.info(f"[models] seeded {len(_known_models)} known model ids from persisted catalog")
+    except Exception as e:
+        logger.warning(f"[models] startup catalog seed failed: {e}")
     await MODEL_REGISTRY_CLIENT.start()
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
+    _HEAL_TASK = asyncio.create_task(_heal_in_flight_loop())
     yield
     logger.info('[lifecycle] wrapper-nous shutting down gracefully...')
-    if _MODEL_REFRESH_TASK:
-        _MODEL_REFRESH_TASK.cancel()
-        try:
-            await _MODEL_REFRESH_TASK
-        except asyncio.CancelledError:
-            pass
-        _MODEL_REFRESH_TASK = None
+    for _task in (_MODEL_REFRESH_TASK, _HEAL_TASK):
+        if _task:
+            _task.cancel()
+            try:
+                await _task
+            except asyncio.CancelledError:
+                pass
+    _MODEL_REFRESH_TASK = None
+    _HEAL_TASK = None
     await MODEL_REGISTRY_CLIENT.stop()
     # Cleanup: close aiohttp session
     global _SESSION
@@ -1578,17 +1856,42 @@ async def health():
     }
 
 
+# N-16 fix: /ready must not hit upstream (through the key pool, burning RPM)
+# on every probe. Serve readiness from the cached catalog age and rate-limit
+# live probes to at most one per READY_PROBE_MIN_INTERVAL_SEC.
+READY_PROBE_MIN_INTERVAL_SEC = int(os.environ.get("READY_PROBE_MIN_INTERVAL_SEC", "60"))
+_ready_probe_state = {"last_probe": 0.0, "status": None, "error": None}
+
 @app.get("/ready")
 async def ready():
     """Readiness checks credentials and catalog reachability, not a hidden model."""
     try:
-        status, result = await get_nous_json_with_retries("/v1/models")
         has_credentials = KEY_POOL.total_keys > 0 or bool(_read_token_from_auth_path())
+        # Fresh cached catalog → upstream was reachable recently; no live call.
+        if MODEL_STORE.get_catalog(fresh_only=True):
+            return {
+                "ready": has_credentials,
+                "upstream_ok": True,
+                "status_code": 200,
+                "source": "catalog_cache",
+                "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+                "last_error": None,
+                "keys": KEY_POOL.total_keys,
+                "available": KEY_POOL.available_keys,
+            }
+        now = time.time()
+        if now - _ready_probe_state["last_probe"] >= READY_PROBE_MIN_INTERVAL_SEC or _ready_probe_state["status"] is None:
+            _ready_probe_state["last_probe"] = now
+            status, result = await get_nous_json_with_retries("/v1/models")
+            _ready_probe_state["status"] = status
+            _ready_probe_state["error"] = None if status == 200 else (result.get("error") if isinstance(result, dict) else str(result))
+        status = _ready_probe_state["status"]
         return {
             "ready": status == 200 and has_credentials,
             "upstream_ok": status == 200,
             "status_code": status,
-            "last_error": None if status == 200 else (result.get("error") if isinstance(result, dict) else str(result)),
+            "source": "live_probe_cached",
+            "last_error": _ready_probe_state["error"],
             "keys": KEY_POOL.total_keys,
             "available": KEY_POOL.available_keys,
         }
@@ -1648,8 +1951,10 @@ async def get_session():
     lock = _get_session_lock()
     async with lock:
         if _SESSION is None or _SESSION.closed:
+            # N-06 fix: session default covers non-streaming calls; streaming
+            # requests override with total=None + sock_read in post_nous.
             _SESSION = aiohttp.ClientSession(
-                timeout=aiohttp.ClientTimeout(total=max(REQUEST_TIMEOUT_SEC, STREAM_REQUEST_TIMEOUT_SEC), sock_connect=CONNECT_TIMEOUT_SEC),
+                timeout=aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC),
                 connector=aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS_PER_HOST, ttl_dns_cache=300, enable_cleanup_closed=True),
             )
         return _SESSION
@@ -1675,14 +1980,17 @@ async def models():
 
     models_list = list(upstream_models)
 
+    # N-17 fix: build the new set first, then swap atomically — no transient
+    # empty _known_models window for concurrent requests.
     global _known_models
-    _known_models = set()
+    new_known: Set[str] = set()
     for m in models_list:
         mid = m.get("id") if isinstance(m, dict) else None
         if mid:
-            _known_models.add(mid)
+            new_known.add(mid)
     for m in CURATED_FREE_MODELS:
-        _known_models.add(m["id"])
+        new_known.add(m["id"])
+    _known_models = new_known
 
     # Add the curated discovery manifest only when upstream catalog is unavailable; it is not an inference fallback
     # Codex CLI needs to discover models before making chat requests
@@ -1768,7 +2076,12 @@ async def capabilities():
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):
-    body = await req.json()
+    # N-18 fix: non-discovery endpoint requires auth.
+    await _auth_check(req)
+    try:
+        body = await req.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
     est = len(str(body)) // 4
     return {"input_tokens": max(1, est)}
 
@@ -1784,11 +2097,10 @@ async def chat_completions(request: Request):
     if not check_rate_limit(client_ip):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
-    if body.get('max_tokens') is not None and (not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0):
-        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': 'max_tokens must be a positive integer'}})
-    # BUG-SEC3 fix: cap max_tokens to prevent overflow
-    if isinstance(body.get('max_tokens'), int) and body['max_tokens'] > 1000000:
-        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': 'max_tokens exceeds maximum allowed value of 1000000'}})
+    # BUG-SEC3 fix (via shared helper, N-11): validate + cap max_tokens
+    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens')
+    if mt_err:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': mt_err}})
 
     requested = body.get("model")
     # Transparent: only alias-map; do not inject DEFAULT_MODEL
@@ -1851,7 +2163,18 @@ async def chat_completions(request: Request):
 @app.post("/v1/responses")
 async def responses(request: Request):
     await _auth_check(request)
-    body = await request.json()
+    # N-04 fix: malformed JSON → 400 invalid_request_error, not a generic 500.
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
+    # N-11 fix: per-IP rate limiting on this endpoint too (SEC sibling gap).
+    if not check_rate_limit(request.client.host):
+        raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
+    # N-11 fix: type-guard + cap max_output_tokens (int("abc") previously → 500).
+    mot_err = validate_max_tokens_field(body.get("max_output_tokens"), "max_output_tokens")
+    if mot_err:
+        return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': mot_err}})
     requested = body.get("model")
     if free_only_enabled() and requested:
         resolved = resolve_model(requested)
@@ -1865,6 +2188,8 @@ async def responses(request: Request):
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses")
+    # N-20 fix: record metrics on this surface too (was only chat_completions).
+    metrics.record(error=(status != 200))
     if status != 200:
         return JSONResponse(status_code=status, content=result)
 
@@ -1879,14 +2204,20 @@ async def responses(request: Request):
                 async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
                     yield line
             finally:
-                # BUG-FIX: store conversation in background to avoid blocking
-                # stream finalization. If store_conversation hangs or is slow,
-                # the generator would not finish and Codex would hang waiting
-                # for the stream to close.
+                # BUG-FIX: store conversation without blocking stream
+                # finalization. N-07 fix: never await in this finally — on
+                # client disconnect (GeneratorExit) an await here suspends the
+                # generator during finalization (RuntimeError: async generator
+                # ignored GeneratorExit) and can skip persistence entirely.
+                # A background task persists the history either way, so the
+                # next turn's previous_response_id still finds the assistant
+                # tool_calls.
                 try:
-                    await store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
+                    asyncio.get_running_loop().create_task(
+                        store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()])
+                    )
                 except Exception as e:
-                    logger.warning(f"[responses] store_conversation failed: {e}")
+                    logger.warning(f"[responses] store_conversation scheduling failed: {e}")
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
     resp = chat_to_responses(chat_body["model"], result)
@@ -1908,9 +2239,18 @@ async def responses(request: Request):
 @app.post("/v1/messages")
 async def messages(request: Request):
     await _auth_check(request)
-    body = await request.json()
-    if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
-        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'max_tokens is required and must be a positive integer'}})
+    # N-04 fix: malformed JSON → 400 invalid_request_error, not a generic 500.
+    try:
+        body = await request.json()
+    except Exception as e:
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
+    # N-11 fix: per-IP rate limiting on this endpoint too (SEC sibling gap).
+    if not check_rate_limit(request.client.host):
+        raise HTTPException(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
+    # N-11 fix: apply the shared SEC3 cap+validation (upper bound was missing).
+    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens', required=True)
+    if mt_err:
+        return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': mt_err}})
     sys_field = body.get('system')
     if sys_field is not None and not isinstance(sys_field, (str, list)):
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '"system" must be a string or array of content blocks'}})
@@ -1932,6 +2272,8 @@ async def messages(request: Request):
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
     await record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages")
+    # N-20 fix: record metrics on this surface too (was only chat_completions).
+    metrics.record(error=(status != 200))
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}
@@ -1950,11 +2292,15 @@ async def messages(request: Request):
 
 # --- METRICS ---
 @app.get("/metrics")
-async def get_metrics():
+async def get_metrics(request: Request):
+    # N-18 fix: telemetry endpoints require the bearer token.
+    await _auth_check(request)
     return metrics.snapshot()
 
 @app.get("/metrics/prom")
-async def prom():
+async def prom(request: Request):
+    # N-18 fix: telemetry endpoints require the bearer token.
+    await _auth_check(request)
     snap = metrics.snapshot()
     lines = [
         f'# HELP wrapper_nous_requests_total Total requests\nwrapper_nous_requests_total {snap["total_requests"]}',
@@ -1963,7 +2309,9 @@ async def prom():
     return Response("\n".join(lines), media_type="text/plain")
 
 @app.get("/metrics/model-status")
-async def model_status():
+async def model_status(request: Request):
+    # N-18 fix: telemetry endpoints require the bearer token.
+    await _auth_check(request)
     return {
         "provider": "nous",
         "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
@@ -1973,21 +2321,21 @@ async def model_status():
 
 @app.get("/dashboard")
 @app.get("/dashboard.html")
-async def dashboard():
-    """Serve the wrapper dashboard HTML."""
+async def dashboard(request: Request):
+    """Serve the wrapper dashboard HTML.
+
+    N-03 fix: requires auth and never injects the raw BEARER_TOKEN into the
+    HTML. The dashboard page prompts for the token client-side instead, so a
+    client that can merely reach the port can no longer read the proxy
+    credential out of an unauthenticated page.
+    """
+    await _auth_check(request)
     from pathlib import Path
+    from fastapi.responses import HTMLResponse
     dashboard_path = Path(__file__).parent / "dashboard.html"
     if not dashboard_path.exists():
-        from fastapi.responses import HTMLResponse
         return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
-    html = dashboard_path.read_text()
-    # Inject bearer token if auth is enabled
-    token = (BEARER_TOKEN or "").strip()
-    if token:
-        meta_tag = '<meta name="wrapper-bearer-token" content="' + token.replace('"', '&quot;') + '">'
-        html = html.replace('<head>', '<head>\n' + meta_tag, 1)
-    from fastapi.responses import HTMLResponse
-    return HTMLResponse(content=html)
+    return HTMLResponse(content=dashboard_path.read_text())
 
 @app.get("/healthz")
 async def healthz(): return await health()

@@ -12,28 +12,6 @@ from typing import Optional, List
 logger = logging.getLogger('wrapper-blackbox')
 
 
-class Mutex:
-    def __init__(self):
-        self._queue: List[asyncio.Future] = []
-        self._locked = False
-
-    async def acquire(self):
-        if not self._locked:
-            self._locked = True
-            return
-        fut = asyncio.get_event_loop().create_future()
-        self._queue.append(fut)
-        await fut
-
-    def release(self):
-        if self._queue:
-            fut = self._queue.pop(0)
-            if not fut.done():
-                fut.set_result(None)
-        else:
-            self._locked = False
-
-
 class KeyEntry:
     def __init__(self, label: str, api_key: str):
         self.label = label
@@ -108,7 +86,12 @@ class KeyPool:
         self.keys: List[KeyEntry] = []
         self.soft_limit = 30
         self.hard_limit = 40
-        self._lock = Mutex()
+        # BB-1 (CRITICAL): the previous hand-rolled Mutex was not
+        # cancellation-safe — a cancelled waiter left a done future in the
+        # queue and release() would neither wake the next waiter nor unlock,
+        # permanently wedging the pool. asyncio.Lock handles cancelled
+        # waiters correctly.
+        self._lock = asyncio.Lock()
         self._rr = 0
         self._in_flight_total = 0
 
@@ -140,8 +123,7 @@ class KeyPool:
         return sum(1 for k in self.keys if not k.is_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit))
 
     async def acquire(self, model: str = '') -> Optional[dict]:
-        await self._lock.acquire()
-        try:
+        async with self._lock:
             inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
             if sum(k.in_flight for k in self.keys) >= inflight_cap:
                 logger.warning(f'[blackbox] Load shedding: in-flight >= {inflight_cap}')
@@ -156,8 +138,6 @@ class KeyPool:
             key.record()
             self._in_flight_total += 1
             return {'key': key}
-        finally:
-            self._lock.release()
 
     def release(self, key: KeyEntry = None):
         if key is None:

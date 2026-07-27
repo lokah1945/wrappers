@@ -302,6 +302,10 @@ class ModelStateStore:
                 "account_scope": account_scope,
             }
             self._last_status_write[write_key] = (now, dict(result))
+            # CM-5 fix: prune on the success path too. Previously only
+            # record_error() pruned, so _last_status_write and
+            # model_state_events grew without bound during healthy periods.
+            self._maybe_prune()
             return result
         finally:
             conn.close()
@@ -397,8 +401,8 @@ class ModelStateStore:
             reason_detail=detail,
             endpoint=endpoint,
         )
-        # Periodic pruning to prevent unbounded growth
-        self._maybe_prune()
+        # CM-5: pruning now happens inside record_status (under the write
+        # lock), covering both success and error paths — no extra call here.
         return result
 
     def _maybe_prune(self) -> None:

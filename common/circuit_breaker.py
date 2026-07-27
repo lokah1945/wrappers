@@ -73,7 +73,19 @@ class CircuitBreaker:
         self._failure_count = 0
         self._success_count = 0
         self._last_failure_time: float = 0
-        self._lock = asyncio.Lock()
+        # CM-2 fix: lazily create the lock so it binds to the running loop
+        # (import-time creation could bind to a different loop under
+        # uvicorn reload / multi-loop tests).
+        self._lock_instance: Optional[asyncio.Lock] = None
+        # CM-2 fix: gate HALF_OPEN to a single in-flight probe to avoid a
+        # thundering herd hitting a sick upstream at the recovery moment.
+        self._half_open_probe_in_flight = False
+
+    @property
+    def _lock(self) -> asyncio.Lock:
+        if self._lock_instance is None:
+            self._lock_instance = asyncio.Lock()
+        return self._lock_instance
 
     @property
     def state(self) -> CircuitState:
@@ -120,6 +132,11 @@ class CircuitBreaker:
             if current == CircuitState.CLOSED:
                 return
             elif current == CircuitState.HALF_OPEN:
+                # CM-2 fix: only one probe may be in flight during HALF_OPEN.
+                if self._half_open_probe_in_flight:
+                    remaining = self.remaining_recovery_seconds
+                    raise CircuitBreakerError(CircuitState.HALF_OPEN, remaining)
+                self._half_open_probe_in_flight = True
                 logger.info(f"[circuit-breaker:{self.name}] half-open: allowing probe request")
                 return
             else:  # OPEN
@@ -134,6 +151,7 @@ class CircuitBreaker:
         """Record a successful request."""
         async with self._lock:
             if self._state == CircuitState.HALF_OPEN:
+                self._half_open_probe_in_flight = False
                 self._success_count += 1
                 if self._success_count >= self.success_threshold:
                     logger.info(
@@ -154,6 +172,7 @@ class CircuitBreaker:
             self._success_count = 0
 
             if self._state == CircuitState.HALF_OPEN:
+                self._half_open_probe_in_flight = False
                 logger.warning(
                     f"[circuit-breaker:{self.name}] probe failed, reopening circuit"
                 )
@@ -183,4 +202,5 @@ class CircuitBreaker:
             self._state = CircuitState.CLOSED
             self._failure_count = 0
             self._success_count = 0
+            self._half_open_probe_in_flight = False
             logger.info(f"[circuit-breaker:{self.name}] manually reset to closed")

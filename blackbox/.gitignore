@@ -1,0 +1,3 @@
+# SEC-4/CFG-2 (audit 2026-07-27): runtime metrics snapshot written by
+# src/metrics.py — runtime artifact, never commit.
+metrics-snapshot.json

@@ -25,10 +25,16 @@ FLUSH_INTERVAL = float(os.environ.get('LOKI_FLUSH_INTERVAL', '5.0'))
 LABELS = json.loads(os.environ.get('LOKI_LABELS_JSON', '{"job":"wrapper-nvidia"}'))
 TENANT = os.environ.get('LOKI_TENANT_ID', '').strip()
 TLS_VERIFY = os.environ.get('LOKI_TLS_VERIFY', '0') == '1'
+# V-04 fix (audit 2026-07-27): bound the retry batch so a failing Loki endpoint
+# cannot grow memory without limit, and stop retry-storming on auth failures.
+MAX_BUFFER = int(os.environ.get('LOKI_MAX_BUFFER', '1000'))
+AUTH_FAILURE_LIMIT = int(os.environ.get('LOKI_AUTH_FAILURE_LIMIT', '3'))
 
 _batch = []
 _last_flush = time.time()
 _session = None  # BUG-D6 fix: reuse one aiohttp session for all pushes
+_auth_failures = 0
+_disabled = False  # set after repeated 401/403 — pushes permanently disabled
 
 
 async def _get_session():
@@ -45,7 +51,10 @@ async def _get_session():
 
 
 async def push_chunk() -> None:
-    global _batch, _last_flush
+    global _batch, _last_flush, _auth_failures, _disabled
+    if _disabled:
+        _batch = []
+        return
     if not _batch:
         return
     base_time_ns = int(time.time() * 1_000_000_000)
@@ -78,21 +87,52 @@ async def push_chunk() -> None:
             ssl=TLS_VERIFY if TLS_VERIFY else False,
         ) as resp:
             if 200 <= resp.status < 300:
+                _auth_failures = 0
                 _batch = _batch[len(snapshot):]
                 print(f"[loki_push] flushed {len(snapshot)} records")
+            elif resp.status in (401, 403):
+                # V-04 fix: repeated auth failures disable pushes (log once)
+                # instead of retrying the same rejected batch forever.
+                _auth_failures += 1
+                _batch = _batch[len(snapshot):]
+                if _auth_failures >= AUTH_FAILURE_LIMIT and not _disabled:
+                    _disabled = True
+                    _batch = []
+                    print(f"[loki_push] HTTP {resp.status} auth failure repeated "
+                          f"{_auth_failures}x — Loki pushes DISABLED (fix "
+                          f"LOKI_TENANT_ID/credentials and restart to re-enable)",
+                          file=sys.stderr)
+                else:
+                    print(f"[loki_push] HTTP {resp.status}", file=sys.stderr)
+            elif 400 <= resp.status < 500:
+                # Permanent client error: this batch will never be accepted — drop it.
+                _batch = _batch[len(snapshot):]
+                print(f"[loki_push] HTTP {resp.status} — dropped {len(snapshot)} records", file=sys.stderr)
             else:
                 print(f"[loki_push] HTTP {resp.status}", file=sys.stderr)
     except Exception as e:
         print(f"[loki_push] error: {e}", file=sys.stderr)
 
+    # V-04 fix: hard cap on the pending batch (drop-oldest).
+    if len(_batch) > MAX_BUFFER:
+        dropped = len(_batch) - MAX_BUFFER
+        _batch = _batch[dropped:]
+        print(f"[loki_push] buffer cap {MAX_BUFFER} exceeded — dropped {dropped} oldest records", file=sys.stderr)
+
     _last_flush = time.time()
 
 
 def process_line(line: str) -> None:
+    global _batch
+    if _disabled:
+        return
     line = line.strip()
     if not line:
         return
     _batch.append(line)
+    # V-04 fix: never let the pending batch grow past the cap (drop-oldest).
+    if len(_batch) > MAX_BUFFER:
+        _batch = _batch[len(_batch) - MAX_BUFFER:]
     if len(_batch) >= BATCH_SIZE:
         asyncio.create_task(push_chunk())
 

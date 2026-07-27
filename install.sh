@@ -90,6 +90,11 @@ while IFS='|' read -r name dir unit health; do
   # Unit files are kept portable in git. Render the repository path used by
   # this installation instead of silently hardcoding /root/wrapper.
   rendered_unit="$(mktemp)"
+  # F13 fix: refuse paths containing the sed delimiter instead of silently
+  # producing a broken unit file.
+  case "$PROJECT_DIR" in
+    *'#'*) fail "PROJECT_DIR must not contain '#': $PROJECT_DIR" ;;
+  esac
   escaped_project="${PROJECT_DIR//&/\\&}"
   sed "s#/root/wrapper#${escaped_project}#g" "$unit_src" > "$rendered_unit"
   install -m 0644 "$rendered_unit" "$unit_dst"
@@ -106,12 +111,15 @@ if [ "$MODE" = "no-restart" ]; then
   exit 0
 fi
 
+# F13 fix: do not abort mid-deploy on the first unhealthy wrapper — that
+# left the remaining services running old code. Restart all, then report.
+FAILED_UNITS=""
 while IFS='|' read -r name dir unit health; do
   log "restarting ${unit}"
   systemctl --user reset-failed "$unit" 2>&1 || true
   systemctl --user restart "$unit"
   sleep 2
-  if curl -sS -m 5 "$health" > "/tmp/${unit}.health.json" 2>&1; then
+  if curl -sS -m 5 "$health" > "/tmp/${unit}.health.json" 2>/dev/null; then
     log "✅ ${name} healthy"
     cat "/tmp/${unit}.health.json"
     printf '\n'
@@ -119,8 +127,12 @@ while IFS='|' read -r name dir unit health; do
     log "❌ ${name} health failed"
     tail -30 "/tmp/${unit}.health.json" || true
     journalctl --user -u "$unit" --since "30 seconds ago" --no-pager | tail -20 || true
-    exit 1
+    FAILED_UNITS="${FAILED_UNITS} ${unit}"
   fi
 done < <(selected_wrappers)
+
+if [ -n "$FAILED_UNITS" ]; then
+  fail "unhealthy after restart:${FAILED_UNITS}"
+fi
 
 log "install complete"

@@ -9,12 +9,18 @@ Three translators:
   - streamOpenaiToAnthropic(stream, ...)       -> response O->A  (SSE async generator)
 """
 
+import os
 import re
 import json
 import time
+import asyncio
 from typing import Optional, AsyncGenerator
 
 from .capabilities import get_context_window
+
+
+def _env_flag(name: str, default: str = '0') -> bool:
+    return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
 
 
 _FINISH_TO_STOP = {
@@ -172,7 +178,10 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
     max_allowed_tokens = max(4000, context_limit - (a.get('max_tokens', 4096) or 4096) - 2000)
     current_tokens = estimate_input_tokens(a)
 
-    if current_tokens > max_allowed_tokens:
+    # V19 fix (transparency audit 2026-07-27): silent history truncation is
+    # opt-in via WRAPPER_AUTO_TRUNCATE. Default OFF: forward the conversation
+    # as-is and let upstream decide (its context error is visible to the client).
+    if current_tokens > max_allowed_tokens and _env_flag('WRAPPER_AUTO_TRUNCATE', '0'):
         while len(a['messages']) > 1 and current_tokens > max_allowed_tokens:
             if a['messages'][0] and a['messages'][0].get('role') == 'system':
                 break
@@ -510,7 +519,10 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
             args = {'raw': fn.get('arguments', '')}
         content.append({'type': 'tool_use', 'id': tc.get('id', ''), 'name': fn.get('name', ''), 'input': args})
 
-    if expect_thinking and not any(c.get('type') == 'thinking' for c in content) and content:
+    # V25 fix (transparency audit 2026-07-27): fabricating a thinking block is
+    # opt-in via WRAPPER_SYNTHETIC_THINKING. Default OFF: omit the block.
+    if (expect_thinking and _env_flag('WRAPPER_SYNTHETIC_THINKING', '0')
+            and not any(c.get('type') == 'thinking' for c in content) and content):
         content.insert(0, {'type': 'thinking', 'thinking': '[Reasoning not supported by this model; responding directly.]'})
 
     if not any(c.get('type') in ('text', 'tool_use') for c in content):
@@ -580,6 +592,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     synthetic_thinking_emitted = False
     errored = False
     error_message = ''
+    client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
 
     async def stop_open():
         nonlocal open_idx, text_index, thinking_index
@@ -636,6 +649,9 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     async def emit_synthetic_thinking():
         nonlocal synthetic_thinking_emitted, thinking_index, open_idx, completed_thinking, next_index
         if synthetic_thinking_emitted or real_thinking_emitted:
+            return
+        # V25 fix: synthetic thinking is opt-in; default is to omit the block.
+        if not _env_flag('WRAPPER_SYNTHETIC_THINKING', '0'):
             return
         synthetic_thinking_emitted = True
         async for chunk in stop_open():
@@ -990,6 +1006,12 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
 
                 if ch.get('finish_reason'):
                     final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
+    except (GeneratorExit, asyncio.CancelledError):
+        # V-15 fix (audit 2026-07-27): client disconnected / task cancelled.
+        # Async generator finalization forbids further yields — mark it so the
+        # finally block does cleanup only, then re-raise.
+        client_gone = True
+        raise
     except Exception as e:
         errored = True
         error_message = str(e) if e else 'upstream connection error'
@@ -1002,26 +1024,27 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     await maybe
         except Exception:
             pass
-        if open_idx is not None:
-            try:
-                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
-            except Exception:
-                pass
-            open_idx = None
+        if not client_gone:
+            if open_idx is not None:
+                try:
+                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
+                except Exception:
+                    pass
+                open_idx = None
 
-        if current_tool_index is not None:
-            try:
-                yield _sse('content_block_delta', {
-                    'type': 'content_block_delta', 'index': current_tool_index,
-                    'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(current_tool_input)},
-                })
-            except Exception:
-                pass
-            try:
-                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': current_tool_index})
-            except Exception:
-                pass
-            current_tool_index = None
+            if current_tool_index is not None:
+                try:
+                    yield _sse('content_block_delta', {
+                        'type': 'content_block_delta', 'index': current_tool_index,
+                        'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(current_tool_input)},
+                    })
+                except Exception:
+                    pass
+                try:
+                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': current_tool_index})
+                except Exception:
+                    pass
+                current_tool_index = None
 
         _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop)
 

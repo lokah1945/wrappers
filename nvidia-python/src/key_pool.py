@@ -28,29 +28,11 @@ NVIDIA_GENAI_URL = 'https://ai.api.nvidia.com'
 NVIDIA_NVCF_URL = 'https://api.nvcf.nvidia.com'
 
 
-class Mutex:
-    """Simple asyncio-based mutex."""
-
-    def __init__(self):
-        self._queue: List[asyncio.Future] = []
-        self._locked = False
-
-    async def acquire(self):
-        if not self._locked:
-            self._locked = True
-            return
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        self._queue.append(fut)
-        await fut
-
-    def release(self):
-        if self._queue:
-            fut = self._queue.pop(0)
-            if not fut.done():
-                fut.set_result(None)
-        else:
-            self._locked = False
+# V-01 fix (audit 2026-07-27): the previous hand-rolled Mutex was not
+# cancellation-safe — a cancelled waiter left the mutex permanently locked and
+# every subsequent acquire() hung forever. asyncio.Lock handles cancellation
+# correctly and exposes the same acquire()/release() interface used here.
+Mutex = asyncio.Lock
 
 
 class KeyEntry:
@@ -191,7 +173,8 @@ class KeyEntry:
         now = time.time()
         return {
             'label': self.label,
-            'key_prefix': (self.api_key[:16] + '...') if self.api_key else 'unknown',
+            # V-10 fix: expose at most 6 chars of key material via metrics/dashboards
+            'key_prefix': (self.api_key[:6] + '...') if self.api_key else 'unknown',
             'current_rpm': rpm,
             'in_flight': self.in_flight,
             'effective_load': self.effective_load,
@@ -227,7 +210,7 @@ class KeyPool:
         self.max_queue_size: int = 500
         self._admit_interval: float = 0.0
         self._version: str = '8.6.5-py'
-        self._lock = Mutex()
+        self._lock = asyncio.Lock()  # V-01 fix: cancellation-safe lock
         self._recent_429: List[dict] = []
         self._model_ts: Dict[str, List[float]] = {}
         self._model_limit: Dict[str, int] = {}
@@ -525,7 +508,22 @@ class KeyPool:
                             lim = s.effective_soft_limit(soft, hard) if self.pacing else s.effective_hard_limit(hard)
                             return current < lim
 
+                        def near_rpm_cap(s: KeyEntry, idle_rpm=idle_rpm) -> bool:
+                            # F1 fix (latency audit 2026-07-27): a key is "near its
+                            # RPM cap" only when its rolling RPM is within 80% of
+                            # the applicable limit. Bursts below that must not be
+                            # paced by the admission interval.
+                            current = s.current_rpm()
+                            if current < idle_rpm:
+                                return False
+                            lim = s.effective_soft_limit(soft, hard) if self.pacing else s.effective_hard_limit(hard)
+                            return current >= max(1, int(lim * 0.8))
+
                         def admit_ok(s: KeyEntry) -> bool:
+                            # F1 fix: apply the admission interval only when the
+                            # key is genuinely near its RPM cap.
+                            if not near_rpm_cap(s):
+                                return True
                             return s.admit_ready(interval)
 
                         ready = [s for s in avail if rpm_ok(s) and admit_ok(s)]
@@ -559,7 +557,9 @@ class KeyPool:
                         waits = []
                         for s in avail:
                             rpm_w = s.seconds_until_below(s.effective_soft_limit(soft, hard))
-                            adm_w = s.seconds_until_admit(interval)
+                            # F1 fix: the admission interval only contributes to the
+                            # wait estimate for keys that are near their RPM cap.
+                            adm_w = s.seconds_until_admit(interval) if near_rpm_cap(s) else 0.0
                             waits.append(max(rpm_w, adm_w))
                         wait = min(waits) if waits else 1.0
 
@@ -594,11 +594,14 @@ class KeyPool:
                     else:
                         await asyncio.sleep(sleep_duration)
 
-            if my_ticket is not None:
-                del self._waiting[my_ticket]
             return (None, time.time() - start)
         finally:
-            pass
+            # V-03 fix (audit 2026-07-27): always remove our waiting ticket, even
+            # when the task is cancelled (client disconnect) while sleeping or
+            # awaiting the abort signal. Ghost tickets previously accumulated in
+            # self._waiting, inflating queue backpressure and pacing rank forever.
+            if my_ticket is not None:
+                self._waiting.pop(my_ticket, None)
 
     def _retry_hint(self, model: str = None) -> Tuple[int, str]:
         now = time.time()
@@ -926,7 +929,9 @@ class KeyPool:
             if not ts:
                 del self._model_limit[model]
         for km in list(self._key_model_limit.keys()):
-            key_label, model = km.split('/')
+            # V-02 fix: model IDs contain '/' (e.g. key1/meta/llama-3.1-8b-instruct);
+            # split only on the first separator or pruning raises ValueError forever.
+            key_label, model = km.split('/', 1)
             k = f'{key_label}/{model}'
             ts = [t for t in self._model_ts_by_key.get(k, []) if now - t < 600]
             if not ts:

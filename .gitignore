@@ -71,9 +71,9 @@ env/
 dist/
 build/
 
-# DB files
-netrics.db
-netrics.db-*
+# DB files (F11: fixed historical typo "netrics.db" -> metrics.db covered below)
+metrics.db
+metrics.db-*
 
 # Local backup directories — never push to GitHub
 nvidia_backup_*/
@@ -116,3 +116,11 @@ htmlcov/
 .env.local
 .env.*.local
 nvidia/
+
+# F10: per-wrapper metrics snapshots are runtime artifacts
+metrics-snapshot.json
+
+# F5: deploy markers are runtime state; a tracked marker can never hold its
+# own deploy commit (git pull clobbers it). Trust /health git_commit instead.
+runtime/
+.deployed_commit

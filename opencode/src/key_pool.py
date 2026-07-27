@@ -18,29 +18,6 @@ from typing import Optional, List
 logger = logging.getLogger('wrapper-opencode')
 
 
-class Mutex:
-    def __init__(self):
-        self._queue: List[asyncio.Future] = []
-        self._locked = False
-
-    async def acquire(self):
-        if not self._locked:
-            self._locked = True
-            return
-        loop = asyncio.get_event_loop()
-        fut = loop.create_future()
-        self._queue.append(fut)
-        await fut
-
-    def release(self):
-        if self._queue:
-            fut = self._queue.pop(0)
-            if not fut.done():
-                fut.set_result(None)
-        else:
-            self._locked = False
-
-
 class KeyEntry:
     def __init__(self, label: str, api_key: str):
         self.label = label
@@ -127,7 +104,7 @@ class KeyPool:
         self.keys: List[KeyEntry] = []
         self.soft_limit: int = 30
         self.hard_limit: int = 40
-        self._lock = Mutex()
+        self._lock = asyncio.Lock()
         self._in_flight_total = 0
         self._rr = 0
 
@@ -165,8 +142,11 @@ class KeyPool:
         return sum(1 for k in self.keys if not k.is_hard_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit))
 
     async def acquire(self, model: str = '') -> Optional[dict]:
-        await self._lock.acquire()
-        try:
+        # OC-1: asyncio.Lock is cancellation-safe — a task cancelled while waiting
+        # in the lock queue is removed on cancel, unlike the old hand-rolled
+        # Mutex whose cancelled future permanently wedged the pool (whole-wrapper
+        # hang under load).
+        async with self._lock:
             inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
             if sum(k.in_flight for k in self.keys) >= inflight_cap:
                 logger.warning(f'[opencode] Load shedding: in-flight >= {inflight_cap}')
@@ -184,8 +164,6 @@ class KeyPool:
             key.increment_in_flight()
             self._in_flight_total += 1
             return {'key': key}
-        finally:
-            self._lock.release()
 
     def release(self, key: KeyEntry = None):
         if key is None:
@@ -193,7 +171,7 @@ class KeyPool:
         key.decrement_in_flight()
         self._in_flight_total = max(0, self._in_flight_total - 1)
 
-    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = ''):
+    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = '', available_keys: int = None):
         if key is None:
             return
         if status_code == 429:
@@ -202,7 +180,13 @@ class KeyPool:
         elif status_code in (401, 403, 402):
             key.block(retry_after or int(os.environ.get('AUTH_KEY_COOLDOWN_SEC', '300')), 'auth_or_quota')
         elif status_code >= 500 or status_code in (408, 409):
-            key.block(retry_after or int(os.environ.get('TRANSIENT_KEY_COOLDOWN_SEC', '15')), 'transient')
+            cooldown = retry_after or int(os.environ.get('TRANSIENT_KEY_COOLDOWN_SEC', '15'))
+            # OC-13: with no other ready key, a single transient blip shouldn't
+            # shed 100% of traffic for the full cooldown — back off briefly so a
+            # retry (or the next request) can still use this key.
+            if available_keys is not None and available_keys <= 0 and cooldown > 1:
+                cooldown = 1
+            key.block(cooldown, 'transient')
         elif reason:
             key.block(retry_after or 15, reason)
 

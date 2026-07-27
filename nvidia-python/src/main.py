@@ -44,6 +44,7 @@ Routes:
 import os
 import sys
 import json
+import hmac
 import time
 import uuid
 import asyncio
@@ -123,6 +124,12 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -
         body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
         account_scope = credential_fingerprint(key.api_key)
+        # V-13 fix: probes consume real upstream RPM — record the timestamp on
+        # the key so the pool's rate view includes verification traffic.
+        try:
+            key.timestamps.append(time.time())
+        except Exception:
+            pass
         session = getattr(pool, "_agent", None)
         owns_session = session is None or session.closed
         if owns_session:
@@ -198,6 +205,7 @@ async def verify_models(pool):
     async def _probe(mid, key):
         async with sem:
             res = await probe_model(pool, mid, TTFT_TIMEOUT_MS, key=key)
+            res["ts"] = time.time()  # V-20 fix: track probe recency
             classification = classify_upstream_error(res.get("status", 0), res.get("reason", ""))
             res["state"] = classification["state"]
             res["reason_code"] = classification["reason_code"]
@@ -234,7 +242,8 @@ async def verify_models(pool):
             _unavailable_models.add(mid)
         else:
             _unavailable_models.discard(mid)
-        latest = max(results, key=lambda result: result.get("account_scope", ""))
+        # V-20 fix: "latest" means most recent probe, not alphabetical fingerprint.
+        latest = max(results, key=lambda result: result.get("ts", 0))
         _model_status[mid] = latest
 
     _retired_models.intersection_update(set(ids))
@@ -246,8 +255,17 @@ async def verify_models(pool):
 async def verify_loop(pool):
     while True:
         try:
+            # F7 fix: never compete with live traffic — skip the sweep while
+            # requests are queued/paced on the key pool.
+            if getattr(pool, '_waiting', None):
+                logger.info('[verify] sweep skipped: %d live request(s) waiting on key pool'
+                            % len(pool._waiting))
+                await asyncio.sleep(30)
+                continue
             await verify_models(pool)
             await asyncio.sleep(VERIFY_INTERVAL / 1000)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"[verify] loop error: {e}")
             await asyncio.sleep(60)
@@ -289,10 +307,17 @@ def check_rate_limit(client_ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
     now = time.time()
     with _rate_limit_lock:
-        _rate_limit_store[client_ip] = [t for t in _rate_limit_store[client_ip] if now - t < 60]
-        if len(_rate_limit_store[client_ip]) >= RATE_LIMIT_RPM:
+        # V-08 fix: prune stale keys so the store cannot grow without bound.
+        if len(_rate_limit_store) > 1024:
+            for ip in list(_rate_limit_store.keys()):
+                if not any(now - t < 60 for t in _rate_limit_store[ip]):
+                    del _rate_limit_store[ip]
+        fresh = [t for t in _rate_limit_store[client_ip] if now - t < 60]
+        if len(fresh) >= RATE_LIMIT_RPM:
+            _rate_limit_store[client_ip] = fresh
             return False
-        _rate_limit_store[client_ip].append(now)
+        fresh.append(now)
+        _rate_limit_store[client_ip] = fresh
     return True
 
 
@@ -555,8 +580,56 @@ else:
         ],
     )
 
+# ---------------------------------------------------------------------------
+# WRAPPER BEHAVIOR ENV FLAGS (audit fixes 2026-07-27) — all documented in
+# nvidia-python/.env.example as well. Transparent-by-default: mutation happens
+# only when compat/emulation strictly requires it or when explicitly opted in.
+#
+#   WRAPPER_AUTO_REASONING=0|1      (default 0) V1/F6: when 1, auto-inject default
+#                                   reasoning params (chat_template_kwargs etc.) for
+#                                   requires_reasoning models when the client did not
+#                                   ask. Default OFF: no injection without client intent.
+#   WRAPPER_SURFACE_REASONING=0|1   (default 0) V15: when 1, an empty message.content
+#                                   on plain /v1/chat/completions is replaced with the
+#                                   model's reasoning text. Default OFF: only the
+#                                   SDK-safety null->"" fix is applied.
+#   WRAPPER_DROP_BUILTIN_PARAMS=0|1 (default 1) V4: when 1, drop the built-in list of
+#                                   params NVIDIA verifiably rejects (think, context_*
+#                                   family). Set 0 to disable built-in drops; DROP_PARAMS
+#                                   env keys are always dropped. max_output_tokens is
+#                                   never silently deleted: it maps to max_tokens when
+#                                   max_tokens is absent, else dropped with a debug log.
+#   WRAPPER_FORCE_USAGE=0|1         (default 0) V7: when 1, inject
+#                                   stream_options.include_usage on plain
+#                                   /v1/chat/completions streams too. By default the
+#                                   wrapper injects it only on translated /v1/messages
+#                                   and /v1/responses paths (it needs usage there).
+#   WRAPPER_AUTO_TRUNCATE=0|1       (default 0) V19: when 1, /v1/messages histories that
+#                                   exceed the estimated context window are silently
+#                                   truncated (oldest first). Default OFF: forward as-is
+#                                   and let upstream decide.
+#   WRAPPER_SYNTHETIC_THINKING=0|1  (default 0) V25: when 1, emit the synthetic
+#                                   "[Reasoning not supported...]" thinking block when a
+#                                   client requested thinking but the model produced
+#                                   none. Default OFF: the thinking block is omitted.
+#   STREAM_SOCK_READ_TIMEOUT_SEC    (default 300) V-09: read-idle timeout for streamed
+#                                   upstream responses (replaces the hard total timeout
+#                                   that killed long generations mid-stream).
+#   LOKI_MAX_BUFFER / LOKI_AUTH_FAILURE_LIMIT  V-04: see loki_push.py.
+#   WRAPPER_EVENTS_MAX_MB           (default 64) V-11: rotate wrapper-events.jsonl when
+#                                   it exceeds this size.
+#   RESPONSES_STORE_MAX_BYTES       (default 64MiB) V-22: byte cap for the /v1/responses
+#                                   previous_response_id history store.
+#   VERIFY_INTERVAL                 (default now 1800s, was 600) F7: verify sweeps also
+#                                   skip while live requests are queued on the key pool.
+# ---------------------------------------------------------------------------
+
+def _env_flag(name: str, default: str = '0') -> bool:
+    return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
+
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9101'))
-BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
+# V-06 fix: default bind is loopback; set LISTEN_HOST explicitly to expose.
+BIND_HOST = os.environ.get('LISTEN_HOST', '127.0.0.1')
 BASE_LLM = (os.environ.get('NVIDIA_BASE_URL') or NVIDIA_BASE_URL).rstrip('/')
 BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/')
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
@@ -571,13 +644,17 @@ PRE_RESPONSE_TIMEOUT_MS = int(os.environ.get('PRE_RESPONSE_TIMEOUT_MS', '300000'
 TTFT_TIMEOUT_MS = int(os.environ.get('TTFT_TIMEOUT_MS', '120000'))
 REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT', '120'))
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '600'))
+# V-09 fix: streams use a read-idle timeout instead of a hard total timeout.
+STREAM_SOCK_READ_TIMEOUT_SEC = int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300'))
 GEN_TIMEOUT_SEC = int(os.environ.get('GEN_TIMEOUT_SEC', '900'))
 ANTI_SILENCE_TIMEOUT_MS = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
 INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
 LOAD_SHEDDING_ENABLED = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
 VERIFY_CONCURRENCY = int(os.environ.get('VERIFY_CONCURRENCY', '8'))
-VERIFY_INTERVAL = int(os.environ.get('VERIFY_INTERVAL', '600')) * 1000
-VERIFY_ON_BOOT = os.environ.get('VERIFY_ON_BOOT', 'false').lower() != 'false'
+# F7 fix: default sweep cadence lowered (600s -> 1800s); env still overrides.
+VERIFY_INTERVAL = int(os.environ.get('VERIFY_INTERVAL', '1800')) * 1000
+# V-13 fix: parse as a real boolean ('no'/'0'/'off' previously enabled it).
+VERIFY_ON_BOOT = _env_flag('VERIFY_ON_BOOT', 'false')
 MODEL_REFRESH_SEC = int(os.environ.get('MODEL_REFRESH_SEC', '600'))
 MAX_STREAM_BUFFER_KB = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512'))
 MAX_STREAM_BUFFER = MAX_STREAM_BUFFER_KB * 1024
@@ -670,8 +747,21 @@ for _p in (os.environ.get('WRAPPER_PARAMS') or '').split(','):
         except (TypeError, ValueError):
             pass
         DEFAULT_PARAMS[_p] = _dv
-PROACTIVE_DROP = set((os.environ.get('DROP_PARAMS', 'think').split(',') if os.environ.get('DROP_PARAMS') else ['think']))
-PROACTIVE_DROP.update(['context_length', 'context_window', 'context_len', 'max_position_embeddings', 'max_context_length', 'max_input_tokens', 'max_output_tokens', 'token_limit'])
+# V4 fix (transparency audit 2026-07-27):
+#  - DROP_PARAMS env keys are always dropped (explicit operator opt-in).
+#  - The built-in list is limited to keys NVIDIA verifiably rejects
+#    (think + the context_* metadata family) and can be disabled entirely
+#    with WRAPPER_DROP_BUILTIN_PARAMS=0.
+#  - max_output_tokens is NOT silently deleted anymore; see
+#    sanitize_nvidia_payload() which maps it to max_tokens when absent.
+_BUILTIN_DROP_PARAMS = {
+    'think', 'context_length', 'context_window', 'context_len',
+    'max_position_embeddings', 'max_context_length', 'max_input_tokens',
+    'token_limit',
+}
+PROACTIVE_DROP = set(p.strip() for p in (os.environ.get('DROP_PARAMS') or '').split(',') if p.strip())
+if _env_flag('WRAPPER_DROP_BUILTIN_PARAMS', '1'):
+    PROACTIVE_DROP.update(_BUILTIN_DROP_PARAMS)
 PROTECTED_PARAMS = {'messages', 'model', 'stream', 'tools', 'tool_choice', 'system'}
 
 def find_reasoning_config(model_id: str) -> Optional[dict]:
@@ -712,14 +802,19 @@ def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking
     if cfg['mechanism'] == 'chat_template_kwargs':
         obj = {}
         for k, v in cfg['params'].items():
-            obj[k] = v if enabled else False
+            # V3 fix (GLM regression): honor client intent. When the client
+            # explicitly requests thinking, config default-off values (e.g.
+            # GLM's {'thinking': False} opt-out) must not force it back off.
+            # Opting out of default thinking applies only when the client did
+            # NOT request thinking (handled by the `enabled` branch below).
+            obj[k] = (True if v is False else v) if enabled else False
         oai_body['chat_template_kwargs'] = {**(oai_body.get('chat_template_kwargs') or {}), **obj}
     elif cfg['mechanism'] == 'reasoning_effort':
         oai_body['reasoning_effort'] = cfg['params'].get('effort', 'high') if enabled else 'low'
     elif cfg['mechanism'] == 'nemotron_chat_template':
         obj = {}
         for k, v in cfg['params'].items():
-            obj[k] = v if enabled else False
+            obj[k] = (True if v is False else v) if enabled else False
         oai_body['chat_template_kwargs'] = {**(oai_body.get('chat_template_kwargs') or {}), **obj}
         rb = (oai_body.get('extra_body', {}).get('reasoning_budget') if isinstance(oai_body.get('extra_body'), dict) else None) or \
              (oai_body.get('chat_template_kwargs', {}).get('reasoning_budget') if isinstance(oai_body.get('chat_template_kwargs'), dict) else None)
@@ -728,6 +823,10 @@ def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking
 
 
 def apply_default_reasoning(body: dict, model_id: str) -> None:
+    # V1/F6 fix (transparency audit 2026-07-27): auto-injection of reasoning
+    # params when the client did not ask is opt-in via WRAPPER_AUTO_REASONING.
+    if not _env_flag('WRAPPER_AUTO_REASONING', '0'):
+        return
     has_explicit = bool(body.get('chat_template_kwargs') or body.get('reasoning_effort') or
                         (isinstance(body.get('extra_body'), dict) and (body['extra_body'].get('chat_template_kwargs') or body['extra_body'].get('reasoning_effort') or body['extra_body'].get('reasoning_budget'))))
     if has_explicit:
@@ -1036,7 +1135,8 @@ def clamp_max_tokens_for_model(body: dict, model_id: str) -> None:
         except (TypeError, ValueError):
             continue
         if val > cap:
-            logger.info(f'[model-cap] clamping {key} for {model_id}: {val} -> {cap}')
+            # V8 fix: clamping stays (upstream would 400) but must be observable.
+            logger.warning(f'[model-cap] clamping {key} for {model_id}: {val} -> {cap}')
             body[key] = cap
 
 
@@ -1087,10 +1187,11 @@ def forward_headers(request: Request) -> dict:
 
 
 def client_ip(request: Request) -> str:
-    xff = request.headers.get('x-forwarded-for', '')
-    if xff:
-        return xff.split(',')[0].strip()
-    return request.headers.get('x-real-ip', 'unknown')
+    # V-08 fix: rate limiting must key on the socket peer address, not the
+    # client-controlled x-forwarded-for/x-real-ip headers (spoof/bypass/poison).
+    if request.client and request.client.host:
+        return request.client.host
+    return 'unknown'
 
 
 def generate_request_id() -> str:
@@ -1102,6 +1203,17 @@ def add_rate_limit_headers(resp_headers: dict, key_label: str) -> None:
 
 
 def sanitize_nvidia_payload(body: dict) -> None:
+    # V4 fix: NVIDIA rejects max_output_tokens, but it carries client intent —
+    # map it to max_tokens when max_tokens is absent instead of deleting it.
+    if isinstance(body, dict) and 'max_output_tokens' in body:
+        mot = body.pop('max_output_tokens')
+        if body.get('max_tokens') is None:
+            try:
+                body['max_tokens'] = int(mot)
+            except (TypeError, ValueError):
+                logger.debug(f'[sanitize] dropped non-integer max_output_tokens={mot!r}')
+        else:
+            logger.debug('[sanitize] dropped max_output_tokens (max_tokens already present)')
     for p in PROACTIVE_DROP:
         if p not in PROTECTED_PARAMS:
             body.pop(p, None)
@@ -1112,19 +1224,63 @@ def ensure_nonempty_content(data: dict) -> None:
         msg = data['choices'][0].get('message', {})
         if not msg.get('content') and not msg.get('tool_calls'):
             nr = extract_internal_reasoning(msg)
-            if nr.get('reasoning'):
-                # BUG-FIX (ILMA audit 2026-07-27): instead of a dead-end
-                # placeholder, surface the model's own reasoning as the content so
-                # clients (e.g. Claude Code) receive usable text instead of
-                # "[No text response; the model returned reasoning only.]".
+            # V15 fix (transparency audit 2026-07-27): surfacing private
+            # reasoning as the answer text is opt-in via
+            # WRAPPER_SURFACE_REASONING. The null->"" SDK-safety fix stays
+            # unconditional.
+            if nr.get('reasoning') and _env_flag('WRAPPER_SURFACE_REASONING', '0'):
                 msg['content'] = nr['reasoning']
-            else:
+            elif msg.get('content') is None or not msg.get('content'):
                 msg['content'] = ''
 
 
 def pre_response_timeout_ms_for(model_id: str) -> int:
     return PRE_RESPONSE_TIMEOUT_MS
 
+
+
+def _parse_retry_after(value, default: int = 65) -> int:
+    """V-12 fix: Retry-After may be an integer OR an RFC HTTP-date.
+
+    The previous bare int() raised on date format, silently skipping 429
+    registration (no cooldown) via the broad except around the request.
+    """
+    if value is None:
+        return default
+    s = str(value).strip()
+    if not s:
+        return default
+    try:
+        return max(0, int(s))
+    except (TypeError, ValueError):
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        dt = parsedate_to_datetime(s)
+        if dt is not None:
+            import datetime as _dt
+            now = _dt.datetime.now(dt.tzinfo) if dt.tzinfo else _dt.datetime.utcnow()
+            return max(0, int((dt - now).total_seconds()))
+    except Exception:
+        pass
+    return default
+
+
+def _fire_and_forget(coro, label: str = 'bg') -> None:
+    """F2 fix (latency audit 2026-07-27): run metrics/DB writes off the hot
+    path. Exceptions are logged instead of being silently dropped."""
+    def _done(task: 'asyncio.Task'):
+        try:
+            exc = task.exception()
+        except asyncio.CancelledError:
+            return
+        if exc:
+            logger.warning(f'[{label}] background task failed: {exc}')
+    try:
+        asyncio.create_task(coro).add_done_callback(_done)
+    except RuntimeError:
+        # No running event loop (import-time/test context) — close the coroutine.
+        coro.close()
 
 
 async def _safe_response_body(resp) -> dict:
@@ -1180,6 +1336,7 @@ class Server:
         self._in_flight = 0
         self._sse_clients: set = set()
         self._start_time = time.time()
+        self._bg_tasks: list = []  # V-17 fix: retained background task handles
 
     async def init(self):
         await MODEL_REGISTRY_CLIENT.start()
@@ -1193,21 +1350,33 @@ class Server:
 
         EVENTS_FILE = os.environ.get('EVENTS_FILE', '/root/wrapper/nvidia/metrics_data/wrapper-events.jsonl')
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
+        events_max_bytes = int(os.environ.get('WRAPPER_EVENTS_MAX_MB', '64')) * 1024 * 1024
 
-        async def _write_event(ev: dict):
+        def _write_event_sync(ev: dict):
+            # V-11 fix: rotate the events file so it cannot grow without bound.
             try:
+                try:
+                    if os.path.getsize(EVENTS_FILE) > events_max_bytes:
+                        os.replace(EVENTS_FILE, EVENTS_FILE + '.1')
+                except OSError:
+                    pass
                 with open(EVENTS_FILE, 'a') as f:
                     f.write(json.dumps(ev) + '\n')
             except Exception:
                 pass
+
+        async def _write_event(ev: dict):
+            # V-11 fix: blocking file I/O runs in a worker thread, not on the loop.
+            await asyncio.to_thread(_write_event_sync, ev)
 
         self.metrics.on_request(lambda ev: asyncio.create_task(_write_event(ev)))
         self.metrics.on_rate_limit(lambda ev: asyncio.create_task(_write_event(ev)))
 
         alert_history.SOURCE = EVENTS_FILE
         loki_push.SOURCE = EVENTS_FILE
-        asyncio.create_task(alert_history.mode_daemon())
-        asyncio.create_task(loki_push.daemon())
+        # V-17 fix: retain background task handles so shutdown can cancel them.
+        self._bg_tasks.append(asyncio.create_task(alert_history.mode_daemon()))
+        self._bg_tasks.append(asyncio.create_task(loki_push.daemon()))
 
         self.registry = Registry()
         self.registry.set_external_agent(self._session)
@@ -1260,8 +1429,35 @@ class Server:
 
         # Full model verification + env watcher (Node audit parity, production)
         if VERIFY_ON_BOOT:
-            asyncio.create_task(verify_models(self.pool))
-        asyncio.create_task(verify_loop(self.pool))
+            self._bg_tasks.append(asyncio.create_task(verify_models(self.pool)))
+        self._bg_tasks.append(asyncio.create_task(verify_loop(self.pool)))
+
+        # V-17 fix: schedule metrics DB pruning daily (was never scheduled).
+        async def _metrics_prune_loop():
+            while True:
+                await asyncio.sleep(86400)
+                try:
+                    await self.metrics.prune()
+                    logger.info('[metrics] daily prune completed')
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f'[metrics] prune failed: {e}')
+
+        # V-18 fix: heal stuck in_flight counters periodically (Node parity),
+        # not only via the manual admin endpoint.
+        async def _heal_in_flight_loop():
+            while True:
+                await asyncio.sleep(300)
+                try:
+                    await self.pool.heal_in_flight()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.warning(f'[heal] heal_in_flight failed: {e}')
+
+        self._bg_tasks.append(asyncio.create_task(_metrics_prune_loop()))
+        self._bg_tasks.append(asyncio.create_task(_heal_in_flight_loop()))
         start_env_watcher()
 
     def _model_status_view(self, metrics_status: Optional[dict] = None) -> dict:
@@ -1332,10 +1528,18 @@ class Server:
                 return JSONResponse(status_code=429, content={'error': {'message': 'Too many requests', 'type': 'rate_limit_error'}})
 
             if BEARER_TOKEN and not is_public:
+                # V-19 fix: constant-time comparison; check authorization and
+                # x-api-key independently (a garbage Authorization header must
+                # not mask a valid x-api-key).
                 auth_header = (request.headers.get('authorization') or '').strip()
                 api_key_header = (request.headers.get('x-api-key') or '').strip()
-                token = auth_header.replace('Bearer ', '', 1) if auth_header.lower().startswith('bearer ') else auth_header or api_key_header
-                if token != BEARER_TOKEN:
+                candidates = []
+                if auth_header:
+                    candidates.append(auth_header[7:].strip() if auth_header.lower().startswith('bearer ') else auth_header)
+                if api_key_header:
+                    candidates.append(api_key_header)
+                authorized = any(hmac.compare_digest(t, BEARER_TOKEN) for t in candidates)
+                if not authorized:
                     # D11: unknown paths return 404, not 401 (don't leak route info)
                     known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
                                    '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
@@ -1730,24 +1934,27 @@ class Server:
         @app.post('/v1/responses')
         async def responses_api(request: Request):
             raw = await request.body()
-            import json as _json
-            try:
-                _b = _json.loads(raw)
-                _temp = _b.get('temperature')
-                _scan = []
-                def _walk(o, path=''):
-                    if isinstance(o, dict):
-                        for k, v in o.items():
-                            if k in ('temperature','top_p') and not isinstance(v, (int, float)):
-                                _scan.append(f'{path}/{k}={v!r}')
-                            _walk(v, f'{path}/{k}')
-                    elif isinstance(o, list):
-                        for i, v in enumerate(o):
-                            _walk(v, f'{path}[{i}]')
-                _walk(_b)
-                logger.debug(f"[DBG responses] top_temp={_temp!r} suspicious={_scan} model={_b.get('model')}")
-            except Exception as _e:
-                logger.debug(f"[DBG responses] parse fail {_e}")
+            # V-14 fix: the recursive debug walk only runs when DEBUG logging is
+            # actually enabled — no O(body) CPU on the Codex hot path otherwise.
+            if logger.isEnabledFor(logging.DEBUG):
+                import json as _json
+                try:
+                    _b = _json.loads(raw)
+                    _temp = _b.get('temperature')
+                    _scan = []
+                    def _walk(o, path=''):
+                        if isinstance(o, dict):
+                            for k, v in o.items():
+                                if k in ('temperature','top_p') and not isinstance(v, (int, float)):
+                                    _scan.append(f'{path}/{k}={v!r}')
+                                _walk(v, f'{path}/{k}')
+                        elif isinstance(o, list):
+                            for i, v in enumerate(o):
+                                _walk(v, f'{path}[{i}]')
+                    _walk(_b)
+                    logger.debug(f"[DBG responses] top_temp={_temp!r} suspicious={_scan} model={_b.get('model')}")
+                except Exception as _e:
+                    logger.debug(f"[DBG responses] parse fail {_e}")
             try:
                 result, stream, status_code = await self.responses_handler.handle_responses_api(request, raw)
                 if stream is not None:
@@ -2058,18 +2265,34 @@ class Server:
             return GEN_TIMEOUT_SEC
         return REQUEST_TIMEOUT_SEC
 
+    def _client_timeout(self, is_streaming: bool, metric_path: str) -> 'aiohttp.ClientTimeout':
+        """V-09 fix: streamed responses must not be killed by a hard total
+        timeout mid-generation. Streams use a read-idle (sock_read) timeout so
+        a dead upstream is detected quickly while long generations survive."""
+        if is_streaming:
+            return aiohttp.ClientTimeout(total=None, sock_connect=30,
+                                         sock_read=STREAM_SOCK_READ_TIMEOUT_SEC)
+        return aiohttp.ClientTimeout(total=self._select_timeout(False, metric_path))
+
     def _classify_retry(self, status: int, classification: dict) -> bool:
         """Determine if a failed request should be retried with another key."""
         return classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
 
-    async def _prepare_proxy_body(self, body: dict, model_id: str) -> dict:
+    async def _prepare_proxy_body(self, body: dict, model_id: str, metric_path: str = '/v1/chat/completions') -> dict:
         """Prepare request body for upstream (P2: extracted from proxy_openai)."""
         body = json.loads(json.dumps(body))  # deep copy
+        # V6: map max_completion_tokens -> max_tokens only when max_tokens is
+        # absent (NIM needs max_tokens); never delete it when max_tokens exists.
         if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
             body['max_tokens'] = body['max_completion_tokens']
             del body['max_completion_tokens']
         clamp_max_tokens_for_model(body, model_id)
-        if body.get('stream'):
+        # V7 fix: inject stream_options.include_usage only where the wrapper
+        # itself needs usage (translated /v1/messages and /v1/responses paths),
+        # or when the operator forces it via WRAPPER_FORCE_USAGE=1. Plain
+        # /v1/chat/completions passthrough stays untouched.
+        wrapper_needs_usage = metric_path in ('/v1/messages', '/v1/responses')
+        if body.get('stream') and (wrapper_needs_usage or _env_flag('WRAPPER_FORCE_USAGE', '0')):
             body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
         return body
 
@@ -2093,7 +2316,7 @@ class Server:
 
         # Transparent contract: exactly one requested model.  Retries below
         # rotate credentials only; they never construct model candidates.
-        primary_body = await self._prepare_proxy_body(body, model_id)
+        primary_body = await self._prepare_proxy_body(body, model_id, metric_path=metric_path)
         cand_model = model_id
         body = json.loads(json.dumps(primary_body))
         body['model'] = cand_model
@@ -2167,22 +2390,23 @@ class Server:
                 }
 
                 is_streaming = bool(body.get('stream'))
-                timeout_sec = self._select_timeout(is_streaming, metric_path)
+                req_timeout = self._client_timeout(is_streaming, metric_path)  # V-09 fix
 
                 if body.get('stream'):
                     resp = await self._session.post(
                         target_url, json=body, headers=fwd_headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                        timeout=req_timeout,
                     )
                     if resp.status == 429:
-                        ra = int(resp.headers.get('retry-after', '65') or '65')
+                        ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
                         await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                         if self.metrics:
-                            await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                            # F2 fix: DB write off the hot path
+                            _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
                         attempt += 1
                         continue
                     if resp.status >= 400:
@@ -2228,18 +2452,19 @@ class Server:
                 else:
                     resp = await self._session.post(
                         target_url, json=body, headers=fwd_headers,
-                        timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                        timeout=req_timeout,
                     )
 
                     if resp.status == 429:
-                        ra = int(resp.headers.get('retry-after', '65') or '65')
+                        ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
                         await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                         if self.metrics:
-                            await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                            # F2 fix: DB write off the hot path
+                            _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
                         attempt += 1
                         continue
 
@@ -2259,13 +2484,14 @@ class Server:
                         return {'status': norm_status, 'data': resp_data}
 
                     if self.metrics:
-                        await self.metrics.record_request(
+                        # F2 fix: DB write off the hot path
+                        _fire_and_forget(self.metrics.record_request(
                             model=model_id, key_label=key.label,
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                             prompt_tokens=resp_data.get('usage', {}).get('prompt_tokens', 0),
                             completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
                             path=metric_path,
-                        )
+                        ), 'metrics')
                     if _HAS_CIRCUIT_BREAKER:
                         await _UPSTREAM_BREAKER.record_success()
                     return {'status': resp.status, 'data': resp_data}
@@ -2310,33 +2536,35 @@ class Server:
                     'Content-Type': 'application/json',
                 }
 
-                # P2: use extracted timeout helper
-                timeout_sec = self._select_timeout(is_streaming, path)
+                # P2/V-09: streaming uses read-idle timeout instead of total
+                req_timeout = self._client_timeout(is_streaming, path)
 
                 resp = await self._session.post(
                     target_url, json=body, headers=fwd_headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                    timeout=req_timeout,
                 )
 
                 if resp.status == 429:
-                    ra = int(resp.headers.get('retry-after', '65') or '65')
+                    ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
                     await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
-                        await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                        # F2 fix: DB write off the hot path
+                        _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
                     attempt += 1
                     continue
 
                 if is_streaming and resp.status < 400:
                     if self.metrics:
-                        await self.metrics.record_request(
+                        # F2 fix: DB write off the hot path
+                        _fire_and_forget(self.metrics.record_request(
                             model=model_id, key_label=key.label,
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                             path=path,
-                        )
+                        ), 'metrics')
                     return StreamingResponse(
                         self._stream_proxy(resp, key),
                         media_type='text/event-stream',
@@ -2361,11 +2589,12 @@ class Server:
                     return JSONResponse(status_code=resp.status, content=err_data)
 
                 if self.metrics:
-                    await self.metrics.record_request(
+                    # F2 fix: DB write off the hot path
+                    _fire_and_forget(self.metrics.record_request(
                         model=model_id, key_label=key.label,
                         status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                         path=path,
-                    )
+                    ), 'metrics')
 
                 return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
 
@@ -2388,6 +2617,12 @@ class Server:
             async for chunk, _ in resp.content.iter_chunks():
                 yield chunk
         finally:
+            # V-05 fix: release the upstream response (mirrors stream_wrapper in
+            # proxy_openai) so aborted client streams don't leak connector slots.
+            try:
+                resp.release()
+            except Exception:
+                pass
             self.pool.release_success(key)
             self._in_flight = max(0, self._in_flight - 1)
 
@@ -2452,36 +2687,38 @@ class Server:
                 if is_post:
                     fwd_headers['Content-Type'] = 'application/json'
 
-                # P2: use extracted timeout helper
-                timeout_sec = self._select_timeout(is_streaming, path)
+                # P2/V-09: streaming uses read-idle timeout instead of total
+                req_timeout = self._client_timeout(is_streaming, path)
 
                 resp = await self._session.request(
                     method, target_url,
                     json=body if is_post else None,
                     headers=fwd_headers,
-                    timeout=aiohttp.ClientTimeout(total=timeout_sec),
+                    timeout=req_timeout,
                 )
 
                 if resp.status == 429:
-                    ra = int(resp.headers.get('retry-after', '65') or '65')
+                    ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
                     await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
-                        await self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra)
+                        # F2 fix: DB write off the hot path
+                        _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
                     attempt += 1
                     continue
 
                 content_type = resp.headers.get('content-type', '')
                 if ('text/event-stream' in content_type or is_streaming) and resp.status < 400:
                     if self.metrics:
-                        await self.metrics.record_request(
+                        # F2 fix: DB write off the hot path
+                        _fire_and_forget(self.metrics.record_request(
                             model=model_id, key_label=key.label,
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                             path=path,
-                        )
+                        ), 'metrics')
                     return StreamingResponse(
                         self._stream_proxy(resp, key),
                         media_type='text/event-stream',
@@ -2493,21 +2730,26 @@ class Server:
                 key.decrement_in_flight()
 
                 if resp.status >= 400:
-                    if attempt < max_attempts - 1:
-                        attempt += 1
-                        continue
+                    # V-07 fix: classify the failure like the other proxy paths —
+                    # deterministic 400/404/422 must not be retried across keys.
                     try:
                         err_data = json.loads(resp_data)
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
+                    classification = classify_upstream_error(resp.status, err_data)
+                    retryable = self._classify_retry(resp.status, classification)
+                    if retryable and attempt < max_attempts - 1:
+                        attempt += 1
+                        continue
                     return JSONResponse(status_code=resp.status, content=err_data)
 
                 if self.metrics:
-                    await self.metrics.record_request(
+                    # F2 fix: DB write off the hot path
+                    _fire_and_forget(self.metrics.record_request(
                         model=model_id, key_label=key.label,
                         status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                         path=path,
-                    )
+                    ), 'metrics')
 
                 try:
                     return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
@@ -2607,6 +2849,11 @@ def create_app() -> FastAPI:
         finally:
             logger.info('[lifecycle] wrapper-nvidia shutting down gracefully...')
             if server:
+                # V-17 fix: cancel retained background tasks at shutdown.
+                for _task in getattr(server, '_bg_tasks', []):
+                    _task.cancel()
+                if server._bg_tasks:
+                    await asyncio.gather(*server._bg_tasks, return_exceptions=True)
                 if server._session:
                     await server._session.close()
                 if server._agent:

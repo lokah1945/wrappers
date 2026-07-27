@@ -19,6 +19,10 @@ logger = logging.getLogger('wrapper-middleware')
 MAX_REQUEST_BYTES = int(os.environ.get('MAX_REQUEST_BYTES', str(10 * 1024 * 1024)))  # 10MB default
 
 
+class _RequestTooLarge(Exception):
+    """Internal sentinel: chunked request exceeded the size cap (CM-3)."""
+
+
 class RequestSizeLimiter:
     """Pure ASGI middleware for request size limiting.
 
@@ -41,28 +45,54 @@ class RequestSizeLimiter:
                 try:
                     size = int(content_length)
                     if size > self.max_bytes:
-                        await send({
-                            'type': 'http.response.start',
-                            'status': 413,
-                            'headers': [
-                                [b'content-type', b'application/json'],
-                            ],
-                        })
-                        import json
-                        body = json.dumps({
-                            'error': {
-                                'type': 'request_too_large',
-                                'message': f'Request body exceeds maximum size of {self.max_bytes} bytes',
-                            }
-                        }).encode()
-                        await send({
-                            'type': 'http.response.body',
-                            'body': body,
-                        })
+                        await self._reject(send)
                         return
                 except (ValueError, TypeError):
                     pass
+            else:
+                # CM-3 fix: requests using Transfer-Encoding: chunked send
+                # no Content-Length, bypassing the cap above. Count actual
+                # received bytes and abort past the limit.
+                if headers.get(b'transfer-encoding', b'').lower() == b'chunked':
+                    counter = {'total': 0}
+                    limit = self.max_bytes
+                    reject = self._reject
+
+                    async def counting_receive():
+                        message = await receive()
+                        if message['type'] == 'http.request':
+                            counter['total'] += len(message.get('body', b''))
+                            if counter['total'] > limit:
+                                await reject(send)
+                                raise _RequestTooLarge()
+                        return message
+
+                    try:
+                        await self.app(scope, counting_receive, send)
+                    except _RequestTooLarge:
+                        pass
+                    return
         await self.app(scope, receive, send)
+
+    async def _reject(self, send: Any) -> None:
+        import json
+        await send({
+            'type': 'http.response.start',
+            'status': 413,
+            'headers': [
+                [b'content-type', b'application/json'],
+            ],
+        })
+        body = json.dumps({
+            'error': {
+                'type': 'request_too_large',
+                'message': f'Request body exceeds maximum size of {self.max_bytes} bytes',
+            }
+        }).encode()
+        await send({
+            'type': 'http.response.body',
+            'body': body,
+        })
 
 
 def setup_graceful_shutdown(shutdown_callback=None):

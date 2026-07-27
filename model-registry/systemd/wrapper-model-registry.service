@@ -8,6 +8,12 @@ Type=simple
 WorkingDirectory=/root/wrapper
 Environment=PYTHONPATH=/root/wrapper
 Environment=LOG_FILE=/root/wrapper/model-registry/registry.log
+# INF-F1 fix: load MODEL_REGISTRY_ADMIN_TOKEN and other settings; without
+# this the registry rejected 100% of internal writes with 503.
+EnvironmentFile=-/root/wrapper/model-registry/.env
+# MR-1 fix: pin the DB path explicitly (service default previously drifted
+# from the orphaned repo-root registry-state.db).
+Environment=MODEL_REGISTRY_DB=/root/wrapper/model-registry/registry-state.db
 ExecStartPre=/bin/bash -c 'mkdir -p /root/wrapper/runtime && git -C /root/wrapper rev-parse HEAD > /root/wrapper/runtime/model-registry.commit 2>/dev/null || true'
 ExecStart=/usr/bin/python3 model-registry/service.py
 Restart=always

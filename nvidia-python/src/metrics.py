@@ -40,6 +40,10 @@ class Metrics:
         self._on_request = None
         self._on_rate_limit = None
         self._save_interval = None
+        # V-23 fix: short-TTL cache so frequent /health polling doesn't rerun
+        # the percentile scans on every call.
+        self._summary_cache = {}
+        self._summary_cache_ttl = 5.0
 
     def on_request(self, cb):
         self._on_request = cb
@@ -97,6 +101,8 @@ class Metrics:
             CREATE INDEX IF NOT EXISTS idx_req_status ON requests(status_code);
             CREATE INDEX IF NOT EXISTS idx_req_ts_model ON requests(ts, model);
             CREATE INDEX IF NOT EXISTS idx_req_ts_key ON requests(ts, key_label);
+            -- V-23 fix: covering index for the percentile OFFSET scans in summary()
+            CREATE INDEX IF NOT EXISTS idx_req_ts_latency ON requests(ts, latency_ms);
 
             CREATE TABLE IF NOT EXISTS model_status (
                 model       TEXT PRIMARY KEY,
@@ -355,6 +361,10 @@ class Metrics:
 
     async def summary(self, window_str='24h') -> dict:
         try:
+            # V-23 fix: serve from the short-TTL cache when fresh.
+            cached = self._summary_cache.get(window_str)
+            if cached and (time.time() - cached[0]) < self._summary_cache_ttl:
+                return cached[1]
             window_secs = WINDOW_SECS.get(window_str, 86400)
             now = time.time()
             since = now - window_secs
@@ -415,7 +425,7 @@ class Metrics:
             req_1h = await get_req_count_since(3600)
             req_24h = await get_req_count_since(86400)
 
-            return {
+            result = {
                 'window': window_str,
                 'total_requests': total_requests,
                 'prompt_tokens': r[1] or 0,
@@ -437,6 +447,8 @@ class Metrics:
                 'req_per_hour': req_1h,
                 'req_per_day': req_24h,
             }
+            self._summary_cache[window_str] = (time.time(), result)  # V-23 fix
+            return result
         except Exception as e:
             logger.error(f'metrics.summary error: {e}')
             return {}

@@ -72,7 +72,14 @@ class AliasResolver:
             raise AliasResolutionError("model name is empty")
         scopes = self._lookup_scopes(scope_chain or [])
         alias = normalized.lower()
-        binding = next((self.bindings.get((kind, scope, alias)) for kind, scope in scopes), None)
+        # CM-1 fix: skip scopes without a binding instead of stopping at the
+        # first scope (the previous generator returned None from the first
+        # scope even when later scopes held a binding).
+        binding = next(
+            (b for kind, scope in scopes
+             if (b := self.bindings.get((kind, scope, alias))) is not None),
+            None,
+        )
         if binding:
             canonical = binding.canonical_target
             if "/" not in canonical:
