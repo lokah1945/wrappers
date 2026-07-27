@@ -920,12 +920,12 @@ def repair_orphan_tool_messages(messages):
         else:
             out.append(m)
     return out
-def responses_to_chat(body: dict) -> dict:
+def responses_to_chat(body: dict, principal: str = '') -> dict:
     model = resolve_model(body.get("model"))
     msgs = []
     prev = body.get("previous_response_id")
-    if prev:
-        stored_msgs = get_stored_conversation(prev)
+    if prev and principal:
+        stored_msgs = get_stored_conversation(principal, prev)
         if stored_msgs:
             msgs.extend(stored_msgs)
 
@@ -1000,7 +1000,34 @@ def _prune_response_store_locked():
         oldest = next(iter(_RESPONSE_STORE))
         _RESPONSE_STORE.pop(oldest, None)
 
-async def store_conversation(rid: str, msgs: list):
+def _extract_principal(request) -> str:
+    """Extract a stable tenant identifier from the request for store namespacing.
+
+    BUG-SEC-RESPONSE-STORE fix (2026-07-28): keys are namespaced by auth
+    principal to prevent cross-tenant data leaks. Priority: Bearer token >
+    x-api-key > client IP > 'anonymous'. Uses a SHA-256 fingerprint (first
+    24 chars) to avoid storing raw credentials as dictionary keys.
+    """
+    import hashlib
+    token = ''
+    try:
+        auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
+        if auth:
+            token = auth.replace("Bearer ", "", 1).strip() if auth.lower().startswith("bearer ") else auth.strip()
+        if not token and request.client:
+            token = request.client.host or ''
+    except Exception:
+        pass
+    if not token:
+        return 'anonymous'
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+
+def _response_store_key(principal: str, rid: str) -> str:
+    """Namespace a response ID by the caller's principal for tenant isolation."""
+    return f"{principal}\x00{rid}"
+
+async def store_conversation(principal: str, rid: str, msgs: list):
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
     async with _STORE_LOCK:
         # N-19 fix: store a deep copy so later in-place mutation of the live
         # message dicts cannot corrupt the stored replay history.
@@ -1008,16 +1035,19 @@ async def store_conversation(rid: str, msgs: list):
             msgs = copy.deepcopy(msgs)
         except Exception:
             msgs = list(msgs)
-        _RESPONSE_STORE[rid] = (time.time(), msgs)
+        key = _response_store_key(principal, rid)
+        _RESPONSE_STORE[key] = (time.time(), msgs)
         _prune_response_store_locked()
 
-def get_stored_conversation(rid: str) -> Optional[list]:
-    """N-19 fix: return a deep copy of stored history (no shared aliasing).
+def get_stored_conversation(principal: str, rid: str) -> Optional[list]:
+    """N-19 fix + BUG-SEC-RESPONSE-STORE fix: return a deep copy of stored
+    history, namespaced by principal for tenant isolation.
 
     Runs synchronously on the single event loop; there is no await point
     between lookup and copy, so the read is consistent without the lock.
     """
-    stored = _RESPONSE_STORE.get(rid)
+    key = _response_store_key(principal, rid)
+    stored = _RESPONSE_STORE.get(key)
     if not stored:
         return None
     try:
@@ -2246,7 +2276,9 @@ async def responses(request: Request):
         resolved = resolve_model(requested)
         if not model_allowed(requested) and not model_allowed(resolved):
             return JSONResponse(status_code=400, content=free_only_error(requested))
-    chat_body = responses_to_chat(body)
+    # BUG-SEC-RESPONSE-STORE fix: extract principal for tenant-isolated store.
+    principal = _extract_principal(request)
+    chat_body = responses_to_chat(body, principal)
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
@@ -2283,7 +2315,7 @@ async def responses(request: Request):
                 # let it be GC'd mid-flight, and log its exceptions.
                 try:
                     _fire_and_forget(
-                        store_conversation(rid, list(chat_body.get("messages", [])) + [state.assistant_message()]),
+                        store_conversation(principal, rid, list(chat_body.get("messages", [])) + [state.assistant_message()]),
                         "store-conversation",
                     )
                 except Exception as e:
@@ -2302,7 +2334,7 @@ async def responses(request: Request):
             "content": amsg.get("content"),
             "tool_calls": amsg.get("tool_calls") or None,
         })
-    await store_conversation(resp["id"], saved_msgs)
+    await store_conversation(principal, resp["id"], saved_msgs)
     return resp
 
 # --- ANTHROPIC MESSAGES ---

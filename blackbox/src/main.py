@@ -732,15 +732,47 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
 
 _RESPONSE_STORE: dict[str, list] = {}
 
+def _extract_principal(request) -> str:
+    """Extract a stable tenant identifier from the request for store namespacing.
+
+    BUG-SEC-RESPONSE-STORE fix (2026-07-28): keys are namespaced by auth
+    principal to prevent cross-tenant data leaks. Priority: Bearer token >
+    x-api-key > client IP > 'anonymous'. Uses a SHA-256 fingerprint (first
+    24 chars) to avoid storing raw credentials as dictionary keys.
+    """
+    import hashlib
+    token = ''
+    try:
+        auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
+        if auth:
+            token = auth.replace('Bearer ', '', 1).strip() if auth.lower().startswith('bearer ') else auth.strip()
+        if not token and request.client:
+            token = request.client.host or ''
+    except Exception:
+        pass
+    if not token:
+        return 'anonymous'
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+
+def _response_store_key(principal: str, rid: str) -> str:
+    """Namespace a response ID by the caller's principal for tenant isolation."""
+    return f"{principal}\x00{rid}"
 
 
 
-def responses_to_chat(body: dict) -> dict:
+
+def responses_to_chat(body: dict, principal: str = '') -> dict:
     model = _normalize_model(body.get('model') or '')
     msgs = []
     prev = body.get('previous_response_id')
-    if prev and prev in _RESPONSE_STORE:
-        msgs.extend(_RESPONSE_STORE[prev])
+    # BUG-SEC-RESPONSE-STORE fix: lookup must use namespaced key so that
+    # a client can only read its own stored conversations, never another
+    # tenant's. Without this, any previous_response_id value would match
+    # across tenants — a cross-tenant data leak.
+    if prev and principal:
+        key = _response_store_key(principal, prev)
+        if key in _RESPONSE_STORE:
+            msgs.extend(_RESPONSE_STORE[key])
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({'role': 'user', 'content': raw})
@@ -1224,7 +1256,9 @@ async def responses(request: Request):
             return JSONResponse(status_code=400, content=free_only_error(requested))
         if free_only_enabled() and model and not model_allowed(model):
             return JSONResponse(status_code=400, content=free_only_error(requested or model))
-        chat_body = responses_to_chat(body)
+        # BUG-SEC-RESPONSE-STORE fix: extract principal for tenant-isolated store.
+        principal = _extract_principal(request)
+        chat_body = responses_to_chat(body, principal)
         chat_body['stream'] = bool(body.get('stream', False))
         # BB-12/DR-9 (BUG-SEC3): validate the translated body — positive-int
         # check and the 1,000,000 max_tokens overflow cap now cover
@@ -1239,14 +1273,14 @@ async def responses(request: Request):
                 await metrics.record_request(model=model, path='/v1/responses', status_code=status)
                 return JSONResponse(status_code=status, content=resp if isinstance(resp, dict) else {'error': {'message': str(resp), 'type': 'api_error'}})
             rid = f"resp_{int(time.time()*1000)}"
-            return StreamingResponse(_responses_stream(resp, key, rid, model, chat_body), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+            return StreamingResponse(_responses_stream(resp, key, rid, model, chat_body, principal), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
         status, data, _ = await proxy_request_with_pool('POST', url, chat_body, request)
         if status != 200:
             await metrics.record_request(model=model, path='/v1/responses', status_code=status)
             return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
         await metrics.record_request(model=model, path='/v1/responses', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0), status_code=status)
         resp_obj = chat_to_responses(model, data)
-        _store_response(resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
+        _store_response(principal, resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
         return JSONResponse(resp_obj)
     except HTTPException:
         raise
@@ -1262,7 +1296,7 @@ def _emit_response_event(seq_ref, etype, payload):
     return f"event: {etype}\ndata: {json.dumps({'type': etype, 'sequence_number': seq_ref[0], **payload}, ensure_ascii=False)}\n\n"
 
 
-async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict):
+async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, principal: str = ''):
     seq = [0]
     msg_id = 'msg-1'
     acc_text = ''
@@ -1376,13 +1410,15 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict):
         outputs.append(fc_item)
     yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj()}})
     yield 'data: [DONE]\n\n'
-    _store_response(rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+    _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
 
-def _store_response(rid: str, messages: list):
+def _store_response(principal: str, rid: str, messages: list):
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
     if not rid:
         return
-    _RESPONSE_STORE[rid] = messages
+    key = _response_store_key(principal, rid)
+    _RESPONSE_STORE[key] = messages
     while len(_RESPONSE_STORE) > 200:
         _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
 

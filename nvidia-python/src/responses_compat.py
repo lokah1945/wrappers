@@ -30,6 +30,11 @@ from .anthropic_compat import extract_internal_reasoning
 # Values are OpenAI chat messages, including the assistant message that contained
 # tool_calls. Without that assistant message a later role=tool result is orphaned
 # and upstream rejects it, which makes agents stop mid-process.
+#
+# BUG-SEC-RESPONSE-STORE fix (2026-07-28): keys are namespaced by auth principal
+# to prevent cross-tenant data leaks. Any client providing another tenant's
+# previous_response_id will NOT find their conversation — the lookup key
+# includes the caller's own principal so the store is per-tenant isolated.
 _RESPONSE_STORE: Dict[str, list] = {}
 _RESPONSE_STORE_SIZES: Dict[str, int] = {}
 # V-22 fix: also bound the store by total bytes, not just entry count.
@@ -47,15 +52,47 @@ def _zero_usage() -> dict:
     return {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
 
 
-def _bounded_store(resp_id: str, messages: list) -> None:
+def _extract_principal(request: Any) -> str:
+    """Extract a stable tenant identifier from the request for store namespacing.
+
+    Priority: Bearer token > x-api-key > client IP > 'anonymous'.
+    Uses a SHA-256 fingerprint (first 24 chars) to avoid storing raw credentials
+    as dictionary keys. This matches the opencode wrapper's OC-11 pattern.
+    """
+    import hashlib
+    token = ''
+    try:
+        # FastAPI/Starlette Request object
+        auth = ''
+        if hasattr(request, 'headers'):
+            auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
+        if auth:
+            token = auth.replace('Bearer ', '', 1).strip() if auth.lower().startswith('bearer ') else auth.strip()
+        if not token and hasattr(request, 'client') and request.client:
+            token = getattr(request.client, 'host', '') or ''
+    except Exception:
+        pass
+    if not token:
+        return 'anonymous'
+    return hashlib.sha256(token.encode('utf-8')).hexdigest()[:24]
+
+
+def _store_key(principal: str, resp_id: str) -> str:
+    """Namespace a response ID by the caller's principal for tenant isolation."""
+    return f"{principal}\x00{resp_id}"
+
+
+def _bounded_store(principal: str, resp_id: str, messages: list) -> None:
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
     if not resp_id:
         return
+    key = _store_key(principal, resp_id)
     try:
         size = len(json.dumps(messages, ensure_ascii=False))
     except Exception:
         size = 0
-    _RESPONSE_STORE[resp_id] = messages
-    _RESPONSE_STORE_SIZES[resp_id] = size
+    _RESPONSE_STORE[key] = messages
+    _RESPONSE_STORE_SIZES[key] = size
     # V-22 fix: evict oldest entries by count (200) AND by total byte budget.
     while len(_RESPONSE_STORE) > 200 or (
             len(_RESPONSE_STORE) > 1 and sum(_RESPONSE_STORE_SIZES.values()) > _STORE_MAX_BYTES):
@@ -445,6 +482,8 @@ class ResponsesHandler:
 
     async def translate_to_nim(self, request: Any, body: dict, model: str) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]]]:
         chat_body = build_chat_body(body, model, self.translate_thinking_to_nim)
+        # BUG-SEC-RESPONSE-STORE fix: extract principal for tenant-isolated store.
+        principal = _extract_principal(request)
         # V7 fix: metric_path marks this as a translated path, where the wrapper
         # itself needs stream usage (and metrics are attributed correctly).
         result = await self.proxy_openai(chat_body, self.forward_headers(request), model, request,
@@ -460,7 +499,7 @@ class ResponsesHandler:
         if not chat_body.get('stream'):
             data = result.get('data', {})
             resp_obj = respond_non_streaming(data, model)
-            _bounded_store(resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
+            _bounded_store(principal, resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
             return resp_obj, None
 
         async def stream_gen() -> AsyncGenerator[str, None]:
@@ -673,7 +712,7 @@ class ResponsesHandler:
                         'response': base_response(resp_id, model, 'completed', outputs, usage)})
             yield 'data: [DONE]\n\n'
 
-            _bounded_store(resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+            _bounded_store(principal, resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
         return None, stream_gen()
 
@@ -688,9 +727,15 @@ class ResponsesHandler:
 
         model = self.resolve_target_model(body['model'])
 
+        # BUG-SEC-RESPONSE-STORE fix: lookup must use namespaced key so that
+        # a client can only read its own stored conversations, never another
+        # tenant's. Without this, any previous_response_id value would match
+        # across tenants — a cross-tenant data leak.
+        principal = _extract_principal(request)
         prev = body.get('previous_response_id')
-        if prev and prev in _RESPONSE_STORE:
-            stored = _RESPONSE_STORE[prev]
+        prev_key = _store_key(principal, prev) if prev else None
+        if prev_key and prev_key in _RESPONSE_STORE:
+            stored = _RESPONSE_STORE[prev_key]
             cur = body.get('input')
             if isinstance(cur, list):
                 body['input'] = stored + cur
