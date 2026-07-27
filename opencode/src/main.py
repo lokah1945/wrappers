@@ -442,9 +442,18 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
     try:
         if is_stream:
             # Caller owns release — do NOT async-with the response
+            # BUG-OC-STREAM fix: use read-idle timeout instead of hard total
+            # timeout. Long generations (reasoning models, agent workflows)
+            # can exceed STREAM_REQUEST_TIMEOUT_SEC (15 min). The sock_read
+            # timeout detects dead upstream connections without killing
+            # legitimate long streams. Parity with nous N-06 and nvidia V-09.
             resp = await sess.request(
                 method, url, json=json_body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=STREAM_REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC),
+                timeout=aiohttp.ClientTimeout(
+                    total=None,
+                    sock_connect=CONNECT_TIMEOUT_SEC,
+                    sock_read=int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300')),
+                ),
             )
             if resp.status >= 400:
                 text = await resp.text()

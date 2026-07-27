@@ -2024,7 +2024,11 @@ class Server:
             body['model'] = model_id
             if is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
-            return await self._proxy_post(request, body, raw, model_id, '/v1/ranking', lambda key: f"{resolve_base(model_id)}/v1/ranking")
+            # BUG-ROUTE1 fix: /v1/ranking must route to BASE_GENAI (image/audio/
+            # video/ranking/infer family), not BASE_LLM. resolve_base(model_id)
+            # always returned BASE_LLM because a model_id never starts with
+            # '/v1/ranking'. Use the endpoint path for routing.
+            return await self._proxy_post(request, body, raw, model_id, '/v1/ranking', lambda key: f"{route_upstream('/v1/ranking')}/v1/ranking")
 
         @app.post('/v1/images/generations')
         async def image_generations(request: Request):
@@ -2286,8 +2290,22 @@ class Server:
         return aiohttp.ClientTimeout(total=self._select_timeout(False, metric_path))
 
     def _classify_retry(self, status: int, classification: dict) -> bool:
-        """Determine if a failed request should be retried with another key."""
-        return classification['state'] in ('rate_limited', 'transient_failure', 'account_forbidden')
+        """Determine if a failed request should be retried with another key.
+        
+        BUG-RETRY1 fix: use the actual ErrorState enum values from contracts.py.
+        Previously checked for 'rate_limited' which never matched the real values
+        'key_rate_limited' / 'model_rate_limited', so 429 responses were never
+        retried across keys — defeating multi-key rotation entirely.
+        """
+        state = classification.get('state', '')
+        # Prefer the explicit retry flag from the classification when available
+        if classification.get('retry_same_model'):
+            return True
+        return state in (
+            'key_rate_limited', 'model_rate_limited',
+            'transient_failure', 'account_forbidden',
+            'network_timeout',
+        )
 
     async def _prepare_proxy_body(self, body: dict, model_id: str, metric_path: str = '/v1/chat/completions') -> dict:
         """Prepare request body for upstream (P2: extracted from proxy_openai)."""
@@ -2368,7 +2386,11 @@ class Server:
         for p, v in preserved.items():
             body[p] = v
 
-        target_url = f"{resolve_base(call_plan.model.provider_model_id)}{call_plan.path}"
+        # BUG-ROUTE1 fix: route by endpoint path, not model_id. A model_id
+        # never starts with '/v1/images' or '/v1/ranking', so the old code
+        # always returned BASE_LLM. Using the call_plan.path correctly routes
+        # chat→BASE_LLM and image/ranking/infer→BASE_GENAI.
+        target_url = f"{route_upstream(call_plan.path)}{call_plan.path}"
 
         start_ms = time.time() * 1000
         attempt = 0
@@ -2523,6 +2545,9 @@ class Server:
 
 
     def _resolve_base(self, model_id: str) -> str:
+        # BUG-ROUTE1: delegate to route_upstream with a synthetic path so
+        # image/genai models still route to BASE_GENAI when called from
+        # legacy paths that pass model_id directly.
         return route_upstream(model_id)
 
     async def _proxy_post(self, request: Request, body: dict, raw: bytes, model_id: str, path: str, get_target_url):
