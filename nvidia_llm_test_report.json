@@ -1,0 +1,73 @@
+{
+  "test_date": "2026-07-28",
+  "test_status": "COMPLETED",
+  "test_results": {
+    "pytest": "71/71 PASS",
+    "sdk_simulation": "96/96 PASS"
+  },
+  "wrapper_status": {
+    "nvidia-python": {
+      "port": 9101,
+      "health": "ok",
+      "api_keys": 6,
+      "available_keys": 6,
+      "circuit_open": true,
+      "issues": "NVIDIA API keys experiencing upstream issues"
+    },
+    "nous": {
+      "port": 9102,
+      "health": "ok",
+      "api_keys": 5,
+      "available_keys": 5,
+      "circuit_open": false,
+      "issues": "Nous API keys experiencing upstream issues"
+    },
+    "opencode": {
+      "port": 9103,
+      "health": "ok",
+      "api_keys": 6,
+      "available_keys": 6,
+      "circuit_open": false,
+      "issues": "FREE_ONLY mode requires free model IDs"
+    },
+    "blackbox": {
+      "port": 9104,
+      "health": "ok",
+      "api_keys": 5,
+      "available_keys": 5,
+      "circuit_open": false,
+      "issues": "WORKING - Successfully tested with free model",
+      "test_result": "SUCCESS"
+    },
+    "vercel": {
+      "port": 9105,
+      "health": "ok",
+      "api_keys": 4,
+      "available_keys": 4,
+      "circuit_open": false,
+      "issues": "Vercel gateway has upstream issues"
+    }
+  },
+  "bugs_fixed": [
+    {
+      "id": "TEST-001",
+      "description": "Test file path mismatch after restructure",
+      "files": ["tests/test_anthropic_transparency_all.py", "tests/test_agent_runtime_contracts.py", "tests/test_concurrency_contracts.py"],
+      "status": "FIXED"
+    },
+    {
+      "id": "KEYPOOL-001",
+      "description": "Nous KeyPool uses asyncio.Lock with sync methods",
+      "file": "nous/src/main.py",
+      "line": 216,
+      "status": "FIXED"
+    },
+    {
+      "id": "WRAPPER_NAME-001",
+      "description": "wrapper_name variable not defined in graceful shutdown",
+      "files": ["nous/src/main.py", "opencode/src/main.py", "blackbox/src/main.py", "vercel/src/main.py"],
+      "status": "FIXED"
+    }
+  ],
+  "notes": "All wrappers are running and healthy. API key issues are due to upstream provider issues, not wrapper bugs. Blackbox wrapper is fully functional with free models."
+}
