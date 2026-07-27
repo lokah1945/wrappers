@@ -557,7 +557,7 @@ _ALIAS_NAME_SET = {
     "claude-sonnet", "claude-opus", "claude-haiku",
 }
 _dynamic_alias_target: str = ""
-_dynamic_alias_lock = asyncio.Lock()
+_dynamic_alias_lock = threading.Lock()
 _known_models: Set[str] = set()
 
 # Optional static metadata for known upstream free models (display only)
@@ -1928,7 +1928,7 @@ async def add_latency_tracking(request: Request, call_next):
     request_id = request.headers.get("x-request-id", "N/A")
     
     logger.info(
-        f"[{wrapper}] request_id={request_id} "
+        f"[{app.title}] request_id={request_id} "
         f"method={request.method} path={request.url.path} "
         f"latency={latency_ms:.2f}ms status={response.status_code}"
     )
