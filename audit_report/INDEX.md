@@ -1,18 +1,19 @@
 # ILMA Wrapper Audit Report Index
 
-**Last audit:** 2026-07-27 ~13:45 WIB (E2E deep audit — IN PROGRESS, partial reports committed)
+**Last audit:** 2026-07-27 ~14:45 WIB (E2E deep audit)
 **Repo HEAD:** `21d0f79` (github/main, up-to-date)
-**Runtime version:** nous/opencode/blackbox restarted 12:37 WIB (post-`21d0f79` → current); nvidia-python started 11:30 WIB (pre-`68c1d47`/`21d0f79` commit time — fix live sebagai patch lokal saat itu, verifikasi ulang disarankan); `runtime/*.commit` & `.deployed_commit` STALE (menunjuk `92893e7`/`1ad8845`/`62307eb`)
+**Runtime version (VERIFIED via /health.git_commit):** nous/opencode/blackbox = `21d0f79` ✅ current; **nvidia-python = `92893e7` STALE (fix 68c1d47 di disk, BELUM live)**; **model-registry = `1ad8845` STALE + telemetry 100% ditolak (unit tanpa EnvironmentFile → admin token tak terbaca)**. `runtime/*.commit` & `.deployed_commit` tidak bisa dipercaya (git-tracked, ter-clobber pull).
 
-## Reports
+## Reports — E2E Audit 2026-07-27
 
 | File | Date | Scope | Key findings |
 |------|------|-------|--------------|
+| **`AUDIT_E2E_KOMPREHENSIF_2026-07-27.md`** | 2026-07-27 14:45 | **LAPORAN INDUK konsolidasi 5 audit paralel** — baca ini dulu | Jawaban 2 pertanyaan Bos: (1) YA ada overwrite thinking/reasoning/effort — nvidia inject `chat_template_kwargs`/`reasoning_effort`, GLM client intent di-override; (2) root cause latency = nvidia key-pool pacing `QUEUE_LIMIT=4` (0.25s/gelombang, terukur +0.3–0.7s saat concurrent) + SQLite write di hot path. Rekomendasi patch Paket A–D menunggu persetujuan. |
 | `parts/2026-07-27_part_transparency.md` | 2026-07-27 13:40 | **Audit transparansi E2E semua 4 wrapper + common** — semua mutasi request/response/header/SSE, per file:line | ❌ TIDAK ADA wrapper yang transparan byte-level. CRITICAL: nvidia inject `chat_template_kwargs`/`reasoning_effort` (V1-V2); GLM thinking client DI-OVERRIDE ke false (V3, regresi 0781634); reasoning disajikan sbg content di plain chat (V15); max_tokens di-floor/clamp/default di semua wrapper (N19/N20/V8); param sampling dibuang saat translasi (O23/B21); riwayat dipotong diam-diam (V19); konten fabricated (V25/O22/B20) |
+| `parts/2026-07-27_part_latency.md` | 2026-07-27 13:45 | **Audit latency wrapper-vs-curl** — statis hot path + pengukuran live (non-stream, streaming TTFB, concurrency, /v1/models) | Root cause TERUKUR: nvidia `key_pool.py` pacing `QUEUE_LIMIT=4` → tangga 250ms saat concurrent (F1); verify-loop makan RPM pool live (F7); SQLite write awaited di hot path 4 wrapper (F3); single request PARITAS (tidak ada penalti wrapper) |
 | `parts/2026-07-27_part_opencode_blackbox_common_registry.md` | 2026-07-27 13:20 | **Deep code audit opencode + blackbox + common + model-registry** + tabel drift antar-wrapper | CRITICAL: Mutex cancellation deadlock (OC-1/BB-1, 3 wrapper); HIGH: `/dashboard` bocorkan BEARER_TOKEN tanpa auth (OC-3/BB-4); blackbox BEARER_TOKEN kosong = tanpa auth (BB-3); heartbeat BUG-CODEX2 belum di-port ke opencode/blackbox (DR-1); circuit breaker mati di 3 wrapper (DR-2); registry DB path drift (MR-1); 13 drift antar-wrapper |
-| _(pending)_ audit latency wrapper-vs-curl | in progress | Statis + pengukuran live TTFB direct vs wrapper | — |
-| _(pending)_ deep audit nous + nvidia-python | in progress | Bit-level code audit | — |
-| _(pending)_ audit infra/runtime/tests/git | in progress | systemd, port, health, log, gitignore, docs drift | — |
+| `parts/2026-07-27_part_infra_runtime.md` | 2026-07-27 13:42 | **Audit infra/runtime/tests/git/docs** — systemd, port, health, log, gitignore, secret scan, install.sh | HIGH: model-registry tolak 2.504 write internal (503, unit tanpa `EnvironmentFile=`) → `providers_loaded=[]`; nvidia-python running stale tanpa fix-nya sendiri; blackbox `.env` 0.0.0.0:9108 bahaya run manual; `runtime/*.commit` git-tracked = tak andal; tidak ada secret nyata di tree; README "100/100" stale |
+| `parts/2026-07-27_part_nous_nvidia.md` | 2026-07-27 | Deep code audit nous + nvidia-python (bit-level) | (menyusul — agent sedang re-emit laporan lengkap) |
 | `AUDIT_COMPREHENSIVE_2026-07-27T11-50.md` | 2026-07-27 11:50 | **Full audit: git/services/ports/health/config/creds + nous-hang + nvidia-500 verification + next-agent playbook** | ✅ nous Codex hang FIXED (f5bfeea verified); ✅ nvidia 500 FIXED (ILMA local patch); ⚠️ blackbox port mismatch 9108≠9104; ⚠️ legacy 9100 in codex config; ⚠️ `.deployed_commit` stale |
 | `AUDIT_COMPREHENSIVE_2026-07-27.md` | 2026-07-27 05:12 | Code-level + client-compat audit | B1 memory leak, B2 registry dead, B3 nvidia circuit_open (historical) |
 | `AUDIT_REBUILD_2026-07-27T04-37.md` | 2026-07-27 04:37 | Runtime probe + stale-version | Runtime stale, model-registry empty |
