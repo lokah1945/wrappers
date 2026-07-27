@@ -1049,7 +1049,7 @@ def _auth_check(request: Request):
 
 @app.get('/health')
 async def health():
-    return {'status': 'ok' if pool.available_keys > 0 else 'degraded', 'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid(), 'keys': pool.total_keys, 'available': pool.available_keys, 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'base': BLACKBOX_BASE, 'metrics': await metrics.summary(), 'model_registry': MODEL_REGISTRY_CLIENT.stats()}
+    return {'status': 'ok' if pool.available_keys > 0 else 'degraded', 'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid(), 'keys': pool.total_keys, 'available': pool.available_keys, 'live_keys': pool.all_stats(), 'free_only': free_only_enabled(), 'dynamic_alias_target': get_dynamic_alias_target() or None, 'base': BLACKBOX_BASE, 'metrics': await metrics.summary(), 'model_registry': MODEL_REGISTRY_CLIENT.stats(), 'models_cached': len(await asyncio.to_thread(MODEL_STORE.get_ids, False))}
 
 
 @app.get('/ready')

@@ -1919,6 +1919,7 @@ async def health():
         "dynamic_alias_target": get_dynamic_alias_target() or None,
         "keys": KEY_POOL.total_keys,
         "available": KEY_POOL.available_keys,
+        "live_keys": KEY_POOL.all_stats(),
         "metrics": metrics.snapshot(),
         "model_registry": MODEL_REGISTRY_CLIENT.stats(),
     }

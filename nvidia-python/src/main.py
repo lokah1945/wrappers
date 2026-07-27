@@ -1585,6 +1585,7 @@ class Server:
                 'pid': os.getpid(),
                 'keys': self.pool.total_keys,
                 'available': self.pool.available_keys,
+                'live_keys': self.pool.all_stats(),
                 'models_cached': len(self.pool.models_cached),
                 'model_registry': MODEL_REGISTRY_CLIENT.stats(),
                 'circuit_breaker': cb_stats,
