@@ -1,5 +1,34 @@
 # wrapper-opencode
 
+## Standardized Structure (2026-07-28)
+
+This wrapper follows the standardized structure:
+
+```
+opencode/
+├── __init__.py
+├── README.md
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   └── main.py
+└── systemd/ (optional)
+```
+
+### Run Command
+
+```bash
+# Development
+uvicorn opencode.src.main:app --reload --port 9103
+
+# Production
+uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103 --workers 4
+```
+
+See WRAPPER_STANDARDIZATION_REPORT.md for details.
+
+
+
 Production proxy for **[OpenCode Zen](https://opencode.ai/docs/zen/)** — multi-protocol AI gateway.
 
 **Status:** ✅ **PRODUCTION READY — 100/100**  

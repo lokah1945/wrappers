@@ -1,5 +1,34 @@
 # wrapper-vercel
 
+## Standardized Structure (2026-07-28)
+
+This wrapper follows the standardized structure:
+
+```
+vercel/
+├── __init__.py
+├── README.md
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   └── main.py
+└── systemd/ (optional)
+```
+
+### Run Command
+
+```bash
+# Development
+uvicorn vercel.src.main:app --reload --port 9105
+
+# Production
+uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105 --workers 4
+```
+
+See WRAPPER_STANDARDIZATION_REPORT.md for details.
+
+
+
 **Port:** 9105  
 **Upstream:** Vercel AI Gateway (`https://ai-gateway.vercel.sh/v1`)  
 **Type:** OpenAI + Anthropic compatible proxy

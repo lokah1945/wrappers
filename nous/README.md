@@ -1,5 +1,34 @@
 # wrapper-nous v2.0.5 — 100/100 Production Grade
 
+## Standardized Structure (2026-07-28)
+
+This wrapper follows the standardized structure:
+
+```
+nous/
+├── __init__.py
+├── README.md
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   └── main.py
+└── systemd/ (optional)
+```
+
+### Run Command
+
+```bash
+# Development
+uvicorn nous.src.main:app --reload --port 9102
+
+# Production
+uvicorn nous.src.main:app --host 0.0.0.0 --port 9102 --workers 4
+```
+
+See WRAPPER_STANDARDIZATION_REPORT.md for details.
+
+
+
 **Full OpenAI + Anthropic compatible proxy** for Nous Research (`inference-api.nousresearch.com`).
 
 > Single, lightweight, async service that makes Nous Research work perfectly with **every** SDK and agent:

@@ -1,5 +1,34 @@
 # wrapper-blackbox
 
+## Standardized Structure (2026-07-28)
+
+This wrapper follows the standardized structure:
+
+```
+blackbox/
+├── __init__.py
+├── README.md
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   └── main.py
+└── systemd/ (optional)
+```
+
+### Run Command
+
+```bash
+# Development
+uvicorn blackbox.src.main:app --reload --port 9104
+
+# Production
+uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104 --workers 4
+```
+
+See WRAPPER_STANDARDIZATION_REPORT.md for details.
+
+
+
 **Port:** 9104  
 **Upstream:** BLACKBOX AI (`https://api.blackbox.ai`)  
 **Type:** OpenAI + Anthropic compatible proxy

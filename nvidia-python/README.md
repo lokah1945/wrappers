@@ -1,5 +1,34 @@
 # wrapper-nvidia (Python) — v8.6.5-py
 
+## Standardized Structure (2026-07-28)
+
+This wrapper follows the standardized structure:
+
+```
+nvidia-python/
+├── __init__.py
+├── README.md
+├── .env.example
+├── src/
+│   ├── __init__.py
+│   └── main.py
+└── systemd/ (optional)
+```
+
+### Run Command
+
+```bash
+# Development
+uvicorn nvidia_python.src.main:app --reload --port 9101
+
+# Production
+uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101 --workers 4
+```
+
+See WRAPPER_STANDARDIZATION_REPORT.md for details.
+
+
+
 > OpenAI- and Anthropic-compatible transparent proxy for the NVIDIA NIM API.
 
 **Status:** ✅ **PRODUCTION READY — 100/100**  

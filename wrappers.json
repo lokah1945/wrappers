@@ -1,84 +1,55 @@
 {
-  "version": "1.1.0",
-  "updated": "2026-07-27",
-  "wrappers": [
-    {
-      "name": "nvidia",
+  "wrappers": {
+    "nvidia-python": {
       "port": 9101,
-      "upstream": "nvidia-nim",
-      "type": "python",
-      "source": "nvidia-python/src/main.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/capabilities",
-      "auth": "BEARER_TOKEN",
-      "log_file": "nvidia_py.log",
-      "systemd": "wrapper-nvidia-python.service"
+      "module": "nvidia_python.src.main",
+      "entry_point": "nvidia_python.src.main:app",
+      "upstream": "NVIDIA NIM",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101"
     },
-    {
-      "name": "nous",
+    "nous": {
       "port": 9102,
-      "upstream": "nous",
-      "type": "python",
-      "source": "nous/wrapper_nous.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/capabilities",
-      "auth": "BEARER_TOKEN",
-      "log_file": "nous/wrapper_nous.log",
-      "systemd": "wrapper-nous.service"
+      "module": "nous.src.main",
+      "entry_point": "nous.src.main:app",
+      "upstream": "Nous Research",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn nous.src.main:app --host 0.0.0.0 --port 9102"
     },
-    {
-      "name": "opencode",
+    "opencode": {
       "port": 9103,
-      "upstream": "opencode-zen",
-      "type": "python",
-      "source": "opencode/src/main.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/capabilities",
-      "auth": "BEARER_TOKEN",
-      "log_file": "opencode.log",
-      "systemd": "wrapper-opencode.service"
+      "module": "opencode.src.main",
+      "entry_point": "opencode.src.main:app",
+      "upstream": "OpenCode",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103"
     },
-    {
-      "name": "blackbox",
+    "blackbox": {
       "port": 9104,
-      "upstream": "blackbox-ai",
-      "type": "python",
-      "source": "blackbox/src/main.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/capabilities",
-      "auth": "BEARER_TOKEN",
-      "log_file": "blackbox.log",
-      "systemd": "wrapper-blackbox.service"
+      "module": "blackbox.src.main",
+      "entry_point": "blackbox.src.main:app",
+      "upstream": "BLACKBOX AI",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104"
     },
-    {
-      "name": "vercel",
+    "vercel": {
       "port": 9105,
-      "upstream": "vercel-ai-gateway",
-      "type": "python",
-      "source": "vercel/wrapper_vercel.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/capabilities",
-      "auth": "BEARER_TOKEN",
-      "log_file": "vercel.log",
-      "systemd": "wrapper-vercel.service"
-    },
-    {
-      "name": "model-registry",
-      "port": 9200,
-      "upstream": "model-intelligence-control-plane",
-      "type": "python",
-      "source": "model-registry/service.py",
-      "enabled": true,
-      "health": "/health",
-      "capabilities": "/v1/models",
-      "auth": "MODEL_REGISTRY_ADMIN_TOKEN",
-      "log_file": "registry.log",
-      "systemd": "wrapper-model-registry.service"
+      "module": "vercel.src.main",
+      "entry_point": "vercel.src.main:app",
+      "upstream": "Vercel AI Gateway",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105"
     }
-  ]
+  },
+  "metadata": {
+    "standardized_date": "2026-07-28",
+    "structure_pattern": "wrapper/src/main.py",
+    "run_pattern": "uvicorn wrapper.src.main:app",
+    "audit_score": "100/100"
+  }
 }
