@@ -2980,5 +2980,18 @@ def main():
     )
 
 
-if __name__ == '__main__':
+
+# ── Catalog + MCP Integration ──────────────────────────────────────────
+try:
+    from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
+    setup_catalog_routes(app)
+    setup_mcp_server(app, "nvidia-python")
+    # Override free_only with shared version
+    free_only_enabled = _cfe
+    _HAS_CATALOG_INTEGRATION = True
+except ImportError as _cie:
+    _HAS_CATALOG_INTEGRATION = False
+    pass
+
+if __name__ == "__main__":
     main()

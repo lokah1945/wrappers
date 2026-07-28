@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>OpenRouter Wrapper Dashboard</title>
+<style>
+  :root { --bg: #0f0f1a; --card: #1a1a2e; --accent: #ff6b35; --text: #eee; --muted: #666; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'SF Mono', 'Fira Code', monospace; background: var(--bg); color: var(--text); padding: 2rem; }
+  h1 { color: var(--accent); font-size: 1.8rem; margin-bottom: 1rem; }
+  h2 { color: var(--text); font-size: 1.1rem; margin-bottom: 0.75rem; border-bottom: 1px solid #333; padding-bottom: 0.5rem; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 1rem; }
+  .card { background: var(--card); border-radius: 12px; padding: 1.25rem; }
+  .stat { margin: 0.5rem 0; }
+  .label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  .value { font-size: 1.4rem; font-weight: bold; }
+  .ok { color: #4caf50; } .warn { color: #ff9800; } .err { color: #f44336; }
+  code { background: #2a2a3e; padding: 0.15rem 0.4rem; border-radius: 4px; font-size: 0.85rem; }
+  ul { list-style: none; }
+  li { padding: 0.25rem 0; }
+  li::before { content: '▸ '; color: var(--accent); }
+  .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 99px; font-size: 0.7rem; font-weight: bold; }
+  .badge.on { background: #1b5e20; color: #81c784; }
+  .badge.off { background: #b71c1c; color: #ef9a9a; }
+</style>
+</head>
+<body>
+  <h1>🔌 OpenRouter Wrapper — Port 9106</h1>
+  <div class="grid">
+    <div class="card" id="status-card">
+      <h2>Status</h2>
+      <div id="status-content">Loading...</div>
+    </div>
+    <div class="card" id="keys-card">
+      <h2>Key Pool</h2>
+      <div id="keys-content">Loading...</div>
+    </div>
+    <div class="card" id="endpoints-card">
+      <h2>Endpoints</h2>
+      <ul>
+        <li><code>POST /v1/chat/completions</code> — Chat</li>
+        <li><code>POST /v1/responses</code> — Responses API</li>
+        <li><code>POST /v1/messages</code> — Anthropic</li>
+        <li><code>GET /v1/models</code> — Models</li>
+        <li><code>GET /catalog/models</code> — NIM Catalog</li>
+        <li><code>GET /mcp/sse</code> — MCP</li>
+      </ul>
+    </div>
+    <div class="card" id="catalog-card">
+      <h2>Catalog</h2>
+      <div id="catalog-content">Loading...</div>
+    </div>
+    <div class="card" id="management-card">
+      <h2>Key Management</h2>
+      <div id="management-content">Loading...</div>
+    </div>
+  </div>
+  <script>
+    async function refresh() {
+      try {
+        const [health, stats, cHealth] = await Promise.all([
+          fetch('/health').then(r => r.json()),
+          fetch('/stats').then(r => r.json()),
+          fetch('/catalog/health').then(r => r.json()),
+        ]);
+
+        document.getElementById('status-content').innerHTML = `
+          <div class="stat"><span class="label">Version</span><div class="value">${health.version || '?'}</div></div>
+          <div class="stat"><span class="label">Uptime</span><div class="value">${(health.uptime_seconds || 0)}s</div></div>
+          <div class="stat"><span class="label">Requests</span><div class="value">${stats.total_requests || 0}</div></div>
+          <div class="stat"><span class="label">Tokens</span><div class="value">${(stats.total_tokens || 0).toLocaleString()}</div></div>
+          <div class="stat"><span class="label">Error Rate</span><div class="value ${(stats.error_rate || 0) > 0.1 ? 'err' : 'ok'}">${((stats.error_rate || 0) * 100).toFixed(1)}%</div></div>
+        `;
+
+        const kp = stats.key_pool || {};
+        let keysHtml = `<div class="stat"><span class="label">Keys</span><div class="value">${kp.total_keys || 0} <span class="${kp.available_keys > 0 ? 'ok' : 'err'}">(${kp.available_keys || 0} available)</span></div></div>`;
+        if (kp.keys) {
+          kp.keys.forEach(k => {
+            keysHtml += `<div class="stat" style="font-size:0.85rem">
+              ${k.label}: ${k.current_rpm} rpm | ${k.in_flight} in-flight
+              <span class="badge ${k.hard_blocked ? 'off' : 'on'}">${k.hard_blocked ? 'BLOCKED' : 'OK'}</span>
+            </div>`;
+          });
+        }
+        document.getElementById('keys-content').innerHTML = keysHtml;
+
+        document.getElementById('catalog-content').innerHTML = `
+          <div class="stat"><span class="label">Status</span><div class="value ${cHealth.ok ? 'ok' : 'err'}">${cHealth.ok ? '✅ Available' : '❌ Unavailable'}</div></div>
+        `;
+
+        // Management status
+        const hasMgmt = health.keys_status && health.keys_status.openrouter && health.keys_status.openrouter.management_enabled;
+        document.getElementById('management-content').innerHTML = `
+          <div class="stat"><span class="label">MANAGEMENT_KEY</span><div class="value ${hasMgmt ? 'ok' : 'err'}">${hasMgmt ? '✅ Configured' : '❌ Not configured'}</div></div>
+          <div class="stat" style="font-size:0.85rem">
+            ${hasMgmt ? 'Endpoints: <code>POST /openrouter/keys/list</code> <code>POST /openrouter/keys/create</code>' : 'Set OPENROUTER_MANAGEMENT_KEY in .env.local'}
+          </div>
+        `;
+      } catch(e) {
+        document.getElementById('status-content').innerHTML = `<div class="err">Error fetching: ${e.message}</div>`;
+      }
+    }
+    refresh();
+    setInterval(refresh, 10000);
+  </script>
+</body>
+</html>

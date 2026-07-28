@@ -1,0 +1,24 @@
+[Unit]
+Description=OpenRouter API Wrapper (Port 9106)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/root/wrapper/openrouter
+ExecStart=/root/wrapper/openrouter/.venv/bin/uvicorn openrouter.src.main:app --host 0.0.0.0 --port 9106 --workers 2
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=65536
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectHome=true
+
+# Environment file
+EnvironmentFile=-/root/wrapper/openrouter/.env
+
+[Install]
+WantedBy=multi-user.target

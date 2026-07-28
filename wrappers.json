@@ -43,13 +43,27 @@
       "upstream": "Vercel AI Gateway",
       "status": "production",
       "structure": "standardized",
+      "catalog_integrated": false,
       "run_command": "uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105"
+    },
+    "openrouter": {
+      "port": 9106,
+      "module": "openrouter.src.main",
+      "entry_point": "openrouter.src.main:app",
+      "upstream": "OpenRouter",
+      "status": "production",
+      "structure": "standardized",
+      "catalog_integrated": true,
+      "management_api": true,
+      "run_command": "uvicorn openrouter.src.main:app --host 0.0.0.0 --port 9106"
     }
   },
   "metadata": {
     "standardized_date": "2026-07-28",
     "structure_pattern": "wrapper/src/main.py",
     "run_pattern": "uvicorn wrapper.src.main:app",
-    "audit_score": "100/100"
+    "audit_score": "100/100",
+    "catalog_integration_version": "1.0",
+    "management_api_providers": ["openrouter"]
   }
 }

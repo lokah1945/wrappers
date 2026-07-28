@@ -2514,6 +2514,19 @@ async def healthz(): return await health()
 async def catch_all(path: str, request: Request):
     return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
 
+
+# ── Catalog + MCP Integration ──────────────────────────────────────────
+try:
+    from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
+    setup_catalog_routes(app)
+    setup_mcp_server(app, "nous")
+    # Override free_only with shared version
+    free_only_enabled = _cfe
+    _HAS_CATALOG_INTEGRATION = True
+except ImportError as _cie:
+    _HAS_CATALOG_INTEGRATION = False
+    pass
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("wrapper_nous:app", host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")
