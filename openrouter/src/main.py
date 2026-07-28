@@ -488,7 +488,7 @@ app.add_middleware(
 )
 
 if _HAS_SIZE_LIMITER:
-    app.add_middleware(RequestSizeLimiter, max_size=50 * 1024 * 1024)
+    app.add_middleware(RequestSizeLimiter, max_bytes=50 * 1024 * 1024)
 
 
 # ── Auth Middleware ────────────────────────────────────────────────────────

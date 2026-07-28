@@ -1,0 +1,69 @@
+{
+  "test": "z-ai/glm-5.2: Wrapper vs Direct Upstream Comparison",
+  "date": "2026-07-28T02:56:22Z",
+  "model": "z-ai/glm-5.2",
+  "control_model": "meta/llama-3.1-8b-instruct",
+  "wrapper_url": "http://127.0.0.1:9101",
+  "upstream_url": "https://integrate.api.nvidia.com",
+  "results": {
+    "control_wrapper_nonstreaming": {
+      "http_status": 200,
+      "time_seconds": 1.215,
+      "content": "Hallo. How are you today?",
+      "status": "SUCCESS"
+    },
+    "wrapper_glm52_nonstreaming": {
+      "http_status": 0,
+      "time_seconds": 120.0,
+      "body": "",
+      "status": "TIMEOUT"
+    },
+    "upstream_glm52_nonstreaming": {
+      "http_status": 0,
+      "time_seconds": 120.0,
+      "body": "",
+      "status": "TIMEOUT"
+    },
+    "wrapper_glm52_streaming": {
+      "http_status": null,
+      "time_seconds": 60.0,
+      "output": "",
+      "status": "TIMEOUT"
+    },
+    "upstream_glm52_streaming": {
+      "http_status": null,
+      "time_seconds": 60.0,
+      "output": "",
+      "status": "TIMEOUT"
+    }
+  },
+  "additional_tests": {
+    "different_api_keys": {
+      "key2": "TIMEOUT (30s)",
+      "key3": "TIMEOUT (30s)",
+      "conclusion": "All API keys time out with GLM-5.2"
+    },
+    "different_endpoint": {
+      "ai_api_nvidia_com": "404 page not found (GLM-5.2 not available on BASE_GENAI)"
+    },
+    "verbose_headers": {
+      "connection": "TLS 1.3 established, HTTP/2 negotiated",
+      "behavior": "Request hangs after headers sent - NVIDIA API accepts connection but never responds"
+    }
+  },
+  "model_availability": {
+    "in_catalog": true,
+    "availability_state": "mixed",
+    "ok": false,
+    "reason": "Availability differs by account or endpoint",
+    "reason_code": "MULTIPLE_ACCOUNT_OR_ENDPOINT_STATES",
+    "verified": true
+  },
+  "wrapper_config": {
+    "request_timeout_sec": 120,
+    "config_bug": "Code reads env var 'REQUEST_TIMEOUT' but .env sets 'REQUEST_TIMEOUT_SEC=600'. Actual timeout is 120s (default), not 600s.",
+    "upstream_base_url": "https://integrate.api.nvidia.com",
+    "routing": "chat completions -> BASE_LLM (integrate.api.nvidia.com)"
+  },
+  "conclusion": "GLM-5.2 times out on both the wrapper and the direct upstream NVIDIA API. The wrapper is transparent - it correctly proxies the upstream behavior without adding latency or transformations. The timeout is an upstream NVIDIA API issue. The model appears in the catalog but has mixed availability state, suggesting it may require special access or is experiencing issues on the NVIDIA API. The control test with meta/llama-3.1-8b-instruct confirms the wrapper functions correctly for other models."
+}
