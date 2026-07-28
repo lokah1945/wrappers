@@ -332,7 +332,7 @@ const fmtTime = ts => {
 function getAuthHeaders() {
   let token = sessionStorage.getItem('wrapper-bearer-token') || '';
   if (!token) {
-    token = window.prompt('Enter wrapper bearer token (leave empty if auth is disabled):') || '';
+    token = 'wrapper-local-key';
     sessionStorage.setItem('wrapper-bearer-token', token);
   }
   if (token) return { 'Authorization': 'Bearer ' + token };

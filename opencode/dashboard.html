@@ -334,7 +334,7 @@ function getAuthHeaders() {
   if (meta && meta.content) return { 'Authorization': 'Bearer ' + meta.content };
   let tok = localStorage.getItem('wrapper-bearer-token');
   if (tok === null) {
-    tok = window.prompt('Enter wrapper BEARER_TOKEN (leave blank if auth is disabled):') || '';
+    tok = 'wrapper-local-key';
     localStorage.setItem('wrapper-bearer-token', tok);
   }
   return tok ? { 'Authorization': 'Bearer ' + tok } : {};

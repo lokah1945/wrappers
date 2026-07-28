@@ -824,7 +824,7 @@ function getAuthHeaders() {
   // 3. One-time client-side prompt; kept in sessionStorage only.
   let token = '';
   try {
-    token = window.prompt('Enter wrapper bearer token (leave empty if auth is disabled):') || '';
+    token = 'wrapper-local-key';
     sessionStorage.setItem('wn-bearer', token);
   } catch {}
   if (token) return { 'Authorization': 'Bearer ' + token };
