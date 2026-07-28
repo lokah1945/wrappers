@@ -1596,7 +1596,7 @@ class Server:
             if not check_rate_limit(_client_ip):
                 return JSONResponse(status_code=429, content={'error': {'message': 'Too many requests', 'type': 'rate_limit_error'}})
 
-            if BEARER_TOKEN and not is_public:
+            if BEARER_TOKEN and not is_public and not os.environ.get('DISABLE_AUTH'):
                 # V-19 fix: constant-time comparison; check authorization and
                 # x-api-key independently (a garbage Authorization header must
                 # not mask a valid x-api-key).

@@ -1251,6 +1251,8 @@ if _HAS_SIZE_LIMITER:
 def _auth_check(request: Request):
     if request.method == 'OPTIONS':
         return  # CORS preflight passes without auth
+    if os.environ.get('DISABLE_AUTH'):
+        return  # pre-auth mode: allow all (LAN/open)
     # G10 fix: if BEARER_TOKEN is set, auth is mandatory and must match.
     # If client sends a token (even wrong) we MUST reject on mismatch.
     # If BEARER_TOKEN empty, remain open (backwards-compatible, logged).

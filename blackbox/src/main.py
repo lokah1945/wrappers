@@ -1093,6 +1093,8 @@ if _HAS_SIZE_LIMITER:
 def _auth_check(request: Request):
     if request.method == 'OPTIONS':
         return
+    if os.environ.get('DISABLE_AUTH'):
+        return  # pre-auth mode: allow all (LAN/open)
     token = _bearer_token()  # re-read so .env rotation takes effect
     if not token:
         # BB-3/DR-10: never fail silently open — log loudly (opencode parity).

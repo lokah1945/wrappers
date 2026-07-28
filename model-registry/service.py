@@ -343,7 +343,7 @@ def main() -> None:
 
     uvicorn.run(
         app,
-        host=os.environ.get("MODEL_REGISTRY_HOST", "127.0.0.1"),
+        host=os.environ.get("MODEL_REGISTRY_HOST", "0.0.0.0"),
         port=int(os.environ.get("MODEL_REGISTRY_PORT", "9200")),
         log_level="info",
     )
