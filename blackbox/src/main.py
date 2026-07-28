@@ -1369,6 +1369,10 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     buffer = b''
     tool_accs = []
     next_output_index = 1
+    rsn_started = False
+    rsn_index = None
+    rsn_id = f"rsn_{int(time.time()*1000)}"
+    acc_reason = ""
 
     def emit(etype, payload):
         return _emit_response_event(seq, etype, payload)
@@ -1391,7 +1395,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         return acc
 
     async def process_payload(payload: bytes):
-        nonlocal acc_text, acc_usage
+        nonlocal acc_text, acc_usage, acc_reason, rsn_started, rsn_index, next_output_index
         if payload in (b'[DONE]', b'', b'"[DONE]"'):
             return
         try:
@@ -1405,6 +1409,18 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         if d.get('content'):
             acc_text += d['content']
             yield emit('response.output_text.delta', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': d['content']})
+        # Reasoning (Blackbox reasoning_content) — MUST be streamed so the client
+        # sees progress during thinking (Codex / OpenAI SDK aborts a silent
+        # stream → "stops mid-way"). Mirror nvidia-python.
+        reason_delta = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else (d.get('reasoning') if isinstance(d.get('reasoning'), str) else '')
+        if reason_delta:
+            if not rsn_started:
+                rsn_started = True
+                rsn_index = next_output_index
+                next_output_index += 1
+                yield emit('response.output_item.added', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': '', 'content': []}})
+            acc_reason += reason_delta
+            yield emit('response.reasoning_text.delta', {'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'delta': reason_delta})
         for tc in d.get('tool_calls') or []:
             acc = get_tool_acc(tc)
             fn = tc.get('function') or {}
@@ -1464,17 +1480,21 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     if failed:
         return
     msg_item = {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
+    if rsn_started:
+        yield emit('response.reasoning_text.done', {'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason})
+        yield emit('response.output_item.done', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason}})
     yield emit('response.output_text.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': acc_text})
     yield emit('response.content_part.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': acc_text, 'annotations': []}})
     yield emit('response.output_item.done', {'output_index': 0, 'item': msg_item})
     outputs = [msg_item]
+    if rsn_started:
+        outputs.append({'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason})
     completed_tools = [a for a in tool_accs if a]
     for acc in completed_tools:
         fc_item = {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed', 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']}
         yield emit('response.output_item.done', {'output_index': acc['output_index'], 'item': fc_item})
         outputs.append(fc_item)
     yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj()}})
-    yield 'data: [DONE]\n\n'
     _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
 

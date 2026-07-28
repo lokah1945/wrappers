@@ -1274,7 +1274,7 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
         if data in (b"[DONE]", b'"[DONE]"'):
             async for ev in emit_state_done():
                 yield ev
-            if state is None or getattr(state, "__class__", type(None)).__name__ == "ResponsesStreamState":
+            if state is None:
                 yield "data: [DONE]\n\n"
             terminated = True
             return
@@ -1381,7 +1381,7 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                         yield f": upstream-error {type(upstream_error).__name__}\n\n"
                     async for ev in emit_state_done():
                         yield ev
-                    if state is None or getattr(state, "__class__", type(None)).__name__ != "AnthropicStreamState":
+                    if state is None:
                         yield "data: [DONE]\n\n"
         finally:
             try:
@@ -1537,6 +1537,9 @@ class ResponsesStreamState:
         self.tool_acc = {}
         self._next_tool_index = 1
         self.reasoning_started = False
+        self.rsn_index = None
+        self.rsn_id = f"rsn-{int(time.time()*1000)}"
+        self.acc_reason = ""
         self.started = False
         self._active_tool_id = None
         self._completed = False
@@ -1625,6 +1628,15 @@ class ResponsesStreamState:
             self.emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text}}),
             self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
         ]
+        # Close the reasoning item opened during thinking (if any).
+        if self.reasoning_started:
+            events.append(self.emit("response.reasoning_text.done", {
+                "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "text": self.acc_reason,
+            }))
+            events.append(self.emit("response.output_item.done", {
+                "output_index": self.rsn_index,
+                "item": {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason},
+            }))
         # Close every tool item that was opened (Codex hangs if a function_call
         # item is added but never marked done).
         for call_id, info in self.tool_acc.items():
@@ -1636,9 +1648,16 @@ class ResponsesStreamState:
                     "arguments": info.get("args", ""),
                 },
             }))
-        output = [{"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}]
+        # Build the final output array sorted by output_index (0=text, 1=reasoning,
+        # 2+ = tools) so the client's response.completed parse is well-ordered.
+        outputs_by_index = {
+            0: {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
+        }
+        if self.reasoning_started:
+            outputs_by_index[self.rsn_index] = {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason}
         for call_id, info in self.tool_acc.items():
-            output.append({"id": call_id, "type": "function_call", "status": "completed", "call_id": call_id, "name": info.get("name", ""), "arguments": info.get("args", "")})
+            outputs_by_index[info.get("output_index", 1)] = {"id": call_id, "type": "function_call", "status": "completed", "call_id": call_id, "name": info.get("name", ""), "arguments": info.get("args", "")}
+        output = [outputs_by_index[i] for i in sorted(outputs_by_index)]
         events.append(self.emit("response.completed", {"response": {"id": rid, "model": self.model, "status": "completed", "output": output, "usage": norm}}))
         return events
 
@@ -1671,6 +1690,30 @@ class ResponsesStreamState:
         # Text
         if delta.get("content"):
             events.append(self.delta(delta["content"]))
+
+        # Reasoning (Nous reasoning_content / reasoning) — MUST be streamed so the
+        # client keeps receiving progress during the model's thinking phase.
+        # The previous behavior DROPPED reasoning, leaving a multi-second silent
+        # gap on the SSE stream that tripped client-side idle timeouts (Codex /
+        # OpenAI SDK "stops mid-way"). Mirror reference nvidia-python
+        # responses_compat: open a 'reasoning' output item then stream deltas.
+        reason_delta = (
+            delta.get("reasoning_content") if isinstance(delta.get("reasoning_content"), str)
+            else (delta.get("reasoning") if isinstance(delta.get("reasoning"), str) else "")
+        )
+        if reason_delta:
+            if not self.reasoning_started:
+                self.reasoning_started = True
+                self.rsn_index = self._next_tool_index
+                self._next_tool_index += 1
+                events.append(self.emit("response.output_item.added", {
+                    "output_index": self.rsn_index,
+                    "item": {"id": self.rsn_id, "type": "reasoning", "status": "in_progress", "summary": "", "content": []},
+                }))
+            self.acc_reason += reason_delta
+            events.append(self.emit("response.reasoning_text.delta", {
+                "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "delta": reason_delta,
+            }))
 
         # Tool calls (parallel support)
         for tc in delta.get("tool_calls", []):
