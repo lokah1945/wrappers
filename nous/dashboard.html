@@ -80,14 +80,26 @@
   }
   .logo { display: flex; align-items: center; gap: 12px; }
   .logo-icon {
-    width: 34px; height: 34px;
+    width: 36px; height: 36px;
     background: var(--gradient);
-    border-radius: 9px;
+    border-radius: 10px;
     display: flex; align-items: center; justify-content: center;
-    font-size: 17px; color: #fff;
-    box-shadow: 0 2px 8px rgba(0,0,0,.2);
-    font-weight: 800;
+    color: #fff;
+    box-shadow: 0 2px 8px rgba(0,0,0,.25);
   }
+  .logo-svg { display: block; }
+  /* Inline SVG icon defaults (Lucide-style, stroke=currentColor) */
+  .icon, svg.icon {
+    display: inline-block; vertical-align: -2px;
+    flex-shrink: 0;
+  }
+  .card-label svg.icon, .key-badge svg.icon, .pill svg.icon {
+    vertical-align: -2px;
+  }
+  .theme-switch button svg.icon { vertical-align: -3px; }
+  .tab svg.icon { vertical-align: -3px; }
+  .sec svg.icon { vertical-align: -3px; }
+  .live-badge svg.icon { vertical-align: -2px; }
   .logo-text { font-size: 16px; font-weight: 700; letter-spacing: -.01em; }
   .logo-sub  { font-size: 11px; color: var(--muted); }
   .header-right { display: flex; align-items: center; gap: 10px; }
@@ -463,7 +475,7 @@
 <!-- Header -->
 <div class="header">
   <div class="logo">
-    <div class="logo-icon">Ψ</div>
+    <div class="logo-icon"><svg class="logo-svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 5a3 3 0 0 0-3 3 3 3 0 0 0-3 3 3 3 0 0 0 1 5 3 3 0 0 0 5 1 3 3 0 0 0 5-1 3 3 0 0 0 1-5 3 3 0 0 0-3-3 3 3 0 0 0-3-3Z"/><path d="M12 5v14"/></svg></div>
     <div>
       <div class="logo-text">wrapper-nous</div>
       <div class="logo-sub">Nous Research Inference Proxy · Operations Dashboard</div>
@@ -471,9 +483,9 @@
   </div>
   <div class="header-right">
     <div class="theme-switch" id="theme-switch" role="group" aria-label="Theme">
-      <button data-theme-opt="light"  title="Light theme">☀</button>
-      <button data-theme-opt="dark"   title="Dark theme">☾</button>
-      <button data-theme-opt="system" title="Follow OS">⌂</button>
+      <button data-theme-opt="light"  title="Light theme"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"/></svg></button>
+      <button data-theme-opt="dark"   title="Dark theme"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8Z"/></svg></button>
+      <button data-theme-opt="system" title="Follow OS"><svg class="icon" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></button>
     </div>
     <span class="live-badge"><span class="live-dot"></span><span id="live-text">Live</span></span>
     <span class="refresh-label" id="refresh-label">—</span>
@@ -497,11 +509,11 @@
 
 <!-- Tabs -->
 <div class="tabs" id="tabs">
-  <div class="tab active" data-tab="overview">Overview</div>
-  <div class="tab" data-tab="models">Models <span class="tab-count" id="tab-models-count">0</span></div>
-  <div class="tab" data-tab="keys">API Keys <span class="tab-count" id="tab-keys-count">0</span></div>
-  <div class="tab" data-tab="activity">Activity</div>
-  <div class="tab" data-tab="health">Health &amp; Models</div>
+  <div class="tab active" data-tab="overview"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg> Overview</div>
+  <div class="tab" data-tab="models"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg> Models <span class="tab-count" id="tab-models-count">0</span></div>
+  <div class="tab" data-tab="keys"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/></svg> API Keys <span class="tab-count" id="tab-keys-count">0</span></div>
+  <div class="tab" data-tab="activity"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Activity</div>
+  <div class="tab" data-tab="health"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Health &amp; Models</div>
 </div>
 
 <!-- Main -->
@@ -523,24 +535,24 @@
     <!-- KPI cards -->
     <div class="grid4" id="ov-kpis">
       <div class="card accent">
-        <div class="card-label">▣ Total Requests</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg> Total Requests</div>
         <div class="card-val accent" id="ov-total-req">—</div>
         <div class="card-sub" id="ov-req-rates">—</div>
         <svg class="sparkline" id="spark-req"></svg>
       </div>
       <div class="card">
-        <div class="card-label">≡ Total Tokens</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m12 2 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5"/><path d="m3 17 9 5 9-5"/></svg> Total Tokens</div>
         <div class="card-val blue" id="ov-total-tok">—</div>
         <div class="card-sub" id="ov-tok-detail">—</div>
         <svg class="sparkline" id="spark-tok"></svg>
       </div>
       <div class="card">
-        <div class="card-label">⚠ Error Rate</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="m21.73 18-8-14a2 2 0 0 0-3.48 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.73-3Z"/><path d="M12 9v4M12 17h.01"/></svg> Error Rate</div>
         <div class="card-val" id="ov-error-rate">—</div>
         <div class="card-sub" id="ov-error-sub">—</div>
       </div>
       <div class="card">
-        <div class="card-label">◷ Uptime</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg> Uptime</div>
         <div class="card-val green" id="ov-uptime">—</div>
         <div class="card-sub" id="ov-uptime-sub">since process start</div>
       </div>
@@ -549,22 +561,22 @@
     <!-- secondary KPIs -->
     <div class="grid4">
       <div class="card">
-        <div class="card-label">⚃ Available Models</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/></svg> Available Models</div>
         <div class="card-val purple" id="ov-model-count">—</div>
         <div class="card-sub">from upstream catalog</div>
       </div>
       <div class="card">
-        <div class="card-label">⚙ API Keys</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="7.5" cy="15.5" r="5.5"/><path d="m21 2-9.6 9.6M15.5 7.5l3 3L22 7l-3-3"/></svg> API Keys</div>
         <div class="card-val" id="ov-key-count">—</div>
         <div class="card-sub" id="ov-key-sub">—</div>
       </div>
       <div class="card">
-        <div class="card-label">⊕ Live Tokens In</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 5v14M19 12l-7 7-7-7"/></svg> Live Tokens In</div>
         <div class="card-val" id="ov-tok-in">—</div>
         <div class="card-sub">prompt + cached</div>
       </div>
       <div class="card">
-        <div class="card-label">⊙ Live Tokens Out</div>
+        <div class="card-label"><svg class="icon" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 19V5M5 12l7-7 7 7"/></svg> Live Tokens Out</div>
         <div class="card-val green" id="ov-tok-out">—</div>
         <div class="card-sub">completion</div>
       </div>
@@ -817,6 +829,18 @@ const WRAPPER_NAME = 'wrapper-nous';
 const HIST_KEY = 'wrapper-' + WRAPPER_NAME + '-history';
 const HIST_MAX = 1440;          // 24h at ~1-minute granularity
 const REFRESH_MS = 10000;
+
+// ── Inline SVG icon constants (used by dynamic JS, e.g. sort arrows,
+//    model-block indicators). Static HTML icons are injected at build time.
+const SVG_WRAP = (body, size) =>
+  '<svg class="icon" width="' + size + '" height="' + size + '" viewBox="0 0 24 24" ' +
+  'fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" ' +
+  'stroke-linejoin="round" aria-hidden="true">' + body + '</svg>';
+const SORT_ARROW_DOWN_SVG = SVG_WRAP('<path d="m6 9 6 6 6-6"/>', 10);
+const SORT_ARROW_UP_SVG   = SVG_WRAP('<path d="m18 15-6-6-6 6"/>', 10);
+const BAN_ICON_SVG        = SVG_WRAP('<circle cx="12" cy="12" r="10"/><path d="m4.93 4.93 14.14 14.14"/>', 12);
+const CHECK_ICON_SVG      = SVG_WRAP('<path d="M20 6 9 17l-5-5"/>', 12);
+const X_ICON_SVG          = SVG_WRAP('<path d="M18 6 6 18M6 6l12 12"/>', 12);
 
 let WINDOW = '24h';
 let ACTIVE_TAB = 'overview';
@@ -1120,9 +1144,9 @@ function renderKeyCard(k) {
   const modelBlocks = k.model_blocks || {};
   const mbKeys = Object.keys(modelBlocks);
   const mbLine = mbKeys.length
-    ? '<div style="font-size:10px;color:var(--purple);margin:6px 0" title="' + mbKeys.join(', ') + '">' +
-      '⛔ ' + mbKeys.length + ' model(s) throttled: ' + mbKeys.slice(0, 3).join(', ') +
-      (mbKeys.length > 3 ? ' +' + (mbKeys.length - 3) : '') + '</div>'
+    ? '<div style="font-size:10px;color:var(--purple);margin:6px 0;display:flex;align-items:center;gap:4px" title="' + mbKeys.join(', ') + '">' +
+      BAN_ICON_SVG + ' <span>' + mbKeys.length + ' model(s) throttled: ' + mbKeys.slice(0, 3).join(', ') +
+      (mbKeys.length > 3 ? ' +' + (mbKeys.length - 3) : '') + '</span></div>'
     : '';
 
   return '<div class="key-card ' + badgeClass + '">' +
@@ -1351,12 +1375,13 @@ function renderModelsTable() {
     return dir * ((Number(va) || 0) - (Number(vb) || 0));
   });
 
-  // Update sort arrows
+  // Update sort arrows (inline SVG chevrons, no unicode glyphs)
   document.querySelectorAll('#mod-table-head .sortable').forEach(th => {
     const arr = th.querySelector('.arr');
     if (arr) arr.remove();
     if (th.dataset.sort === key) {
-      th.insertAdjacentHTML('beforeend', '<span class="arr">' + (dir < 0 ? '▼' : '▲') + '</span>');
+      const svg = dir < 0 ? SORT_ARROW_DOWN_SVG : SORT_ARROW_UP_SVG;
+      th.insertAdjacentHTML('beforeend', ' <span class="arr">' + svg + '</span>');
     }
   });
 
