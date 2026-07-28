@@ -9,11 +9,10 @@ Goals:
 - keep in-flight accounting exact for long-running agent streams.
 """
 
-import os
-import time
 import asyncio
 import logging
-from typing import Optional, List
+import os
+import time
 
 logger = logging.getLogger('wrapper-openrouter')
 
@@ -26,7 +25,7 @@ class KeyEntry:
         self.api_key = api_key
         self.soft_rpm: int = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
         self.hard_rpm: int = int(os.environ.get('HARD_LIMIT_RPM', '60'))
-        self.timestamps: List[float] = []
+        self.timestamps: list[float] = []
         self.hard_blocked_until: float = 0.0
         self.block_reason: str = ''
         self.in_flight: int = 0
@@ -135,7 +134,7 @@ class KeyPool:
     """Manages multiple OpenRouter API keys with rotation, cooldown and in-flight tracking."""
 
     def __init__(self):
-        self.keys: List[KeyEntry] = []
+        self.keys: list[KeyEntry] = []
         self.soft_limit: int = 30
         self.hard_limit: int = 60
         self._lock = asyncio.Lock()
@@ -179,7 +178,7 @@ class KeyPool:
             if not k.is_hard_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit)
         )
 
-    async def acquire(self, model: str = '') -> Optional[dict]:
+    async def acquire(self, model: str = '') -> dict | None:
         """Acquire the best available key for a request."""
         async with self._lock:
             inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
@@ -212,8 +211,8 @@ class KeyPool:
         key.decrement_in_flight()
         self._in_flight_total = max(0, self._in_flight_total - 1)
 
-    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None,
-                     reason: str = '', available_keys: int = None, model: str = ''):
+    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int | None = None,
+                     reason: str = '', available_keys: int | None = None, model: str = ''):
         """Mark a key failure with appropriate cooldown."""
         if key is None:
             return

@@ -7,16 +7,15 @@ guarantees of nvidia's SQLite-backed metrics.
 
 import json
 import os
-import time
 import threading
+import time
 from pathlib import Path
-from typing import Dict
 
 
 class Metrics:
     """Thread-safe request metrics with disk persistence."""
 
-    def __init__(self, db_path: str = None):
+    def __init__(self, db_path: str | None = None):
         self.start = time.time()
         self.requests = 0
         self.tokens_in = 0
@@ -77,7 +76,7 @@ class Metrics:
             self.errors += 1
             self.requests += 1
 
-    async def summary(self, window: str = "24h") -> Dict:
+    async def summary(self, window: str = "24h") -> dict:
         uptime = time.time() - self.start
         with self._lock:
             return {

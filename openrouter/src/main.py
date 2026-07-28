@@ -18,27 +18,42 @@ Production features:
 - FREE_ONLY mode
 """
 
+import asyncio
+import hmac
+import json
+import logging
 import os
 import sys
-import json
-import hmac
+import threading
 import time
 import uuid
-import asyncio
-import logging
-import threading
-from pathlib import Path
-from typing import Optional, Set, AsyncGenerator
 from contextlib import asynccontextmanager
+from pathlib import Path
+
+import aiohttp
+import anyio
 
 # ── Shared monorepo imports ──────────────────────────────────────────────
 try:
-    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
-    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
+    from common.model import (
+        LocalModelRegistry,
+        ModelRegistryClient,
+        same_provider_model_id,
+    )
+    from common.model_state import (
+        ModelStateStore,
+        classify_upstream_error,
+        credential_fingerprint,
+    )
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-    from common.model_state import ModelStateStore, classify_upstream_error, credential_fingerprint
-    from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
+    from common.model import (
+        LocalModelRegistry,
+        ModelRegistryClient,
+    )
+    from common.model_state import (
+        ModelStateStore,
+    )
 
 # ── Catalog MCP integration ──────────────────────────────────────────────
 CATALOG_REPO = os.environ.get('CATALOG_REPO', str(Path(__file__).resolve().parents[2] / 'model_fetcher'))
@@ -46,8 +61,16 @@ if CATALOG_REPO not in sys.path:
     sys.path.insert(0, CATALOG_REPO)
 
 try:
-    from catalog_queries import search_models, get_model, list_providers, search_provider_models, \
-        get_provider_model, stats as catalog_stats, open_db, DEFAULT_DB
+    from catalog_queries import (
+        DEFAULT_DB,
+        get_model,
+        get_provider_model,
+        list_providers,
+        open_db,
+        search_models,
+        search_provider_models,
+    )
+    from catalog_queries import stats as catalog_stats
     from env_config import free_only as catalog_free_only
     _HAS_CATALOG = True
 except ImportError:
@@ -74,9 +97,9 @@ except ImportError:
     MGT = _MgtStub()
 
 # ── FastAPI + deps ───────────────────────────────────────────────────────
-from fastapi import FastAPI, Request, Response, HTTPException
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -93,8 +116,8 @@ except ImportError:
 from dotenv import load_dotenv
 
 try:
-    from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
+    from watchdog.observers import Observer
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
@@ -115,9 +138,15 @@ from .metrics import Metrics
 try:
     from common.translations import (
         AnthropicStreamState,
+    )
+    from common.translations import (
         normalize_upstream_error as _normalize_upstream_error,
-        strip_cache_control as _strip_cache,
+    )
+    from common.translations import (
         repair_orphan_tool_messages as _repair_orphan_tool_messages,
+    )
+    from common.translations import (
+        strip_cache_control as _strip_cache,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -233,9 +262,7 @@ def is_free_model(model_id: str) -> bool:
     if not model_id:
         return False
     mid = str(model_id).lower().strip()
-    if mid.endswith(':free') or mid.endswith('-free'):
-        return True
-    return False
+    return bool(mid.endswith((':free', '-free')))
 
 
 def _bearer_token() -> str:
@@ -254,6 +281,7 @@ def _client_ip(request: Request) -> str:
 
 # ── Rate Limiting ────────────────────────────────────────────────────────
 from collections import defaultdict
+
 _rate_limit_store = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 _rate_limit_last_sweep = 0.0
@@ -353,7 +381,7 @@ pool = KeyPool()
 metrics = Metrics()
 
 # ── Async HTTP session ────────────────────────────────────────────────────
-_agent: Optional[aiohttp.ClientSession] = None
+_agent: aiohttp.ClientSession | None = None
 
 
 async def get_agent() -> aiohttp.ClientSession:
@@ -513,8 +541,8 @@ async def auth_middleware(request: Request, call_next):
 # PROXY ROUTES
 # ══════════════════════════════════════════════════════════════════════════
 
-async def _proxy_request(method: str, path: str, body: Optional[dict] = None,
-                         headers: Optional[dict] = None, stream: bool = False) -> Response:
+async def _proxy_request(method: str, path: str, body: dict | None = None,
+                         headers: dict | None = None, stream: bool = False) -> Response:
     """Generic proxy handler for OpenRouter API."""
     acq = await pool.acquire(model=(body or {}).get("model", "") if body else "")
     if not acq:
@@ -589,7 +617,7 @@ async def _proxy_request(method: str, path: str, body: Optional[dict] = None,
         pool.release(key_obj)
 
 
-def _check_free_only(model: str) -> Optional[JSONResponse]:
+def _check_free_only(model: str) -> JSONResponse | None:
     """Check FREE_ONLY constraint. Returns error response if blocked."""
     if free_only_enabled() and model and not is_free_model(model):
         return JSONResponse(
@@ -773,6 +801,7 @@ def _anthropic_to_openai(body: dict) -> dict:
         else:
             messages.append({"role": role, "content": msg.get("content", "")})
 
+    model = body.get("model", "")
     openai_body = {
         "model": model,
         "messages": messages,
@@ -934,8 +963,8 @@ MANAGEMENT_KEY = os.environ.get('OPENROUTER_MANAGEMENT_KEY', '').strip()
 MANAGEMENT_ENABLED = MGT.is_management_enabled("openrouter") if _HAS_MANAGEMENT else False
 
 
-async def _mgmt_request(method: str, path: str = "", json_body: dict = None,
-                          params: dict = None) -> Response:
+async def _mgmt_request(method: str, path: str = "", json_body: dict | None = None,
+                          params: dict | None = None) -> Response:
     """Make authenticated management API request to OpenRouter."""
     if not MANAGEMENT_ENABLED:
         return JSONResponse(
@@ -1059,14 +1088,13 @@ async def mcp_sse(request: Request):
         return JSONResponse({"error": "MCP not available"}, status_code=503)
 
     async def event_generator():
-        async with anyio.create_task_group() as tg:
-            async with SSE_TRANSPORT.connect_sse(
-                request.scope, tg, request._receive
-            ) as streams:
-                await MCP_SERVER._mcp_server.run(
-                    streams[0], streams[1],
-                    MCP_SERVER._create_initialization_options()
-                )
+        async with anyio.create_task_group() as tg, SSE_TRANSPORT.connect_sse(
+            request.scope, tg, request._receive
+        ) as streams:
+            await MCP_SERVER._mcp_server.run(
+                streams[0], streams[1],
+                MCP_SERVER._create_initialization_options()
+            )
 
     return StreamingResponse(event_generator(), media_type="text/event-stream")
 

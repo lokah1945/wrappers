@@ -22,12 +22,10 @@ Usage (in any wrapper's main.py):
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
-import time
-import logging
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger('catalog-integration')
 
@@ -54,8 +52,16 @@ if CATALOG_REPO and CATALOG_REPO not in sys.path:
     sys.path.insert(0, CATALOG_REPO)
 
 try:
-    from catalog_queries import search_models, get_model, list_providers as _list_providers, \
-        search_provider_models, get_provider_model, stats as catalog_stats, open_db, DEFAULT_DB
+    from catalog_queries import (
+        DEFAULT_DB,
+        get_model,
+        get_provider_model,
+        open_db,
+        search_models,
+        search_provider_models,
+    )
+    from catalog_queries import list_providers as _list_providers
+    from catalog_queries import stats as catalog_stats
     from env_config import free_only as _catalog_free_only
 
     CATALOG_DB_PATH = os.environ.get('CATALOG_DB',
@@ -97,9 +103,7 @@ def is_free_model(model_id: str) -> bool:
     if not model_id:
         return False
     mid = str(model_id).lower().strip()
-    if mid.endswith(':free') or mid.endswith('-free'):
-        return True
-    return False
+    return bool(mid.endswith((':free', '-free')))
 
 
 # ── DB helper ──────────────────────────────────────────────────────────
@@ -128,10 +132,10 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
         return
 
     try:
+        import anyio
         from mcp.server.fastmcp import FastMCP
         from mcp.server.sse import SseServerTransport
-        import anyio
-        from starlette.responses import StreamingResponse, JSONResponse
+        from starlette.responses import JSONResponse, StreamingResponse
 
         mcp = FastMCP(
             f"{wrapper_name}-catalog",
@@ -244,7 +248,7 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
                 request.scope, request._receive, request._send
             )
 
-        logger.info(f"[catalog] MCP server mounted at /mcp/sse")
+        logger.info("[catalog] MCP server mounted at /mcp/sse")
         return mcp
 
     except ImportError as e:
@@ -266,7 +270,6 @@ def setup_catalog_routes(app, prefix: str = "") -> None:
         return
 
     from fastapi import APIRouter
-    from fastapi.responses import JSONResponse
 
     router = APIRouter(prefix=prefix or "/catalog", tags=["catalog"])
 
