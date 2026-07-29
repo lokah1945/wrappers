@@ -36,16 +36,6 @@
       "structure": "standardized",
       "run_command": "uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104"
     },
-    "vercel": {
-      "port": 9105,
-      "module": "vercel.src.main",
-      "entry_point": "vercel.src.main:app",
-      "upstream": "Vercel AI Gateway",
-      "status": "production",
-      "structure": "standardized",
-      "catalog_integrated": false,
-      "run_command": "uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105"
-    },
     "openrouter": {
       "port": 9106,
       "module": "openrouter.src.main",
