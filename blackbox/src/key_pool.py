@@ -123,6 +123,17 @@ class KeyPool:
         return sum(1 for k in self.keys if not k.is_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit))
 
     async def acquire(self, model: str = '') -> Optional[dict]:
+        """
+        Acquire an available API key from the pool.
+        
+        Returns:
+            Optional[dict]: A dictionary containing the acquired key, or None if no keys were available.
+            Callers MUST check for None return value before using the result.
+            
+        The method returns None when:
+        - All keys are blocked or at their rate limits
+        - The system is under load shedding (in-flight requests >= INFLIGHT_SOFT_CAP)
+        """
         async with self._lock:
             inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
             if sum(k.in_flight for k in self.keys) >= inflight_cap:
