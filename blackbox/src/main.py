@@ -945,6 +945,12 @@ def start_env_watcher():
             def on_modified(self, event):
                 if '.env' in event.src_path:
                     load_dotenv(ROOT / '.env', override=True)
+                    # Reload the key pool so new BLACKBOX_API_KEY_* entries
+                    # take effect without a process restart.
+                    try:
+                        pool.load_from_env()
+                    except Exception as e:
+                        logger.warning(f'[env] pool reload failed: {e}')
                     logger.info('[env] .env hot-reloaded')
         obs = Observer()
         obs.schedule(EnvWatcher(), path=str(ROOT), recursive=False)

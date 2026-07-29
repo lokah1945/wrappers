@@ -302,8 +302,19 @@ def validate_config():
     print(f"✅ Configuration validated successfully")
 
 
+# Callbacks invoked after .env hot-reload. The wrapper server registers
+# a pool-sync callback here during startup so new API keys take effect
+# without a process restart.
+_ENV_RELOAD_CALLBACKS = []
+
+
 def start_env_watcher():
-    """Start .env hot-reload watcher (exact parity with Node reloadDotenv + fs.watch)."""
+    """Start .env hot-reload watcher (exact parity with Node reloadDotenv + fs.watch).
+
+    On .env modification, reloads env vars AND triggers the registered
+    _ENV_RELOAD_CALLBACKS so the key pool can pick up new keys without
+    a process restart.
+    """
     if not HAS_WATCHDOG:
         logger.warning('[env] watchdog not available; hot reload disabled')
         return
@@ -312,7 +323,12 @@ def start_env_watcher():
             def on_modified(self, event):
                 if event.src_path.endswith('.env') or event.src_path.endswith('/.env'):
                     load_dotenv(override=True)
-                    # Re-apply any runtime config that depends on env (alias etc if needed)
+                    # Invoke registered reload callbacks (e.g. pool.sync_from_env).
+                    for cb in _ENV_RELOAD_CALLBACKS:
+                        try:
+                            cb()
+                        except Exception as e:
+                            logger.warning(f'[env] reload callback failed: {e}')
                     logger.info('[env] .env reloaded (hot)')
 
         observer = Observer()
@@ -1503,6 +1519,29 @@ class Server:
 
         self._bg_tasks.append(asyncio.create_task(_metrics_prune_loop()))
         self._bg_tasks.append(asyncio.create_task(_heal_in_flight_loop()))
+
+        # Register a hot-reload callback so new NVIDIA_API_KEY_* entries
+        # in .env are picked up without a process restart. sync_keys is
+        # async, so we schedule it on the running event loop.
+        def _sync_pool_from_env():
+            import re as _re
+            new_keys = []
+            seen = set()
+            for key_name, value in sorted(os.environ.items()):
+                if _re.match(r'^NVIDIA_API_KEY(_\d+)?$', key_name):
+                    v = (value or '').strip()
+                    if v and len(v) >= 10 and v not in seen:
+                        seen.add(v)
+                        new_keys.append(v)
+            if new_keys:
+                try:
+                    loop = asyncio.get_event_loop()
+                    asyncio.run_coroutine_threadsafe(self.pool.sync_keys(new_keys), loop)
+                    logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
+                except Exception as e:
+                    logger.warning(f'[env] pool sync schedule failed: {e}')
+
+        _ENV_RELOAD_CALLBACKS.append(_sync_pool_from_env)
         start_env_watcher()
 
     def _model_status_view(self, metrics_status: Optional[dict] = None) -> dict:
