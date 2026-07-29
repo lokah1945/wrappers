@@ -2544,4 +2544,4 @@ async def catch_all(path: str, request: Request):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("wrapper_nous:app", host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")
+    uvicorn.run("src.main:app", host=LISTEN_HOST, port=LISTEN_PORT, log_level="info")

@@ -2,10 +2,12 @@
 # install.sh — canonical installer for the wrappers monorepo.
 #
 # Installs one or all Python wrapper services using the same layout/contract:
-#   nvidia-python -> port 9101
-#   nous          -> port 9102
-#   opencode      -> port 9103
-#   blackbox      -> port 9104
+#   nvidia-python  -> port 9101
+#   nous           -> port 9102
+#   opencode       -> port 9103
+#   blackbox       -> port 9104
+#   openrouter     -> port 9106
+#   model-registry -> port 9200
 #
 # Usage:
 #   sudo ./install.sh                         # install all wrappers
@@ -38,6 +40,7 @@ WRAPPERS=(
   "nous|nous|wrapper-nous.service|http://127.0.0.1:9102/health"
   "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9103/health"
   "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9104/health"
+  "openrouter|openrouter|wrapper-openrouter.service|http://127.0.0.1:9106/health"
   "model-registry|model-registry|wrapper-model-registry.service|http://127.0.0.1:9200/health"
 )
 
@@ -64,13 +67,14 @@ if [ "$MODE" = "status" ]; then
   exit 0
 fi
 
-if [ "$(id -u)" -eq 0 ]; then
-  log "WARN: running as root — units install to /root/.config/systemd/user (user-level systemd for root)"
+if [ "$(id -u)" -eq 0 ] && [ "${HOME:-}" = "/root" ]; then
+  log "INFO: running as root — units install to /root/.config/systemd/user (user-level systemd for root)"
 fi
 
 # Deployment model: USER-LEVEL systemd (per wrapper runtime reality).
 # Services run under the invoking user's manager, not the system manager.
-USER_UNIT_DIR="/root/.config/systemd/user"
+# Use $HOME when available (works for non-root deploys too); fall back to /root.
+USER_UNIT_DIR="${HOME:-/root}/.config/systemd/user"
 mkdir -p "$USER_UNIT_DIR"
 
 while IFS='|' read -r name dir unit health; do
@@ -80,7 +84,16 @@ while IFS='|' read -r name dir unit health; do
   [ -d "$src_dir" ] || fail "missing wrapper dir: $src_dir"
   [ -f "$unit_src" ] || fail "missing systemd unit: $unit_src"
 
-  [ -f "${src_dir}/.env" ] || log "WARN: ${dir}/.env missing — copy ${dir}/.env.example and fill credentials before runtime"
+  # Auto-bootstrap .env from .env.example if missing (operator still needs
+  # to fill in credentials, but at least the service can boot to a clear
+  # 'missing required env' error instead of failing to find .env).
+  if [ ! -f "${src_dir}/.env" ] && [ -f "${src_dir}/.env.example" ]; then
+    log "WARN: ${dir}/.env missing — copying from .env.example (edit credentials before runtime)"
+    cp "${src_dir}/.env.example" "${src_dir}/.env"
+    chmod 600 "${src_dir}/.env"
+  elif [ ! -f "${src_dir}/.env" ]; then
+    log "WARN: ${dir}/.env missing and no .env.example available — service may fail to boot"
+  fi
 
   if [ -f "${src_dir}/requirements.txt" ]; then
     log "installing Python deps for ${name}"

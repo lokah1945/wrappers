@@ -1,0 +1,20 @@
+[Unit]
+Description=wrapper-openrouter: OpenRouter API proxy (port 9106)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper/openrouter
+Environment=PYTHONPATH=/root/wrapper/openrouter
+EnvironmentFile=-/root/wrapper/openrouter/.env
+Environment=LOG_FILE=/root/wrapper/openrouter/openrouter.log
+ExecStartPre=/bin/bash -c 'mkdir -p /root/wrapper/runtime && git -C /root/wrapper rev-parse HEAD > /root/wrapper/runtime/openrouter.commit 2>/dev/null || true'
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9106
+Restart=always
+RestartSec=3
+StandardOutput=append:/root/wrapper/openrouter/openrouter.log
+StandardError=append:/root/wrapper/openrouter/openrouter.log
+
+[Install]
+WantedBy=default.target

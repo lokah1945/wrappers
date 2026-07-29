@@ -10,7 +10,7 @@ Environment=PYTHONPATH=/root/wrapper/nous
 EnvironmentFile=-/root/wrapper/nous/.env
 Environment=LOG_FILE=/root/wrapper/nous/wrapper_nous.log
 ExecStartPre=/bin/bash -c 'mkdir -p /root/wrapper/runtime && git -C /root/wrapper rev-parse HEAD > /root/wrapper/runtime/nous.commit 2>/dev/null || true'
-ExecStart=/usr/bin/python3 wrapper_nous.py
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9102
 Restart=always
 RestartSec=3
 StandardOutput=append:/root/wrapper/nous/wrapper_nous.log
