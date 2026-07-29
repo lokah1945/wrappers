@@ -508,7 +508,10 @@ if _HAS_SIZE_LIMITER:
 DISABLE_AUTH = os.environ.get('DISABLE_AUTH', '').strip().lower() in ('1', 'true', 'yes')
 PUBLIC_PATHS = {'/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
                 '/catalog/health', '/catalog/ready', '/catalog/metrics',
-                '/mcp/sse', '/mcp/messages', '/mcp'}
+                '/mcp/sse', '/mcp/messages', '/mcp',
+                # Public model discovery (Ollama + OpenAI compatible) — agents
+                # need to list models before authenticating.
+                '/api/tags', '/v1/models', '/version'}
 
 # Headers forwarded upstream (transparent passthrough to preserve client identity
 # and beta-feature flags for OpenAI/Anthropic SDKs).
@@ -968,6 +971,47 @@ async def list_models(request: Request):
 @app.get("/v1/models/{model_id}")
 async def get_model_detail(model_id: str, request: Request):
     return await _proxy_request("GET", f"models/{model_id}")
+
+
+@app.get("/api/tags")
+async def api_tags():
+    """Ollama-compatible model discovery — PUBLIC (no auth).
+
+    Returns the model list in Ollama's /api/tags format so Ollama clients
+    can discover models served by this wrapper.
+    """
+    try:
+        # Reuse /v1/models internal logic without auth (it's already public).
+        models_resp = await list_models(Request(scope={'type': 'http', 'headers': [], 'method': 'GET', 'path': '/v1/models', 'query_string': b''}))
+        if hasattr(models_resp, 'body'):
+            try:
+                data = json.loads(models_resp.body)
+            except Exception:
+                data = {}
+        elif isinstance(models_resp, dict):
+            data = models_resp
+        else:
+            data = {}
+    except Exception:
+        data = {}
+    out_models = []
+    for m in (data.get('data') or []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get('id', '')
+        if not mid:
+            continue
+        family = mid.split('/')[0] if '/' in mid else mid
+        out_models.append({
+            'name': mid, 'model': mid,
+            'modified_at': '1970-01-01T00:00:00Z', 'size': 0, 'digest': '',
+            'details': {
+                'parent_model': '', 'format': 'gguf',
+                'family': family, 'families': [family],
+                'parameter_size': '', 'quantization_level': '',
+            },
+        })
+    return {'models': out_models}
 
 
 # ── Anthropic-compatible ─────────────────────────────────────────────────

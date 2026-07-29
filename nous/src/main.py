@@ -2244,6 +2244,38 @@ async def models():
             enriched[i]["checked_at"] = st.get("checked_at")
     return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
 
+
+@app.get("/api/tags")
+async def api_tags():
+    """Ollama-compatible model discovery — PUBLIC (no auth).
+
+    Returns the model list in Ollama's /api/tags format so Ollama clients
+    can discover models served by this wrapper.
+    """
+    try:
+        models_data = await models()
+    except Exception:
+        models_data = {"data": []}
+    out_models = []
+    for m in (models_data.get("data") or []):
+        if not isinstance(m, dict):
+            continue
+        mid = m.get("id", "")
+        if not mid:
+            continue
+        family = mid.split("/")[0] if "/" in mid else mid
+        out_models.append({
+            "name": mid, "model": mid,
+            "modified_at": "1970-01-01T00:00:00Z", "size": 0, "digest": "",
+            "details": {
+                "parent_model": "", "format": "gguf",
+                "family": family, "families": [family],
+                "parameter_size": "", "quantization_level": "",
+            },
+        })
+    return {"models": out_models}
+
+
 @app.get("/v1/capabilities")
 async def capabilities():
     try:
@@ -2567,6 +2599,29 @@ except ImportError as _cie:
     pass
 
 # catch-all
+
+
+@app.post("/v1/embeddings")
+async def embeddings(request: Request):
+    """Embeddings endpoint — not supported by this upstream provider.
+
+    Returns a clear 501 so SDK clients get a structured error instead of
+    a 404 catch-all. Operators who need embeddings should use nvidia-python
+    or openrouter wrappers which DO support embeddings.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
+    return JSONResponse({
+        "error": {
+            "message": "Embeddings not supported by this provider. Use nvidia-python (port 9101) or openrouter (port 9106) for embeddings.",
+            "type": "not_implemented_error",
+            "code": 501,
+        }
+    }, status_code=501)
+
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
     return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
