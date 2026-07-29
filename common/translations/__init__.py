@@ -10,6 +10,9 @@ from .shared import (
     repair_orphan_tool_messages,
     strip_cache_control,
     normalize_upstream_error,
+    parse_retry_after,
+    is_retriable_status,
+    should_cooldown_key,
 )
 
 __all__ = [
@@ -18,4 +21,7 @@ __all__ = [
     "repair_orphan_tool_messages",
     "strip_cache_control",
     "normalize_upstream_error",
+    "parse_retry_after",
+    "is_retriable_status",
+    "should_cooldown_key",
 ]

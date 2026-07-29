@@ -73,6 +73,9 @@ try:
         repair_orphan_tool_messages as _repair_orphan_tool_messages,
         normalize_upstream_error as _normalize_upstream_error,
         strip_cache_control as strip_cache_control,
+        parse_retry_after as _parse_retry_after,
+        is_retriable_status as _is_retriable_status,
+        should_cooldown_key as _should_cooldown_key,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -662,6 +665,12 @@ def get_model_meta(mid):
 
 
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
+    """Transparent proxy: forward chat/completions to Nous upstream.
+
+    On 429, parses the HTTP Retry-After header and embeds it in the error
+    dict so post_nous_with_retries can cool down the key for the correct
+    duration (anti rate-limit).
+    """
     url = f"{NOUS_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     if stream:
@@ -671,17 +680,8 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
         headers.update({k: v for k, v in extra_headers.items() if v})
 
     sess = await get_session()
-    # N-01 fix: any aiohttp/network error (DNS failure, connection reset,
-    # client-side timeout) is converted to a shaped 502 instead of propagating
-    # out of post_nous_with_retries after KEY_POOL.acquire() incremented
-    # in_flight (which permanently leaked the slot). Callers release the key
-    # entry in their own finally/error paths on non-200.
     try:
         if stream:
-            # IMPORTANT: Do NOT use async with for streaming — caller must release
-            # N-06 fix: no hard total timeout on streams (long generations were
-            # killed at 15 min); instead a sock_read idle timeout detects a
-            # silently dead upstream connection quickly.
             stream_timeout = aiohttp.ClientTimeout(
                 total=None,
                 sock_connect=CONNECT_TIMEOUT_SEC,
@@ -690,14 +690,32 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
             resp = await sess.post(url, json=payload, headers=headers, timeout=stream_timeout)
             if resp.status != 200:
                 text = await resp.text()
+                # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else 0
                 resp.release()
-                return resp.status, _normalize_upstream_error(resp.status, text)
+                try:
+                    data = json.loads(text) if text else text
+                except Exception:
+                    data = text
+                err = _normalize_upstream_error(resp.status, data)
+                if retry_after and isinstance(err, dict):
+                    err.setdefault('error', {})['retry_after'] = retry_after
+                return resp.status, err
             return 200, resp
         else:
             async with sess.post(url, json=payload, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status != 200:
-                    return resp.status, _normalize_upstream_error(resp.status, text)
+                    # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                    try:
+                        body_data = json.loads(text) if text else text
+                    except Exception:
+                        body_data = text
+                    retry_after = _parse_retry_after(resp.headers, body_data if isinstance(body_data, dict) else None) if resp.status == 429 else 0
+                    err = _normalize_upstream_error(resp.status, body_data)
+                    if retry_after and isinstance(err, dict):
+                        err.setdefault('error', {})['retry_after'] = retry_after
+                    return resp.status, err
                 try:
                     data = json.loads(text) if text else {}
                 except Exception:
@@ -711,16 +729,11 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
 
 
 def _retry_after_seconds(data, default=65) -> int:
-    if isinstance(data, dict):
-        err = data.get("error") if isinstance(data.get("error"), dict) else data
-        for k in ("retry_after", "retry_after_seconds", "retry-after"):
-            v = err.get(k) if isinstance(err, dict) else None
-            if v is not None:
-                try:
-                    return max(1, int(float(v)))
-                except (TypeError, ValueError):
-                    pass
-    return default
+    """Delegate to shared parse_retry_after. Kept for backward compat."""
+    if isinstance(data, tuple) and len(data) == 2:
+        headers, body = data
+        return _parse_retry_after(headers, body, default)
+    return _parse_retry_after(None, data if isinstance(data, dict) else None, default)
 
 
 def _is_retriable_upstream_status(status: int, data=None) -> bool:
@@ -959,9 +972,18 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
 
     msgs = repair_orphan_tool_messages(msgs)
     out = {"model": model, "messages": msgs, "stream": body.get("stream", False)}
-    if body.get("max_output_tokens"): out["max_tokens"] = max(int(body["max_output_tokens"]), 1024)
-    else: out["max_tokens"] = 4096
-    for k in ("temperature", "top_p", "tool_choice"):
+    # TRANSPARENT PROXY: only set max_tokens if client explicitly sent one.
+    # Never inject a default or enforce a minimum (was max(..., 1024) and
+    # default 4096) — that mutates client intent.
+    if body.get("max_output_tokens") is not None:
+        out["max_tokens"] = body["max_output_tokens"]
+    elif body.get("max_tokens") is not None:
+        out["max_tokens"] = body["max_tokens"]
+    # Forward all client params verbatim (transparent proxy).
+    for k in ("temperature", "top_p", "tool_choice", "stop", "seed",
+              "parallel_tool_calls", "stream_options", "user", "metadata",
+              "frequency_penalty", "presence_penalty", "logit_bias",
+              "logprobs", "top_logprobs", "response_format", "service_tier"):
         if body.get(k) is not None: out[k] = body[k]
 
     if body.get("tools"):
@@ -1135,8 +1157,13 @@ def anthropic_to_openai(req: dict) -> dict:
         msgs.append(am)
 
     out = {"model": model, "messages": msgs, "stream": req.get("stream", False)}
-    out["max_tokens"] = max(int(req.get("max_tokens", 4096)), 1024)
-    for k in ("temperature", "top_p"):
+    # TRANSPARENT PROXY: only set max_tokens if client explicitly sent one.
+    # Never inject a default or enforce a minimum (was max(..., 1024) and
+    # default 4096) — that mutates client intent.
+    if req.get("max_tokens") is not None:
+        out["max_tokens"] = req["max_tokens"]
+    # Forward all client params verbatim (transparent proxy).
+    for k in ("temperature", "top_p", "top_k"):
         if req.get(k) is not None: out[k] = req[k]
     if req.get("stop_sequences"): out["stop"] = req["stop_sequences"]
     if req.get("tools"):
@@ -2293,8 +2320,10 @@ async def chat_completions(request: Request):
             return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)"}})
         if isinstance(m, dict) and m.get('role') == 'tool' and not m.get('tool_call_id'):
             return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': "tool role requires tool_call_id"}})
-    for bad in ["n", "logprobs", "logit_bias", "user", "frequency_penalty", "presence_penalty"]:
-        body.pop(bad, None)
+    # TRANSPARENT PROXY: do NOT drop client params (was silently stripping
+    # n, logprobs, logit_bias, user, frequency_penalty, presence_penalty).
+    # Forward the body verbatim — upstream will reject unsupported params
+    # with a clear 400 if it doesn't accept them.
     # Drop name:null tools (Codex/Hermes) before upstream
     if isinstance(body.get("tools"), list):
         cleaned = []

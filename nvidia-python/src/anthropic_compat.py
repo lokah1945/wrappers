@@ -336,7 +336,12 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
             msgs.append(am)
 
     oai['messages'] = msgs
-    oai['max_tokens'] = a.get('max_tokens') if a.get('max_tokens') is not None else 8192
+    # TRANSPARENT PROXY: only set max_tokens if the client explicitly sent one.
+    # Anthropic spec requires max_tokens, so most clients send it. But if a
+    # client omits it, let upstream return a clear 400 rather than us
+    # silently injecting 8192 (which mutates client intent).
+    if a.get('max_tokens') is not None:
+        oai['max_tokens'] = a['max_tokens']
 
     param_map = [
         ('temperature', 'temperature'),

@@ -77,6 +77,9 @@ try:
         normalize_upstream_error as _normalize_upstream_error,
         strip_cache_control as _strip_cache,
         repair_orphan_tool_messages as _repair_orphan_tool_messages,
+        parse_retry_after as _parse_retry_after,
+        is_retriable_status as _is_retriable_status,
+        should_cooldown_key as _should_cooldown_key,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -275,8 +278,7 @@ def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
     if not model_id or is_alias_name(model_id):
         return
     mid = str(model_id).strip()
-    if mid.lower().startswith('opencode/'):
-        mid = mid.split('/', 1)[1]
+    # TRANSPARENT PROXY: do NOT strip 'opencode/' prefix — forward verbatim.
     if not mid:
         return
     if not force and mid not in _known_models:
@@ -430,8 +432,11 @@ def _normalize_model(model: str) -> str:
     m = str(model).strip()
     if not m:
         return ""
-    if m.lower().startswith('opencode/'):
-        m = m.split('/', 1)[1]
+    # TRANSPARENT PROXY: do NOT strip 'opencode/' prefix from client model id.
+    # Forward the model id verbatim — upstream will return a clear 404 if it
+    # doesn't recognize the prefixed form. Stripping was a silent mutation of
+    # client intent that made it impossible to send a literal 'opencode/...'
+    # model id through the wrapper.
     if is_alias_name(m):
         tgt = get_dynamic_alias_target()
         return tgt if tgt else m
@@ -441,17 +446,19 @@ def _normalize_model(model: str) -> str:
 
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
+    """Transparent proxy: forward request to upstream, return (status, data).
+
+    On 429/5xx, the caller's retry loop (proxy_request_with_pool) will
+    rotate to the next key. The retry_after value is embedded in the
+    returned error dict so mark_failure can cool down the key for the
+    correct duration.
+    """
     import aiohttp
     sess = await get_session()
     headers = headers or {}
     try:
         if is_stream:
             # Caller owns release — do NOT async-with the response
-            # BUG-OC-STREAM fix: use read-idle timeout instead of hard total
-            # timeout. Long generations (reasoning models, agent workflows)
-            # can exceed STREAM_REQUEST_TIMEOUT_SEC (15 min). The sock_read
-            # timeout detects dead upstream connections without killing
-            # legitimate long streams. Parity with nous N-06 and nvidia V-09.
             resp = await sess.request(
                 method, url, json=json_body, headers=headers,
                 timeout=aiohttp.ClientTimeout(
@@ -462,12 +469,20 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             )
             if resp.status >= 400:
                 text = await resp.text()
+                # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else 0
                 resp.release()
                 try:
                     data = json.loads(text)
                 except (json.JSONDecodeError, ValueError):
                     data = text
-                return resp.status, _normalize_upstream_error(resp.status, data)
+                err = _normalize_upstream_error(resp.status, data)
+                if retry_after:
+                    if isinstance(err, dict):
+                        err.setdefault('error', {})['retry_after'] = retry_after
+                    else:
+                        err = {'error': {'message': str(err)[:2000], 'type': 'rate_limit_error', 'retry_after': retry_after}}
+                return resp.status, err
             return 200, resp
         async with sess.request(
             method, url, json=json_body, headers=headers,
@@ -479,7 +494,12 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             except Exception:
                 data = text
             if resp.status >= 400:
-                return resp.status, _normalize_upstream_error(resp.status, data)
+                # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                retry_after = _parse_retry_after(resp.headers, data if isinstance(data, dict) else None) if resp.status == 429 else 0
+                err = _normalize_upstream_error(resp.status, data)
+                if retry_after and isinstance(err, dict):
+                    err.setdefault('error', {})['retry_after'] = retry_after
+                return resp.status, err
             if not isinstance(data, dict):
                 data = {"error": {"message": str(data)[:2000], "type": "api_error"}}
             return resp.status, data
@@ -490,16 +510,13 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
 
 
 def _retry_after_seconds(data, default=65) -> int:
-    if isinstance(data, dict):
-        err = data.get("error") if isinstance(data.get("error"), dict) else data
-        for k in ("retry_after", "retry_after_seconds", "retry-after"):
-            v = err.get(k) if isinstance(err, dict) else None
-            if v is not None:
-                try:
-                    return max(1, int(float(v)))
-                except (TypeError, ValueError):
-                    pass
-    return default
+    """Delegate to shared parse_retry_after. Kept for backward compat with
+    code that calls _retry_after_seconds(data) — now also handles HTTP headers
+    if `data` is a tuple of (headers, body)."""
+    if isinstance(data, tuple) and len(data) == 2:
+        headers, body = data
+        return _parse_retry_after(headers, body, default)
+    return _parse_retry_after(None, data if isinstance(data, dict) else None, default)
 
 
 def _is_retriable_upstream_status(status: int, data=None) -> bool:
@@ -741,13 +758,27 @@ def anthropic_to_openai(body: dict) -> dict:
             msgs.append(am)
     # DR-4: repair orphan tool messages (tool/tool_result without a preceding
     # assistant tool_call) so upstream doesn't 400 on the /messages path.
-    out = {"model": model, "messages": _repair_orphan_tool_messages(msgs), "stream": bool(body.get('stream')),
-           "max_tokens": max(int(body.get('max_tokens') or 4096), 1)}
+    # TRANSPARENT PROXY: only set max_tokens if the client explicitly sent one.
+    # Never inject a default (was 4096) — that mutates client intent and can
+    # cause upstream 400 if the value exceeds the model's limit.
+    out = {"model": model, "messages": _repair_orphan_tool_messages(msgs), "stream": bool(body.get('stream'))}
+    if body.get('max_tokens') is not None:
+        try:
+            out['max_tokens'] = int(body['max_tokens'])
+        except (TypeError, ValueError):
+            out['max_tokens'] = body['max_tokens']  # let upstream validate
     if body.get('tools'):
         out['tools'] = [{"type": "function", "function": {
             "name": t['name'], "description": t.get('description', ''),
             "parameters": t.get('input_schema') or {},
         }} for t in body['tools'] if t.get('name')]
+    # Forward all other client params verbatim (transparent proxy).
+    for k in ('temperature', 'top_p', 'stop', 'seed', 'parallel_tool_calls',
+              'stream_options', 'user', 'metadata', 'frequency_penalty',
+              'presence_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
+              'response_format', 'service_tier', 'tool_choice'):
+        if body.get(k) is not None:
+            out[k] = body[k]
     return out
 
 

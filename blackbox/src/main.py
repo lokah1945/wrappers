@@ -75,6 +75,9 @@ from common.translations import (
     strip_cache_control as _strip_cache,
     repair_orphan_tool_messages as _repair_orphan_tool_messages,
     parse_dsml_from_text as _parse_dsml_from_text,  # BB-14/DR-6
+    parse_retry_after as _parse_retry_after,
+    is_retriable_status as _is_retriable_status,
+    should_cooldown_key as _should_cooldown_key,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -419,6 +422,12 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
 
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
+    """Transparent proxy: forward request to upstream, return (status, data).
+
+    On 429, parses the HTTP Retry-After header and embeds it in the error
+    dict so proxy_request_with_pool can cool down the key for the correct
+    duration (anti rate-limit).
+    """
     import aiohttp as _aiohttp
     sess = await get_session()
     headers = headers or {}
@@ -432,11 +441,6 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
 
     try:
         if is_stream:
-            # BUG-BB-STREAM fix: use read-idle timeout instead of hard total
-            # timeout. Long generations (reasoning models, agent workflows)
-            # can exceed STREAM_REQUEST_TIMEOUT_SEC (15 min). The sock_read
-            # timeout detects dead upstream connections without killing
-            # legitimate long streams. Parity with nous N-06 and nvidia V-09.
             resp = await sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(
                 total=None,
                 sock_connect=CONNECT_TIMEOUT_SEC,
@@ -444,12 +448,17 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             ))
             if resp.status >= 400:
                 text = await resp.text()
+                # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else 0
                 resp.release()
                 try:
                     data = json.loads(text)
                 except (json.JSONDecodeError, ValueError):
                     data = text
-                return resp.status, _upstream_error_body(resp.status, data)
+                err = _upstream_error_body(resp.status, data)
+                if retry_after and isinstance(err, dict):
+                    err.setdefault('error', {})['retry_after'] = retry_after
+                return resp.status, err
             return 200, resp
         async with sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC)) as resp:
             text = await resp.text()
@@ -458,7 +467,12 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             except Exception:
                 data = text
             if resp.status >= 400:
-                return resp.status, _upstream_error_body(resp.status, data)
+                # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                retry_after = _parse_retry_after(resp.headers, data if isinstance(data, dict) else None) if resp.status == 429 else 0
+                err = _upstream_error_body(resp.status, data)
+                if retry_after and isinstance(err, dict):
+                    err.setdefault('error', {})['retry_after'] = retry_after
+                return resp.status, err
             if not isinstance(data, dict):
                 data = {'error': {'message': str(data)[:2000], 'type': 'api_error'}}
             return resp.status, data
@@ -468,16 +482,11 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
 
 
 def _retry_after_seconds(data, default=65) -> int:
-    if isinstance(data, dict):
-        err = data.get('error') if isinstance(data.get('error'), dict) else data
-        for k in ('retry_after', 'retry_after_seconds', 'retry-after'):
-            v = err.get(k) if isinstance(err, dict) else None
-            if v is not None:
-                try:
-                    return max(1, int(float(v)))
-                except (TypeError, ValueError):
-                    pass
-    return default
+    """Delegate to shared parse_retry_after. Kept for backward compat."""
+    if isinstance(data, tuple) and len(data) == 2:
+        headers, body = data
+        return _parse_retry_after(headers, body, default)
+    return _parse_retry_after(None, data if isinstance(data, dict) else None, default)
 
 
 def _is_retriable_upstream_status(status: int) -> bool:
@@ -653,11 +662,11 @@ def anthropic_to_openai(body: dict) -> dict:
             am['reasoning_content'] = '\n'.join(reasoning)
         msgs.append(am)
     out = {'model': model, 'messages': _repair_orphan_tool_messages(msgs), 'stream': bool(body.get('stream'))}
-    # B21 (transparency): never override an explicit client max_tokens.
-    # The default (4096) applies only when the client omitted/invalidated it
-    # (the endpoint already validates it is a positive int).
+    # TRANSPARENT PROXY: only set max_tokens if the client explicitly sent one.
+    # Never inject a default (was 4096) — that mutates client intent.
     mt = body.get('max_tokens')
-    out['max_tokens'] = mt if isinstance(mt, int) and mt > 0 else 4096
+    if mt is not None:
+        out['max_tokens'] = mt
     # B21 (transparency, severe): forward client sampling parameters verbatim
     # instead of silently dropping them.
     for k in ('temperature', 'top_p', 'top_k'):

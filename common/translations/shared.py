@@ -190,3 +190,92 @@ def normalize_upstream_error(status: int, text_or_data: Any) -> dict:
         etype = "server_error"
 
     return {"error": {"message": str(msg)[:2000], "type": etype, "code": status}}
+
+
+def parse_retry_after(resp_headers: dict, body: Any = None, default: int = 65) -> int:
+    """Parse Retry-After from upstream response.
+
+    Handles three sources (in priority order):
+      1. HTTP `Retry-After` response header (int seconds OR RFC 1123 HTTP-date).
+      2. JSON body keys: `retry_after`, `retry_after_seconds`, `retry-after`.
+      3. Default fallback.
+
+    This is the canonical implementation — used by nvidia-python, nous,
+    opencode, blackbox, openrouter. Replaces 4 divergent _retry_after_seconds
+    implementations across the wrappers.
+
+    Args:
+        resp_headers: dict-like with .get() (e.g. aiohttp.ClientResponse.headers
+            or dict). Case-insensitive lookup attempted.
+        body: parsed JSON body (dict) or None.
+        default: fallback seconds if no source provides a value.
+
+    Returns:
+        int seconds to wait before retrying (minimum 1).
+    """
+    # 1. HTTP Retry-After header (int seconds or RFC 1123 date)
+    if resp_headers:
+        # Case-insensitive lookup
+        ra = None
+        if hasattr(resp_headers, 'get'):
+            # Try common casings
+            for k in ('Retry-After', 'retry-after', 'Retry-after', 'RETRY-AFTER'):
+                ra = resp_headers.get(k)
+                if ra:
+                    break
+        if ra:
+            ra_str = str(ra).strip()
+            # Try int seconds first
+            try:
+                return max(1, int(ra_str))
+            except ValueError:
+                pass
+            # Try RFC 1123 HTTP-date
+            try:
+                from email.utils import parsedate_to_datetime
+                dt = parsedate_to_datetime(ra_str)
+                if dt:
+                    import datetime as _dt
+                    now = _dt.datetime.now(_dt.timezone.utc)
+                    delta = (dt - now).total_seconds()
+                    if delta > 0:
+                        return max(1, int(delta))
+            except Exception:
+                pass
+
+    # 2. JSON body keys
+    if isinstance(body, dict):
+        err = body.get('error') if isinstance(body.get('error'), dict) else body
+        for k in ('retry_after', 'retry_after_seconds', 'retry-after'):
+            v = err.get(k) if isinstance(err, dict) else None
+            if v is not None:
+                try:
+                    return max(1, int(float(v)))
+                except (TypeError, ValueError):
+                    pass
+
+    # 3. Default
+    return max(1, default)
+
+
+def is_retriable_status(status: int) -> bool:
+    """True if the HTTP status is retryable across keys (429, 5xx, 408, 409)."""
+    return status == 429 or status >= 500 or status in (408, 409)
+
+
+def should_cooldown_key(status: int, body: Any) -> bool:
+    """Heuristic: should this response trigger a per-key cooldown?
+
+    True for 429 (rate limit) and 401/403 (auth/quota) — these are
+    per-credential failures that won't be fixed by retrying the same key.
+    """
+    if status in (429, 401, 402, 403):
+        return True
+    # Some upstreams return 200 with an error envelope (rare but happens)
+    if isinstance(body, dict):
+        err = body.get('error') if isinstance(body.get('error'), dict) else body
+        if isinstance(err, dict):
+            msg = str(err.get('message', '')).lower()
+            if 'rate limit' in msg or 'quota' in msg or 'too many requests' in msg:
+                return True
+    return False

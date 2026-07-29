@@ -145,6 +145,11 @@ try:
     from common.translations import (
         strip_cache_control as _strip_cache,
     )
+    from common.translations import (
+        parse_retry_after as _parse_retry_after,
+        is_retriable_status as _is_retriable_status,
+        should_cooldown_key as _should_cooldown_key,
+    )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
     raise RuntimeError("common.translations import failed; wrapper requires shared translations") from _imp_err
@@ -615,8 +620,12 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 # Streaming: do NOT async-with so caller owns release; release in finally.
                 resp = await agent.request(method, url, json=body, headers=fwd, timeout=timeout)
                 if resp.status >= 400:
+                    # Parse Retry-After header for 429 cooldown (anti rate-limit).
+                    retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else None
                     pool.mark_failure(key_obj, status_code=resp.status,
-                                      available_keys=pool.available_keys)
+                                      available_keys=pool.available_keys,
+                                      model=model_id,
+                                      retry_after=retry_after)
                     error_text = await resp.text()
                     resp.release()
                     pool.release(key_obj)
@@ -626,7 +635,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     except Exception:
                         last_data = {"error": {"message": error_text[:2000], "type": "upstream_error",
                                                  "status": resp.status}}
-                    if resp.status in (401, 402, 403, 408, 409, 429) or resp.status >= 500:
+                    if _is_retriable_status(resp.status):
                         continue  # retry with next key
                     return JSONResponse(last_data, status_code=resp.status)
                 pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
@@ -674,18 +683,22 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 await metrics.record_request(model=model_id, status_code=resp.status)
                 text = await resp.text()
                 if resp.status >= 400:
-                    pool.mark_failure(key_obj, status_code=resp.status,
-                                      available_keys=pool.available_keys)
+                    # Parse Retry-After header for 429 cooldown (anti rate-limit).
                     try:
-                        data = json.loads(text) if text else {}
+                        body_data = json.loads(text) if text else {}
                     except Exception:
-                        data = {"error": {"message": text[:2000], "type": "upstream_error",
+                        body_data = {"error": {"message": text[:2000], "type": "upstream_error",
                                            "status": resp.status}}
+                    retry_after = _parse_retry_after(resp.headers, body_data if isinstance(body_data, dict) else None) if resp.status == 429 else None
+                    pool.mark_failure(key_obj, status_code=resp.status,
+                                      available_keys=pool.available_keys,
+                                      model=model_id,
+                                      retry_after=retry_after)
                     last_status = resp.status
-                    last_data = data
-                    if resp.status in (401, 402, 403, 408, 409, 429) or resp.status >= 500:
+                    last_data = body_data
+                    if _is_retriable_status(resp.status):
                         continue  # retry with next key
-                    return JSONResponse(data, status_code=resp.status)
+                    return JSONResponse(body_data, status_code=resp.status)
                 # Success
                 if hasattr(pool, 'mark_success'):
                     pool.mark_success(key_obj, available_keys=pool.available_keys)
@@ -1282,11 +1295,14 @@ def _anthropic_to_openai(body: dict) -> dict:
             messages.append({"role": role, "content": content})
 
     model = body.get("model", "")
+    # TRANSPARENT PROXY: only set max_tokens if the client explicitly sent one.
+    # Never inject a default (was 4096) — that mutates client intent.
     openai_body = {
         "model": model,
         "messages": messages,
-        "max_tokens": body.get("max_tokens", 4096),
     }
+    if body.get("max_tokens") is not None:
+        openai_body["max_tokens"] = body["max_tokens"]
     if "temperature" in body:
         openai_body["temperature"] = body["temperature"]
     if "top_p" in body:

@@ -220,12 +220,21 @@ class KeyPool:
 
     def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int | None = None,
                      reason: str = '', available_keys: int | None = None, model: str = ''):
-        """Mark a key failure with appropriate cooldown."""
+        """Mark a key failure with appropriate cooldown.
+
+        ANTI RATE-LIMIT: when a 429 hits, prefer model-scoped block (so the
+        same key can still serve other models). Only fall back to whole-key
+        block if model is unknown. This maximizes key availability across
+        the multi-model request mix.
+        """
         if key is None:
             return
         if status_code == 429:
             cooldown = retry_after or int(os.environ.get('RATE_LIMIT_COOLDOWN_SEC', '65'))
-            key.block(cooldown, 'rate_limit')
+            if model:
+                key.block_model(model, cooldown, 'rate_limit')
+            else:
+                key.block(cooldown, 'rate_limit')
         elif status_code in (401, 403, 402):
             cooldown = retry_after or int(os.environ.get('AUTH_KEY_COOLDOWN_SEC', '300'))
             key.block(cooldown, 'auth_or_quota')
