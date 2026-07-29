@@ -60,6 +60,11 @@ CATALOG_REPO = os.environ.get('CATALOG_REPO', str(Path(__file__).resolve().paren
 if CATALOG_REPO not in sys.path:
     sys.path.insert(0, CATALOG_REPO)
 
+# Also add src/ if it exists
+src_path = os.path.join(CATALOG_REPO, 'src')
+if os.path.isdir(src_path) and src_path not in sys.path:
+    sys.path.insert(0, src_path)
+
 try:
     from catalog_queries import (
         DEFAULT_DB,

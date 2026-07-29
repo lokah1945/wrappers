@@ -35,21 +35,29 @@ _CANDIDATE_PATHS = [
     os.environ.get('CATALOG_REPO', ''),
     str(Path(__file__).resolve().parents[2] / 'model_fetcher'),
     str(Path(__file__).resolve().parents[3] / 'model_fetcher'),
+    '/root/wrapper/model_fetcher',  # Primary: wrapper monorepo location
     '/root/model_fetcher',
     '/home/user/model_fetcher',
 ]
 
 CATALOG_REPO = ''
 for _p in _CANDIDATE_PATHS:
-    if _p and os.path.isdir(os.path.join(_p, 'catalog_queries.py')):
+    # Check for catalog_queries.py in root or src/
+    if _p and (os.path.isfile(os.path.join(_p, 'catalog_queries.py')) or 
+               os.path.isfile(os.path.join(_p, 'src', 'catalog_queries.py'))):
         CATALOG_REPO = _p
         break
 
 _HAS_CATALOG = False
 _HAS_MANAGEMENT = False
 
-if CATALOG_REPO and CATALOG_REPO not in sys.path:
-    sys.path.insert(0, CATALOG_REPO)
+if CATALOG_REPO:
+    # Add both root and src/ to path
+    if CATALOG_REPO not in sys.path:
+        sys.path.insert(0, CATALOG_REPO)
+    src_path = os.path.join(CATALOG_REPO, 'src')
+    if os.path.isdir(src_path) and src_path not in sys.path:
+        sys.path.insert(0, src_path)
 
 try:
     from catalog_queries import (

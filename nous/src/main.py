@@ -678,7 +678,7 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
             return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
 
     url = f"{NOUS_BASE}/v1/chat/completions"
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     if stream:
         headers["Accept"] = "text/event-stream"
 
@@ -2552,12 +2552,6 @@ async def dashboard(request: Request):
 @app.get("/healthz")
 async def healthz(): return await health()
 
-# catch-all
-@app.api_route("/{path:path}", methods=["GET", "POST"])
-async def catch_all(path: str, request: Request):
-    return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
-
-
 # ── Catalog + MCP Integration ──────────────────────────────────────────
 try:
     from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
@@ -2569,6 +2563,12 @@ try:
 except ImportError as _cie:
     _HAS_CATALOG_INTEGRATION = False
     pass
+
+# catch-all
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def catch_all(path: str, request: Request):
+    return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
+
 
 if __name__ == "__main__":
     import uvicorn

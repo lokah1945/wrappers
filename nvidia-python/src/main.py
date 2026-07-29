@@ -1589,7 +1589,9 @@ class Server:
                          or (method == 'GET' and path in ('/api/v1/models', '/models'))
                          or (method == 'GET' and path in ('/props', '/v1/props'))
                          or (method == 'GET' and path == '/v1/capabilities')
-                         or (method == 'GET' and path == '/v1/capabilities/params'))
+                         or (method == 'GET' and path == '/v1/capabilities/params')
+                         or (method == 'GET' and path.startswith('/catalog/'))
+                         or (method == 'GET' and path.startswith('/mcp/')))
 
             # Per-IP rate limiting
             _client_ip = client_ip(request)
@@ -2723,13 +2725,18 @@ class Server:
         is_post = method in ('POST', 'PUT', 'PATCH')
 
         # D11: return 404 for paths that don't match any known API endpoint
+        # CRITICAL: Skip catalog/mcp paths entirely - let dedicated handlers handle them
+        if path.startswith('/catalog/') or path.startswith('/mcp/'):
+            return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
+            
         known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
                        '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
                        '/v1/moderations', '/v1/responses', '/v1/files',
                        '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
                        '/v1/messages', '/v1/messages/count_tokens',
                        '/v1/capabilities', '/v1/capabilities/params',
-                       '/v2/', '/api/', '/v1/complete')
+                       '/v2/', '/api/', '/v1/complete',
+                       '/catalog', '/catalog/', '/mcp', '/mcp/')
         normalized = path if path.startswith('/') else '/' + path
         if path != '/' and not any(normalized == s.rstrip('/') or normalized.startswith(s) for s in known_stems):
             return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
@@ -2923,13 +2930,20 @@ def create_app() -> FastAPI:
     if _HAS_SIZE_LIMITER:
         app.add_middleware(RequestSizeLimiter)
 
+    # ── Catalog + MCP Integration (MUST BE BEFORE server routes with catch-all) ──────────────────────
+    try:
+        from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
+        setup_catalog_routes(app)
+        setup_mcp_server(app, "nvidia-python")
+        # Override free_only with shared version
+        free_only_enabled = _cfe
+        _HAS_CATALOG_INTEGRATION = True
+    except ImportError as _cie:
+        _HAS_CATALOG_INTEGRATION = False
+        pass
+
     server = Server(app)
     server._register_routes()
-
-    @app.exception_handler(Exception)
-    async def global_exception_handler(request: Request, exc: Exception):
-        logger.exception(f"[global] Unhandled exception on {request.method} {request.url.path}: {exc}")
-        return JSONResponse(status_code=500, content={'error': {'message': 'Internal server error', 'type': 'server_error'}})
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
@@ -2959,39 +2973,9 @@ def create_app() -> FastAPI:
     app.router.lifespan_context = lifespan
     return app
 
-
-# ── Shared translations override (deduplication) ──────────────────────
-# After all local definitions, override with canonical shared implementations.
-if _USING_SHARED_TRANSLATIONS:
-    AnthropicStreamState = _SharedAnthropicStreamState
-    _parse_dsml_from_text = _shared_parse_dsml
-
-
-app = create_app()
-
-
-def main():
-    import uvicorn
-    uvicorn.run(
-        'src.main:app',
-        host=BIND_HOST,
-        port=LISTEN_PORT,
-        log_level='info',
-    )
-
-
-
-# ── Catalog + MCP Integration ──────────────────────────────────────────
-try:
-    from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
-    setup_catalog_routes(app)
-    setup_mcp_server(app, "nvidia-python")
-    # Override free_only with shared version
-    free_only_enabled = _cfe
-    _HAS_CATALOG_INTEGRATION = True
-except ImportError as _cie:
-    _HAS_CATALOG_INTEGRATION = False
-    pass
-
 if __name__ == "__main__":
     main()
+
+
+# Export app for uvicorn
+app = create_app()
