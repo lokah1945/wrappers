@@ -23,8 +23,10 @@ class KeyEntry:
     def __init__(self, label: str, api_key: str):
         self.label = label
         self.api_key = api_key
-        self.soft_rpm: int = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
-        self.hard_rpm: int = int(os.environ.get('HARD_LIMIT_RPM', '60'))
+        self.soft_rpm: int = int(os.environ.get('OPENROUTER_SOFT_LIMIT_RPM',
+                                                 os.environ.get('SOFT_LIMIT_RPM', '30')))
+        self.hard_rpm: int = int(os.environ.get('OPENROUTER_HARD_LIMIT_RPM',
+                                                 os.environ.get('HARD_LIMIT_RPM', '60')))
         self.timestamps: list[float] = []
         self.hard_blocked_until: float = 0.0
         self.block_reason: str = ''
@@ -156,8 +158,10 @@ class KeyPool:
                 seen.add(v)
                 env_keys.append(v)
 
-        self.soft_limit = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
-        self.hard_limit = int(os.environ.get('HARD_LIMIT_RPM', '60'))
+        self.soft_limit = int(os.environ.get('OPENROUTER_SOFT_LIMIT_RPM',
+                                              os.environ.get('SOFT_LIMIT_RPM', '30')))
+        self.hard_limit = int(os.environ.get('OPENROUTER_HARD_LIMIT_RPM',
+                                              os.environ.get('HARD_LIMIT_RPM', '60')))
 
         if env_keys:
             self.keys = [KeyEntry(f'key{i+1}', k) for i, k in enumerate(env_keys)]

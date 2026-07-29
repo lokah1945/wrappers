@@ -41,8 +41,12 @@ class KeyEntry:
     def __init__(self, label: str, api_key: str):
         self.label = label
         self.api_key = api_key
-        self.soft_rpm: int = 30
-        self.hard_rpm: int = 40
+        # Honor provider-prefixed env vars first (NVIDIA_HARD_LIMIT_RPM),
+        # fall back to bare HARD_LIMIT_RPM for parity with siblings.
+        self.soft_rpm: int = int(os.environ.get('NVIDIA_SOFT_LIMIT_RPM',
+                                                 os.environ.get('SOFT_LIMIT_RPM', '30')))
+        self.hard_rpm: int = int(os.environ.get('NVIDIA_HARD_LIMIT_RPM',
+                                                 os.environ.get('HARD_LIMIT_RPM', '40')))
         self.timestamps: List[float] = []
         self.hard_blocked_until: float = 0.0
         self.model_blocks: Dict[str, float] = {}
@@ -263,8 +267,10 @@ class KeyPool:
             logger.warning('[wrapper-nvidia] No NVIDIA_API_KEY* found in environment '
                            '--- running in discovery-only mode. Inference requests will be rejected.')
 
-        self.soft_limit = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
-        self.hard_limit = int(os.environ.get('HARD_LIMIT_RPM', '40'))
+        self.soft_limit = int(os.environ.get('NVIDIA_SOFT_LIMIT_RPM',
+                                              os.environ.get('SOFT_LIMIT_RPM', '30')))
+        self.hard_limit = int(os.environ.get('NVIDIA_HARD_LIMIT_RPM',
+                                              os.environ.get('HARD_LIMIT_RPM', '40')))
         self.queue_limit = float(os.environ.get('QUEUE_LIMIT', '4'))
         self.max_queue_size = int(os.environ.get('MAX_QUEUE_SIZE', '500'))
         self.pacing_max_wait = int(os.environ.get('PACING_MAX_WAIT', '120'))

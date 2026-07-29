@@ -16,8 +16,12 @@ class KeyEntry:
     def __init__(self, label: str, api_key: str):
         self.label = label
         self.api_key = api_key
-        self.soft_rpm = int(os.environ.get('SOFT_LIMIT_RPM', '30'))
-        self.hard_rpm = int(os.environ.get('HARD_LIMIT_RPM', '40'))
+        # Honor provider-prefixed env vars first (BLACKBOX_HARD_LIMIT_RPM),
+        # fall back to bare HARD_LIMIT_RPM for parity with siblings.
+        self.soft_rpm = int(os.environ.get('BLACKBOX_SOFT_LIMIT_RPM',
+                                            os.environ.get('SOFT_LIMIT_RPM', '30')))
+        self.hard_rpm = int(os.environ.get('BLACKBOX_HARD_LIMIT_RPM',
+                                            os.environ.get('HARD_LIMIT_RPM', '40')))
         self.timestamps: List[float] = []
         self.hard_blocked_until = 0.0
         self.block_reason = ''
