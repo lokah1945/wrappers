@@ -1588,7 +1588,8 @@ async def anthropic_messages(request: Request):
 
 
 @app.get('/metrics')
-async def get_metrics():
+async def get_metrics(request: Request):
+    _auth_check(request)
     return await metrics.summary()
 
 

@@ -33,8 +33,10 @@ NGC_FEATURED_URL = (os.environ.get('NGC_FEATURED_MODELS_URL') or
 
 REGISTRY_REFRESH_SEC = int(os.environ.get('REGISTRY_REFRESH_SEC', '3600'))
 
+# Cache file lives INSIDE the nvidia-python wrapper directory (next to src/),
+# not in a sibling 'nvidia/' directory that doesn't exist.
 CACHE_FILE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                          'nvidia', 'ngc-featured-cache.json')
+                          'ngc-featured-cache.json')
 
 STATIC_SEED = {
     'nvidia/nemotron-3-ultra-550b-a55b': {'context': 1048576, 'maxOutput': 8192},

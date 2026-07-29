@@ -1779,7 +1779,8 @@ async def anthropic_messages(request: Request):
         return _jr(502, {"type": "error", "error": {"type": "api_error", "message": str(e)}})
 
 @app.get("/metrics")
-async def get_metrics():
+async def get_metrics(request: Request):
+    _auth_check(request)
     return await metrics.summary()
 
 @app.get("/metrics/prom")

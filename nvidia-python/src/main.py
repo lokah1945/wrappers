@@ -1406,7 +1406,10 @@ class Server:
         self.metrics = Metrics(DB_PATH)
         await self.metrics.init()
 
-        EVENTS_FILE = os.environ.get('EVENTS_FILE', '/root/wrapper/nvidia/metrics_data/wrapper-events.jsonl')
+        # Default EVENTS_FILE inside the nvidia-python wrapper directory (not
+        # the deprecated /nvidia/ sibling). Resolves to a path next to src/.
+        _default_events_file = str(Path(__file__).resolve().parents[1] / 'metrics_data' / 'wrapper-events.jsonl')
+        EVENTS_FILE = os.environ.get('EVENTS_FILE', _default_events_file)
         os.makedirs(os.path.dirname(EVENTS_FILE), exist_ok=True)
         events_max_bytes = int(os.environ.get('WRAPPER_EVENTS_MAX_MB', '64')) * 1024 * 1024
 
@@ -1660,7 +1663,12 @@ class Server:
                                    '/v1/messages', '/v1/messages/count_tokens',
                                    '/v1/capabilities', '/v1/capabilities/params',
                                    '/v2/', '/api/', '/v1/complete',
-                                   '/dashboard', '/dashboard.html')
+                                   '/dashboard', '/dashboard.html',
+                                   '/metrics', '/metrics/prom', '/metrics/models',
+                                   '/metrics/keys', '/metrics/activity', '/metrics/rate-limits',
+                                   '/metrics/model-status', '/metrics/chart',
+                                   '/stats', '/events', '/version', '/api/version',
+                                   '/admin', '/catalog', '/mcp')
                     if path != '/' and not any(path == s.rstrip('/') or path.startswith(s) for s in known_stems):
                         return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: {path}', 'type': 'invalid_request_error'}})
                     return JSONResponse(status_code=401, content={'error': {'message': 'Unauthorized', 'type': 'authentication_error'}})
