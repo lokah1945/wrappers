@@ -264,7 +264,7 @@ All wrappers include a **monitoring dashboard** at `/dashboard`:
 - **Real-time metrics** - RPS, latency, error rate
 - **Key status** - Available, blocked, in-flight
 - **Model availability** - Per-model status
-- **Circuit breaker state** - Open/closed/half-open
+- **Rate-limit / 429 events** - Per-key cooldowns (circuit breaker removed 2026-07-30)
 - **Auto-refresh** - Every 10 seconds
 - **Auth prompt** - Token entered client-side (not embedded)
 

@@ -291,8 +291,8 @@ wrappers/
 - ✅ Header injection prevention
 - ✅ Cross-tenant isolation
 - ✅ CORS restricted to localhost
-- ✅ Rate limiting (per-IP and per-key)
-- ✅ Circuit breaker pattern
+- ✅ Rate limiting (per-IP and per-key; RATE_LIMIT_RPM=0 disables per-IP)
+- ✅ Multi-key rotation with 429 backoff (no circuit breaker — removed 2026-07-30)
 - ✅ Request size limiting
 
 ---
@@ -304,7 +304,7 @@ All wrappers include a **monitoring dashboard** at `/dashboard`:
 - **Real-time metrics** - RPS, latency, error rate
 - **Key status** - Available, blocked, in-flight
 - **Model availability** - Per-model status
-- **Circuit breaker state** - Open/closed/half-open
+- **Rate-limit / 429 events** - Per-key cooldowns
 - **Auto-refresh** - Every 10 seconds
 - **Auth prompt** - Token entered client-side (not embedded in HTML)
 
@@ -387,7 +387,7 @@ open http://localhost:XXXX/dashboard
 ## 🎓 Key Design Decisions
 
 1. **Multi-key rotation** - Distributes load and provides redundancy
-2. **Circuit breaker pattern** - Prevents cascade failures
+2. **429 with Retry-After on exhaustion** - SDKs auto-retry with backoff (no circuit breaker — removed 2026-07-30 to prevent false-positive cascading failures)
 3. **Streaming heartbeat** - Keeps connections alive during long generations
 4. **Dynamic aliases** - Allows flexible model routing
 5. **Graceful shutdown** - Prevents request drops

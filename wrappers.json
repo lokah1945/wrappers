@@ -2,57 +2,83 @@
   "wrappers": {
     "nvidia-python": {
       "port": 9101,
-      "module": "nvidia_python.src.main",
-      "entry_point": "nvidia_python.src.main:app",
+      "module": "src.main",
+      "entry_point": "src.main:app",
       "upstream": "NVIDIA NIM",
       "status": "production",
       "structure": "standardized",
-      "run_command": "uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101"
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9101",
+      "env_prefix": "NVIDIA_",
+      "supports": ["openai_chat", "openai_responses", "anthropic_messages", "embeddings", "rerank", "images"]
     },
     "nous": {
       "port": 9102,
-      "module": "nous.src.main",
-      "entry_point": "nous.src.main:app",
+      "module": "src.main",
+      "entry_point": "src.main:app",
       "upstream": "Nous Research",
       "status": "production",
       "structure": "standardized",
-      "run_command": "uvicorn nous.src.main:app --host 0.0.0.0 --port 9102"
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9102",
+      "env_prefix": "NOUS_",
+      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
     },
     "opencode": {
       "port": 9103,
-      "module": "opencode.src.main",
-      "entry_point": "opencode.src.main:app",
+      "module": "src.main",
+      "entry_point": "src.main:app",
       "upstream": "OpenCode",
       "status": "production",
       "structure": "standardized",
-      "run_command": "uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103"
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9103",
+      "env_prefix": "OPENCODE_",
+      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
     },
     "blackbox": {
       "port": 9104,
-      "module": "blackbox.src.main",
-      "entry_point": "blackbox.src.main:app",
+      "module": "src.main",
+      "entry_point": "src.main:app",
       "upstream": "BLACKBOX AI",
       "status": "production",
       "structure": "standardized",
-      "run_command": "uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104"
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9104",
+      "env_prefix": "BLACKBOX_",
+      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
     },
     "openrouter": {
       "port": 9106,
-      "module": "openrouter.src.main",
-      "entry_point": "openrouter.src.main:app",
+      "module": "src.main",
+      "entry_point": "src.main:app",
       "upstream": "OpenRouter",
       "status": "production",
       "structure": "standardized",
       "catalog_integrated": true,
       "management_api": true,
-      "run_command": "uvicorn openrouter.src.main:app --host 0.0.0.0 --port 9106"
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9106",
+      "env_prefix": "OPENROUTER_",
+      "supports": ["openai_chat", "openai_responses", "anthropic_messages", "embeddings", "images"]
+    },
+    "model-registry": {
+      "port": 9200,
+      "module": "service",
+      "entry_point": "service:app",
+      "upstream": "internal",
+      "status": "production",
+      "structure": "service",
+      "run_command": "python3 service.py",
+      "env_prefix": "MODEL_REGISTRY_",
+      "supports": ["model_registry", "call_plan", "catalog_sync"]
     }
   },
   "metadata": {
-    "standardized_date": "2026-07-28",
+    "standardized_date": "2026-07-30",
     "structure_pattern": "wrapper/src/main.py",
-    "run_pattern": "uvicorn wrapper.src.main:app",
-    "audit_score": "100/100",
+    "run_pattern": "uvicorn src.main:app (WorkingDirectory=wrapper dir, PYTHONPATH=wrapper dir)",
+    "audit_status": "remediated_2026-07-30",
+    "circuit_breaker_removed": true,
+    "all_keys_exhausted_returns": 429,
+    "load_shedding_default": "off",
+    "rate_limit_per_ip_rpm_default": 600,
+    "agent_compatibility": "universal (Claude Code, Codex, OpenCode, Hermes, OpenClaw, Cursor, Windsurf, Cline, Continue, Roo Code, Aider, Goose, Gemini CLI, generic OpenAI/Anthropic SDKs)",
     "catalog_integration_version": "1.0",
     "management_api_providers": ["openrouter"]
   }
