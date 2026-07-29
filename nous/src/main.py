@@ -1820,6 +1820,7 @@ def _fire_and_forget(coro, label: str = "bg") -> None:
 # RATE LIMIT
 # --------------------------------------------------------------------------
 from collections import defaultdict
+import hmac
 rate_limits = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 
@@ -2005,7 +2006,7 @@ async def _auth_check(request: Request):
     if os.environ.get('DISABLE_AUTH'): return
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     token = auth.replace("Bearer ", "", 1).strip()
-    if token != BEARER_TOKEN:
+    if not hmac.compare_digest(token, BEARER_TOKEN):
         raise HTTPException(401, detail={"error": {"type": "authentication_error", "message": "Unauthorized"}})
 
 @app.get("/health")
