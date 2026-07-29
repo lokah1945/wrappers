@@ -1847,18 +1847,7 @@ async def dashboard(request: Request):
 @app.get("/version")
 async def version():
     return {"version": VERSION, "git_commit": GIT_COMMIT, "source_root": SOURCE_ROOT, "pid": os.getpid()}
-
-@app.api_route("/{path:path}", methods=["GET", "POST"])
-async def catch_all(path: str, request: Request):
-    return _jr(404, {"error": {"message": f"Unsupported: /{path}", "type": "not_found_error"}})
-
-def main():
-    import uvicorn
-    uvicorn.run("src.main:app", host=BIND_HOST, port=LISTEN_PORT, log_level="info")
-
-
-
-# ── Catalog + MCP Integration ──────────────────────────────────────────
+# ── Catalog + MCP Integration (MUST BE BEFORE catch-all) ─────────────────
 try:
     from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
     setup_catalog_routes(app)
@@ -1869,6 +1858,19 @@ try:
 except ImportError as _cie:
     _HAS_CATALOG_INTEGRATION = False
     pass
+
+
+@app.api_route("/{path:path}", methods=["GET", "POST"])
+async def catch_all(path: str, request: Request):
+    # Skip catalog/mcp paths - they have dedicated handlers
+    if path.startswith("catalog/") or path.startswith("mcp/"):
+        return _jr(404, {"error": {"message": f"Unknown endpoint: /{path}", "type": "invalid_request_error"}})
+    return _jr(404, {"error": {"message": f"Unsupported: /{path}", "type": "not_found_error"}})
+
+def main():
+    import uvicorn
+    uvicorn.run("src.main:app", host=BIND_HOST, port=LISTEN_PORT, log_level="info")
+
 
 if __name__ == "__main__":
     main()

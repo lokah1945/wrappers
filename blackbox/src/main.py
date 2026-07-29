@@ -1649,18 +1649,8 @@ async def dashboard(request: Request):
         return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
     return HTMLResponse(content=dashboard_path.read_text())
 
-@app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE'])
-async def catch_all(path: str, request: Request):
-    return JSONResponse(status_code=404, content={'error': {'message': f'Unsupported: /{path}', 'type': 'not_found_error'}})
 
-
-def main():
-    import uvicorn
-    uvicorn.run('src.main:app', host=BIND_HOST, port=LISTEN_PORT, log_level='info')
-
-
-
-# ── Catalog + MCP Integration ──────────────────────────────────────────
+# ── Catalog + MCP Integration (MUST BE BEFORE catch-all) ─────────────────
 try:
     from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe
     setup_catalog_routes(app)
@@ -1671,6 +1661,20 @@ try:
 except ImportError as _cie:
     _HAS_CATALOG_INTEGRATION = False
     pass
+
+
+@app.api_route('/{path:path}', methods=['GET', 'POST'])
+async def catch_all(path: str, request: Request):
+    # Skip catalog/mcp paths - they have dedicated handlers
+    if path.startswith("catalog/") or path.startswith("mcp/"):
+        return JSONResponse(status_code=404, content={'error': {'message': f'Unknown endpoint: /{path}', 'type': 'invalid_request_error'}})
+    return JSONResponse(status_code=404, content={'error': {'message': f'Unsupported: /{path}', 'type': 'not_found_error'}})
+
+
+def main():
+    import uvicorn
+    uvicorn.run('src.main:app', host=BIND_HOST, port=LISTEN_PORT, log_level='info')
+
 
 if __name__ == "__main__":
     main()
