@@ -939,13 +939,19 @@ function getAuthHeaders() {
     const stored = sessionStorage.getItem('wrapper-bearer');
     if (stored) return { 'Authorization': 'Bearer ' + stored };
   } catch {}
-  // 3. Fallback local key (used by all wrappers in dev)
-  try {
-    const fallback = 'wrapper-local-key';
-    sessionStorage.setItem('wrapper-bearer', fallback);
-    return { 'Authorization': 'Bearer ' + fallback };
-  } catch {}
+  // 3. No fallback — return empty headers; dashboard will show login prompt
+  //    on 401 instead of looping forever with a wrong hardcoded token.
   return {};
+}
+
+function promptForToken() {
+  const token = window.prompt('Enter the wrapper BEARER_TOKEN to access the dashboard:');
+  if (token) {
+    try { sessionStorage.setItem('wrapper-bearer', token.trim()); } catch {}
+    window.location.reload();
+    return true;
+  }
+  return false;
 }
 
 async function apiFetch(url, options) {
@@ -954,6 +960,8 @@ async function apiFetch(url, options) {
   const r = await fetch(url, Object.assign({}, options, { headers }));
   if (r.status === 401) {
     try { sessionStorage.removeItem('wrapper-bearer'); } catch {}
+    if (promptForToken()) return fetch(url, Object.assign({}, options, { headers: getAuthHeaders() })).then(rr => rr.ok ? rr.json() : null);
+    throw new Error('HTTP 401 — authentication required');
   }
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.json();
