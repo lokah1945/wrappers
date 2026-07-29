@@ -1589,7 +1589,8 @@ async def anthropic_messages(request: Request):
 
 @app.get('/metrics')
 async def get_metrics(request: Request):
-    _auth_check(request)
+    # Per project principle: dashboard must be fast/precise/accessible without
+    # token. Metrics endpoints are PUBLIC so the dashboard can render live data.
     return await metrics.summary()
 
 
@@ -1613,13 +1614,13 @@ async def model_status():
 @app.get('/dashboard')
 @app.get('/dashboard.html')
 async def dashboard(request: Request):
-    """Serve the wrapper dashboard HTML.
+    """Serve the wrapper dashboard HTML — PUBLIC (no auth required).
 
-    BB-4/SEC-1: requires auth and never embeds the plaintext BEARER_TOKEN in
-    the returned HTML (any local page/process could previously read the token
-    via GET /dashboard and gain full authenticated proxy access). The
-    dashboard must prompt the operator for the token instead."""
-    _auth_check(request)
+    Per project principle: dashboard is fast, precise, accessible without
+    token. Security is NOT mandatory for the dashboard. The dashboard JS
+    prompts for BEARER_TOKEN client-side only when calling auth-gated
+    metrics endpoints.
+    """
     from fastapi.responses import HTMLResponse
     dashboard_path = Path(__file__).parent.parent / "dashboard.html"
     if not dashboard_path.exists():

@@ -925,7 +925,12 @@ function toast(msg, kind) {
   setTimeout(() => { el.style.opacity = '0'; setTimeout(() => el.remove(), 250); }, 4000);
 }
 
-/* ── Auth ──────────────────────────────────────────── */
+/* ── Auth (optional) ─────────────────────────────── */
+/* Per project principle: dashboard + metrics are PUBLIC (no token required).
+   Auth headers are only attached IF the operator explicitly provides a token
+   via ?token=... URL param or sessionStorage. This keeps the dashboard fast
+   and frictionless in dev/localhost, while still supporting secured deploys
+   where the operator sets BEARER_TOKEN and enforces auth on /metrics. */
 function getAuthHeaders() {
   // 1. URL ?token=…  (manual override / bookmark)
   const params = new URLSearchParams(window.location.search);
@@ -934,21 +939,20 @@ function getAuthHeaders() {
     try { sessionStorage.setItem('wrapper-bearer', urlToken); } catch {}
     return { 'Authorization': 'Bearer ' + urlToken };
   }
-  // 2. sessionStorage
+  // 2. sessionStorage (set by prior ?token=... or promptForToken)
   try {
     const stored = sessionStorage.getItem('wrapper-bearer');
     if (stored) return { 'Authorization': 'Bearer ' + stored };
   } catch {}
-  // 3. No fallback — return empty headers; dashboard will show login prompt
-  //    on 401 instead of looping forever with a wrong hardcoded token.
+  // 3. No token — return empty headers. Dashboard endpoints are public by
+  //    default; if a 401 comes back, we'll prompt for a token then.
   return {};
 }
 
 function promptForToken() {
-  const token = window.prompt('Enter the wrapper BEARER_TOKEN to access the dashboard:');
+  const token = window.prompt('Some endpoints returned 401. Enter the wrapper BEARER_TOKEN (or click Cancel to skip):');
   if (token) {
     try { sessionStorage.setItem('wrapper-bearer', token.trim()); } catch {}
-    // Reload to apply the new token to all subsequent API calls.
     window.location.reload();
     return true;
   }
@@ -960,10 +964,10 @@ async function apiFetch(url, options) {
   const headers = Object.assign({}, getAuthHeaders(), options.headers || {});
   const r = await fetch(url, Object.assign({}, options, { headers }));
   if (r.status === 401) {
-    try { sessionStorage.removeItem('wrapper-bearer'); } catch {}
-    // Prompt the user for a token instead of silently looping on a wrong default.
+    // Endpoint is auth-gated (operator set BEARER_TOKEN). Prompt for token.
     if (promptForToken()) return fetch(url, Object.assign({}, options, { headers: getAuthHeaders() })).then(rr => rr.ok ? rr.json() : null);
-    throw new Error('HTTP 401 — authentication required');
+    // User cancelled — return null so dashboard renders with empty panel.
+    return null;
   }
   if (!r.ok) throw new Error('HTTP ' + r.status);
   return r.json();

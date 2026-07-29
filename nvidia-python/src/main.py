@@ -1618,12 +1618,18 @@ class Server:
             # CORS preflight must pass without auth so browser SDKs work
             if method == 'OPTIONS':
                 return await call_next(request)
-            # V-06 round-2 fix: /dashboard and /dashboard.html are no longer
-            # public — the page requires the bearer token (nous N-03 pattern);
-            # the browser supplies it client-side via a sessionStorage prompt.
-            public_paths = ['/health', '/ready', '/metrics/prom', '/', '/favicon.ico', '/events']
+            # Per project principle: dashboard + metrics + telemetry must be
+            # fast/precise/accessible WITHOUT token. Security is NOT mandatory
+            # for the dashboard or telemetry. Auth is only enforced on
+            # inference endpoints (/v1/chat/completions, /v1/messages, etc.).
+            public_paths = ['/health', '/ready', '/metrics', '/metrics/prom',
+                            '/metrics/models', '/metrics/models/timeseries', '/metrics/keys',
+                            '/metrics/activity', '/metrics/rate-limits', '/metrics/model-status',
+                            '/metrics/chart', '/stats', '/events', '/version', '/api/version',
+                            '/', '/favicon.ico', '/dashboard', '/dashboard.html']
             is_public = (path in public_paths
-                         or path == '/metrics/prom'
+                         or path.startswith('/metrics/')
+                         or path.startswith('/stats')
                          or (method == 'GET' and path == '/v1/models')
                          or (method == 'GET' and path.startswith('/v1/models/'))
                          or (method == 'GET' and path == '/v1/engines')

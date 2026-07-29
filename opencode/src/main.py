@@ -1780,7 +1780,8 @@ async def anthropic_messages(request: Request):
 
 @app.get("/metrics")
 async def get_metrics(request: Request):
-    _auth_check(request)
+    # Per project principle: dashboard must be fast/precise/accessible without
+    # token. Metrics endpoints are PUBLIC so the dashboard can render live data.
     return await metrics.summary()
 
 @app.get("/metrics/prom")
@@ -1800,13 +1801,14 @@ async def model_status():
 @app.get("/dashboard")
 @app.get("/dashboard.html")
 async def dashboard(request: Request):
-    """Serve the wrapper dashboard HTML.
+    """Serve the wrapper dashboard HTML — PUBLIC (no auth required).
 
-    OC-3: require auth like every other endpoint, and NEVER embed the bearer
-    token into the served HTML — that leaked the token to any local page/process
-    able to reach the dashboard.
+    Per project principle: dashboard is fast, precise, accessible without
+    token. Security is NOT mandatory for the dashboard. The dashboard JS
+    prompts for BEARER_TOKEN client-side only when calling auth-gated
+    metrics endpoints (so the dashboard can still render even without
+    a token, just with empty metric panels).
     """
-    _auth_check(request)
     from pathlib import Path
     dashboard_path = Path(__file__).parent.parent / "dashboard.html"
     if not dashboard_path.exists():

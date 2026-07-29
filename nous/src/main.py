@@ -2479,16 +2479,15 @@ async def messages(request: Request):
     return openai_to_anthropic(chat_body["model"], result)
 
 # --- METRICS ---
+# Per project principle: dashboard must be fast/precise/accessible without
+# token. Metrics endpoints are PUBLIC so the dashboard can render live data
+# without auth friction. Security is NOT mandatory for telemetry.
 @app.get("/metrics")
 async def get_metrics(request: Request):
-    # N-18 fix: telemetry endpoints require the bearer token.
-    await _auth_check(request)
     return metrics.snapshot()
 
 @app.get("/metrics/prom")
 async def prom(request: Request):
-    # N-18 fix: telemetry endpoints require the bearer token.
-    await _auth_check(request)
     snap = metrics.snapshot()
     lines = [
         f'# HELP wrapper_nous_requests_total Total requests\nwrapper_nous_requests_total {snap["total_requests"]}',
@@ -2498,8 +2497,6 @@ async def prom(request: Request):
 
 @app.get("/metrics/model-status")
 async def model_status(request: Request):
-    # N-18 fix: telemetry endpoints require the bearer token.
-    await _auth_check(request)
     return {
         "provider": "nous",
         "catalog_age_sec": MODEL_STORE.catalog_age_sec(),

@@ -757,6 +757,13 @@ async def chat_completions(request: Request):
 
 @app.post("/v1/responses")
 async def responses(request: Request):
+    """OpenAI Responses API (Codex/Claude Code) → Chat Completions translation.
+
+    The Responses API uses `input` (string or array) instead of `messages`.
+    We translate to Chat Completions, forward to OpenRouter, then translate
+    the response back to Responses format. Streaming is supported via the
+    ResponsesStreamState event lifecycle.
+    """
     try:
         body = await request.json()
     except Exception:
@@ -768,8 +775,130 @@ async def responses(request: Request):
     if blocked:
         return blocked
 
-    return await _proxy_request("POST", "chat/completions", body, stream=body.get("stream", False),
-                                request=request)
+    # Translate Responses → Chat Completions
+    principal = _request_principal(request)
+    chat_body = responses_to_chat(body, principal=principal)
+    is_stream = bool(chat_body.get("stream", False))
+
+    response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
+
+    if isinstance(response, JSONResponse):
+        # Reshape error to Responses API format.
+        try:
+            payload = json.loads(response.body)
+            if isinstance(payload, dict) and 'error' in payload:
+                return JSONResponse(
+                    {"error": payload['error'], "type": "error"},
+                    status_code=response.status_code,
+                )
+        except Exception:
+            pass
+        return response
+
+    # Streaming: translate OpenAI SSE → Responses SSE event lifecycle.
+    if is_stream and isinstance(response, StreamingResponse):
+        return StreamingResponse(
+            _translate_openai_stream_to_responses(response.body_iterator, model),
+            media_type="text/event-stream",
+            headers={"x-request-id": response.headers.get("x-request-id", "")},
+        )
+
+    # Non-streaming: translate Chat Completions JSON → Responses JSON.
+    try:
+        payload = json.loads(response.body)
+        if isinstance(payload, dict) and 'choices' in payload:
+            resp = chat_to_responses(model, payload, body)
+            # Store for previous_response_id continuity.
+            resp_id = resp.get('id')
+            if resp_id and principal:
+                _RESPONSE_STORE[_response_store_key(principal, resp_id)] = chat_body.get('messages', [])
+            return JSONResponse(resp, status_code=response.status_code)
+    except Exception as e:
+        logger.warning(f"[openrouter] /v1/responses translation failed: {e}")
+    return response
+
+
+async def _translate_openai_stream_to_responses(openai_gen, model: str):
+    """Translate OpenAI Chat Completions SSE stream → Responses API SSE stream.
+
+    Emits the full Responses event lifecycle:
+      response.created → response.in_progress → response.output_item.added →
+      response.content_part.added → response.output_text.delta →
+      response.output_text.done → response.content_part.done →
+      response.output_item.done → response.completed → [DONE]
+    """
+    resp_id = f"resp_{int(time.time()*1000)}"
+    created_at = int(time.time())
+
+    # response.created
+    yield 'event: response.created\n'
+    yield f'data: {json.dumps({"type": "response.created", "response": {"id": resp_id, "object": "response", "created_at": created_at, "model": model, "status": "in_progress", "output": []}})}\n\n'
+
+    # response.in_progress
+    yield 'event: response.in_progress\n'
+    yield f'data: {json.dumps({"type": "response.in_progress", "response": {"id": resp_id, "status": "in_progress"}})}\n\n'
+
+    msg_id = f"msg_{int(time.time()*1000)}"
+    text_started = False
+    full_text = ''
+
+    async for chunk in openai_gen:
+        if isinstance(chunk, bytes):
+            line = chunk.decode('utf-8', errors='replace')
+        else:
+            line = chunk
+
+        if not line.startswith('data: '):
+            continue
+        data_str = line[6:].strip()
+        if data_str == '[DONE]':
+            break
+
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        if data.get('object') != 'chat.completion.chunk':
+            continue
+        choices = data.get('choices', [])
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get('delta', {})
+
+        if delta.get('content'):
+            if not text_started:
+                # output_item.added (message)
+                yield 'event: response.output_item.added\n'
+                yield f'data: {json.dumps({"type": "response.output_item.added", "output_index": 0, "item": {"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})}\n\n'
+                # content_part.added (output_text)
+                yield 'event: response.content_part.added\n'
+                yield f'data: {json.dumps({"type": "response.content_part.added", "item_id": msg_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})}\n\n'
+                text_started = True
+            full_text += delta['content']
+            yield 'event: response.output_text.delta\n'
+            yield f'data: {json.dumps({"type": "response.output_text.delta", "item_id": msg_id, "output_index": 0, "content_index": 0, "delta": delta["content"]})}\n\n'
+
+        if choice.get('finish_reason'):
+            break
+
+    if text_started:
+        # output_text.done
+        yield 'event: response.output_text.done\n'
+        yield f'data: {json.dumps({"type": "response.output_text.done", "item_id": msg_id, "output_index": 0, "content_index": 0, "text": full_text})}\n\n'
+        # content_part.done
+        yield 'event: response.content_part.done\n'
+        yield f'data: {json.dumps({"type": "response.content_part.done", "item_id": msg_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}})}\n\n'
+        # output_item.done
+        yield 'event: response.output_item.done\n'
+        yield f'data: {json.dumps({"type": "response.output_item.done", "output_index": 0, "item": {"id": msg_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": full_text, "annotations": []}]}})}\n\n'
+
+    # response.completed
+    yield 'event: response.completed\n'
+    yield f'data: {json.dumps({"type": "response.completed", "response": {"id": resp_id, "object": "response", "created_at": created_at, "model": model, "status": "completed", "output": [{"id": msg_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": full_text, "annotations": []}]}]}})}\n\n'
+
+    yield 'data: [DONE]\n\n'
 
 
 @app.post("/v1/embeddings")
@@ -906,6 +1035,147 @@ async def count_tokens(request: Request):
                     total_chars += len(json.dumps(b.get("input", {})))
     est_tokens = max(1, total_chars // 4)
     return JSONResponse({"input_tokens": est_tokens})
+
+
+# ── Responses API (Codex/Claude Code) ↔ Chat Completions translation ──────
+# These translators allow the wrapper to accept /v1/responses requests
+# (which use `input` instead of `messages`) and forward them as standard
+# /v1/chat/completions to OpenRouter — then translate the response back.
+
+# Tenant-isolated response store for previous_response_id continuity.
+_RESPONSE_STORE: dict[str, list] = {}
+
+
+def _response_store_key(principal: str, response_id: str) -> str:
+    import hashlib
+    return hashlib.sha256(f"{principal}|{response_id}".encode()).hexdigest()
+
+
+def _request_principal(request: Request) -> str:
+    """Stable per-client principal for response-store namespacing.
+    Uses the BEARER_TOKEN fingerprint (or 'anon' if auth disabled)."""
+    tok = (request.headers.get('authorization') or request.headers.get('x-api-key') or '').strip()
+    if tok.lower().startswith('bearer '):
+        tok = tok[7:].strip()
+    if not tok:
+        return 'anon'
+    import hashlib
+    return hashlib.sha256(tok.encode()).hexdigest()[:16]
+
+
+def responses_to_chat(body: dict, principal: str = '') -> dict:
+    """Convert OpenAI Responses API request → Chat Completions request.
+
+    Handles:
+      - `input` as string (single user message) or array (mixed items).
+      - `instructions` → system message (prepended).
+      - `previous_response_id` → inject stored messages (tenant-scoped).
+      - `function_call` / `function_call_output` items → tool_calls / tool role.
+      - Forward all client params verbatim (transparent proxy principle).
+    """
+    model = body.get('model') or ''
+    msgs: list = []
+    prev = body.get('previous_response_id')
+    if prev and principal:
+        key = _response_store_key(principal, prev)
+        if key in _RESPONSE_STORE:
+            msgs.extend(_RESPONSE_STORE[key])
+    raw = body.get('input')
+    if isinstance(raw, str):
+        msgs.append({'role': 'user', 'content': raw})
+    elif isinstance(raw, list):
+        for it in raw:
+            if isinstance(it, str):
+                msgs.append({'role': 'user', 'content': it})
+                continue
+            if not isinstance(it, dict):
+                continue
+            t = it.get('type')
+            if t == 'function_call_output':
+                outv = it.get('output', '')
+                msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id') or '',
+                             'content': outv if isinstance(outv, str) else json.dumps(outv, ensure_ascii=False)})
+            elif t == 'function_call':
+                args = it.get('arguments', '')
+                if not isinstance(args, str):
+                    args = json.dumps(args or {}, ensure_ascii=False)
+                msgs.append({'role': 'assistant', 'content': None,
+                             'tool_calls': [{'id': it.get('call_id') or it.get('id') or 'call_1',
+                                             'type': 'function',
+                                             'function': {'name': it.get('name', '') or '',
+                                                          'arguments': args}}]})
+            else:
+                role = it.get('role', 'user')
+                if role == 'developer':
+                    role = 'system'
+                c = it.get('content', '')
+                if isinstance(c, list):
+                    c = ''.join(p.get('text', '') for p in c
+                                if isinstance(p, dict) and p.get('type') in ('input_text', 'text', 'output_text'))
+                msgs.append({'role': role or 'user', 'content': c})
+    if body.get('instructions'):
+        if msgs and msgs[0].get('role') == 'system':
+            msgs[0]['content'] = body['instructions'] + '\n\n' + str(msgs[0].get('content') or '')
+        else:
+            msgs.insert(0, {'role': 'system', 'content': body['instructions']})
+    out = {'model': model, 'messages': msgs, 'stream': bool(body.get('stream', False))}
+    # Forward client params verbatim (transparent proxy — no mutation).
+    if body.get('max_output_tokens') is not None:
+        out['max_tokens'] = body['max_output_tokens']
+    elif body.get('max_tokens') is not None:
+        out['max_tokens'] = body['max_tokens']
+    for k in ('temperature', 'top_p', 'tool_choice', 'stop', 'seed',
+              'parallel_tool_calls', 'stream_options', 'user', 'metadata',
+              'frequency_penalty', 'presence_penalty', 'logit_bias',
+              'logprobs', 'top_logprobs', 'response_format', 'service_tier'):
+        if body.get(k) is not None:
+            out[k] = body[k]
+    if body.get('tools'):
+        tools = []
+        for t in body['tools']:
+            if not isinstance(t, dict):
+                continue
+            fn = t.get('function') if isinstance(t.get('function'), dict) else t
+            name = fn.get('name') if isinstance(fn, dict) else None
+            if not name:
+                continue
+            tools.append({'type': 'function', 'function': {
+                'name': name,
+                'description': fn.get('description', '') or '',
+                'parameters': fn.get('parameters') or fn.get('input_schema') or {},
+            }})
+        if tools:
+            out['tools'] = tools
+    return out
+
+
+def chat_to_responses(model: str, data: dict, request_body: dict | None = None) -> dict:
+    """Convert OpenAI Chat Completions response → Responses API response."""
+    msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
+    text = msg.get('content') or ''
+    output = []
+    # Surface upstream reasoning_content as a reasoning output item.
+    reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    if reasoning:
+        output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning',
+                       'status': 'completed', 'text': reasoning})
+    for tc in msg.get('tool_calls') or []:
+        fn = tc.get('function') or {}
+        output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call',
+                       'status': 'completed', 'call_id': tc.get('id'),
+                       'name': fn.get('name', '') or '',
+                       'arguments': fn.get('arguments', '') or ''})
+    output.append({'id': f"msg_{int(time.time()*1000)}", 'type': 'message',
+                   'status': 'completed', 'role': 'assistant',
+                   'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
+    u = data.get('usage') or {}
+    resp = {'id': data.get('id') or f"resp_{int(time.time()*1000)}",
+            'object': 'response', 'created_at': int(time.time()),
+            'model': model, 'status': 'completed', 'output': output,
+            'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0,
+                      'output_tokens': u.get('completion_tokens', 0) or 0,
+                      'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
+    return resp
 
 
 def _anthropic_to_openai(body: dict) -> dict:
