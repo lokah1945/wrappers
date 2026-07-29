@@ -78,6 +78,9 @@ htmlcov/
 # F10: per-wrapper metrics snapshots are runtime artifacts
 metrics-snapshot.json
 
+# nvidia-python NGC featured-models cache (runtime artifact, fetched from NGC)
+ngc-featured-cache.json
+
 # F5: deploy markers are runtime state; a tracked marker can never hold its
 # own deploy commit (git pull clobbers it). Trust /health git_commit instead.
 runtime/
