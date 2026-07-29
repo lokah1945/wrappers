@@ -62,13 +62,6 @@ except ImportError:
 
 from .key_pool import KeyPool
 
-# Circuit breaker for upstream protection
-try:
-    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
-    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="blackbox-upstream")
-    _HAS_CIRCUIT_BREAKER = True
-except ImportError:
-    _HAS_CIRCUIT_BREAKER = False
 from .metrics import Metrics
 
 # ── Shared translations from common/translations (P0 deduplication) ──
@@ -424,29 +417,9 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
 
 
 async def proxy_request(method: str, url: str, json_body: dict = None, headers: dict = None, is_stream: bool = False):
-    # Circuit breaker: reject if upstream is failing
-    if _HAS_CIRCUIT_BREAKER:
-        try:
-            await _UPSTREAM_BREAKER.before_request()
-        except CircuitBreakerError as cb_err:
-            return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
-
     import aiohttp as _aiohttp
     sess = await get_session()
     headers = headers or {}
-
-    async def _breaker_record(ok: bool):
-        # BB-7/DR-2: actually record outcomes so the breaker can trip/recover
-        # (previously only before_request() was ever called — dead code).
-        if not _HAS_CIRCUIT_BREAKER:
-            return
-        try:
-            if ok:
-                await _UPSTREAM_BREAKER.record_success()
-            else:
-                await _UPSTREAM_BREAKER.record_failure()
-        except Exception:
-            pass
 
     def _upstream_error_body(status: int, data):
         # B7 (opt-in transparency): RAW_UPSTREAM_ERRORS=yes passes upstream
@@ -474,9 +447,7 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                     data = json.loads(text)
                 except (json.JSONDecodeError, ValueError):
                     data = text
-                await _breaker_record(resp.status < 500)
                 return resp.status, _upstream_error_body(resp.status, data)
-            await _breaker_record(True)
             return 200, resp
         async with sess.request(method, url, json=json_body, headers=headers, timeout=_aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SEC, sock_connect=CONNECT_TIMEOUT_SEC)) as resp:
             text = await resp.text()
@@ -485,14 +456,11 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
             except Exception:
                 data = text
             if resp.status >= 400:
-                await _breaker_record(resp.status < 500)
                 return resp.status, _upstream_error_body(resp.status, data)
-            await _breaker_record(True)
             if not isinstance(data, dict):
                 data = {'error': {'message': str(data)[:2000], 'type': 'api_error'}}
             return resp.status, data
     except Exception as e:
-        await _breaker_record(False)
         # SEC-6: truncate transport exception text in client-facing 502s.
         return 502, {'error': {'message': str(e)[:2000], 'type': 'api_error'}}
 
@@ -557,8 +525,8 @@ async def _record_model_result(model_id: str, api_key: str, status: int, data, u
 
 async def proxy_request_with_pool(method: str, url: str, json_body: dict, request: Request, is_stream: bool = False):
     attempts = max(1, pool.total_keys)
-    last_status = 503
-    last_data = {'error': {'message': 'No capacity', 'type': 'server_error'}}
+    last_status = 429
+    last_data = {'error': {'message': 'No capacity — all keys exhausted or rate-limited', 'type': 'rate_limit_error'}}
     tried = 0
     model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
     # BB-2/DR-13/B9: validate the call plan BEFORE any upstream request.

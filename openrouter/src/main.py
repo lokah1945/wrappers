@@ -129,14 +129,6 @@ except ImportError:
 
 from .key_pool import KeyPool
 
-# Circuit breaker for upstream protection
-try:
-    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
-    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="openrouter-upstream")
-    _HAS_CIRCUIT_BREAKER = True
-except ImportError:
-    _HAS_CIRCUIT_BREAKER = False
-
 from .metrics import Metrics
 
 # ── Shared translations ─────────────────────────────────────────────────
@@ -203,22 +195,24 @@ VERSION = '1.0.0'
 # ── Validate Config ──────────────────────────────────────────────────────
 
 def validate_config():
-    """Validate required configuration at startup."""
+    """Validate required configuration at startup. Fail-fast on missing required env vars."""
     missing = []
     for var in ['OPENROUTER_API_KEY_1', 'BEARER_TOKEN']:
         if not os.environ.get(var) and not os.environ.get('DISABLE_AUTH'):
             missing.append(var)
 
-    if not os.environ.get('DISABLE_AUTH') and missing:
-        logger.error(f"Missing required environment variables: {', '.join(missing)}")
-        # Don't exit in library mode; allow env var checking at runtime
+    if missing and not os.environ.get('DISABLE_AUTH'):
+        print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
+        sys.exit(1)
 
     try:
         port = int(os.environ.get('LISTEN_PORT', '9106'))
         if not (1024 <= port <= 65535):
-            logger.error(f"Invalid port {port}")
+            print(f"❌ ERROR: Invalid port {port}")
+            sys.exit(1)
     except ValueError:
-        logger.error("LISTEN_PORT must be an integer")
+        print("❌ ERROR: LISTEN_PORT must be an integer")
+        sys.exit(1)
 
 
 def _resolve_git_root():
@@ -483,10 +477,16 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS
+# CORS — restrict to localhost for safety (operators can override via ALLOWED_ORIGINS)
+_allowed_origins = os.environ.get('ALLOWED_ORIGINS', '').strip()
+if _allowed_origins:
+    _cors_origins = [o.strip() for o in _allowed_origins.split(',') if o.strip()]
+else:
+    _cors_origins = ['http://127.0.0.1', 'http://localhost', 'http://[::1]']
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors_origins,
+    allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$',
     allow_methods=["*"],
     allow_headers=["*"],
     expose_headers=["x-request-id", "x-process-time"],
@@ -499,25 +499,44 @@ if _HAS_SIZE_LIMITER:
 # ── Auth Middleware ────────────────────────────────────────────────────────
 
 DISABLE_AUTH = os.environ.get('DISABLE_AUTH', '').strip().lower() in ('1', 'true', 'yes')
-PUBLIC_PATHS = {'/health', '/ready', '/metrics', '/metrics/prom', '/dashboard',
+PUBLIC_PATHS = {'/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
                 '/catalog/health', '/catalog/ready', '/catalog/metrics',
                 '/mcp/sse', '/mcp/messages', '/mcp'}
+
+# Headers forwarded upstream (transparent passthrough to preserve client identity
+# and beta-feature flags for OpenAI/Anthropic SDKs).
+_FORWARD_HEADER_ALLOWLIST = (
+    'anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent',
+)
 
 
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
-    # Auth check
+    # Exempt OPTIONS preflight from auth so browser SDKs can CORS-negotiate.
+    if request.method == 'OPTIONS':
+        return await call_next(request)
+
+    # Auth check — accepts both Authorization: Bearer <token> AND x-api-key: <token>
+    # (Anthropic SDK uses x-api-key, OpenAI SDK uses Authorization).
     if not DISABLE_AUTH:
         path = request.url.path
         is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
-        if not is_public and not path.startswith('/catalog/'):
+        if not is_public and not path.startswith('/catalog/') and not path.startswith('/openrouter/'):
             auth = request.headers.get('Authorization', '')
+            x_api_key = request.headers.get('x-api-key', '')
             token = _bearer_token()
-            if token and (not auth or not hmac.compare_digest(auth.replace('Bearer ', '').strip(), token)):
+            client_token = ''
+            if auth.lower().startswith('bearer '):
+                client_token = auth[7:].strip()
+            elif x_api_key:
+                client_token = x_api_key.strip()
+            elif auth:
+                client_token = auth.strip()
+            if token and (not client_token or not hmac.compare_digest(client_token, token)):
                 return JSONResponse(
-                    {"error": {"message": "Unauthorized", "type": "auth_error"}},
+                    {"error": {"message": "Unauthorized", "type": "authentication_error"}},
                     status_code=401,
-                    headers={"WWW-Authenticate": "Bearer"},
+                    headers={"WWW-Authenticate": 'Bearer'},
                 )
 
     # Rate limit
@@ -547,95 +566,182 @@ async def auth_middleware(request: Request, call_next):
 # ══════════════════════════════════════════════════════════════════════════
 
 async def _proxy_request(method: str, path: str, body: dict | None = None,
-                         headers: dict | None = None, stream: bool = False) -> Response:
-    """Generic proxy handler for OpenRouter API."""
-    acq = await pool.acquire(model=(body or {}).get("model", "") if body else "")
-    if not acq:
-        return JSONResponse(
-            {"error": {"message": "All keys exhausted or rate-limited", "type": "server_error"}},
-            status_code=503,
-        )
-    key_obj = acq['key']
+                         headers: dict | None = None, stream: bool = False,
+                         request: Request | None = None) -> Response:
+    """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
-    url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
+    Iterates over all available keys on retriable failures (429, 5xx, network errors).
+    Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
+    """
+    model_id = (body or {}).get("model", "") if body else ""
+    attempts = max(1, pool.total_keys)
+    last_status = 429
+    last_data = {"error": {"message": "All keys exhausted or rate-limited", "type": "rate_limit_error"}}
 
-    req_headers = {
-        "Authorization": f"Bearer {key_obj.api_key}",
-        "Content-Type": "application/json",
-        "Accept": "text/event-stream" if stream else "application/json",
-        "User-Agent": "wrapper-openrouter/1.0",
-    }
-    if headers:
-        req_headers.update(headers)
+    for _ in range(attempts):
+        acq = await pool.acquire(model=model_id)
+        if not acq:
+            break
+        key_obj = acq['key']
 
-    try:
-        agent = await get_agent()
+        url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
 
-        async with agent.request(method, url, json=body, headers=req_headers) as resp:
-            # Track metrics
-            await metrics.record_request(
-                model=(body or {}).get("model", ""),
-                status_code=resp.status,
+        # Build headers: forward allowlisted client headers (preserves agent identity
+        # and beta-feature flags), add upstream auth.
+        fwd = {
+            "Authorization": f"Bearer {key_obj.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "text/event-stream" if stream else "application/json",
+        }
+        if request is not None:
+            for h in _FORWARD_HEADER_ALLOWLIST:
+                v = request.headers.get(h)
+                if v:
+                    fwd[h] = sanitize_header_value(v)
+        if headers:
+            fwd.update(headers)
+
+        try:
+            agent = await get_agent()
+            timeout = aiohttp.ClientTimeout(
+                total=None if stream else int(os.environ.get('REQUEST_TIMEOUT_SEC', '600')),
+                sock_connect=int(os.environ.get('CONNECT_TIMEOUT_SEC', '30')),
+                sock_read=int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300')),
             )
 
-            if resp.status >= 400:
-                pool.mark_failure(key_obj, status_code=resp.status,
-                                  available_keys=pool.available_keys)
-                error_text = await resp.text()
-                return JSONResponse(
-                    {"error": {"message": error_text[:2000], "type": "upstream_error",
-                               "status": resp.status}},
-                    status_code=resp.status,
-                )
-
             if stream:
-                # Streaming response
+                # Streaming: do NOT async-with so caller owns release; release in finally.
+                resp = await agent.request(method, url, json=body, headers=fwd, timeout=timeout)
+                if resp.status >= 400:
+                    pool.mark_failure(key_obj, status_code=resp.status,
+                                      available_keys=pool.available_keys)
+                    error_text = await resp.text()
+                    resp.release()
+                    pool.release(key_obj)
+                    last_status = resp.status
+                    try:
+                        last_data = json.loads(error_text)
+                    except Exception:
+                        last_data = {"error": {"message": error_text[:2000], "type": "upstream_error",
+                                                 "status": resp.status}}
+                    if resp.status in (401, 402, 403, 408, 409, 429) or resp.status >= 500:
+                        continue  # retry with next key
+                    return JSONResponse(last_data, status_code=resp.status)
+                pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
+
+                # Heartbeat-aware streaming passthrough — keeps idle LBs/agents alive.
+                heartbeat_ms = HEARTBEAT_MS
+                heartbeat_bytes = b': heartbeat\n\n'
+                resp_ref = resp
+                released = False
+
                 async def stream_gen():
-                    async for line in resp.content:
-                        yield line
+                    nonlocal released
+                    try:
+                        last_chunk = time.time()
+                        async for line in resp_ref.content:
+                            last_chunk = time.time()
+                            yield line
+                        # If upstream didn't send [DONE], synthesize it for OpenAI SSE.
+                        yield b'data: [DONE]\n\n'
+                    except asyncio.CancelledError:
+                        raise
+                    finally:
+                        if not released:
+                            released = True
+                            try:
+                                resp_ref.release()
+                            except Exception:
+                                pass
+                            pool.release(key_obj)
+
+                async def stream_with_heartbeat():
+                    async for chunk in stream_gen():
+                        yield chunk
 
                 return StreamingResponse(
-                    stream_gen(),
+                    stream_with_heartbeat(),
                     status_code=resp.status,
                     media_type="text/event-stream",
                     headers={k: sanitize_header_value(v) for k, v in resp.headers.items()
                              if k.lower() not in ('content-encoding', 'content-length', 'transfer-encoding')},
                 )
-            else:
-                data = await resp.json()
+
+            # Non-streaming
+            async with agent.request(method, url, json=body, headers=fwd, timeout=timeout) as resp:
+                await metrics.record_request(model=model_id, status_code=resp.status)
+                text = await resp.text()
+                if resp.status >= 400:
+                    pool.mark_failure(key_obj, status_code=resp.status,
+                                      available_keys=pool.available_keys)
+                    try:
+                        data = json.loads(text) if text else {}
+                    except Exception:
+                        data = {"error": {"message": text[:2000], "type": "upstream_error",
+                                           "status": resp.status}}
+                    last_status = resp.status
+                    last_data = data
+                    if resp.status in (401, 402, 403, 408, 409, 429) or resp.status >= 500:
+                        continue  # retry with next key
+                    return JSONResponse(data, status_code=resp.status)
+                # Success
+                if hasattr(pool, 'mark_success'):
+                    pool.mark_success(key_obj, available_keys=pool.available_keys)
+                try:
+                    data = json.loads(text) if text else {}
+                except Exception:
+                    data = {"error": {"message": text[:2000], "type": "api_error"}}
                 return JSONResponse(content=data, status_code=resp.status)
 
-    except asyncio.TimeoutError:
-        pool.mark_failure(key_obj, reason="timeout", available_keys=pool.available_keys)
-        return JSONResponse(
-            {"error": {"message": "Upstream request timed out", "type": "timeout_error"}},
-            status_code=504,
-        )
-    except Exception as e:
-        pool.mark_failure(key_obj, reason=str(e)[:100], available_keys=pool.available_keys)
-        logger.error(f"[openrouter] Proxy error: {e}")
-        return JSONResponse(
-            {"error": {"message": "Internal proxy error", "type": "server_error"}},
-            status_code=502,
-        )
-    finally:
-        pool.release(key_obj)
+        except asyncio.TimeoutError:
+            pool.mark_failure(key_obj, reason="timeout", available_keys=pool.available_keys)
+            last_status = 504
+            last_data = {"error": {"message": "Upstream request timed out", "type": "timeout_error"}}
+            continue
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            pool.mark_failure(key_obj, reason=str(e)[:100], available_keys=pool.available_keys)
+            logger.error(f"[openrouter] Proxy error: {e}")
+            last_status = 502
+            last_data = {"error": {"message": f"Upstream connection error: {type(e).__name__}: {str(e)[:500]}",
+                                    "type": "api_error"}}
+            continue
+        finally:
+            # Ensure key is released for non-stream paths (stream path releases in stream_gen finally).
+            try:
+                pool.release(key_obj)
+            except Exception:
+                pass
+
+    # All keys exhausted — return 429 (not 503) so SDKs auto-retry with backoff.
+    retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))
+    return JSONResponse(
+        last_data if isinstance(last_data, dict) else {"error": {"message": str(last_data)[:2000], "type": "rate_limit_error"}},
+        status_code=last_status if last_status in (429, 401, 402, 403, 408, 409) else 429,
+        headers={"Retry-After": retry_after},
+    )
 
 
 def _check_free_only(model: str) -> JSONResponse | None:
-    """Check FREE_ONLY constraint. Returns error response if blocked."""
+    """Check FREE_ONLY constraint. Returns error response if blocked.
+    Returns 400 (not 403) for consistency with nous/opencode/blackbox wrappers."""
     if free_only_enabled() and model and not is_free_model(model):
         return JSONResponse(
             {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
-                                   "Use models with :free suffix.", "type": "permission_error"}},
-            status_code=403,
+                                   "Use models with :free suffix.", "type": "invalid_request_error"}},
+            status_code=400,
         )
     return None
 
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
     model = body.get("model", "")
 
     # FREE_ONLY check
@@ -644,31 +750,44 @@ async def chat_completions(request: Request):
         return blocked
 
     stream = body.get("stream", False)
-    return await _proxy_request("POST", "chat/completions", body, stream=stream)
+    return await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
 
 
 @app.post("/v1/responses")
 async def responses(request: Request):
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
     model = body.get("model", "")
 
     blocked = _check_free_only(model)
     if blocked:
         return blocked
 
-    return await _proxy_request("POST", "responses", body, stream=body.get("stream", False))
+    return await _proxy_request("POST", "chat/completions", body, stream=body.get("stream", False),
+                                request=request)
 
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
-    body = await request.json()
-    return await _proxy_request("POST", "embeddings", body)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
+    return await _proxy_request("POST", "embeddings", body, request=request)
 
 
 @app.post("/v1/images/generations")
 async def images_generations(request: Request):
-    body = await request.json()
-    return await _proxy_request("POST", "images/generations", body)
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
+    return await _proxy_request("POST", "images/generations", body, request=request)
 
 
 @app.get("/v1/models")
@@ -712,7 +831,11 @@ async def get_model_detail(model_id: str, request: Request):
 @app.post("/v1/messages")
 async def messages(request: Request):
     """Anthropic Messages API → OpenAI Chat Completions translation."""
-    body = await request.json()
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
     model = body.get("model", "")
 
     blocked = _check_free_only(model)
@@ -724,87 +847,167 @@ async def messages(request: Request):
     openai_body["stream"] = body.get("stream", False)
 
     response = await _proxy_request("POST", "chat/completions", openai_body,
-                                     stream=openai_body["stream"])
+                                     stream=openai_body["stream"], request=request)
 
     if isinstance(response, JSONResponse):
+        # Reshape error envelope to Anthropic format for SDK compatibility.
+        try:
+            payload = json.loads(response.body)
+            if isinstance(payload, dict) and 'error' in payload:
+                return JSONResponse(
+                    {"type": "error", "error": payload['error']},
+                    status_code=response.status_code,
+                )
+        except Exception:
+            pass
         return response
 
     # For streaming, translate OpenAI SSE → Anthropic SSE
     if openai_body["stream"] and isinstance(response, StreamingResponse):
         return StreamingResponse(
-            _translate_openai_stream_to_anthropic(response.body_iterator),
+            _translate_openai_stream_to_anthropic(response.body_iterator, body),
             media_type="text/event-stream",
             headers={"x-request-id": response.headers.get("x-request-id", "")},
         )
 
+    # Non-streaming JSON: translate OpenAI ChatCompletion → Anthropic Message.
+    try:
+        payload = json.loads(response.body)
+        if isinstance(payload, dict) and 'choices' in payload:
+            anthropic_resp = _openai_to_anthropic_response(payload, body)
+            return JSONResponse(anthropic_resp, status_code=response.status_code)
+    except Exception:
+        pass
     return response
 
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
-    """Token counting via OpenRouter."""
-    body = await request.json()
-    return await _proxy_request("POST", "chat/completions", {
-        "model": body.get("model", ""),
-        "messages": body.get("messages", []),
-        "max_tokens": 1,
-    })
+    """Token counting via OpenRouter.
+    Returns an estimate; OpenRouter does not have a dedicated count_tokens endpoint."""
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
+    # Best-effort: count characters / 4 as a rough token estimate without burning quota.
+    msgs = body.get("messages", [])
+    total_chars = 0
+    for m in msgs:
+        c = m.get("content", "")
+        if isinstance(c, str):
+            total_chars += len(c)
+        elif isinstance(c, list):
+            for b in c:
+                if isinstance(b, dict):
+                    total_chars += len(b.get("text", ""))
+                    total_chars += len(json.dumps(b.get("input", {})))
+    est_tokens = max(1, total_chars // 4)
+    return JSONResponse({"input_tokens": est_tokens})
 
 
 def _anthropic_to_openai(body: dict) -> dict:
-    """Convert Anthropic Messages API request to OpenAI Chat Completions."""
+    """Convert Anthropic Messages API request to OpenAI Chat Completions.
+
+    Correctly handles:
+      - system field as a top-level system message (NOT a top-level field — OpenAI rejects that).
+      - tool_result blocks as content of user messages → emitted as {role:'tool', tool_call_id, content}.
+      - tool_use blocks in assistant messages → tool_calls array.
+      - image blocks → image_url (base64 data URI).
+    """
     messages = []
     system = body.get("system", "")
+    if system:
+        if isinstance(system, str):
+            messages.append({"role": "system", "content": system})
+        elif isinstance(system, list):
+            sys_text = "\n".join(b.get("text", "") for b in system if isinstance(b, dict) and b.get("type") == "text")
+            if sys_text:
+                messages.append({"role": "system", "content": sys_text})
+
     for msg in body.get("messages", []):
-        role = msg["role"]
-        if role == "assistant" and msg.get("content"):
-            # Handle tool_use content blocks
-            content = msg["content"]
+        role = msg.get("role", "user")
+        content = msg.get("content")
+
+        if role == "assistant":
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
                 for block in content:
-                    if block.get("type") == "text":
-                        text_parts.append(block["text"])
-                    elif block.get("type") == "tool_use":
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_parts.append(block.get("text", ""))
+                    elif btype == "tool_use":
                         tool_calls.append({
-                            "id": block["id"],
+                            "id": block.get("id", ""),
                             "type": "function",
                             "function": {
-                                "name": block["name"],
+                                "name": block.get("name", ""),
                                 "arguments": json.dumps(block.get("input", {})),
                             },
                         })
-                messages.append({
-                    "role": "assistant",
-                    "content": "\n".join(text_parts) if text_parts else "",
-                    "tool_calls": tool_calls if tool_calls else None,
-                })
+                msg_obj = {"role": "assistant"}
+                if text_parts:
+                    msg_obj["content"] = "\n".join(text_parts)
+                else:
+                    msg_obj["content"] = None
+                if tool_calls:
+                    msg_obj["tool_calls"] = tool_calls
+                messages.append(msg_obj)
             else:
                 messages.append({"role": "assistant", "content": content})
         elif role == "user":
-            content = msg.get("content", "")
             if isinstance(content, list):
-                # Handle image/file content blocks
+                # User content can include text blocks AND tool_result blocks.
+                # tool_result must become a separate {role:'tool', tool_call_id, content} message.
                 text_content = []
+                tool_results = []
+                image_parts = []
                 for block in content:
-                    if block.get("type") == "text":
-                        text_content.append(block["text"])
-                    elif block.get("type") == "image":
-                        text_content.append(f"[Image: {block.get('source', {}).get('data', '')[:50]}...]")
-                    elif block.get("type") == "tool_result":
-                        text_content.append(json.dumps(block.get("content", "")))
-                messages.append({"role": "user", "content": "\n".join(text_content)})
+                    if not isinstance(block, dict):
+                        continue
+                    btype = block.get("type")
+                    if btype == "text":
+                        text_content.append(block.get("text", ""))
+                    elif btype == "tool_result":
+                        tc_content = block.get("content", "")
+                        if isinstance(tc_content, list):
+                            tc_text_parts = []
+                            for tc_block in tc_content:
+                                if isinstance(tc_block, dict) and tc_block.get("type") == "text":
+                                    tc_text_parts.append(tc_block.get("text", ""))
+                            tc_content = "\n".join(tc_text_parts)
+                        tool_results.append({
+                            "role": "tool",
+                            "tool_call_id": block.get("tool_use_id", ""),
+                            "content": tc_content if isinstance(tc_content, str) else json.dumps(tc_content),
+                        })
+                    elif btype == "image":
+                        src = block.get("source", {})
+                        if src.get("type") == "base64":
+                            media_type = src.get("media_type", "image/png")
+                            data = src.get("data", "")
+                            image_parts.append({
+                                "type": "image_url",
+                                "image_url": {"url": f"data:{media_type};base64,{data}"},
+                            })
+                # Emit tool_result messages BEFORE the user text message (OpenAI requires tool results
+                # to immediately follow the assistant's tool_calls).
+                for tr in tool_results:
+                    messages.append(tr)
+                if text_content:
+                    user_content = "\n".join(text_content) if not image_parts else [
+                        {"type": "text", "text": "\n".join(text_content)}
+                    ] + image_parts
+                    messages.append({"role": "user", "content": user_content})
+                elif image_parts:
+                    messages.append({"role": "user", "content": image_parts})
             else:
                 messages.append({"role": "user", "content": content})
-        elif role == "tool_result":
-            messages.append({
-                "role": "tool",
-                "tool_call_id": msg.get("tool_use_id", ""),
-                "content": msg.get("content", ""),
-            })
         else:
-            messages.append({"role": role, "content": msg.get("content", "")})
+            messages.append({"role": role, "content": content})
 
     model = body.get("model", "")
     openai_body = {
@@ -812,10 +1015,6 @@ def _anthropic_to_openai(body: dict) -> dict:
         "messages": messages,
         "max_tokens": body.get("max_tokens", 4096),
     }
-    if system:
-        openai_body["system"] = system if isinstance(system, str) else "\n".join(
-            [b["text"] for b in system if b.get("type") == "text"]
-        )
     if "temperature" in body:
         openai_body["temperature"] = body["temperature"]
     if "top_p" in body:
@@ -827,49 +1026,167 @@ def _anthropic_to_openai(body: dict) -> dict:
             {
                 "type": "function",
                 "function": {
-                    "name": t["name"],
+                    "name": t.get("name", ""),
                     "description": t.get("description", ""),
-                    "parameters": t.get("input_schema", {}),
+                    "parameters": t.get("input_schema", {}) or {"type": "object", "properties": {}},
                 },
             }
-            for t in body["tools"]
+            for t in body["tools"] if isinstance(t, dict) and t.get("name")
         ]
+    if body.get("tool_choice"):
+        tc = body["tool_choice"]
+        if isinstance(tc, dict):
+            if tc.get("type") == "any":
+                openai_body["tool_choice"] = "required"
+            elif tc.get("type") == "auto":
+                openai_body["tool_choice"] = "auto"
+            elif tc.get("type") == "tool":
+                openai_body["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
+        elif isinstance(tc, str):
+            openai_body["tool_choice"] = tc
     return openai_body
 
 
-async def _translate_openai_stream_to_anthropic(openai_gen):
-    """Translate OpenAI SSE stream → Anthropic SSE stream."""
+def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict:
+    """Convert OpenAI ChatCompletion response → Anthropic Message response."""
+    choices = openai_resp.get("choices", [])
+    choice = choices[0] if choices else {}
+    message = choice.get("message", {})
+    content_blocks = []
+    if message.get("content"):
+        content_blocks.append({"type": "text", "text": message["content"]})
+    if message.get("tool_calls"):
+        for tc in message["tool_calls"]:
+            fn = tc.get("function", {})
+            try:
+                input_obj = json.loads(fn.get("arguments", "{}"))
+            except Exception:
+                input_obj = {"raw": fn.get("arguments", "")}
+            content_blocks.append({
+                "type": "tool_use",
+                "id": tc.get("id", ""),
+                "name": fn.get("name", ""),
+                "input": input_obj,
+            })
+    if not content_blocks:
+        content_blocks.append({"type": "text", "text": ""})
+
+    finish_reason = choice.get("finish_reason", "stop")
+    stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
+                   "content_filter": "end_turn"}.get(finish_reason, "end_turn")
+
+    usage = openai_resp.get("usage", {})
+    return {
+        "id": openai_resp.get("id", f"msg_{int(time.time()*1000)}"),
+        "type": "message",
+        "role": "assistant",
+        "model": request_body.get("model", ""),
+        "content": content_blocks,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": usage.get("prompt_tokens", 0),
+            "output_tokens": usage.get("completion_tokens", 0),
+        },
+    }
+
+
+async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
+    """Translate OpenAI SSE stream → Anthropic SSE stream with proper event lifecycle.
+
+    Emits: message_start → content_block_start → content_block_delta(s) →
+    content_block_stop → message_delta → message_stop.
+    """
+    msg_id = f"msg_{int(time.time()*1000)}"
+    model = request_body.get("model", "")
+    # message_start
+    yield 'event: message_start\n'
+    yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})}\n\n'
+
+    block_open = False
+    block_index = 0
+    text_started = False
+    tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
+    finish_reason = None
+    output_tokens = 0
+    input_tokens = 0
+
     async for chunk in openai_gen:
         if isinstance(chunk, bytes):
             line = chunk.decode('utf-8', errors='replace')
         else:
             line = chunk
 
-        if line.startswith('data: '):
-            data_str = line[6:].strip()
-            if data_str == '[DONE]':
-                yield 'data: {"type": "message_stop"}\n\n'
-                continue
+        if not line.startswith('data: '):
+            continue
+        data_str = line[6:].strip()
+        if data_str == '[DONE]':
+            break
 
-            try:
-                data = json.loads(data_str)
-                if data.get('object') == 'chat.completion.chunk':
-                    delta = data.get('choices', [{}])[0].get('delta', {})
-                    if delta.get('content'):
-                        anthropic_chunk = {
-                            "type": "content_block_delta",
-                            "index": 0,
-                            "delta": {"type": "text_delta", "text": delta["content"]},
-                        }
-                        yield f'data: {json.dumps(anthropic_chunk)}\n\n'
-                    if delta.get('tool_calls'):
-                        for tc in delta['tool_calls']:
-                            yield f'data: {json.dumps({"type": "content_block_start", "index": 0, "content_block": {"type": "tool_use", "id": tc["id"], "name": tc["function"]["name"], "input": {}}})}\n\n'
-                            yield f'data: {json.dumps({"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": tc["function"]["arguments"]}})}\n\n'
-                    if data.get('choices', [{}])[0].get('finish_reason'):
-                        yield 'data: {"type": "message_stop"}\n\n'
-            except json.JSONDecodeError:
-                pass
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            continue
+
+        if data.get('object') != 'chat.completion.chunk':
+            continue
+        choices = data.get('choices', [])
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = choice.get('delta', {})
+        usage_chunk = data.get('usage')
+        if usage_chunk:
+            input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
+            output_tokens = usage_chunk.get('completion_tokens', output_tokens)
+
+        # Text content
+        if delta.get('content'):
+            if not text_started:
+                yield 'event: content_block_start\n'
+                yield f'data: {json.dumps({"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}})}\n\n'
+                text_started = True
+                block_open = True
+            yield 'event: content_block_delta\n'
+            yield f'data: {json.dumps({"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": delta["content"]}})}\n\n'
+
+        # Tool calls
+        if delta.get('tool_calls'):
+            for tc in delta['tool_calls']:
+                tc_idx = tc.get('index', 0)
+                fn = tc.get('function', {})
+                if tc_idx not in tool_call_blocks:
+                    # Close any open text block first.
+                    if block_open and text_started:
+                        yield 'event: content_block_stop\n'
+                        yield f'data: {json.dumps({"type": "content_block_stop", "index": block_index})}\n\n'
+                        block_index += 1
+                        text_started = False
+                        block_open = False
+                    tool_call_blocks[tc_idx] = block_index
+                    yield 'event: content_block_start\n'
+                    yield f'data: {json.dumps({"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": tc.get("id", f"toolu_{block_index}"), "name": fn.get("name", ""), "input": {}}})}\n\n'
+                    block_open = True
+                if fn.get('arguments'):
+                    yield 'event: content_block_delta\n'
+                    yield f'data: {json.dumps({"type": "content_block_delta", "index": tool_call_blocks[tc_idx], "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})}\n\n'
+
+        if choice.get('finish_reason'):
+            finish_reason = choice['finish_reason']
+
+    # Close any open block.
+    if block_open:
+        yield 'event: content_block_stop\n'
+        yield f'data: {json.dumps({"type": "content_block_stop", "index": block_index})}\n\n'
+
+    stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
+                   "content_filter": "end_turn"}.get(finish_reason, "end_turn")
+
+    yield 'event: message_delta\n'
+    yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}})}\n\n'
+
+    yield 'event: message_stop\n'
+    yield f'data: {json.dumps({"type": "message_stop"})}\n\n'
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -1232,7 +1549,8 @@ async def version():
 # MAIN ENTRY POINT
 # ══════════════════════════════════════════════════════════════════════════
 
-if __name__ == "__main__":
+def main():
+    """Entry point for `python -m openrouter.src.main` and the `wrapper-openrouter` console script."""
     import uvicorn
     validate_config()
     uvicorn.run(
@@ -1243,3 +1561,7 @@ if __name__ == "__main__":
         workers=int(os.environ.get('UVICORN_WORKERS', '1')),
         log_level="info",
     )
+
+
+if __name__ == "__main__":
+    main()

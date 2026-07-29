@@ -48,14 +48,6 @@ except ImportError:
 
 import aiohttp
 
-# Circuit breaker for upstream protection
-try:
-    from common.circuit_breaker import CircuitBreaker, CircuitBreakerError
-    _UPSTREAM_BREAKER = CircuitBreaker(failure_threshold=10, recovery_timeout=30, name="nous-upstream")
-    _HAS_CIRCUIT_BREAKER = True
-except ImportError:
-    _HAS_CIRCUIT_BREAKER = False
-
 # Shared header sanitization (BUG-SEC2 fix — deduplicated from common/middleware)
 try:
     # Ensure /root/wrapper (where the shared `common` package lives) is on the
@@ -670,13 +662,6 @@ def get_model_meta(mid):
 
 
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
-    # Circuit breaker: reject if upstream is failing
-    if _HAS_CIRCUIT_BREAKER:
-        try:
-            await _UPSTREAM_BREAKER.before_request()
-        except CircuitBreakerError as cb_err:
-            return 503, {"error": {"message": str(cb_err), "type": "service_unavailable"}}
-
     url = f"{NOUS_BASE}/v1/chat/completions"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     if stream:
@@ -706,35 +691,21 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
             if resp.status != 200:
                 text = await resp.text()
                 resp.release()
-                if _HAS_CIRCUIT_BREAKER:
-                    await _UPSTREAM_BREAKER.record_failure()
                 return resp.status, _normalize_upstream_error(resp.status, text)
-            if _HAS_CIRCUIT_BREAKER:
-                await _UPSTREAM_BREAKER.record_success()
             return 200, resp
         else:
             async with sess.post(url, json=payload, headers=headers) as resp:
                 text = await resp.text()
                 if resp.status != 200:
-                    if _HAS_CIRCUIT_BREAKER:
-                        await _UPSTREAM_BREAKER.record_failure()
                     return resp.status, _normalize_upstream_error(resp.status, text)
                 try:
                     data = json.loads(text) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
-                if _HAS_CIRCUIT_BREAKER:
-                    await _UPSTREAM_BREAKER.record_success()
                 return resp.status, data
     except asyncio.CancelledError:
         raise
     except Exception as e:
-        # N-15 fix: circuit breaker now actually records upstream failures.
-        if _HAS_CIRCUIT_BREAKER:
-            try:
-                await _UPSTREAM_BREAKER.record_failure()
-            except Exception:
-                pass
         logger.warning(f"[upstream] post_nous network error: {type(e).__name__}: {e}")
         return 502, {"error": {"type": "api_error", "message": f"Upstream connection error: {type(e).__name__}: {str(e)[:500]}", "code": "upstream_connection_error"}}
 
@@ -788,8 +759,8 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
         except ValueError as exc:
             return 400, {"error": {"type": "invalid_request_error", "message": str(exc), "code": "MODEL_CALL_PLAN_INVALID"}}, None
 
-    last_status = 503
-    last_result = {"error": {"message": "No capacity", "type": "server_error"}}
+    last_status = 429
+    last_result = {"error": {"message": "No capacity — all keys exhausted or rate-limited", "type": "rate_limit_error"}}
     tried = 0
     # BUG-M1 fix: preserve OAuth retry-after so it's not lost if static keys also fail
     oauth_retry_after = 0
@@ -863,8 +834,8 @@ async def get_nous_json_with_retries(path: str) -> tuple:
     """GET Nous endpoint using OAuth/static key pool with all-key retry."""
     url = f"{NOUS_BASE}{path}"
     sess = await get_session()
-    last_status = 503
-    last_data = {"error": {"message": "No capacity", "type": "server_error"}}
+    last_status = 429
+    last_data = {"error": {"message": "No capacity — all keys exhausted or rate-limited", "type": "rate_limit_error"}}
     oauth_token = _read_token_from_auth_path()
     if oauth_token:
         try:
