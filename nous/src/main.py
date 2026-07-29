@@ -434,7 +434,7 @@ STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get("STREAM_REQUEST_TIMEOUT_SEC", "9
 # so long generations are not killed at STREAM_REQUEST_TIMEOUT_SEC and a dead
 # upstream connection is detected within STREAM_SOCK_READ_TIMEOUT_SEC.
 STREAM_SOCK_READ_TIMEOUT_SEC = int(os.environ.get("STREAM_SOCK_READ_TIMEOUT_SEC", "300"))
-RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "60"))
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "600"))
 VERSION = "2.0.7-audit-hardening"
 
 # Build identity (H-04/H-02): resolve git root + source root from __file__, portable
@@ -1796,6 +1796,10 @@ rate_limits = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 
 def check_rate_limit(ip: str):
+    """Return True if request is allowed, False if rate-limited.
+    RATE_LIMIT_RPM=0 disables per-IP limiting entirely."""
+    if RATE_LIMIT_RPM <= 0:
+        return True
     now = time.time()
     with _rate_limit_lock:
         rate_limits[ip] = [t for t in rate_limits[ip] if now - t < 60]

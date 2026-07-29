@@ -329,10 +329,17 @@ from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_UR
 from collections import defaultdict
 _rate_limit_store = defaultdict(list)
 _rate_limit_lock = threading.Lock()
-RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+# Default 600 RPM per IP — high enough to support 4-5 concurrent agents on
+# the same loopback IP without false-positive 429s. Operators can lower
+# via env var, or set to 0 to disable per-IP limiting entirely.
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "600"))
 
 def check_rate_limit(client_ip: str) -> bool:
-    """Return True if request is allowed, False if rate-limited."""
+    """Return True if request is allowed, False if rate-limited.
+    RATE_LIMIT_RPM=0 disables per-IP limiting entirely (multi-agent setups
+    that prefer per-key RPM limits only)."""
+    if RATE_LIMIT_RPM <= 0:
+        return True
     now = time.time()
     with _rate_limit_lock:
         # V-08 fix: prune stale keys so the store cannot grow without bound.
@@ -669,8 +676,10 @@ STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '6
 STREAM_SOCK_READ_TIMEOUT_SEC = int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300'))
 GEN_TIMEOUT_SEC = int(os.environ.get('GEN_TIMEOUT_SEC', '900'))
 ANTI_SILENCE_TIMEOUT_MS = int(os.environ.get('ANTI_SILENCE_TIMEOUT_MS', '960000'))
-INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
-LOAD_SHEDDING_ENABLED = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
+# Default OFF for multi-agent localhost deployments; per-key RPM limits
+# already protect the upstream. Bump cap to 500 for headroom when enabled.
+INFLIGHT_SOFT_CAP = int(os.environ.get('INFLIGHT_SOFT_CAP', '500'))
+LOAD_SHEDDING_ENABLED = os.environ.get('LOAD_SHEDDING_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
 VERIFY_CONCURRENCY = int(os.environ.get('VERIFY_CONCURRENCY', '8'))
 # F7 fix: default sweep cadence lowered (600s -> 1800s); env still overrides.
 VERIFY_INTERVAL = int(os.environ.get('VERIFY_INTERVAL', '1800')) * 1000

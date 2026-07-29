@@ -185,8 +185,11 @@ class KeyPool:
     async def acquire(self, model: str = '') -> dict | None:
         """Acquire the best available key for a request."""
         async with self._lock:
-            inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
-            if sum(k.in_flight for k in self.keys) >= inflight_cap:
+            # Default OFF for multi-agent localhost deployments; per-key RPM
+            # limits already protect upstream. Bump cap to 500 for headroom.
+            inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '500'))
+            load_shedding = os.environ.get('LOAD_SHEDDING_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
+            if load_shedding and sum(k.in_flight for k in self.keys) >= inflight_cap:
                 logger.warning(f'[openrouter] Load shedding: in-flight >= {inflight_cap}')
                 return None
 

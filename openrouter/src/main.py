@@ -284,11 +284,13 @@ from collections import defaultdict
 _rate_limit_store = defaultdict(list)
 _rate_limit_lock = threading.Lock()
 _rate_limit_last_sweep = 0.0
-RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "120"))
+RATE_LIMIT_RPM = int(os.environ.get("RATE_LIMIT_RPM", "600"))
 
 
 def check_rate_limit(client_ip: str) -> bool:
     """Return True if request is allowed, False if rate-limited."""
+    if RATE_LIMIT_RPM <= 0:
+        return True  # per-IP limiting disabled (multi-agent setups)
     global _rate_limit_last_sweep
     now = time.time()
     with _rate_limit_lock:

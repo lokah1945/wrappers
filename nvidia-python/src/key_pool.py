@@ -447,12 +447,15 @@ class KeyPool:
         abort_promise = None
 
         # Load shedding check (safe outside lock)
-        load_shedding_enabled = os.environ.get('LOAD_SHEDDING_ENABLED', 'true').lower() != 'false'
-        inflight_soft_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
+        # Default OFF for multi-agent localhost deployments — per-key RPM limits
+        # already protect the upstream. Operators who want explicit load shedding
+        # can set LOAD_SHEDDING_ENABLED=true and tune INFLIGHT_SOFT_CAP.
+        load_shedding_enabled = os.environ.get('LOAD_SHEDDING_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
+        inflight_soft_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '500'))
         if load_shedding_enabled:
             total_in_flight = sum(k.in_flight for k in self.keys)
             if total_in_flight >= inflight_soft_cap:
-                logger.warning(f'[wrapper-nvidia] Load shedding: total in-flight {total_in_flight} >= INFLIGHT_SOFT_CAP {inflight_soft_cap}. Rejecting with 503.')
+                logger.warning(f'[wrapper-nvidia] Load shedding: total in-flight {total_in_flight} >= INFLIGHT_SOFT_CAP {inflight_soft_cap}. Rejecting with 429.')
                 return (None, 0.0)
 
         if signal is not None:

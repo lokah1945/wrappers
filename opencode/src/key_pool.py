@@ -151,8 +151,11 @@ class KeyPool:
         # Mutex whose cancelled future permanently wedged the pool (whole-wrapper
         # hang under load).
         async with self._lock:
-            inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '100'))
-            if sum(k.in_flight for k in self.keys) >= inflight_cap:
+            # Default OFF for multi-agent localhost deployments; per-key RPM
+            # limits already protect upstream. Bump cap to 500 for headroom.
+            inflight_cap = int(os.environ.get('INFLIGHT_SOFT_CAP', '500'))
+            load_shedding = os.environ.get('LOAD_SHEDDING_ENABLED', 'false').lower() in ('1', 'true', 'yes', 'on')
+            if load_shedding and sum(k.in_flight for k in self.keys) >= inflight_cap:
                 logger.warning(f'[opencode] Load shedding: in-flight >= {inflight_cap}')
                 return None
 
