@@ -82,13 +82,17 @@ class Metrics:
     async def summary(self, window: str = "24h") -> Dict:
         uptime = time.time() - self.start
         with self._lock:
+            if self.requests == 0:
+                error_rate = 0.0
+            else:
+                error_rate = round(self.errors / self.requests, 4)
             return {
                 "uptime_seconds": int(uptime),
                 "total_requests": self.requests,
                 "total_tokens": self.tokens_in + self.tokens_out,
                 "input_tokens": self.tokens_in,
                 "output_tokens": self.tokens_out,
-                "error_rate": round(self.errors / max(1, self.requests), 4),
+                "error_rate": error_rate,
             }
 
     async def close(self):
