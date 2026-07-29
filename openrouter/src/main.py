@@ -324,7 +324,7 @@ def _create_mcp_server():
         instructions=(
             "AI Model Catalog integrated with OpenRouter wrapper. "
             "Search and inspect the audited NVIDIA NIM catalog and multi-provider "
-            "model listings (OpenRouter, Nous, OpenCode, Blackbox, Vercel)."
+            "model listings (OpenRouter, Nous, OpenCode, Blackbox)."
         ),
     )
 

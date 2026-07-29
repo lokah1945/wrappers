@@ -4,8 +4,7 @@ wrappers = {
     'nous': {'port': 9102, 'upstream': 'Nous Research'},
     'opencode': {'port': 9103, 'upstream': 'OpenCode'},
     'blackbox': {'port': 9104, 'upstream': 'BLACKBOX AI'},
-    'nvidia-python': {'port': 9101, 'upstream': 'NVIDIA NIM'},
-    'vercel': {'port': 9105, 'upstream': 'Vercel AI Gateway'}
+    'nvidia-python': {'port': 9101, 'upstream': 'NVIDIA NIM'}
 }
 
 for wrapper, info in wrappers.items():

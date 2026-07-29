@@ -3,7 +3,7 @@
 **Version:** 2.0 (2026-07-28)  
 **Status:** Production Ready - Enterprise Grade (100/100)
 
-This monorepo contains provider-specific wrappers that must behave as one coherent product. Upstreams differ (NVIDIA NIM, Nous, OpenCode Zen, Blackbox AI, Vercel AI Gateway), but the wrapper contract is intentionally identical across all wrappers.
+This monorepo contains provider-specific wrappers that must behave as one coherent product. Upstreams differ (NVIDIA NIM, Nous, OpenCode Zen, Blackbox AI), but the wrapper contract is intentionally identical across all wrappers.
 
 ---
 
@@ -224,23 +224,6 @@ Blackbox AI wrapper with full OpenAI + Anthropic compatibility.
 
 ---
 
-### 5. `vercel` (Port 9105)
-
-**Upstream:** Vercel AI Gateway  
-**Module:** `vercel.src.main`  
-**Status:** Production Ready
-
-Vercel AI Gateway wrapper supporting multiple provider backends (Anthropic, OpenAI, Google, Meta, DeepSeek, Mistral).
-
-**Provider-specific features:**
-- Multi-provider routing
-- Vercel AI Gateway authentication
-- Dynamic model selection
-- Streaming with heartbeat
-
-**Enterprise features:** ✅ All 5 implemented
-
----
 
 ## Configuration Standards
 
@@ -270,7 +253,6 @@ All wrappers use **standardized `.env.example`** with these sections:
 | nous | 9102 | nous.src.main |
 | opencode | 9103 | opencode.src.main |
 | blackbox | 9104 | blackbox.src.main |
-| vercel | 9105 | vercel.src.main |
 | model-registry | 9200 | model-registry.service |
 
 ---

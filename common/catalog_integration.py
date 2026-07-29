@@ -151,7 +151,7 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
                 f"AI Model Catalog integrated with {wrapper_name}. "
                 "Search and inspect the audited NVIDIA NIM catalog and "
                 "multi-provider model listings (OpenRouter, Nous, OpenCode, "
-                "Blackbox, Vercel)."
+                "Blackbox)."
             ),
         )
 

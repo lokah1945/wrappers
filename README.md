@@ -16,7 +16,6 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **nous** | ✅ Production | **100/100** | 9102 | Nous Research | `nous.src.main` |
 | **opencode** | ✅ Production | **100/100** | 9103 | OpenCode Zen | `opencode.src.main` |
 | **blackbox** | ✅ Production | **100/100** | 9104 | BLACKBOX AI | `blackbox.src.main` |
-| **vercel** | ✅ Production | **100/100** | 9105 | Vercel AI Gateway | `vercel.src.main` |
 
 **All wrappers achieve perfect 100/100 scores across all audit aspects:**
 - ✅ Structure Consistency: 100/100
@@ -40,7 +39,6 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 - [nous/README.md](nous/README.md)
 - [opencode/README.md](opencode/README.md)
 - [blackbox/README.md](blackbox/README.md)
-- [vercel/README.md](vercel/README.md)
 
 ---
 
@@ -237,7 +235,6 @@ wrappers/
 │       ├── __init__.py
 │       └── main.py
 │
-├── vercel/                          # Vercel AI Gateway proxy (Port 9105)
 │   ├── __init__.py
 │   ├── README.md
 │   ├── .env.example
