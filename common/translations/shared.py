@@ -279,3 +279,94 @@ def should_cooldown_key(status: int, body: Any) -> bool:
             if 'rate limit' in msg or 'quota' in msg or 'too many requests' in msg:
                 return True
     return False
+
+
+# ── Transparent header forwarding ─────────────────────────────────────────
+# Per project principle #1 (TRANSPARENT PROXY): wrappers must NOT drop client
+# headers. The wrapper only swaps Authorization (to use a pool key) and strips
+# hop-by-hop headers. Everything else is forwarded verbatim.
+
+# Hop-by-hop headers (RFC 7230) — must NOT be forwarded by proxies.
+HOP_BY_HOP_HEADERS = frozenset({
+    'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+    'te', 'trailers', 'transfer-encoding', 'upgrade',
+})
+
+# Headers that the wrapper sets itself (must not be overwritten by client).
+WRAPPER_OWNED_HEADERS = frozenset({
+    'authorization', 'content-length', 'content-type', 'host',
+    'accept-encoding',  # wrapper handles decompression
+})
+
+# Client headers that should ALWAYS be forwarded upstream (transparent proxy).
+# This is a broad allowlist covering all standard OpenAI/Anthropic SDK headers
+# plus common agent/client identity headers.
+FORWARD_HEADER_ALLOWLIST = (
+    # OpenAI / Anthropic SDK identity
+    'user-agent', 'x-stainless-lang', 'x-stainless-package-version',
+    'x-stainless-os', 'x-stainless-arch', 'x-stainless-runtime',
+    'x-stainless-runtime-version', 'x-stainless-retry-count',
+    # Anthropic-specific
+    'anthropic-version', 'anthropic-beta', 'anthropic-dangerous-direct-browser-access',
+    # OpenAI-specific
+    'openai-beta', 'openai-organization', 'openai-project',
+    # Request tracing
+    'x-request-id', 'x-correlation-id', 'traceparent', 'tracestate',
+    # Client identity (for logging/metrics upstream)
+    'x-client-id', 'x-session-id',
+    # Content negotiation
+    'accept', 'accept-language',
+    # Caching (some upstreams honor these)
+    'if-none-match', 'if-modified-since',
+)
+
+
+def build_forward_headers(client_headers, extra: dict | None = None) -> dict:
+    """Build the upstream header dict from client headers (transparent proxy).
+
+    Forwards:
+      - All headers in FORWARD_HEADER_ALLOWLIST (if present in client_headers).
+      - Any additional headers from `extra` (wrapper-specific overrides).
+
+    Strips:
+      - Hop-by-hop headers (RFC 7230).
+      - Wrapper-owned headers (authorization, content-length, content-type, host,
+        accept-encoding) — these are set by the wrapper itself.
+
+    Case-insensitive lookup on client_headers (works with Starlette/aiohttp
+    headers objects that use case-insensitive .get()).
+
+    Args:
+        client_headers: dict-like with case-insensitive .get() (e.g.
+            starlette.datastructures.Headers, dict, aiohttp.ClientResponse.headers).
+        extra: optional dict of wrapper-specific headers to add/override.
+
+    Returns:
+        dict of headers to send upstream (all values sanitized to str).
+    """
+    out = {}
+    if client_headers and hasattr(client_headers, 'get'):
+        for h in FORWARD_HEADER_ALLOWLIST:
+            v = client_headers.get(h)
+            if v is not None:
+                out[h] = str(v)
+    if extra:
+        for k, v in extra.items():
+            if v is not None and k.lower() not in HOP_BY_HOP_HEADERS:
+                out[k] = str(v)
+    return out
+
+
+def sanitize_header_value(value: str, max_len: int = 8192) -> str:
+    """Sanitize a header value for safe forwarding.
+
+    Strips CR/LF (CRLF injection prevention) and truncates to max_len.
+    """
+    if value is None:
+        return ''
+    s = str(value)
+    # Strip CR/LF and other control chars (except tab, which is allowed in headers).
+    s = ''.join(c for c in s if c == '\t' or (ord(c) >= 32 and ord(c) != 127))
+    if len(s) > max_len:
+        s = s[:max_len]
+    return s

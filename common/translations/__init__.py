@@ -13,6 +13,10 @@ from .shared import (
     parse_retry_after,
     is_retriable_status,
     should_cooldown_key,
+    build_forward_headers,
+    sanitize_header_value,
+    FORWARD_HEADER_ALLOWLIST,
+    HOP_BY_HOP_HEADERS,
 )
 
 __all__ = [
@@ -24,4 +28,8 @@ __all__ = [
     "parse_retry_after",
     "is_retriable_status",
     "should_cooldown_key",
+    "build_forward_headers",
+    "sanitize_header_value",
+    "FORWARD_HEADER_ALLOWLIST",
+    "HOP_BY_HOP_HEADERS",
 ]

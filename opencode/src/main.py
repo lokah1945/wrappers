@@ -80,6 +80,8 @@ try:
         parse_retry_after as _parse_retry_after,
         is_retriable_status as _is_retriable_status,
         should_cooldown_key as _should_cooldown_key,
+        build_forward_headers as _build_forward_headers,
+        sanitize_header_value,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -669,18 +671,19 @@ def _jr(status: int, content: dict):
     return JSONResponse(status_code=status, content=content)
 
 def _auth_headers(api_key: str, request: Request = None) -> dict:
-    # F5: do not force `Accept-Encoding: identity` — let aiohttp negotiate gzip
-    # with upstream (it transparently decompresses for both .text() and the
-    # streaming iter_any() reader), saving bandwidth on large generations.
+    """Build upstream headers: Authorization swap + transparent client header forwarding.
+
+    Per project principle #1 (TRANSPARENT PROXY): forward ALL client headers
+    (not just a 5-item allowlist) so client identity, beta-feature flags,
+    tracing IDs, and SDK metadata reach upstream unchanged. Only swap
+    Authorization (to use a pool key) and set Content-Type.
+    """
     h = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     if request is not None:
-        for k in ("anthropic-beta", "anthropic-version", "openai-beta", "x-api-key", "x-request-id"):
-            v = request.headers.get(k)
-            if v:
-                # BUG-SEC2 fix: use shared sanitization function
-                v = sanitize_header_value(v)
-                if v:
-                    h[k] = v
+        # Use shared build_forward_headers for transparent, broad forwarding.
+        forwarded = _build_forward_headers(request.headers)
+        for k, v in forwarded.items():
+            h[k] = v
     return h
 
 # --- minimal Anthropic <-> OpenAI helpers (surgical, local) ---

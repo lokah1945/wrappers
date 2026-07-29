@@ -76,6 +76,8 @@ try:
         parse_retry_after as _parse_retry_after,
         is_retriable_status as _is_retriable_status,
         should_cooldown_key as _should_cooldown_key,
+        build_forward_headers as _build_forward_headers,
+        sanitize_header_value as _sanitize_header_value,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -2373,7 +2375,7 @@ async def chat_completions(request: Request):
             body.pop("tools", None)
 
     is_stream = body.get("stream", False)
-    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
 
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
     # F3 round-2 fix: model-state persistence must not delay the response;
@@ -2427,7 +2429,7 @@ async def responses(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
-    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
@@ -2516,7 +2518,7 @@ async def messages(request: Request):
     if free_only_enabled() and chat_body.get("model") and not model_allowed(chat_body.get("model", "")):
         return JSONResponse(status_code=400, content=free_only_anthropic_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
-    extra_h = {h: _sanitize_header_value(request.headers.get(h)) for h in ["anthropic-beta", "anthropic-version", "openai-beta", "x-request-id"] if request.headers.get(h)}
+    extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).

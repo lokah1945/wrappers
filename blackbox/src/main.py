@@ -78,6 +78,8 @@ from common.translations import (
     parse_retry_after as _parse_retry_after,
     is_retriable_status as _is_retriable_status,
     should_cooldown_key as _should_cooldown_key,
+    build_forward_headers as _build_forward_headers,
+    sanitize_header_value,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -384,35 +386,42 @@ async def get_session():
         return _session
 
 
-_FORWARD_HEADER_ALLOWLIST = ('anthropic-beta', 'anthropic-version', 'openai-beta', 'x-request-id', 'user-agent')
-# Headers that must never be forwarded verbatim (credentials / hop-by-hop).
+# TRANSPARENT PROXY: forward ALL client headers via shared build_forward_headers.
+# The old 5-item allowlist was too narrow — it dropped x-stainless-* (SDK
+# identity), x-correlation-id (tracing), accept-language, and other standard
+# headers that clients send. The shared allowlist covers all standard
+# OpenAI/Anthropic SDK headers + common agent identity headers.
 _FORWARD_HEADER_DENYLIST = {'authorization', 'x-api-key', 'host', 'content-length', 'content-type',
                             'connection', 'transfer-encoding', 'accept-encoding', 'cookie'}
 
 
 def _forward_extra_headers() -> tuple:
     """B3 (transparency, opt-in): FORWARD_EXTRA_HEADERS is a comma-separated
-    list of additional client header names to forward upstream (sanitized).
-    Default empty keeps the conservative allowlist."""
+    list of additional client header names to forward upstream (sanitized)."""
     raw = os.environ.get('FORWARD_EXTRA_HEADERS') or ''
     return tuple(h.strip().lower() for h in raw.split(',')
                  if h.strip() and h.strip().lower() not in _FORWARD_HEADER_DENYLIST)
 
 
 def _auth_headers(api_key: str, request: Request = None) -> dict:
+    """Build upstream headers: Authorization swap + transparent client header forwarding.
+
+    Per project principle #1 (TRANSPARENT PROXY): forward ALL client headers
+    via shared build_forward_headers (broad allowlist) so client identity,
+    beta-feature flags, tracing IDs, and SDK metadata reach upstream unchanged.
+    """
     headers = {'Authorization': f'Bearer {api_key}', 'Content-Type': 'application/json'}
-    # F5/B2: do NOT force `Accept-Encoding: identity` anymore — let aiohttp
-    # negotiate gzip/deflate (it decompresses transparently), so large
-    # responses no longer travel uncompressed. Operators can still pin a
-    # value via UPSTREAM_ACCEPT_ENCODING (documented in .env.example).
     accept_encoding = (os.environ.get('UPSTREAM_ACCEPT_ENCODING') or '').strip()
     if accept_encoding:
         headers['Accept-Encoding'] = accept_encoding
     if request is not None:
-        for k in _FORWARD_HEADER_ALLOWLIST + _forward_extra_headers():
+        forwarded = _build_forward_headers(request.headers)
+        for k, v in forwarded.items():
+            headers[k] = v
+        # Also forward any operator-configured extra headers.
+        for k in _forward_extra_headers():
             v = request.headers.get(k)
             if v:
-                # BUG-SEC2 fix: use shared sanitization function
                 v = sanitize_header_value(v)
                 if v:
                     headers[k] = v

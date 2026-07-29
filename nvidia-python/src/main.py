@@ -378,10 +378,24 @@ try:
     from common.translations import (
         AnthropicStreamState as _SharedAnthropicStreamState,
         parse_dsml_from_text as _shared_parse_dsml,
+        build_forward_headers as _build_forward_headers,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
+    # Fallback: minimal build_forward_headers so the wrapper still works
+    # if common.translations is not importable (shouldn't happen in prod).
+    def _build_forward_headers(client_headers, extra=None):
+        out = {}
+        if client_headers and hasattr(client_headers, 'get'):
+            for h in ('user-agent', 'anthropic-version', 'anthropic-beta',
+                      'openai-beta', 'x-request-id', 'accept'):
+                v = client_headers.get(h)
+                if v:
+                    out[h] = str(v)
+        if extra:
+            out.update(extra)
+        return out
 
 from .anthropic_compat import (
     anthropic_to_openai,
@@ -1216,16 +1230,14 @@ def model_from_path(path: str) -> str:
 
 
 def forward_headers(request: Request) -> dict:
-    headers = {}
-    for key in ['x-forwarded-for', 'x-real-ip', 'user-agent', 'accept',
-                'anthropic-version', 'anthropic-beta', 'openai-beta',
-                'x-request-id']:  # P2: correlation ID passthrough
-        val = request.headers.get(key)
-        if val:
-            # BUG-SEC2 fix: use shared sanitization function
-            sanitized = sanitize_header_value(val)
-            if sanitized:
-                headers[key] = sanitized
+    """Transparent proxy: forward ALL client headers via shared build_forward_headers.
+
+    Per project principle #1: wrappers must NOT drop client headers. Only
+    swap Authorization (done by caller) and set Content-Type. Everything
+    else (user-agent, x-stainless-*, anthropic-*, openai-*, x-request-id,
+    x-correlation-id, accept, accept-language, etc.) is forwarded verbatim.
+    """
+    headers = _build_forward_headers(request.headers)
     # Generate a request ID if the client didn't provide one
     if 'x-request-id' not in headers:
         headers['x-request-id'] = generate_request_id()

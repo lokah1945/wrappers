@@ -149,6 +149,8 @@ try:
         parse_retry_after as _parse_retry_after,
         is_retriable_status as _is_retriable_status,
         should_cooldown_key as _should_cooldown_key,
+        build_forward_headers as _build_forward_headers,
+        sanitize_header_value,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -596,18 +598,17 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
         url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
 
-        # Build headers: forward allowlisted client headers (preserves agent identity
-        # and beta-feature flags), add upstream auth.
+        # Build headers: transparent proxy — forward ALL client headers via
+        # shared build_forward_headers (broad allowlist), add upstream auth.
         fwd = {
             "Authorization": f"Bearer {key_obj.api_key}",
             "Content-Type": "application/json",
             "Accept": "text/event-stream" if stream else "application/json",
         }
         if request is not None:
-            for h in _FORWARD_HEADER_ALLOWLIST:
-                v = request.headers.get(h)
-                if v:
-                    fwd[h] = sanitize_header_value(v)
+            forwarded = _build_forward_headers(request.headers)
+            for k, v in forwarded.items():
+                fwd[k] = v
         if headers:
             fwd.update(headers)
 
