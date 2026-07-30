@@ -111,7 +111,17 @@ def classify_upstream_error(status: int, payload: Any = "") -> ErrorClassificati
     if status == 429:
         model_limited = any(term in lower for term in ("model", "deployment", "capacity"))
         if model_limited:
-            return ErrorClassification(ErrorState.MODEL_RATE_LIMITED, "MODEL_OR_DEPLOYMENT_RATE_LIMIT")
+            # NO MODEL FALLBACK: a model rate limit is per-key-per-model.
+            # The rate limit is on THIS key for THIS model — another key may
+            # still serve the same model. Retry the SAME model with a DIFFERENT
+            # key (retry_same_model=True, rotate_key=True). Never substitute
+            # model B for model A.
+            return ErrorClassification(
+                ErrorState.MODEL_RATE_LIMITED,
+                "MODEL_OR_DEPLOYMENT_RATE_LIMIT",
+                retry_same_model=True,
+                rotate_key=True,
+            )
         return ErrorClassification(
             ErrorState.KEY_RATE_LIMITED,
             "KEY_RATE_LIMIT",

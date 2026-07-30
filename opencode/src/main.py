@@ -577,20 +577,25 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
     A single rate-limited/bad key is cooled down and the request is retried with
     the next key. Only after every available key fails do we return an error to
     the client/agent.
+
+    NO MODEL FALLBACK: the model id is extracted once and reused for EVERY
+    retry. The same model A is retried across keys — never substituted with
+    model B. Model-scoped blocks ensure error on model A at key1 only blocks
+    key1 for model A; model B can still use key1.
     """
+    model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
     attempts = max(1, pool.total_keys)
     last_status = 429
     last_data = {"error": {"message": "No capacity — all keys exhausted or rate-limited", "type": "rate_limit_error"}}
     tried = 0
     for _ in range(attempts):
-        key_result = await pool.acquire()
+        key_result = await pool.acquire(model=model_id)
         if not key_result:
             break
         key = key_result["key"]
         headers = _auth_headers(key.api_key, request)
         if url.endswith('/messages') and not headers.get('anthropic-version'):
             headers['anthropic-version'] = '2023-06-01'
-        model_id = json_body.get('model', '') if isinstance(json_body, dict) else ''
         surface = 'anthropic_messages' if '/messages' in url else ('openai_responses' if '/responses' in url else 'openai_chat')
         # OC-2 / DR-13: validate the call-plan + model identity BEFORE spending an
         # upstream request (and a key's quota). Returning here means no live
@@ -625,7 +630,7 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
             # available_keys<=0 short-cooldown branch in mark_failure is dead.
             avail = len([k for k in pool.keys if k is not key and not k.is_hard_blocked()])
             if _should_cooldown_key(status, data):
-                pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream', available_keys=avail)
+                pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream', available_keys=avail, model=model_id)
             pool.release(key)
             continue
         pool.release(key)

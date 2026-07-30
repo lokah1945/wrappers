@@ -544,6 +544,12 @@ async def _record_model_result(model_id: str, api_key: str, status: int, data, u
 
 
 async def proxy_request_with_pool(method: str, url: str, json_body: dict, request: Request, is_stream: bool = False):
+    """NO MODEL FALLBACK: retry model A across keys, never substitute model B.
+
+    The model id is extracted once and reused for EVERY retry. Model-scoped
+    blocks ensure error on model A at key1 only blocks key1 for model A;
+    model B can still use key1.
+    """
     attempts = max(1, pool.total_keys)
     last_status = 429
     last_data = {'error': {'message': 'No capacity — all keys exhausted or rate-limited', 'type': 'rate_limit_error'}}
@@ -581,7 +587,7 @@ async def proxy_request_with_pool(method: str, url: str, json_body: dict, reques
         classification = classify_upstream_error(status, data)
         if _is_retriable_upstream_status(status) and classification['retry_same_model']:
             if _should_cooldown_key(status, data):
-                pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream')
+                pool.mark_failure(key, status, _retry_after_seconds(data), 'upstream', model=model_id)
             pool.release(key)
             continue
         pool.release(key)

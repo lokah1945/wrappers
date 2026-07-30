@@ -25,6 +25,9 @@ class KeyEntry:
         self.timestamps: List[float] = []
         self.hard_blocked_until = 0.0
         self.block_reason = ''
+        # NO MODEL FALLBACK: model-scoped blocks ensure error on model A
+        # at key1 only blocks key1 for model A — model B can still use key1.
+        self.model_blocks: dict[str, tuple[float, str]] = {}  # model_id → (blocked_until, reason)
         self.in_flight = 0
         self.total_requests = 0
         self.total_429s = 0
@@ -68,7 +71,35 @@ class KeyEntry:
             self.total_429s += 1
         logger.warning(f'[blackbox] key {self.label} cooled down for {seconds}s ({reason})')
 
+    def block_model(self, model_id: str, seconds: int, reason: str):
+        """NO MODEL FALLBACK: cool down only this key+model pair.
+
+        Error on model A at key1 blocks key1 ONLY for model A.
+        Model B can still use key1 because it's a different model.
+        """
+        if not model_id:
+            return
+        seconds = max(1, min(int(seconds or 1), int(os.environ.get('KEY_COOLDOWN_MAX_SEC', '300'))))
+        self.model_blocks[model_id] = (time.time() + seconds, reason)
+        self.total_failures += 1
+        if reason == 'rate_limit':
+            self.total_429s += 1
+        logger.warning(f'[blackbox] key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})')
+
+    def is_model_blocked(self, model_id: str) -> bool:
+        if not model_id:
+            return False
+        entry = self.model_blocks.get(model_id)
+        if not entry:
+            return False
+        blocked_until, _reason = entry
+        if time.time() < blocked_until:
+            return True
+        del self.model_blocks[model_id]
+        return False
+
     def stats(self) -> dict:
+        now = time.time()
         return {
             'label': self.label,
             'current_rpm': self.current_rpm(),
@@ -77,6 +108,7 @@ class KeyEntry:
             'hard_blocked': self.is_blocked(),
             'hard_blocked_remaining_s': max(0, round(self.hard_blocked_until - time.time(), 1)),
             'block_reason': self.block_reason or None,
+            'model_blocks': {m: {'until': round(u - now, 1), 'reason': r} for m, (u, r) in self.model_blocks.items() if u > now},
             'total_requests': self.total_requests,
             'total_429s': self.total_429s,
             'total_failures': self.total_failures,
@@ -135,7 +167,13 @@ class KeyPool:
             if load_shedding and sum(k.in_flight for k in self.keys) >= inflight_cap:
                 logger.warning(f'[blackbox] Load shedding: in-flight >= {inflight_cap}')
                 return None
-            candidates = [k for k in self.keys if not k.is_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit)]
+            # NO MODEL FALLBACK: filter candidates by model-scoped blocks.
+            # Error on model A at key1 blocks key1 ONLY for model A —
+            # model B can still use key1 because it's a different model.
+            candidates = [k for k in self.keys
+                          if not k.is_blocked()
+                          and not (model and k.is_model_blocked(model))
+                          and k.current_rpm() < (k.hard_rpm or self.hard_limit)]
             if not candidates:
                 return None
             min_load = min(k.effective_load for k in candidates)
@@ -152,17 +190,38 @@ class KeyPool:
         key.release()
         self._in_flight_total = max(0, self._in_flight_total - 1)
 
-    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = ''):
+    def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = '', model: str = ''):
+        """NO MODEL FALLBACK: model-scoped block for 429/5xx.
+
+        Error on model A at key1 blocks key1 ONLY for model A.
+        Model B can still use key1 because it's a different model.
+        Auth/quota errors (401/402/403) block the whole key (credential issue).
+        """
         if key is None:
             return
         if status_code == 429:
-            key.block(retry_after or int(os.environ.get('RATE_LIMIT_COOLDOWN_SEC', '65')), 'rate_limit')
+            cooldown = retry_after or int(os.environ.get('RATE_LIMIT_COOLDOWN_SEC', '65'))
+            # Model-scoped block: only block this key for this model.
+            if model:
+                key.block_model(model, cooldown, 'rate_limit')
+            else:
+                key.block(cooldown, 'rate_limit')
         elif status_code in (401, 402, 403):
+            # Auth/quota = credential issue → block whole key.
             key.block(retry_after or int(os.environ.get('AUTH_KEY_COOLDOWN_SEC', '300')), 'auth_or_quota')
         elif status_code >= 500 or status_code in (408, 409):
-            key.block(retry_after or int(os.environ.get('TRANSIENT_KEY_COOLDOWN_SEC', '15')), 'transient')
+            cooldown = retry_after or int(os.environ.get('TRANSIENT_KEY_COOLDOWN_SEC', '15'))
+            # Model-scoped block for transient errors too.
+            if model:
+                key.block_model(model, cooldown, 'transient')
+            else:
+                key.block(cooldown, 'transient')
         elif reason:
-            key.block(retry_after or 15, reason)
+            cooldown = retry_after or 15
+            if model:
+                key.block_model(model, cooldown, reason)
+            else:
+                key.block(cooldown, reason)
 
     def all_stats(self) -> list:
         return [k.stats() for k in self.keys]
