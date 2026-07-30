@@ -252,8 +252,10 @@ def free_only_anthropic_error(model_id: str) -> dict:
         },
     }
 
-# Dynamic aliases: NO hardcoded model targets.
-# Calling minimaxai/minimax-m3 or z-ai/glm-5.2 binds sonnet/haiku/opus/claude-* to that id.
+# Dynamic aliases: operator-configured name resolution (NOT model fallback).
+# The operator sets DYNAMIC_ALIAS_TARGET env var at startup to bind all aliases
+# to a concrete model id. Concrete client requests are forwarded verbatim and
+# NEVER mutate alias state.
 _ALIAS_NAME_SET = {
     'sonnet', 'opus', 'haiku',
     'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-haiku-4-5',
@@ -424,10 +426,12 @@ def _zen_family(model: str) -> str:
 
 
 def _normalize_model(model: str) -> str:
-    """Transparent pass-through + dynamic aliases (no hardcoded targets).
+    """Transparent pass-through + operator-configured alias resolution.
 
-    Concrete id (minimaxai/minimax-m3, z-ai/glm-5.2, ...) passes through and
-    binds all aliases. Alias names resolve to the current bound target only.
+    Concrete id passes through unchanged (NEVER mutates alias state).
+    Alias names resolve to operator-configured DYNAMIC_ALIAS_TARGET if bound
+    at startup; else pass through unchanged.
+    NO MODEL FALLBACK: model id is never changed based on availability or error.
     """
     if model is None:
         return ""

@@ -540,11 +540,12 @@ except ImportError:
     logger = logging.getLogger("wrapper-nous")
 
 # --------------------------------------------------------------------------
-# DYNAMIC ALIASES — no hardcoded model targets
+# DYNAMIC ALIASES — operator-configured name resolution (NOT model fallback)
 # --------------------------------------------------------------------------
 # Virtual Claude Code / Anthropic short names. They NEVER point to a fixed model.
-# When the client calls a concrete model (e.g. tencent/hy3:free, poolside/...),
-# all aliases below bind dynamically to that concrete id for subsequent requests.
+# The operator sets DYNAMIC_ALIAS_TARGET env var at startup to bind all aliases
+# to a concrete model id. Concrete client requests are forwarded verbatim and
+# NEVER mutate alias state.
 _ALIAS_NAME_SET = {
     "sonnet", "opus", "haiku",
     "claude-sonnet-4-20250514", "claude-opus-4-20250514", "claude-haiku-4-20250514",
@@ -588,11 +589,14 @@ def set_dynamic_alias_target(model_id: str, force: bool = False) -> None:
         _dynamic_alias_target = mid
 
 def resolve_model(m: str) -> str:
-    """Transparent pass-through + dynamic aliases.
+    """Transparent pass-through + operator-configured alias resolution.
 
-    - Concrete id → pass through AND bind all aliases to it.
-    - Alias (sonnet/haiku/...) → current dynamic target if bound; else pass through unchanged.
+    - Concrete id → pass through unchanged (NEVER mutates alias state).
+    - Alias (sonnet/haiku/...) → operator-configured DYNAMIC_ALIAS_TARGET if
+      bound at startup; else pass through unchanged.
     - Never inject DEFAULT_MODEL / REASONING_MODEL as a hidden default.
+    - NO MODEL FALLBACK: the model id is never changed based on availability
+      or error. Alias resolution is name resolution, not substitution.
     """
     if not m:
         return m or ""

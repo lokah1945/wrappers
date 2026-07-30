@@ -996,7 +996,7 @@ _ALIAS_NAME_SET = {
     'claude-sonnet-4-6', 'claude-opus-4-6', 'claude-opus-4-1', 'claude-opus-4-8',
     'claude-sonnet-4-20250514', 'claude-opus-4-20250514', 'claude-haiku-4-20250514',
 }
-_dynamic_alias_target: str = ''  # last concrete model id seen from any client request
+_dynamic_alias_target: str = ''  # operator-configured via DYNAMIC_ALIAS_TARGET env var at startup
 _dynamic_alias_lock = threading.Lock()
 _known_models: Set[str] = set()  # known model ids for alias validation (RC-2)
 
