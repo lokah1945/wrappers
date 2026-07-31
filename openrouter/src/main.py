@@ -653,9 +653,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 async def stream_gen():
                     nonlocal released
                     try:
-                        last_chunk = time.time()
                         async for line in resp_ref.content:
-                            last_chunk = time.time()
                             yield line
                         # If upstream didn't send [DONE], synthesize it for OpenAI SSE.
                         yield b'data: [DONE]\n\n'
@@ -671,8 +669,22 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                             pool.release(key_obj)
 
                 async def stream_with_heartbeat():
+                    # Heartbeat injection: keep connection alive during upstream
+                    # idle (reasoning models, long generations). Without this,
+                    # clients/LBs with idle timeouts kill the stream mid-turn.
+                    last_hb = time.time()
+                    at_line_boundary = True
+                    hb_interval = float(HEARTBEAT_MS) / 1000.0
                     async for chunk in stream_gen():
                         yield chunk
+                        if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                            at_line_boundary = chunk.endswith(b'\n')
+                        elif chunk:
+                            at_line_boundary = str(chunk).endswith('\n')
+                        now = time.time()
+                        if at_line_boundary and (now - last_hb) > hb_interval:
+                            yield b': heartbeat\n\n'
+                            last_hb = now
 
                 return StreamingResponse(
                     stream_with_heartbeat(),

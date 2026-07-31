@@ -2577,9 +2577,37 @@ class Server:
 
                     async def stream_wrapper(resp=resp, key=key):
                         nonlocal released
+                        # Heartbeat injection: keep connection alive during upstream
+                        # idle (reasoning models, long generations). Without this,
+                        # clients/LBs with idle timeouts kill the stream mid-turn,
+                        # causing "response berhenti di tengah".
+                        last_hb = time.time()
+                        at_line_boundary = True
+                        saw_done = False
+                        hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
                         try:
                             async for chunk, _ in resp.content.iter_chunks():
+                                # Check for [DONE] marker
+                                if isinstance(chunk, (bytes, bytearray)):
+                                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
+                                        saw_done = True
+                                else:
+                                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
+                                        saw_done = True
                                 yield chunk
+                                # Track line boundary for safe heartbeat injection
+                                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                                    at_line_boundary = chunk.endswith(b'\n')
+                                elif chunk:
+                                    at_line_boundary = str(chunk).endswith('\n')
+                                # Inject heartbeat during idle if at line boundary
+                                now = time.time()
+                                if at_line_boundary and (now - last_hb) > hb_interval:
+                                    yield b': heartbeat\n\n'
+                                    last_hb = now
+                            # Synthesize [DONE] if upstream EOF'd without one
+                            if not saw_done:
+                                yield b'data: [DONE]\n\n'
                         finally:
                             if not released:
                                 released = True
@@ -2759,9 +2787,30 @@ class Server:
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
     async def _stream_proxy(self, resp, key):
+        # Heartbeat injection: keep connection alive during upstream idle.
+        last_hb = time.time()
+        at_line_boundary = True
+        saw_done = False
+        hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
         try:
             async for chunk, _ in resp.content.iter_chunks():
+                if isinstance(chunk, (bytes, bytearray)):
+                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
+                        saw_done = True
+                else:
+                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
+                        saw_done = True
                 yield chunk
+                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                    at_line_boundary = chunk.endswith(b'\n')
+                elif chunk:
+                    at_line_boundary = str(chunk).endswith('\n')
+                now = time.time()
+                if at_line_boundary and (now - last_hb) > hb_interval:
+                    yield b': heartbeat\n\n'
+                    last_hb = now
+            if not saw_done:
+                yield b'data: [DONE]\n\n'
         finally:
             # V-05 fix: release the upstream response (mirrors stream_wrapper in
             # proxy_openai) so aborted client streams don't leak connector slots.
