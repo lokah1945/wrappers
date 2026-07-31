@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -422,7 +423,8 @@ async def get_agent() -> aiohttp.ClientSession:
 # ── Model Refresh ─────────────────────────────────────────────────────────
 async def _refresh_models_loop():
     """Periodically refresh model catalog from upstream."""
-    global _MODEL_REFRESH_TASK
+    # B-22: `global _MODEL_REFRESH_TASK` removed — never assigned in this scope
+    # (the task handle is set by lifespan, which declares it correctly).
     try:
         # Initial load
         ids = await _refresh_models()
@@ -453,6 +455,44 @@ async def _refresh_models(force: bool = False) -> list:
         return []
 
 
+# ── Background tasks ───────────────────────────────────────────────────────
+# B-35 fix: openrouter was the only wrapper with no background-task registry.
+# asyncio only holds a WEAK reference to a running task, so a fire-and-forget
+# coroutine can be garbage-collected mid-flight. All four siblings retain
+# strong refs (_BG_TASKS / _spawn_bg_task / _spawn_background); this is the
+# openrouter equivalent.
+_BG_TASKS: set = set()
+
+
+def _spawn_background(coro, label: str = 'bg'):
+    """Fire-and-forget with a retained strong reference + error logging."""
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task):
+        _BG_TASKS.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning('[bg:%s] background task failed: %r', label, exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _drain_background_tasks(timeout: float = 5.0):
+    """Await outstanding background tasks during shutdown (B-35)."""
+    if not _BG_TASKS:
+        return
+    pending = list(_BG_TASKS)
+    logger.info('[openrouter] draining %d background task(s)', len(pending))
+    try:
+        await asyncio.wait(pending, timeout=timeout)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning('[openrouter] background drain error: %r', e)
+
+
 # ── Lifecycle ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -476,16 +516,38 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("[openrouter] Shutting down")
+    # B-34 fix: drain in-flight requests before tearing down the session.
+    # Previously openrouter closed the aiohttp session immediately, severing
+    # every active stream mid-response on each deploy/restart (all three
+    # siblings already implement this drain).
+    logger.info("[openrouter] Starting graceful shutdown...")
+    shutdown_start = time.time()
+    max_wait = int(os.environ.get('SHUTDOWN_DRAIN_SEC', '30'))
+    while shutdown_start + max_wait > time.time():
+        total = sum(k.in_flight for k in pool.keys)
+        if total == 0:
+            logger.info("[openrouter] All requests drained")
+            break
+        await asyncio.sleep(0.1)
+    else:
+        logger.warning("[openrouter] Drain timeout — %d request(s) still in flight",
+                       sum(k.in_flight for k in pool.keys))
+
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
         try:
             await _MODEL_REFRESH_TASK
         except asyncio.CancelledError:
             pass
+
+    # B-35 fix: await outstanding fire-and-forget tasks so metrics/model-state
+    # writes are not lost (and cannot be GC'd mid-flight).
+    await _drain_background_tasks()
+
     await metrics.close()
     if _agent and not _agent.closed:
         await _agent.close()
+    logger.info("[openrouter] Shutdown complete")
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────
@@ -711,6 +773,9 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     resp.release()
                     pool.release(key_obj)
                     key_released = True  # I4: mark released, skip outer finally
+                    # B-39 fix: record upstream stream failures.
+                    _spawn_background(metrics.record_request(model=model_id, status_code=resp.status),
+                                      'metrics-stream-err')
                     last_status = resp.status
                     try:
                         last_data = json.loads(error_text)
@@ -721,10 +786,16 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                         continue  # retry with next key
                     return JSONResponse(last_data, status_code=resp.status)
                 pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
+                # B-39 fix: streaming requests were never counted, so
+                # error_rate was permanently ~0 and the dashboard reported
+                # false health. Count the stream as a request now.
+                _spawn_background(metrics.record_request(model=model_id, status_code=200),
+                                  'metrics-stream')
 
                 # Heartbeat-aware streaming passthrough — keeps idle LBs/agents alive.
-                heartbeat_ms = HEARTBEAT_MS
-                heartbeat_bytes = b': heartbeat\n\n'
+                # B-23: `heartbeat_ms` / `heartbeat_bytes` were dead locals —
+                # the heartbeat interval and payload are handled inside
+                # stream_with_heartbeat() below. Removed.
                 resp_ref = resp
                 released = False
                 key_released = True  # I4: stream path owns release; outer finally skips
@@ -965,7 +1036,8 @@ async def responses(request: Request):
             # Store for previous_response_id continuity.
             resp_id = resp.get('id')
             if resp_id and principal:
-                _RESPONSE_STORE[_response_store_key(principal, resp_id)] = chat_body.get('messages', [])
+                # B-33: bounded + TTL-pruned write.
+                _store_response(principal, resp_id, chat_body.get('messages', []))
             return JSONResponse(resp, status_code=response.status_code)
     except Exception as e:
         logger.warning(f"[openrouter] /v1/responses translation failed: {e}")
@@ -1370,7 +1442,60 @@ async def count_tokens(request: Request):
 # /v1/chat/completions to OpenRouter — then translate the response back.
 
 # Tenant-isolated response store for previous_response_id continuity.
-_RESPONSE_STORE: dict[str, list] = {}
+# B-33 fix: this store was COMPLETELY UNBOUNDED — one full conversation
+# history per /v1/responses call, retained for the process lifetime, with no
+# eviction anywhere. A long-running Codex session leaked until OOM. Now bounded
+# by entry count, total bytes, and TTL (opencode/nous parity).
+_RESPONSE_STORE: "OrderedDict[str, tuple]" = OrderedDict()
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+
+
+def _store_response(principal: str, response_id: str, messages: list) -> None:
+    """Bounded, TTL-pruned write to the response store (B-33)."""
+    if not response_id or not principal:
+        return
+    key = _response_store_key(principal, response_id)
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = 0
+    # Reject a single oversized entry outright rather than evicting everything.
+    if size > _RESPONSE_STORE_MAX_BYTES:
+        logger.warning('[responses] history for %s too large (%dB); not stored', response_id, size)
+        return
+    _RESPONSE_STORE[key] = (time.time(), size, messages)
+    _RESPONSE_STORE.move_to_end(key)
+    _prune_response_store()
+
+
+def _prune_response_store() -> None:
+    """Evict expired, then oldest, entries until within all bounds (B-33)."""
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for k in [k for k, (ts, _s, _m) in _RESPONSE_STORE.items()
+                  if now - ts > _RESPONSE_STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(k, None)
+    while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
+        _RESPONSE_STORE.popitem(last=False)
+    total = sum(s for _ts, s, _m in _RESPONSE_STORE.values())
+    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+        _k, (_ts, s, _m) = _RESPONSE_STORE.popitem(last=False)
+        total -= s
+
+
+def _get_stored_conversation(principal: str, response_id: str) -> list:
+    """Read a stored history, honouring TTL (B-33)."""
+    key = _response_store_key(principal, response_id)
+    entry = _RESPONSE_STORE.get(key)
+    if not entry:
+        return []
+    ts, _size, msgs = entry
+    if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
+        _RESPONSE_STORE.pop(key, None)
+        return []
+    return list(msgs)
 
 
 def _response_store_key(principal: str, response_id: str) -> str:
@@ -1404,9 +1529,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
     msgs: list = []
     prev = body.get('previous_response_id')
     if prev and principal:
-        key = _response_store_key(principal, prev)
-        if key in _RESPONSE_STORE:
-            msgs.extend(_RESPONSE_STORE[key])
+        # B-33: TTL-aware read from the bounded store.
+        msgs.extend(_get_stored_conversation(principal, prev))
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({'role': 'user', 'content': raw})

@@ -144,23 +144,32 @@ class KeyEntry:
         return self.current_rpm() + self.in_flight
 
     def is_blocked(self) -> bool:
-        if time.time() < self.hard_blocked_until:
-            return True
-        if self.hard_blocked_until:
+        """B-37 fix: side-effect-free predicate (see blackbox key_pool)."""
+        return time.time() < self.hard_blocked_until
+
+    def expire_block(self) -> None:
+        """Clear an elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
             self.hard_blocked_until = 0.0
             self.block_reason = ""
-        return False
 
     def record(self):
+        """B-36 fix: telemetry only; in-flight accounting is now explicit."""
         now = time.time()
         self.timestamps.append(now)
         self.total_requests += 1
         self.last_used = now
+
+    def increment_in_flight(self):
         self.in_flight += 1
 
-    def release(self):
+    def decrement_in_flight(self):
         if self.in_flight > 0:
             self.in_flight -= 1
+
+    def release(self):
+        # Backwards-compatible alias.
+        self.decrement_in_flight()
 
     def block(self, seconds: int, reason: str):
         seconds = max(1, min(int(seconds or 1), int(os.environ.get("KEY_COOLDOWN_MAX_SEC", "300"))))
@@ -244,6 +253,9 @@ class KeyPool:
         skipped for that model but stay usable for other models.
         """
         with self._lock:
+            # B-37: expire elapsed blocks explicitly, under the lock.
+            for k in self.keys:
+                k.expire_block()
             candidates = [
                 k for k in self.keys
                 if not k.is_blocked() and k.current_rpm() < self.hard_limit
@@ -256,14 +268,16 @@ class KeyPool:
             best = [k for k in candidates if k.effective_load == min_load]
             entry = best[self._rr % len(best)]
             self._rr += 1
+            # B-36: telemetry and in-flight accounting are now explicit.
             entry.record()
+            entry.increment_in_flight()
             return entry
 
     def release(self, entry: Optional[KeyEntry]):
         if entry is None:
             return
         with self._lock:
-            entry.release()
+            entry.decrement_in_flight()
 
     def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None, model_id: str = None, model_scoped: bool = False):
         if entry is None:
@@ -761,12 +775,12 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` that used to live here SHADOWED
+# the `should_cooldown_key` imported from common.translations, so cooldown
+# policy silently diverged per wrapper — exactly the drift
+# CROSS_WRAPPER_BUG_POLICY.md exists to prevent. The model-capacity carve-out
+# has been promoted into the shared implementation; this module now uses it
+# directly (imported above as _should_cooldown_key).
 
 
 async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None, client_surface: str = "openai_chat") -> tuple:
@@ -1812,18 +1826,63 @@ class ResponsesStreamState:
 # METRICS
 # --------------------------------------------------------------------------
 class Metrics:
+    """B-39 fix: nous was the only wrapper whose metrics had NO persistence —
+    every counter reset to zero on each restart, so the dashboard's
+    total_requests/error_rate were meaningless after a deploy. Now persists to
+    a JSON snapshot periodically and reloads it at startup (blackbox /
+    opencode / openrouter parity)."""
+
     def __init__(self):
         self.requests = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.errors = 0
         self.start = time.time()
+        self._lock = threading.Lock()
+        self._persist_interval = float(os.environ.get('METRICS_PERSIST_SEC', '60'))
+        self._last_persist = time.time()
+        self._load_persisted()
+
+    def _persist_path(self) -> str:
+        return str(Path(__file__).resolve().parents[1] / 'metrics-snapshot.json')
+
+    def _load_persisted(self):
+        try:
+            path = self._persist_path()
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                self.requests = int(data.get('requests', 0))
+                self.tokens_in = int(data.get('tokens_in', 0))
+                self.tokens_out = int(data.get('tokens_out', 0))
+                self.errors = int(data.get('errors', 0))
+        except Exception:
+            pass
+
+    def _persist(self):
+        try:
+            with open(self._persist_path(), 'w') as f:
+                json.dump({
+                    'requests': self.requests,
+                    'tokens_in': self.tokens_in,
+                    'tokens_out': self.tokens_out,
+                    'errors': self.errors,
+                    'saved_at': time.time(),
+                }, f)
+        except Exception:
+            pass
 
     def record(self, prompt=0, completion=0, error=False):
-        self.requests += 1
-        self.tokens_in += prompt
-        self.tokens_out += completion
-        if error: self.errors += 1
+        with self._lock:
+            self.requests += 1
+            self.tokens_in += prompt
+            self.tokens_out += completion
+            if error:
+                self.errors += 1
+            now = time.time()
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
 
     def snapshot(self):
         uptime = time.time() - self.start
@@ -2027,7 +2086,7 @@ async def lifespan(app: FastAPI):
     _HEAL_TASK = None
     await MODEL_REGISTRY_CLIENT.stop()
     # Cleanup: close aiohttp session
-    global _SESSION
+    # B-22: `global _SESSION` removed — never assigned in this scope.
     if _SESSION is not None and not _SESSION.closed:
         try:
             await _SESSION.close()
@@ -2416,10 +2475,11 @@ async def count_tokens(req: Request):
 # --- OPENAI CHAT ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     await _auth_check(request)
     try:
         body = await request.json()
@@ -2720,7 +2780,9 @@ async def embeddings(request: Request):
     if not check_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

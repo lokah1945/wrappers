@@ -872,7 +872,7 @@ def _store_response(principal: str, key: str, data) -> None:
     single-turn entries are truncated before storage; trimming drops oldest
     turns using the precomputed per-entry sizes.
     """
-    global _RESPONSE_STORE
+    # B-22: `global _RESPONSE_STORE` removed — mutated in place, never rebound.
     if isinstance(data, list):
         entries, sizes = [], []
         for item in data:
@@ -1170,7 +1170,8 @@ async def model_catalog_refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _session, _MODEL_REFRESH_TASK, _METRICS_PERSIST_TASK, _env_observer
+    # B-22: `_session` dropped from this global stmt — never rebound here.
+    global _MODEL_REFRESH_TASK, _METRICS_PERSIST_TASK, _env_observer
     pool.load_from_env()
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
@@ -1340,7 +1341,7 @@ async def models(request: Request):
         {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "north-mini-code-free", "object": "model", "owned_by": "opencode-zen"},
     ]
-    global _known_models
+    # B-22: `global _known_models` removed — never assigned in this scope.
     for m in fallback_all:
         _known_models.add(m["id"])
     for alias in ("sonnet", "opus", "haiku"):
@@ -1442,7 +1443,7 @@ async def capabilities(request: Request):
     try:
         model_response = await models(request)
         models_list = model_response.get("data", []) if isinstance(model_response, dict) else []
-        global _known_models
+        # B-22: `global _known_models` removed — never assigned in this scope.
         for m in models_list:
             if isinstance(m, dict) and m.get("id"):
                 _known_models.add(m.get("id", ""))
@@ -1474,10 +1475,11 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
     _ip = _client_ip(request)
@@ -1509,8 +1511,9 @@ async def chat_completions(request: Request):
             return _jr(400, {"error": {"type": "invalid_request_error", "message": "tool role requires tool_call_id"}})
     is_stream = bool(body.get("stream", False))
 
-    # Prefer chat/completions; if model is responses/messages-native, still accept chat shape via conversion path upstream may reject — try chat first for openai-compatible clients
-    family = _zen_family(body.get("model") or "")
+    # B-23: `family = _zen_family(...)` was computed and never used — OC-12
+    # routes every model through the OpenAI-compatible chat endpoint below, so
+    # the family lookup is dead. Removed.
     # OC-12: gemini/google family was incorrectly routed to the catalog URL
     # `{base}/models/{model}` (a GET listing), which 404/405s and cooled down a
     # key. Route it through the OpenAI-compatible chat endpoint like the rest.
@@ -1967,7 +1970,9 @@ async def embeddings(request: Request):
     if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

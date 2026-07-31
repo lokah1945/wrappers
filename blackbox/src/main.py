@@ -517,12 +517,12 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` that used to live here SHADOWED
+# the `should_cooldown_key` imported from common.translations, so cooldown
+# policy silently diverged per wrapper — exactly the drift
+# CROSS_WRAPPER_BUG_POLICY.md exists to prevent. The model-capacity carve-out
+# has been promoted into the shared implementation; this module now uses it
+# directly (imported above as _should_cooldown_key).
 
 
 _BACKGROUND_TASKS: set = set()
@@ -770,7 +770,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     return {'id': data.get('id') or f"msg_{int(time.time()*1000)}", 'type': 'message', 'role': 'assistant', 'model': model, 'content': content, 'stop_reason': stop, 'stop_sequence': None, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0}}
 
 
-_RESPONSE_STORE: dict[str, list] = {}
+_RESPONSE_STORE: dict[str, tuple] = {}  # key -> (ts, size, messages)
 
 def _extract_principal(request) -> str:
     """Extract a stable tenant identifier from the request for store namespacing.
@@ -810,9 +810,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
     # tenant's. Without this, any previous_response_id value would match
     # across tenants — a cross-tenant data leak.
     if prev and principal:
-        key = _response_store_key(principal, prev)
-        if key in _RESPONSE_STORE:
-            msgs.extend(_RESPONSE_STORE[key])
+        # B-33: TTL-aware read from the bounded store.
+        msgs.extend(_get_stored_conversation(principal, prev))
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({'role': 'user', 'content': raw})
@@ -1031,7 +1030,8 @@ async def model_catalog_refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _session, _MODEL_REFRESH_TASK
+    # B-22: `global _session` removed — never assigned in this scope.
+    global _MODEL_REFRESH_TASK
     pool.load_from_env()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed and not is_alias_name(seed):
@@ -1323,10 +1323,11 @@ def _clean_tools(body: dict):
 
 @app.post('/v1/chat/completions')
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     _auth_check(request)
     if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
@@ -1567,14 +1568,58 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
 
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+
+
 def _store_response(principal: str, rid: str, messages: list):
-    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix).
+
+    B-33 fix: the previous implementation capped ENTRY COUNT only (200) with no
+    TTL and no byte bound — 200 multi-MB histories is still unbounded in memory.
+    Now bounded on all three axes (opencode/nous parity).
+    """
     if not rid:
         return
     key = _response_store_key(principal, rid)
-    _RESPONSE_STORE[key] = messages
-    while len(_RESPONSE_STORE) > 200:
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = 0
+    if size > _RESPONSE_STORE_MAX_BYTES:
+        logger.warning(f'[responses] history for {rid} too large ({size}B); not stored')
+        return
+    _RESPONSE_STORE[key] = (time.time(), size, messages)
+    _prune_response_store()
+
+
+def _prune_response_store():
+    """Evict expired, then oldest, entries until within all bounds (B-33)."""
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for k in [k for k, v in list(_RESPONSE_STORE.items())
+                  if isinstance(v, tuple) and now - v[0] > _RESPONSE_STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(k, None)
+    while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
         _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
+    total = sum(v[1] for v in _RESPONSE_STORE.values() if isinstance(v, tuple))
+    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+        _k, v = _RESPONSE_STORE.popitem()
+        if isinstance(v, tuple):
+            total -= v[1]
+
+
+def _get_stored_conversation(principal: str, rid: str) -> list:
+    """TTL-aware read from the bounded store (B-33)."""
+    entry = _RESPONSE_STORE.get(_response_store_key(principal, rid))
+    if not entry or not isinstance(entry, tuple):
+        return []
+    ts, _size, msgs = entry
+    if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
+        _RESPONSE_STORE.pop(_response_store_key(principal, rid), None)
+        return []
+    return list(msgs)
 
 
 @app.post('/v1/messages')
@@ -1767,7 +1812,9 @@ async def embeddings(request: Request):
     if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

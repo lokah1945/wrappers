@@ -390,7 +390,16 @@ class BaseWrapper:
         path = request.url.path
         method = request.method
         # Public paths: no auth required (dashboard, metrics, model discovery).
-        is_public = path in self.PUBLIC_PATHS or path.startswith('/metrics/') or path.startswith('/catalog/') or path.startswith('/mcp/')
+        # B-17/B-27 fix: `method` was computed and then IGNORED here, so a POST
+        # to a discovery-only path was treated as public exactly like a GET.
+        # Read-only surfaces are now gated to safe methods.
+        _safe = method in ('GET', 'HEAD')
+        is_public = (
+            (path in self.PUBLIC_PATHS and _safe)
+            or (_safe and (path.startswith('/metrics/')
+                           or path.startswith('/catalog/')
+                           or path.startswith('/mcp/')))
+        )
         # Per-IP rate limiting (applies to all requests; 0 disables).
         client_ip = getattr(request.client, 'host', '') or 'unknown'
         if not self.rate_limiter.check(client_ip):

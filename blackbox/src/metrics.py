@@ -79,6 +79,21 @@ class Metrics:
                 self._last_persist = now
                 self._persist()
 
+    def record_error(self, status_code: int = 0, **kwargs):
+        """B-39 fix: parity with opencode/openrouter.
+
+        blackbox was the only wrapper whose Metrics class lacked record_error,
+        so error paths that did not also call record_request could never move
+        the errors counter.
+        """
+        with self._lock:
+            self.errors += 1
+            self.requests += 1
+            now = time.time()
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
+
     async def summary(self, window: str = "24h") -> Dict:
         uptime = time.time() - self.start
         with self._lock:

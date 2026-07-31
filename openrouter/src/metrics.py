@@ -23,6 +23,12 @@ class Metrics:
         self.errors = 0
         self._db_path = db_path
         self._lock = threading.Lock()
+        # B-39 fix: persist periodically, not only on graceful shutdown, so
+        # counters survive SIGKILL/OOM (blackbox BB-15/OC-14 parity). This
+        # matters more here because openrouter previously had no graceful
+        # shutdown at all (B-34).
+        self._persist_interval = float(os.environ.get('METRICS_PERSIST_SEC', '60'))
+        self._last_persist = time.time()
         self._load_persisted()
 
     def _persist_path(self) -> str:
@@ -70,6 +76,10 @@ class Metrics:
             self.tokens_out += completion_tokens
             if kwargs.get('status_code', 200) >= 400:
                 self.errors += 1
+            now = time.time()
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
 
     def record_error(self, status_code: int = 0, **kwargs):
         with self._lock:

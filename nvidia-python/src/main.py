@@ -64,6 +64,10 @@ try:
     # path, since the systemd service sets PYTHONPATH=.../nvidia-python only.
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.middleware import RequestSizeLimiter, sanitize_header_value
+    from common.sse import (
+        IDLE as _IDLE,
+        iter_chunks_with_idle as _iter_chunks_with_idle,
+    )
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
@@ -163,7 +167,10 @@ async def verify_models(pool):
     Verification is account-scoped. Only explicit provider EOL can affect the
     global retired set; all other outcomes remain observations.
     """
-    global _unavailable_models, _retired_models, _model_status, _model_state_store, _verify_cursor
+    # B-24: only `_verify_cursor` is rebound in this scope; the other names are
+    # mutated in place (dict/set methods), so declaring them global was dead
+    # code that implied a rebinding which never happened.
+    global _verify_cursor
     ids = await pool.refresh_models(force=True) or []
     if not ids:
         return
@@ -2632,18 +2639,18 @@ class Server:
                         saw_done = False
                         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
                         try:
-                            aiter = resp.content.__aiter__()
-                            while True:
-                                try:
-                                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
-                                except asyncio.TimeoutError:
-                                    # Upstream idle — inject heartbeat at line boundary
-                                    if at_line_boundary:
+                            # B-08 fix: sentinel-task idle detection replaces
+                            # asyncio.wait_for, which cancels the pending read
+                            # and cannot distinguish an idle upstream from a
+                            # dead one (a failed stream was heartbeated
+                            # forever). Also fixes the dead `last_hb`.
+                            async for chunk in _iter_chunks_with_idle(resp, hb_interval):
+                                if chunk is _IDLE:
+                                    _now = time.time()
+                                    if at_line_boundary and (_now - last_hb) > hb_interval:
                                         yield b': heartbeat\n\n'
-                                        last_hb = time.time()
+                                        last_hb = _now
                                     continue
-                                except StopAsyncIteration:
-                                    break
                                 # Check for [DONE] marker
                                 if isinstance(chunk, (bytes, bytearray)):
                                     if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
@@ -2656,7 +2663,6 @@ class Server:
                                     at_line_boundary = chunk.endswith(b'\n')
                                 elif chunk:
                                     at_line_boundary = str(chunk).endswith('\n')
-                                last_hb = time.time()
                             # Synthesize [DONE] if upstream EOF'd without one
                             if not saw_done:
                                 yield b'data: [DONE]\n\n'
@@ -2845,17 +2851,14 @@ class Server:
         saw_done = False
         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
         try:
-            aiter = resp.content.__aiter__()
-            while True:
-                try:
-                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
-                except asyncio.TimeoutError:
-                    if at_line_boundary:
+            # B-08 fix: sentinel-task idle detection (see common/sse.py).
+            async for chunk in _iter_chunks_with_idle(resp, hb_interval):
+                if chunk is _IDLE:
+                    _now = time.time()
+                    if at_line_boundary and (_now - last_hb) > hb_interval:
                         yield b': heartbeat\n\n'
-                        last_hb = time.time()
+                        last_hb = _now
                     continue
-                except StopAsyncIteration:
-                    break
                 if isinstance(chunk, (bytes, bytearray)):
                     if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
                         saw_done = True
@@ -3113,6 +3116,23 @@ def create_app() -> FastAPI:
             yield
         finally:
             logger.info('[lifecycle] wrapper-nvidia shutting down gracefully...')
+            # B-34 fix: drain in-flight requests before closing the session, so
+            # a deploy/restart does not sever active streams mid-response
+            # (nous/opencode/blackbox parity).
+            try:
+                _drain_start = time.time()
+                _max_wait = int(os.environ.get('SHUTDOWN_DRAIN_SEC', '30'))
+                while _drain_start + _max_wait > time.time():
+                    _inflight = sum(k.in_flight for k in getattr(server.pool, 'keys', []))
+                    if _inflight == 0:
+                        logger.info('[lifecycle] all requests drained')
+                        break
+                    await asyncio.sleep(0.1)
+                else:
+                    logger.warning('[lifecycle] drain timeout — %d request(s) still in flight',
+                                   sum(k.in_flight for k in getattr(server.pool, 'keys', [])))
+            except Exception as _e:
+                logger.warning(f'[lifecycle] drain skipped: {_e}')
             if server:
                 # V-17 fix: cancel retained background tasks at shutdown.
                 for _task in getattr(server, '_bg_tasks', []):
@@ -3131,6 +3151,15 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
     return app
+
+def main():
+    """B-15 fix: the __main__ guard called an UNDEFINED `main`, so
+    `python -m src.main` raised NameError. Production launches via
+    `uvicorn src.main:app` (see wrappers.json / systemd), which is why this
+    never surfaced there. Every sibling defines main() — parity restored."""
+    import uvicorn
+    uvicorn.run('src.main:app', host=BIND_HOST, port=LISTEN_PORT, log_level='info')
+
 
 if __name__ == "__main__":
     main()

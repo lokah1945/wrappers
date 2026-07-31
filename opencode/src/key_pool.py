@@ -108,12 +108,21 @@ class KeyEntry:
         return False
 
     def is_hard_blocked(self) -> bool:
-        if time.time() < self.hard_blocked_until:
-            return True
-        if self.hard_blocked_until:
+        """B-37 fix: side-effect-free predicate.
+
+        Previously this CLEARED hard_blocked_until as a side effect of being
+        asked "are you blocked?". It is also called from stats()/health_json()
+        outside the pool lock, so a concurrent metrics scrape could clear a
+        live block. Expiry is now explicit (expire_block()), done under the
+        lock in acquire().
+        """
+        return time.time() < self.hard_blocked_until
+
+    def expire_block(self) -> None:
+        """Clear an elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
             self.hard_blocked_until = 0.0
             self.block_reason = ''
-        return False
 
     def stats(self, soft: int, hard: int) -> dict:
         rpm = self.current_rpm()
@@ -191,6 +200,9 @@ class KeyPool:
                 logger.warning(f'[opencode] Load shedding: in-flight >= {inflight_cap}')
                 return None
 
+            # B-37: expire elapsed blocks explicitly, under the lock.
+            for _k in self.keys:
+                _k.expire_block()
             # NO MODEL FALLBACK: filter candidates by model-scoped blocks.
             # Error on model A at key1 blocks key1 ONLY for model A —
             # model B can still use key1 because it's a different model.
