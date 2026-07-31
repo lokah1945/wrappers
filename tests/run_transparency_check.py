@@ -27,7 +27,10 @@ def no_dsml(obj) -> None:
 
 
 def load_nous():
-    src = (ROOT / "nous" / "wrapper_nous.py").read_text()
+    p = ROOT / "nous" / "src" / "main.py"
+    if not p.exists():
+        p = ROOT / "nous" / "wrapper_nous.py"
+    src = p.read_text()
     src = src.replace(
         '"/root/wrapper/nous/wrapper_nous.log"',
         f'"{LOGDIR / "nous.log"}"',

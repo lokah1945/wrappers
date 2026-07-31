@@ -379,6 +379,9 @@ try:
         AnthropicStreamState as _SharedAnthropicStreamState,
         parse_dsml_from_text as _shared_parse_dsml,
         build_forward_headers as _build_forward_headers,
+        anthropic_to_openai_response,
+        openai_to_anthropic_response,
+        stream_anthropic_to_openai,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -2237,6 +2240,8 @@ class Server:
         data = result.get('data', {})
         if status_code != 200 and data.get('error'):
             return JSONResponse(status_code=status_code, content=data)
+        if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
+            data = anthropic_to_openai_response(data, model_id)
         ensure_nonempty_content(data)
         return JSONResponse(status_code=200, content=data)
 
@@ -2390,7 +2395,10 @@ class Server:
             err = data['error']
             return JSONResponse(status_code=status_code, content=anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error')))
 
-        anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
+        if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
+            anthropic_resp = data
+        else:
+            anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
         return JSONResponse(status_code=200, content=anthropic_resp)
 
     def _select_timeout(self, is_streaming: bool, metric_path: str) -> int:

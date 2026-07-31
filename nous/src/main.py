@@ -78,6 +78,9 @@ try:
         should_cooldown_key as _should_cooldown_key,
         build_forward_headers as _build_forward_headers,
         sanitize_header_value as _sanitize_header_value,
+        anthropic_to_openai_response,
+        openai_to_anthropic_response,
+        stream_anthropic_to_openai,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -1191,6 +1194,9 @@ def anthropic_to_openai(req: dict) -> dict:
 
 def openai_to_anthropic(model: str, chat: dict) -> dict:
     """OpenAI chat completion → Anthropic message (Claude Code native blocks)."""
+    if isinstance(chat, dict) and chat.get("type") == "message" and "content" in chat:
+        return chat
+
     msg = (chat.get("choices") or [{}])[0].get("message", {}) or {}
     text = msg.get("content") or ""
     if text is None:
@@ -1294,15 +1300,16 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
             return
         try:
             parsed = json.loads(data)
-            if state and hasattr(state, "translate_chunk"):
-                for ev in state.translate_chunk(parsed):
-                    if isinstance(ev, str):
-                        yield ev
-                    else:
-                        yield serialize_fn(ev)
-            else:
-                yield f"data: {data.decode()}\n\n"
         except Exception:
+            parsed = {"choices": [{"delta": {"content": data.decode(errors='replace')}}]}
+
+        if state and hasattr(state, "translate_chunk"):
+            for ev in state.translate_chunk(parsed):
+                if isinstance(ev, str):
+                    yield ev
+                else:
+                    yield serialize_fn(ev) if callable(serialize_fn) else ev
+        else:
             yield f"data: {data.decode(errors='replace')}\n\n"
 
     # BUG-FIX: heartbeats fire even when upstream is idle. N-05 fix: instead of
@@ -2406,6 +2413,8 @@ async def chat_completions(request: Request):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     if isinstance(result, dict):
+        if result.get("type") == "message" and "content" in result:
+            result = anthropic_to_openai_response(result, body.get("model", ""))
         _ensure_chat_content(result)
         if not result.get('usage'):
             result['usage'] = {

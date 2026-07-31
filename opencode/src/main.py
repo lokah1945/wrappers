@@ -82,6 +82,9 @@ try:
         should_cooldown_key as _should_cooldown_key,
         build_forward_headers as _build_forward_headers,
         sanitize_header_value,
+        anthropic_to_openai_response,
+        openai_to_anthropic_response,
+        stream_anthropic_to_openai,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -797,6 +800,8 @@ def anthropic_to_openai(body: dict) -> dict:
 
 
 def openai_to_anthropic(model: str, data: dict) -> dict:
+    if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
+        return data
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
     text = msg.get('content') or ''
     if text is None:
@@ -1510,6 +1515,8 @@ async def chat_completions(request: Request):
         status, data, _ = await proxy_request_with_pool("POST", url, body, request)
         if status != 200:
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
+        if isinstance(data, dict) and data.get("type") == "message" and "content" in data:
+            data = anthropic_to_openai_response(data, body.get("model", ""))
         await metrics.record_request(model=body.get("model"), path="/v1/chat/completions",
                                      prompt_tokens=(data.get("usage") or {}).get("prompt_tokens", 0),
                                      completion_tokens=(data.get("usage") or {}).get("completion_tokens", 0))

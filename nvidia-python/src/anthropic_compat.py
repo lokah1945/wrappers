@@ -472,6 +472,9 @@ def estimate_input_tokens(a: dict) -> int:
 def openai_to_anthropic(o: dict, model: str, request_id: str = None,
                         expect_thinking: bool = False, estimated_input: int = None) -> dict:
     """Translate OpenAI chat completion response -> Anthropic message."""
+    if isinstance(o, dict) and o.get('type') == 'message' and 'content' in o:
+        return o
+
     choice = (o.get('choices') or [{}])[0] if o.get('choices') else {}
     msg = choice.get('message', {})
     content = []
@@ -1024,6 +1027,32 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
 
                 if ch.get('finish_reason'):
                     final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
+
+        if buffer:
+            trimmed = buffer.strip()
+            if trimmed.startswith('data:'):
+                data = trimmed[5:].strip()
+                if data and data != '[DONE]':
+                    try:
+                        chunk = json.loads(data)
+                        if chunk.get('choices'):
+                            ch = chunk['choices'][0]
+                            delta = ch.get('delta', {})
+                            content_text = delta.get('content', '') or ''
+                            reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+                            if reasoning:
+                                generated_chars += len(reasoning)
+                                async for c in parse_and_emit(reasoning, True):
+                                    yield c
+                            if content_text:
+                                generated_chars += len(content_text)
+                                async for c in parse_and_emit(content_text, False):
+                                    yield c
+                            if ch.get('finish_reason'):
+                                final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
+                    except Exception:
+                        pass
+            buffer = ''
     except (GeneratorExit, asyncio.CancelledError):
         # V-15 fix (audit 2026-07-27): client disconnected / task cancelled.
         # Async generator finalization forbids further yields — mark it so the

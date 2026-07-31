@@ -80,6 +80,9 @@ from common.translations import (
     should_cooldown_key as _should_cooldown_key,
     build_forward_headers as _build_forward_headers,
     sanitize_header_value,
+    anthropic_to_openai_response,
+    openai_to_anthropic_response,
+    stream_anthropic_to_openai,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -731,6 +734,8 @@ def _parse_tool_args(s: str):
 
 
 def openai_to_anthropic(model: str, data: dict) -> dict:
+    if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
+        return data
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
     text = msg.get('content') or ''
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
@@ -1334,6 +1339,8 @@ async def chat_completions(request: Request):
         # BB-15: record errors too so the error_rate metric can move.
         await metrics.record_request(model=body.get('model'), path='/v1/chat/completions', status_code=status)
         return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
+    if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
+        data = anthropic_to_openai_response(data, body.get('model', ''))
     await metrics.record_request(model=body.get('model'), path='/v1/chat/completions', prompt_tokens=(data.get('usage') or {}).get('prompt_tokens', 0), completion_tokens=(data.get('usage') or {}).get('completion_tokens', 0), status_code=status)
     return JSONResponse(_ensure_chat_message(data))
 

@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, List
+from typing import Any, List, AsyncGenerator
 
 
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
@@ -370,3 +370,266 @@ def sanitize_header_value(value: str, max_len: int = 8192) -> str:
     if len(s) > max_len:
         s = s[:max_len]
     return s
+
+
+def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
+    """Convert Anthropic Message response object -> OpenAI ChatCompletion response object.
+    
+    If input `a_resp` is already an OpenAI response (contains 'choices'), returns it as-is.
+    """
+    if not isinstance(a_resp, dict):
+        return a_resp
+    if "choices" in a_resp:
+        return a_resp
+
+    msg_id = a_resp.get("id") or f"msg_{int(time.time() * 1000)}"
+    oai_id = f"chatcmpl-{msg_id}"
+    model = a_resp.get("model") or request_model or ""
+    role = a_resp.get("role", "assistant")
+    content_blocks = a_resp.get("content", [])
+
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = []
+
+    if isinstance(content_blocks, str):
+        text_parts.append(content_blocks)
+    elif isinstance(content_blocks, list):
+        for b in content_blocks:
+            if not isinstance(b, dict):
+                continue
+            b_type = b.get("type")
+            if b_type == "text" and "text" in b:
+                text_parts.append(str(b["text"]))
+            elif b_type in ("thinking", "reasoning") and ("thinking" in b or "reasoning" in b):
+                reasoning_parts.append(str(b.get("thinking") or b.get("reasoning") or ""))
+            elif b_type == "tool_use":
+                tc_id = b.get("id") or f"call_{len(tool_calls)}"
+                tc_name = b.get("name") or ""
+                tc_input = b.get("input", {})
+                if not isinstance(tc_input, str):
+                    try:
+                        tc_args = json.dumps(tc_input)
+                    except Exception:
+                        tc_args = str(tc_input)
+                else:
+                    tc_args = tc_input
+                tool_calls.append({
+                    "id": tc_id,
+                    "type": "function",
+                    "function": {
+                        "name": tc_name,
+                        "arguments": tc_args,
+                    }
+                })
+
+    final_text = "".join(text_parts)
+    final_reasoning = "".join(reasoning_parts)
+
+    anthro_stop = a_resp.get("stop_reason")
+    finish_map = {
+        "end_turn": "stop",
+        "stop_sequence": "stop",
+        "max_tokens": "length",
+        "tool_use": "tool_calls",
+        "refusal": "content_filter",
+    }
+    finish_reason = finish_map.get(anthro_stop) or ("tool_calls" if tool_calls else "stop")
+
+    msg_obj = {
+        "role": role,
+        "content": final_text or (None if tool_calls else ""),
+    }
+    if final_reasoning:
+        msg_obj["reasoning_content"] = final_reasoning
+    if tool_calls:
+        msg_obj["tool_calls"] = tool_calls
+
+    usage = a_resp.get("usage", {}) if isinstance(a_resp.get("usage"), dict) else {}
+    in_tok = usage.get("input_tokens", 0) or 0
+    out_tok = usage.get("output_tokens", 0) or 0
+
+    return {
+        "id": oai_id,
+        "object": "chat.completion",
+        "created": int(time.time()),
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": msg_obj,
+            "finish_reason": finish_reason,
+        }],
+        "usage": {
+            "prompt_tokens": in_tok,
+            "completion_tokens": out_tok,
+            "total_tokens": in_tok + out_tok,
+        }
+    }
+
+
+def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str = None) -> dict:
+    """Convert OpenAI ChatCompletion response object -> Anthropic Message response object.
+
+    If input `o_resp` is already an Anthropic response (type == 'message'), returns it as-is.
+    """
+    if not isinstance(o_resp, dict):
+        return o_resp
+    if o_resp.get("type") == "message" and "content" in o_resp:
+        return o_resp
+
+    choices = o_resp.get("choices") or [{}]
+    choice = choices[0] if isinstance(choices, list) and choices else {}
+    msg = choice.get("message") or {}
+
+    content = []
+
+    # Reasoning
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning")
+    if reasoning and isinstance(reasoning, str):
+        content.append({"type": "thinking", "thinking": reasoning})
+
+    # Text content
+    raw_text = msg.get("content") or ""
+    if raw_text:
+        clean_text, dsml_tools = parse_dsml_from_text(raw_text)
+        if clean_text:
+            content.append({"type": "text", "text": clean_text})
+        for dt in dsml_tools:
+            content.append(dt)
+    elif not reasoning and not msg.get("tool_calls"):
+        content.append({"type": "text", "text": ""})
+
+    # Tool calls
+    for tc in (msg.get("tool_calls") or []):
+        if not isinstance(tc, dict):
+            continue
+        fn = tc.get("function") or {}
+        raw_args = fn.get("arguments") or "{}"
+        if isinstance(raw_args, dict):
+            args = raw_args
+        else:
+            try:
+                args = json.loads(raw_args)
+            except Exception:
+                args = {"raw": str(raw_args)}
+        content.append({
+            "type": "tool_use",
+            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}",
+            "name": fn.get("name") or "",
+            "input": args,
+        })
+
+    finish_map = {
+        "stop": "end_turn",
+        "length": "max_tokens",
+        "tool_calls": "tool_use",
+        "content_filter": "refusal",
+    }
+    finish_reason = choice.get("finish_reason")
+    stop_reason = "tool_use" if any(c.get("type") == "tool_use" for c in content) else finish_map.get(finish_reason, "end_turn")
+
+    u = o_resp.get("usage") or {}
+    prompt_tok = u.get("prompt_tokens") or u.get("input_tokens") or 0
+    comp_tok = u.get("completion_tokens") or u.get("output_tokens") or 0
+    cached_tok = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+
+    res_model = o_resp.get("model") or model or ""
+    res_id = request_id or o_resp.get("id") or f"msg_{int(time.time() * 1000)}"
+
+    return {
+        "id": str(res_id) if str(res_id).startswith("msg_") else f"msg_{res_id}",
+        "type": "message",
+        "role": "assistant",
+        "model": res_model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": prompt_tok,
+            "output_tokens": comp_tok,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": cached_tok,
+        }
+    }
+
+
+async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
+    """Async generator: consume Anthropic SSE stream, yield OpenAI Chat SSE events."""
+    msg_id = f"chatcmpl-{int(time.time() * 1000)}"
+
+    async def iter_lines():
+        buffer = ""
+        async for chunk in anthropic_stream:
+            chunk_text = chunk.decode("utf-8", errors="replace") if isinstance(chunk, (bytes, bytearray)) else str(chunk)
+            buffer += chunk_text
+            lines = buffer.split("\n")
+            buffer = lines.pop() if lines else ""
+            for l in lines:
+                yield l
+        if buffer:
+            yield buffer
+
+    current_event = None
+    async for line in iter_lines():
+        line_str = line.strip()
+        if not line_str:
+            continue
+        if line_str.startswith("event:"):
+            current_event = line_str[6:].strip()
+            continue
+        if line_str.startswith("data:"):
+            data_str = line_str[5:].strip()
+            if not data_str:
+                continue
+            try:
+                data = json.loads(data_str)
+            except Exception:
+                continue
+
+            event_type = data.get("type") or current_event
+
+            if event_type == "content_block_delta":
+                delta = data.get("delta") or {}
+                d_type = delta.get("type")
+                if d_type == "text_delta":
+                    text = delta.get("text", "")
+                    if text:
+                        yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
+                elif d_type == "thinking_delta":
+                    thinking = delta.get("thinking", "")
+                    if thinking:
+                        yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'reasoning_content': thinking}, 'finish_reason': None}]})}\n\n"
+                elif d_type == "input_json_delta":
+                    partial = delta.get("partial_json", "")
+                    idx = data.get("index", 0)
+                    yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'function': {'arguments': partial}}]}, 'finish_reason': None}]})}\n\n"
+
+            elif event_type == "content_block_start":
+                cb = data.get("content_block") or {}
+                if cb.get("type") == "tool_use":
+                    idx = data.get("index", 0)
+                    tid = cb.get("id") or f"call_{idx}"
+                    name = cb.get("name") or ""
+                    yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'tool_calls': [{'index': idx, 'id': tid, 'type': 'function', 'function': {'name': name, 'arguments': ''}}]}, 'finish_reason': None}]})}\n\n"
+
+            elif event_type == "message_delta":
+                delta = data.get("delta") or {}
+                stop_reason = delta.get("stop_reason")
+                finish_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls", "refusal": "content_filter"}
+                finish = finish_map.get(stop_reason, "stop") if stop_reason else None
+                usage = data.get("usage") or {}
+                oai_usage = {
+                    "prompt_tokens": usage.get("input_tokens", 0),
+                    "completion_tokens": usage.get("output_tokens", 0),
+                    "total_tokens": usage.get("input_tokens", 0) + usage.get("output_tokens", 0),
+                } if usage else None
+                out_chunk = {
+                    'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model,
+                    'choices': [{'index': 0, 'delta': {}, 'finish_reason': finish}],
+                }
+                if oai_usage:
+                    out_chunk["usage"] = oai_usage
+                yield f"data: {json.dumps(out_chunk)}\n\n"
+
+            elif event_type == "message_stop":
+                yield "data: [DONE]\n\n"

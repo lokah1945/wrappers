@@ -17,6 +17,9 @@ from .shared import (
     sanitize_header_value,
     FORWARD_HEADER_ALLOWLIST,
     HOP_BY_HOP_HEADERS,
+    anthropic_to_openai_response,
+    openai_to_anthropic_response,
+    stream_anthropic_to_openai,
 )
 
 __all__ = [
@@ -32,4 +35,7 @@ __all__ = [
     "sanitize_header_value",
     "FORWARD_HEADER_ALLOWLIST",
     "HOP_BY_HOP_HEADERS",
+    "anthropic_to_openai_response",
+    "openai_to_anthropic_response",
+    "stream_anthropic_to_openai",
 ]

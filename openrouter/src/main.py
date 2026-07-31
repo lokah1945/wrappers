@@ -151,6 +151,9 @@ try:
         should_cooldown_key as _should_cooldown_key,
         build_forward_headers as _build_forward_headers,
         sanitize_header_value,
+        anthropic_to_openai_response,
+        openai_to_anthropic_response,
+        stream_anthropic_to_openai,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -793,7 +796,16 @@ async def chat_completions(request: Request):
         return blocked
 
     stream = body.get("stream", False)
-    return await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
+    res = await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
+    if isinstance(res, JSONResponse) and res.status_code == 200:
+        try:
+            payload = json.loads(res.body)
+            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
+                oai_resp = anthropic_to_openai_response(payload, model)
+                return JSONResponse(oai_resp, status_code=200)
+        except Exception:
+            pass
+    return res
 
 
 @app.post("/v1/responses")
@@ -1539,6 +1551,8 @@ def _anthropic_to_openai(body: dict) -> dict:
 
 def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict:
     """Convert OpenAI ChatCompletion response → Anthropic Message response."""
+    if isinstance(openai_resp, dict) and openai_resp.get("type") == "message" and "content" in openai_resp:
+        return openai_resp
     choices = openai_resp.get("choices", [])
     choice = choices[0] if choices else {}
     message = choice.get("message", {})
