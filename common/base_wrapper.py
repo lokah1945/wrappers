@@ -499,6 +499,7 @@ class BaseWrapper:
             if not acq:
                 break
             key_obj = acq['key']
+            key_released = False  # guard: track exactly-once release (I4)
 
             # Transparent header forwarding: swap Authorization, forward everything else.
             fwd = {
@@ -524,6 +525,7 @@ class BaseWrapper:
                         text = await resp.text()
                         resp.release()
                         self.pool.release(key_obj)
+                        key_released = True  # guard: prevent double-release in outer finally
                         last_status = resp.status
                         try:
                             last_data = json.loads(text)
@@ -533,13 +535,40 @@ class BaseWrapper:
                             continue
                         return JSONResponse(last_data, status_code=resp.status)
                     # Stream passthrough with heartbeat.
+                    # CRITICAL: key ownership transfers to stream_gen() — it
+                    # releases the key in its finally block when the stream
+                    # ends. The outer finally MUST NOT release again (double-
+                    # release bug fix — see Temuan Kritis #3 in master prompt).
                     resp_ref = resp
                     released = False
+                    key_released = True  # guard: outer finally skips release for stream path
                     async def stream_gen():
                         nonlocal released
+                        # Fase 3.1: idle-aware heartbeat via asyncio.wait_for.
+                        # Fires even when upstream is completely silent (reasoning
+                        # models thinking 30+ sec). Without this, client/LB idle
+                        # timeouts kill the stream mid-turn.
+                        last_hb = time.time()
+                        at_line_boundary = True
+                        hb_interval = float(self.config.heartbeat_interval_ms) / 1000.0
                         try:
-                            async for line in resp_ref.content:
+                            aiter = resp_ref.content.__aiter__()
+                            while True:
+                                try:
+                                    line = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
+                                except asyncio.TimeoutError:
+                                    if at_line_boundary:
+                                        yield b': heartbeat\n\n'
+                                        last_hb = time.time()
+                                    continue
+                                except StopAsyncIteration:
+                                    break
                                 yield line
+                                if isinstance(line, (bytes, bytearray)) and len(line):
+                                    at_line_boundary = line.endswith(b'\n')
+                                elif line:
+                                    at_line_boundary = str(line).endswith('\n')
+                                last_hb = time.time()
                             yield b'data: [DONE]\n\n'
                         except asyncio.CancelledError:
                             raise
@@ -586,10 +615,15 @@ class BaseWrapper:
                 last_data = {'error': {'message': f'Upstream error: {type(e).__name__}: {str(e)[:500]}', 'type': 'api_error'}}
                 continue
             finally:
-                try:
-                    self.pool.release(key_obj)
-                except Exception:
-                    pass
+                # I4: exactly-once release — skip if key already released
+                # (stream path releases in stream_gen finally; error path
+                # releases inline before continue/return).
+                if not key_released:
+                    try:
+                        self.pool.release(key_obj)
+                    except Exception:
+                        pass
+                    key_released = True
 
         # All keys exhausted → 429 (not 503) so SDKs auto-retry.
         retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))

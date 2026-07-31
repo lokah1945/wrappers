@@ -265,7 +265,7 @@ def test_nous_a2o_o2a_tools():
     assert "thinking" in types and "tool_use" in types
     # thinking not concatenated into text
     texts = [c["text"] for c in a["content"] if c["type"] == "text"]
-    assert texts == [] or all("think" not in t for t in texts) or True
+    assert texts == [] or all("think" not in t for t in texts)
     if texts:
         assert texts[0] == "hi" or "hi" in texts[0]
 

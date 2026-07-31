@@ -598,6 +598,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
         if not acq:
             break
         key_obj = acq['key']
+        key_released = False  # I4: exactly-once release guard
 
         url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
 
@@ -636,6 +637,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     error_text = await resp.text()
                     resp.release()
                     pool.release(key_obj)
+                    key_released = True  # I4: mark released, skip outer finally
                     last_status = resp.status
                     try:
                         last_data = json.loads(error_text)
@@ -652,6 +654,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 heartbeat_bytes = b': heartbeat\n\n'
                 resp_ref = resp
                 released = False
+                key_released = True  # I4: stream path owns release; outer finally skips
 
                 async def stream_gen():
                     nonlocal released
@@ -754,11 +757,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                     "type": "api_error"}}
             continue
         finally:
-            # Ensure key is released for non-stream paths (stream path releases in stream_gen finally).
-            try:
-                pool.release(key_obj)
-            except Exception:
-                pass
+            # I4: exactly-once release — skip if key already released
+            # (stream path releases in stream_gen finally; stream-error path
+            # releases inline before continue/return).
+            if not key_released:
+                try:
+                    pool.release(key_obj)
+                except Exception:
+                    pass
+                key_released = True
 
     # All keys exhausted — return 429 (not 503) so SDKs auto-retry with backoff.
     retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))
