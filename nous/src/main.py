@@ -1168,10 +1168,20 @@ def anthropic_to_openai(req: dict) -> dict:
     # default 4096) — that mutates client intent.
     if req.get("max_tokens") is not None:
         out["max_tokens"] = req["max_tokens"]
-    # Forward all client params verbatim (transparent proxy).
-    for k in ("temperature", "top_p", "top_k"):
-        if req.get(k) is not None: out[k] = req[k]
-    if req.get("stop_sequences"): out["stop"] = req["stop_sequences"]
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from opencode's 15-param list for cross-wrapper normalization.
+    param_map = [
+        ('temperature', 'temperature'), ('top_p', 'top_p'), ('top_k', 'top_k'),
+        ('stop_sequences', 'stop'), ('seed', 'seed'),
+        ('parallel_tool_calls', 'parallel_tool_calls'),
+        ('frequency_penalty', 'frequency_penalty'),
+        ('presence_penalty', 'presence_penalty'),
+        ('logit_bias', 'logit_bias'), ('logprobs', 'logprobs'),
+        ('top_logprobs', 'top_logprobs'), ('response_format', 'response_format'),
+        ('service_tier', 'service_tier'), ('user', 'user'), ('metadata', 'metadata'),
+    ]
+    for src, dst in param_map:
+        if req.get(src) is not None: out[dst] = req[src]
     if req.get("tools"):
         out["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": normalize_schema(t.get("input_schema", {}))}} for t in req["tools"] if t.get("name")]
     return out

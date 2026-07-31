@@ -682,13 +682,21 @@ def anthropic_to_openai(body: dict) -> dict:
     mt = body.get('max_tokens')
     if mt is not None:
         out['max_tokens'] = mt
-    # B21 (transparency, severe): forward client sampling parameters verbatim
-    # instead of silently dropping them.
-    for k in ('temperature', 'top_p', 'top_k'):
-        if body.get(k) is not None:
-            out[k] = body[k]
-    if body.get('stop_sequences') is not None:
-        out['stop'] = body['stop_sequences']  # required rename for OpenAI shape
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from opencode's 15-param list for cross-wrapper normalization.
+    param_map = [
+        ('temperature', 'temperature'), ('top_p', 'top_p'), ('top_k', 'top_k'),
+        ('stop_sequences', 'stop'), ('seed', 'seed'),
+        ('parallel_tool_calls', 'parallel_tool_calls'),
+        ('frequency_penalty', 'frequency_penalty'),
+        ('presence_penalty', 'presence_penalty'),
+        ('logit_bias', 'logit_bias'), ('logprobs', 'logprobs'),
+        ('top_logprobs', 'top_logprobs'), ('response_format', 'response_format'),
+        ('service_tier', 'service_tier'), ('user', 'user'), ('metadata', 'metadata'),
+    ]
+    for src, dst in param_map:
+        if body.get(src) is not None:
+            out[dst] = body[src]
     tc = body.get('tool_choice')
     if tc is not None:
         if isinstance(tc, dict):

@@ -949,19 +949,19 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             msgs.insert(0, {"role": "system", "content": body['instructions']})
     msgs = _repair_orphan_tool_messages(msgs)
     out = {"model": model, "messages": msgs, "stream": bool(body.get('stream', False))}
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from nous/blackbox/openrouter's 15-param list for cross-wrapper
+    # normalization. No float() casts — let upstream validate.
     if body.get('max_output_tokens') is not None:
-        out['max_tokens'] = int(body['max_output_tokens'])
+        out['max_tokens'] = body['max_output_tokens']
     elif body.get('max_tokens') is not None:
-        out['max_tokens'] = int(body['max_tokens'])
-    for k in ('temperature', 'top_p', 'tool_choice'):
+        out['max_tokens'] = body['max_tokens']
+    for k in ('temperature', 'top_p', 'top_k', 'tool_choice', 'stop', 'seed',
+              'parallel_tool_calls', 'stream_options', 'user', 'metadata',
+              'frequency_penalty', 'presence_penalty', 'logit_bias',
+              'logprobs', 'top_logprobs', 'response_format', 'service_tier'):
         if body.get(k) is not None:
-            v = body[k]
-            if k in ('temperature', 'top_p'):
-                try:
-                    v = float(v)
-                except (TypeError, ValueError):
-                    pass
-            out[k] = v
+            out[k] = body[k]
     if body.get('tools'):
         tools = []
         for t in body['tools']:

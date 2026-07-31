@@ -407,26 +407,29 @@ def build_chat_body(body: dict, model: str, translate_thinking_to_nim) -> dict:
         'stream': bool(body.get('stream')),
     }
 
-    if body.get('temperature') is not None:
-        try:
-            chat_body['temperature'] = float(body['temperature'])
-        except (TypeError, ValueError):
-            pass
-    if body.get('top_p') is not None:
-        try:
-            chat_body['top_p'] = float(body['top_p'])
-        except (TypeError, ValueError):
-            pass
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from nous/blackbox/openrouter's 15-param list for cross-wrapper
+    # normalization. Only max_output_tokens/max_tokens get int() casting (NIM
+    # requires int); other params forwarded as-is.
     if body.get('max_output_tokens') is not None:
         try:
             chat_body['max_tokens'] = int(body['max_output_tokens'])
         except (TypeError, ValueError):
-            pass
+            chat_body['max_tokens'] = body['max_output_tokens']
     elif body.get('max_tokens') is not None:
         try:
             chat_body['max_tokens'] = int(body['max_tokens'])
         except (TypeError, ValueError):
-            pass
+            chat_body['max_tokens'] = body['max_tokens']
+    # temperature/top_p: forward verbatim (no float() cast — let upstream validate)
+    for k in ('temperature', 'top_p', 'top_k', 'seed', 'parallel_tool_calls',
+              'frequency_penalty', 'presence_penalty', 'logit_bias', 'logprobs',
+              'top_logprobs', 'response_format', 'service_tier', 'user',
+              'metadata', 'stream_options'):
+        if body.get(k) is not None:
+            chat_body[k] = body[k]
+    if body.get('stop') is not None:
+        chat_body['stop'] = body['stop']
 
     tools = convert_tools(body.get('tools'))
     if tools:

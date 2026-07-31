@@ -343,11 +343,24 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
     if a.get('max_tokens') is not None:
         oai['max_tokens'] = a['max_tokens']
 
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from opencode's 15-param list for cross-wrapper normalization.
     param_map = [
         ('temperature', 'temperature'),
         ('top_p', 'top_p'),
         ('top_k', 'top_k'),
         ('stop_sequences', 'stop'),
+        ('seed', 'seed'),
+        ('parallel_tool_calls', 'parallel_tool_calls'),
+        ('frequency_penalty', 'frequency_penalty'),
+        ('presence_penalty', 'presence_penalty'),
+        ('logit_bias', 'logit_bias'),
+        ('logprobs', 'logprobs'),
+        ('top_logprobs', 'top_logprobs'),
+        ('response_format', 'response_format'),
+        ('service_tier', 'service_tier'),
+        ('user', 'user'),
+        ('metadata', 'metadata'),
     ]
     for src, dst in param_map:
         if a.get(src) is not None:

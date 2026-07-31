@@ -669,22 +669,29 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                             pool.release(key_obj)
 
                 async def stream_with_heartbeat():
-                    # Heartbeat injection: keep connection alive during upstream
-                    # idle (reasoning models, long generations). Without this,
-                    # clients/LBs with idle timeouts kill the stream mid-turn.
+                    # Idle-aware heartbeat: fires even when upstream is silent
+                    # (reasoning models thinking 30+ sec). Uses sentinel-task
+                    # pattern via asyncio.wait_for on the upstream iterator.
                     last_hb = time.time()
                     at_line_boundary = True
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
-                    async for chunk in stream_gen():
+                    inner = stream_gen()
+                    while True:
+                        try:
+                            chunk = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
+                        except asyncio.TimeoutError:
+                            if at_line_boundary:
+                                yield b': heartbeat\n\n'
+                                last_hb = time.time()
+                            continue
+                        except StopAsyncIteration:
+                            break
                         yield chunk
                         if isinstance(chunk, (bytes, bytearray)) and len(chunk):
                             at_line_boundary = chunk.endswith(b'\n')
                         elif chunk:
                             at_line_boundary = str(chunk).endswith('\n')
-                        now = time.time()
-                        if at_line_boundary and (now - last_hb) > hb_interval:
-                            yield b': heartbeat\n\n'
-                            last_hb = now
+                        last_hb = time.time()
 
                 return StreamingResponse(
                     stream_with_heartbeat(),
@@ -897,56 +904,83 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             'response': {'id': resp_id, 'status': 'in_progress'},
         })
 
-        async for chunk in openai_gen:
-            if isinstance(chunk, bytes):
-                line = chunk.decode('utf-8', errors='replace')
-            else:
-                line = chunk
+        # Buffer accumulator: upstream chunks may contain multiple SSE lines
+        # or partial lines split across chunk boundaries. Accumulate and split
+        # on \n to parse complete lines only.
+        buffer = b''
+        hb_interval = float(HEARTBEAT_MS) / 1000.0
+        done = False
 
-            if not line.startswith('data: '):
-                continue
-            data_str = line[6:].strip()
+        def _parse_line(line_str: str):
+            """Parse one complete SSE line. Returns (events_list, is_done)."""
+            nonlocal text_started, full_text
+            events = []
+            if not line_str.startswith('data: '):
+                return events, False
+            data_str = line_str[6:].strip()
             if data_str == '[DONE]':
-                break
-
+                return events, True
             try:
                 data = json.loads(data_str)
             except json.JSONDecodeError:
-                continue
-
+                return events, False
             if data.get('object') != 'chat.completion.chunk':
-                continue
+                return events, False
             choices = data.get('choices', [])
             if not choices:
-                continue
+                return events, False
             choice = choices[0]
             delta = choice.get('delta', {})
-
             if delta.get('content'):
                 if not text_started:
-                    # output_item.added (message)
-                    yield _sse('response.output_item.added', {
+                    events.append(_sse('response.output_item.added', {
                         'type': 'response.output_item.added', 'output_index': 0,
                         'item': {
                             'id': msg_id, 'type': 'message', 'status': 'in_progress',
                             'role': 'assistant', 'content': [],
                         },
-                    })
-                    # content_part.added (output_text)
-                    yield _sse('response.content_part.added', {
+                    }))
+                    events.append(_sse('response.content_part.added', {
                         'type': 'response.content_part.added', 'item_id': msg_id,
                         'output_index': 0, 'content_index': 0,
                         'part': {'type': 'output_text', 'text': '', 'annotations': []},
-                    })
+                    }))
                     text_started = True
                 full_text += delta['content']
-                yield _sse('response.output_text.delta', {
+                events.append(_sse('response.output_text.delta', {
                     'type': 'response.output_text.delta', 'item_id': msg_id,
                     'output_index': 0, 'content_index': 0, 'delta': delta['content'],
-                })
-
+                }))
             if choice.get('finish_reason'):
+                return events, True
+            return events, False
+
+        # Idle-aware iteration with heartbeat
+        inner = openai_gen.__aiter__()
+        while not done:
+            try:
+                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
+            except asyncio.TimeoutError:
+                # Upstream idle — inject heartbeat
+                yield ': heartbeat\n\n'
+                continue
+            except StopAsyncIteration:
                 break
+            if isinstance(raw, str):
+                raw = raw.encode('utf-8', errors='replace')
+            buffer += raw
+            # Split on \n, process complete lines, retain tail in buffer
+            while b'\n' in buffer:
+                line_bytes, buffer = buffer.split(b'\n', 1)
+                line_str = line_bytes.decode('utf-8', errors='replace').strip()
+                if not line_str:
+                    continue
+                events, is_done = _parse_line(line_str)
+                for ev in events:
+                    yield ev
+                if is_done:
+                    done = True
+                    break
 
         if text_started:
             # output_text.done
@@ -1460,12 +1494,23 @@ def _anthropic_to_openai(body: dict) -> dict:
     }
     if body.get("max_tokens") is not None:
         openai_body["max_tokens"] = body["max_tokens"]
-    if "temperature" in body:
-        openai_body["temperature"] = body["temperature"]
-    if "top_p" in body:
-        openai_body["top_p"] = body["top_p"]
-    if "stop_sequences" in body:
-        openai_body["stop"] = body["stop_sequences"]
+    # Forward ALL client params verbatim (transparent proxy — no silent drops).
+    # Ported from opencode's 15-param list for cross-wrapper normalization.
+    param_map = [
+        ('temperature', 'temperature'), ('top_p', 'top_p'), ('top_k', 'top_k'),
+        ('stop_sequences', 'stop'), ('seed', 'seed'),
+        ('parallel_tool_calls', 'parallel_tool_calls'),
+        ('frequency_penalty', 'frequency_penalty'),
+        ('presence_penalty', 'presence_penalty'),
+        ('logit_bias', 'logit_bias'), ('logprobs', 'logprobs'),
+        ('top_logprobs', 'top_logprobs'), ('response_format', 'response_format'),
+        ('service_tier', 'service_tier'), ('user', 'user'), ('metadata', 'metadata'),
+    ]
+    for src, dst in param_map:
+        if body.get(src) is not None:
+            openai_body[dst] = body[src]
+    # Strip Anthropic-only cache_control annotations (upstream may 400 on them).
+    _strip_cache(openai_body)
     if body.get("tools"):
         openai_body["tools"] = [
             {
@@ -1575,64 +1620,84 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
             },
         })
 
-        async for chunk in openai_gen:
-            if isinstance(chunk, bytes):
-                line = chunk.decode('utf-8', errors='replace')
-            else:
-                line = chunk
-
-            if not line.startswith('data: '):
-                continue
-            data_str = line[6:].strip()
-            if data_str == '[DONE]':
-                break
-
+        # Buffer accumulator + idle-aware heartbeat.
+        # Upstream chunks may contain multiple SSE lines or partial lines split
+        # across chunk boundaries. Accumulate and split on \n to parse complete
+        # lines only. Heartbeat fires on idle so reasoning models don't timeout.
+        buffer = b''
+        hb_interval = float(HEARTBEAT_MS) / 1000.0
+        done = False
+        inner = openai_gen.__aiter__()
+        while not done:
             try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
+                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
+            except asyncio.TimeoutError:
+                yield ': heartbeat\n\n'
                 continue
+            except StopAsyncIteration:
+                break
+            if isinstance(raw, str):
+                raw = raw.encode('utf-8', errors='replace')
+            buffer += raw
+            while b'\n' in buffer:
+                line_bytes, buffer = buffer.split(b'\n', 1)
+                line = line_bytes.decode('utf-8', errors='replace').strip()
+                if not line:
+                    continue
 
-            if data.get('object') != 'chat.completion.chunk':
-                continue
-            choices = data.get('choices', [])
-            if not choices:
-                continue
-            choice = choices[0]
-            delta = choice.get('delta', {})
-            usage_chunk = data.get('usage')
-            if usage_chunk:
-                input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
-                output_tokens = usage_chunk.get('completion_tokens', output_tokens)
+                if not line.startswith('data: '):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == '[DONE]':
+                    done = True
+                    break
 
-            # Text content
-            if delta.get('content'):
-                if not text_started:
-                    yield _sse('content_block_start', {
-                        'type': 'content_block_start', 'index': block_index,
-                        'content_block': {'type': 'text', 'text': ''},
+                try:
+                    data = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if data.get('object') != 'chat.completion.chunk':
+                    continue
+                choices = data.get('choices', [])
+                if not choices:
+                    continue
+                choice = choices[0]
+                delta = choice.get('delta', {})
+                usage_chunk = data.get('usage')
+                if usage_chunk:
+                    input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
+                    output_tokens = usage_chunk.get('completion_tokens', output_tokens)
+
+                # Text content
+                if delta.get('content'):
+                    if not text_started:
+                        yield _sse('content_block_start', {
+                            'type': 'content_block_start', 'index': block_index,
+                            'content_block': {'type': 'text', 'text': ''},
+                        })
+                        text_started = True
+                        block_open = True
+                    yield _sse('content_block_delta', {
+                        'type': 'content_block_delta', 'index': block_index,
+                        'delta': {'type': 'text_delta', 'text': delta['content']},
                     })
-                    text_started = True
-                    block_open = True
-                yield _sse('content_block_delta', {
-                    'type': 'content_block_delta', 'index': block_index,
-                    'delta': {'type': 'text_delta', 'text': delta['content']},
-                })
 
-            # Tool calls
-            if delta.get('tool_calls'):
-                for tc in delta['tool_calls']:
-                    tc_idx = tc.get('index', 0)
-                    fn = tc.get('function', {})
-                    if tc_idx not in tool_call_blocks:
-                        # Close any open text block first.
-                        if block_open and text_started:
-                            yield _sse('content_block_stop', {
-                                'type': 'content_block_stop', 'index': block_index,
-                            })
-                            block_index += 1
-                            text_started = False
-                            block_open = False
-                        tool_call_blocks[tc_idx] = block_index
+                # Tool calls
+                if delta.get('tool_calls'):
+                    for tc in delta['tool_calls']:
+                        tc_idx = tc.get('index', 0)
+                        fn = tc.get('function', {})
+                        if tc_idx not in tool_call_blocks:
+                            # Close any open text block first.
+                            if block_open and text_started:
+                                yield _sse('content_block_stop', {
+                                    'type': 'content_block_stop', 'index': block_index,
+                                })
+                                block_index += 1
+                                text_started = False
+                                block_open = False
+                            tool_call_blocks[tc_idx] = block_index
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {
@@ -1649,8 +1714,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
                         })
 
-            if choice.get('finish_reason'):
-                finish_reason = choice['finish_reason']
+                if choice.get('finish_reason'):
+                    finish_reason = choice['finish_reason']
 
         # Close any open block.
         if block_open:
