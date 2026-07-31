@@ -548,12 +548,10 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` here SHADOWED the
+# `should_cooldown_key` imported from common.translations, so cooldown policy
+# diverged silently per wrapper. The model-capacity carve-out is now part of
+# the shared implementation; this module uses it directly.
 
 
 # NB-8: strong references for fire-and-forget tasks — asyncio only keeps a weak
