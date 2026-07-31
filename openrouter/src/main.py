@@ -113,10 +113,18 @@ try:
 except ImportError:
     _HAS_SIZE_LIMITER = False
     import re as _re
+
     def sanitize_header_value(value):
         if not isinstance(value, str):
             value = str(value)
         return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
+
+# B-08 fix: shared sentinel-task idle iterator + CRLF normalisation.
+from common.sse import (  # noqa: E402
+    IDLE as _IDLE,
+    iter_chunks_with_idle as _iter_chunks_with_idle,
+    normalize_sse_newlines as _normalize_sse_newlines,
+)
 
 from dotenv import load_dotenv
 
@@ -740,29 +748,45 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                             pool.release(key_obj)
 
                 async def stream_with_heartbeat():
-                    # Idle-aware heartbeat: fires even when upstream is silent
-                    # (reasoning models thinking 30+ sec). Uses sentinel-task
-                    # pattern via asyncio.wait_for on the upstream iterator.
+                    # B-08 fix: use the shared sentinel-task iterator instead of
+                    # asyncio.wait_for. wait_for CANCELS the pending read on
+                    # timeout and its TimeoutError is indistinguishable from a
+                    # genuine socket read timeout — so a DEAD upstream was
+                    # heartbeated forever and the client hung until its own
+                    # timeout. (nous N-05 / blackbox BB-5 parity.)
                     last_hb = time.time()
                     at_line_boundary = True
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
                     inner = stream_gen()
-                    while True:
+                    try:
+                        async for chunk in _iter_chunks_with_idle(inner, hb_interval):
+                            now = time.time()
+                            if chunk is _IDLE:
+                                # Only inject a comment at a clean line boundary
+                                # so a heartbeat can never split a data: frame.
+                                if at_line_boundary and (now - last_hb) > hb_interval:
+                                    yield b': heartbeat\n\n'
+                                    last_hb = now
+                                continue
+                            yield chunk
+                            if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                                at_line_boundary = chunk.endswith(b'\n')
+                            elif chunk:
+                                at_line_boundary = str(chunk).endswith('\n')
+                            last_hb = time.time()
+                    except (GeneratorExit, asyncio.CancelledError):
+                        raise
+                    except Exception as e:
+                        # B-08: a real upstream failure must terminate the
+                        # stream visibly rather than being masked as idle.
+                        logger.warning(
+                            f'[openrouter] upstream stream error ({type(e).__name__}: {e}); finalizing')
+                        yield f': upstream-error {type(e).__name__}\n\n'.encode()
+                    finally:
                         try:
-                            chunk = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-                        except asyncio.TimeoutError:
-                            if at_line_boundary:
-                                yield b': heartbeat\n\n'
-                                last_hb = time.time()
-                            continue
-                        except StopAsyncIteration:
-                            break
-                        yield chunk
-                        if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                            at_line_boundary = chunk.endswith(b'\n')
-                        elif chunk:
-                            at_line_boundary = str(chunk).endswith('\n')
-                        last_hb = time.time()
+                            await inner.aclose()
+                        except Exception:
+                            pass
 
                 return StreamingResponse(
                     stream_with_heartbeat(),
@@ -1042,20 +1066,20 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 return events, True
             return events, False
 
-        # Idle-aware iteration with heartbeat
-        inner = openai_gen.__aiter__()
-        while not done:
-            try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
-                # Upstream idle — inject heartbeat
+        # B-08 fix: sentinel-task idle detection (see common/sse.py). The old
+        # asyncio.wait_for could not distinguish an idle upstream from a dead
+        # one, so a failed stream was heartbeated indefinitely.
+        async for raw in _iter_chunks_with_idle(openai_gen, hb_interval):
+            if done:
+                break
+            if raw is _IDLE:
                 yield ': heartbeat\n\n'
                 continue
-            except StopAsyncIteration:
-                break
             if isinstance(raw, str):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
+            # Parity fix: tolerate CRLF SSE framing (nous N-08).
+            buffer = _normalize_sse_newlines(buffer)
             # Split on \n, process complete lines, retain tail in buffer
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
@@ -1729,18 +1753,18 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
         buffer = b''
         hb_interval = float(HEARTBEAT_MS) / 1000.0
         done = False
-        inner = openai_gen.__aiter__()
-        while not done:
-            try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
+        # B-08 fix: sentinel-task idle detection (see common/sse.py).
+        async for raw in _iter_chunks_with_idle(openai_gen, hb_interval):
+            if done:
+                break
+            if raw is _IDLE:
                 yield ': heartbeat\n\n'
                 continue
-            except StopAsyncIteration:
-                break
             if isinstance(raw, str):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
+            # Parity fix: tolerate CRLF SSE framing (nous N-08).
+            buffer = _normalize_sse_newlines(buffer)
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
                 line = line_bytes.decode('utf-8', errors='replace').strip()

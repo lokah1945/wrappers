@@ -703,7 +703,15 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         })
 
     async def process_dsml(chunk):
-        nonlocal dsml_buffer, in_dsml_mode, current_tool_index, current_tool_name, current_tool_id, current_tool_input, next_index, open_idx, sent_content_block_start, sent_text_or_tool_block, real_thinking_emitted, synthetic_thinking_emitted
+        # B-18 (hygiene): only names actually rebound in THIS scope are
+        # declared. The removed names (sent_content_block_start,
+        # real_thinking_emitted, synthetic_thinking_emitted) are mutated by the
+        # sibling closures emit_text/emit_thinking_start/emit_synthetic_thinking,
+        # which declare them correctly — so behaviour is unchanged; these were
+        # redundant declarations, not a state-desync bug.
+        nonlocal dsml_buffer, in_dsml_mode, current_tool_index, current_tool_name
+        nonlocal current_tool_id, current_tool_input, next_index, open_idx
+        nonlocal sent_text_or_tool_block
         dsml_buffer += chunk
 
         while True:
@@ -794,7 +802,9 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
             break
 
     async def parse_and_emit(chunk, is_reasoning):
-        nonlocal in_dsml_mode, completed_thinking, in_think_tag, thinking_index, open_idx, next_index, sent_content_block_start, sent_text_or_tool_block, real_thinking_emitted, synthetic_thinking_emitted, generated_chars
+        # B-18 (hygiene): this scope only rebinds these three; the rest are
+        # mutated by sibling closures that declare them properly.
+        nonlocal in_dsml_mode, completed_thinking, in_think_tag
         if in_dsml_mode:
             async for c in process_dsml(chunk):
                 yield c
