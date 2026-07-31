@@ -1704,6 +1704,8 @@ async def responses(request: Request):
                                 last_hb = time.time()
                             continue
                         buffer += chunk
+                        if b"\r" in buffer:  # CRLF parity (nous N-08)
+                            buffer = buffer.replace(b"\r\n", b"\n")
                         while b"\n" in buffer:
                             line, buffer = buffer.split(b"\n", 1)
                             line = line.strip()
@@ -1839,6 +1841,11 @@ async def anthropic_messages(request: Request):
                                 last_hb = time.time()
                             continue
                         buf += chunk
+                        # CRLF parity (nous N-08): normalise \r\n framing so a
+                        # CRLF upstream streams incrementally instead of
+                        # buffering the whole response until EOF.
+                        if b"\r" in buf:
+                            buf = buf.replace(b"\r\n", b"\n")
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
                             line = line.strip()

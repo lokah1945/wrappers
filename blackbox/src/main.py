@@ -1521,6 +1521,8 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
                     last_hb = now
                 continue
             buffer += chunk
+            if b'\r' in buffer:  # CRLF parity (nous N-08)
+                buffer = buffer.replace(b'\r\n', b'\n')
             while b'\n' in buffer:
                 line, buffer = buffer.split(b'\n', 1)
                 line = line.strip()
@@ -1680,6 +1682,9 @@ async def anthropic_messages(request: Request):
                                 last_hb = now
                             continue
                         buf += chunk
+                        # CRLF parity (nous N-08).
+                        if b'\r' in buf:
+                            buf = buf.replace(b'\r\n', b'\n')
                         while b'\n' in buf:
                             line, buf = buf.split(b'\n', 1)
                             line = line.strip()

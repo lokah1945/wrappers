@@ -481,6 +481,30 @@ def _spawn_background(coro, label: str = 'bg'):
     return task
 
 
+async def _record_model_result(model_id: str, api_key: str, status: int, data, url: str):
+    """Persist the account-scoped upstream outcome (parity fix).
+
+    openrouter was the only wrapper that never recorded model-state
+    observations, so its models were invisible to the shared model registry
+    (MODEL_STORE / MODEL_REGISTRY_CLIENT were constructed but never written to).
+    Runs as a background task so the SQLite commit never sits on the TTFB path.
+    """
+    try:
+        if status == 200:
+            stored = await MODEL_STORE.record_status_async(
+                model_id, credential_fingerprint(api_key), 'available', status, 'OK', endpoint=url)
+        else:
+            stored = await MODEL_STORE.record_error_async(model_id, api_key, status, data, endpoint=url)
+        MODEL_REGISTRY_CLIENT.schedule_observation(
+            'openrouter', model_id,
+            stored.get('account_scope', credential_fingerprint(api_key)),
+            stored.get('state', 'unknown'), status, stored.get('reason_code', ''),
+            stored.get('reason_detail', ''), url,
+        )
+    except Exception as e:
+        logger.warning(f'[model-state] openrouter result record failed: {e}')
+
+
 async def _drain_background_tasks(timeout: float = 5.0):
     """Await outstanding background tasks during shutdown (B-35)."""
     if not _BG_TASKS:
@@ -724,6 +748,29 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
     """
     model_id = (body or {}).get("model", "") if body else ""
+
+    # Parity fix: openrouter was the ONLY wrapper with no call-plan validation
+    # and no model-identity guard (MODEL_REGISTRY / same_provider_model_id were
+    # imported but never used). Validate BEFORE spending an upstream request so
+    # a mutated/invalid model id cannot burn a key's quota, and so the
+    # "NO MODEL FALLBACK" contract is enforced here too.
+    if model_id:
+        surface = ('anthropic_messages' if '/messages' in path
+                   else ('openai_responses' if '/responses' in path else 'openai_chat'))
+        try:
+            call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
+            if not same_provider_model_id('openrouter', call_plan.model.provider_model_id, model_id):
+                return JSONResponse({"error": {
+                    "type": "server_error",
+                    "message": "Model identity changed during call-plan resolution",
+                    "code": "MODEL_ID_MUTATION"}}, status_code=500)
+        except ValueError as exc:
+            return JSONResponse({"error": {
+                "type": "invalid_request_error", "message": str(exc),
+                "code": "MODEL_CALL_PLAN_INVALID"}}, status_code=400)
+        except Exception as exc:  # registry unavailable — do not block traffic
+            logger.debug(f'[openrouter] call-plan check skipped: {exc}')
+
     attempts = max(1, pool.total_keys)
     last_status = 429
     last_data = {"error": {"message": "All keys exhausted or rate-limited", "type": "rate_limit_error"}}
@@ -776,6 +823,10 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # B-39 fix: record upstream stream failures.
                     _spawn_background(metrics.record_request(model=model_id, status_code=resp.status),
                                       'metrics-stream-err')
+                    if model_id:
+                        _spawn_background(_record_model_result(model_id, key_obj.api_key,
+                                                               resp.status, last_data, url),
+                                          'model-state')
                     last_status = resp.status
                     try:
                         last_data = json.loads(error_text)
@@ -791,6 +842,9 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 # false health. Count the stream as a request now.
                 _spawn_background(metrics.record_request(model=model_id, status_code=200),
                                   'metrics-stream')
+                if model_id:
+                    _spawn_background(_record_model_result(model_id, key_obj.api_key, 200, None, url),
+                                      'model-state')
 
                 # Heartbeat-aware streaming passthrough — keeps idle LBs/agents alive.
                 # B-23: `heartbeat_ms` / `heartbeat_bytes` were dead locals —
@@ -876,6 +930,11 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
             async with agent.request(method, url, json=body, headers=fwd, timeout=timeout) as resp:
                 await metrics.record_request(model=model_id, status_code=resp.status)
                 text = await resp.text()
+                if model_id:
+                    _spawn_background(
+                        _record_model_result(model_id, key_obj.api_key, resp.status,
+                                             None if resp.status == 200 else text, url),
+                        'model-state')
                 if resp.status >= 400:
                     # Parse Retry-After header for 429 cooldown (anti rate-limit).
                     try:
