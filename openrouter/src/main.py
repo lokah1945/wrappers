@@ -678,8 +678,13 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     stream_with_heartbeat(),
                     status_code=resp.status,
                     media_type="text/event-stream",
-                    headers={k: sanitize_header_value(v) for k, v in resp.headers.items()
-                             if k.lower() not in ('content-encoding', 'content-length', 'transfer-encoding')},
+                    headers={
+                        **{k: sanitize_header_value(v) for k, v in resp.headers.items()
+                           if k.lower() not in ('content-encoding', 'content-length', 'transfer-encoding')},
+                        "Cache-Control": "no-cache",
+                        "Connection": "keep-alive",
+                        "X-Accel-Buffering": "no",
+                    },
                 )
 
             # Non-streaming
@@ -817,7 +822,12 @@ async def responses(request: Request):
         return StreamingResponse(
             _translate_openai_stream_to_responses(response.body_iterator, model),
             media_type="text/event-stream",
-            headers={"x-request-id": response.headers.get("x-request-id", "")},
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "x-request-id": response.headers.get("x-request-id", ""),
+            },
         )
 
     # Non-streaming: translate Chat Completions JSON → Responses JSON.
@@ -843,79 +853,164 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
       response.content_part.added → response.output_text.delta →
       response.output_text.done → response.content_part.done →
       response.output_item.done → response.completed → [DONE]
+
+    CRITICAL: each SSE event MUST be yielded as a SINGLE string with the
+    `\n\n` terminator inline. Splitting `event:` and `data:` into separate
+    yields causes Starlette to flush them as separate HTTP chunks; the client
+    receives a partial frame and surfaces it as raw text.
     """
     resp_id = f"resp_{int(time.time()*1000)}"
     created_at = int(time.time())
-
-    # response.created
-    yield 'event: response.created\n'
-    yield f'data: {json.dumps({"type": "response.created", "response": {"id": resp_id, "object": "response", "created_at": created_at, "model": model, "status": "in_progress", "output": []}})}\n\n'
-
-    # response.in_progress
-    yield 'event: response.in_progress\n'
-    yield f'data: {json.dumps({"type": "response.in_progress", "response": {"id": resp_id, "status": "in_progress"}})}\n\n'
-
     msg_id = f"msg_{int(time.time()*1000)}"
     text_started = False
     full_text = ''
 
-    async for chunk in openai_gen:
-        if isinstance(chunk, bytes):
-            line = chunk.decode('utf-8', errors='replace')
-        else:
-            line = chunk
+    def _sse(event_type: str, payload: dict) -> str:
+        """Build a complete SSE frame: event:\ndata:\n\n"""
+        return f'event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
 
-        if not line.startswith('data: '):
-            continue
-        data_str = line[6:].strip()
-        if data_str == '[DONE]':
-            break
+    try:
+        # response.created
+        yield _sse('response.created', {
+            'type': 'response.created',
+            'response': {
+                'id': resp_id, 'object': 'response', 'created_at': created_at,
+                'model': model, 'status': 'in_progress', 'output': [],
+            },
+        })
 
+        # response.in_progress
+        yield _sse('response.in_progress', {
+            'type': 'response.in_progress',
+            'response': {'id': resp_id, 'status': 'in_progress'},
+        })
+
+        async for chunk in openai_gen:
+            if isinstance(chunk, bytes):
+                line = chunk.decode('utf-8', errors='replace')
+            else:
+                line = chunk
+
+            if not line.startswith('data: '):
+                continue
+            data_str = line[6:].strip()
+            if data_str == '[DONE]':
+                break
+
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+            if data.get('object') != 'chat.completion.chunk':
+                continue
+            choices = data.get('choices', [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get('delta', {})
+
+            if delta.get('content'):
+                if not text_started:
+                    # output_item.added (message)
+                    yield _sse('response.output_item.added', {
+                        'type': 'response.output_item.added', 'output_index': 0,
+                        'item': {
+                            'id': msg_id, 'type': 'message', 'status': 'in_progress',
+                            'role': 'assistant', 'content': [],
+                        },
+                    })
+                    # content_part.added (output_text)
+                    yield _sse('response.content_part.added', {
+                        'type': 'response.content_part.added', 'item_id': msg_id,
+                        'output_index': 0, 'content_index': 0,
+                        'part': {'type': 'output_text', 'text': '', 'annotations': []},
+                    })
+                    text_started = True
+                full_text += delta['content']
+                yield _sse('response.output_text.delta', {
+                    'type': 'response.output_text.delta', 'item_id': msg_id,
+                    'output_index': 0, 'content_index': 0, 'delta': delta['content'],
+                })
+
+            if choice.get('finish_reason'):
+                break
+
+        if text_started:
+            # output_text.done
+            yield _sse('response.output_text.done', {
+                'type': 'response.output_text.done', 'item_id': msg_id,
+                'output_index': 0, 'content_index': 0, 'text': full_text,
+            })
+            # content_part.done
+            yield _sse('response.content_part.done', {
+                'type': 'response.content_part.done', 'item_id': msg_id,
+                'output_index': 0, 'content_index': 0,
+                'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
+            })
+            # output_item.done
+            yield _sse('response.output_item.done', {
+                'type': 'response.output_item.done', 'output_index': 0,
+                'item': {
+                    'id': msg_id, 'type': 'message', 'status': 'completed',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+                },
+            })
+
+        # response.completed
+        yield _sse('response.completed', {
+            'type': 'response.completed',
+            'response': {
+                'id': resp_id, 'object': 'response', 'created_at': created_at,
+                'model': model, 'status': 'completed',
+                'output': [{
+                    'id': msg_id, 'type': 'message', 'status': 'completed',
+                    'role': 'assistant',
+                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+                }],
+            },
+        })
+
+        yield 'data: [DONE]\n\n'
+
+    except Exception as e:
+        logger.error(f'[openrouter] responses stream translation error: {e}')
+        # Ensure terminal events are always emitted.
         try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
-
-        if data.get('object') != 'chat.completion.chunk':
-            continue
-        choices = data.get('choices', [])
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = choice.get('delta', {})
-
-        if delta.get('content'):
-            if not text_started:
-                # output_item.added (message)
-                yield 'event: response.output_item.added\n'
-                yield f'data: {json.dumps({"type": "response.output_item.added", "output_index": 0, "item": {"id": msg_id, "type": "message", "status": "in_progress", "role": "assistant", "content": []}})}\n\n'
-                # content_part.added (output_text)
-                yield 'event: response.content_part.added\n'
-                yield f'data: {json.dumps({"type": "response.content_part.added", "item_id": msg_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": []}})}\n\n'
-                text_started = True
-            full_text += delta['content']
-            yield 'event: response.output_text.delta\n'
-            yield f'data: {json.dumps({"type": "response.output_text.delta", "item_id": msg_id, "output_index": 0, "content_index": 0, "delta": delta["content"]})}\n\n'
-
-        if choice.get('finish_reason'):
-            break
-
-    if text_started:
-        # output_text.done
-        yield 'event: response.output_text.done\n'
-        yield f'data: {json.dumps({"type": "response.output_text.done", "item_id": msg_id, "output_index": 0, "content_index": 0, "text": full_text})}\n\n'
-        # content_part.done
-        yield 'event: response.content_part.done\n'
-        yield f'data: {json.dumps({"type": "response.content_part.done", "item_id": msg_id, "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": full_text, "annotations": []}})}\n\n'
-        # output_item.done
-        yield 'event: response.output_item.done\n'
-        yield f'data: {json.dumps({"type": "response.output_item.done", "output_index": 0, "item": {"id": msg_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": full_text, "annotations": []}]}})}\n\n'
-
-    # response.completed
-    yield 'event: response.completed\n'
-    yield f'data: {json.dumps({"type": "response.completed", "response": {"id": resp_id, "object": "response", "created_at": created_at, "model": model, "status": "completed", "output": [{"id": msg_id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": full_text, "annotations": []}]}]}})}\n\n'
-
-    yield 'data: [DONE]\n\n'
+            if text_started:
+                yield _sse('response.output_text.done', {
+                    'type': 'response.output_text.done', 'item_id': msg_id,
+                    'output_index': 0, 'content_index': 0, 'text': full_text,
+                })
+                yield _sse('response.content_part.done', {
+                    'type': 'response.content_part.done', 'item_id': msg_id,
+                    'output_index': 0, 'content_index': 0,
+                    'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
+                })
+                yield _sse('response.output_item.done', {
+                    'type': 'response.output_item.done', 'output_index': 0,
+                    'item': {
+                        'id': msg_id, 'type': 'message', 'status': 'completed',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+                    },
+                })
+            yield _sse('response.completed', {
+                'type': 'response.completed',
+                'response': {
+                    'id': resp_id, 'object': 'response', 'created_at': created_at,
+                    'model': model, 'status': 'completed',
+                    'output': [{
+                        'id': msg_id, 'type': 'message', 'status': 'completed',
+                        'role': 'assistant',
+                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+                    }],
+                },
+            })
+            yield 'data: [DONE]\n\n'
+        except Exception:
+            pass
 
 
 @app.post("/v1/embeddings")
@@ -1056,7 +1151,12 @@ async def messages(request: Request):
         return StreamingResponse(
             _translate_openai_stream_to_anthropic(response.body_iterator, body),
             media_type="text/event-stream",
-            headers={"x-request-id": response.headers.get("x-request-id", "")},
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+                "x-request-id": response.headers.get("x-request-id", ""),
+            },
         )
 
     # Non-streaming JSON: translate OpenAI ChatCompletion → Anthropic Message.
@@ -1429,12 +1529,19 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
 
     Emits: message_start → content_block_start → content_block_delta(s) →
     content_block_stop → message_delta → message_stop.
+
+    CRITICAL: each SSE event MUST be yielded as a SINGLE string with the
+    `\n\n` terminator inline. Splitting `event:` and `data:` into separate
+    yields causes Starlette to flush them as separate HTTP chunks; the client
+    receives a partial frame (`event: ...\n` with no data and no blank-line
+    terminator) and surfaces it as raw text (Claude Code bug).
     """
     msg_id = f"msg_{int(time.time()*1000)}"
     model = request_body.get("model", "")
-    # message_start
-    yield 'event: message_start\n'
-    yield f'data: {json.dumps({"type": "message_start", "message": {"id": msg_id, "type": "message", "role": "assistant", "model": model, "content": [], "stop_reason": None, "stop_sequence": None, "usage": {"input_tokens": 0, "output_tokens": 0}}})}\n\n'
+
+    def _sse(event_type: str, payload: dict) -> str:
+        """Build a complete SSE frame: event:\ndata:\n\n"""
+        return f'event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
 
     block_open = False
     block_index = 0
@@ -1444,82 +1551,129 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     output_tokens = 0
     input_tokens = 0
 
-    async for chunk in openai_gen:
-        if isinstance(chunk, bytes):
-            line = chunk.decode('utf-8', errors='replace')
-        else:
-            line = chunk
+    try:
+        # message_start (always first)
+        yield _sse('message_start', {
+            'type': 'message_start',
+            'message': {
+                'id': msg_id, 'type': 'message', 'role': 'assistant',
+                'model': model, 'content': [],
+                'stop_reason': None, 'stop_sequence': None,
+                'usage': {'input_tokens': 0, 'output_tokens': 0},
+            },
+        })
 
-        if not line.startswith('data: '):
-            continue
-        data_str = line[6:].strip()
-        if data_str == '[DONE]':
-            break
+        async for chunk in openai_gen:
+            if isinstance(chunk, bytes):
+                line = chunk.decode('utf-8', errors='replace')
+            else:
+                line = chunk
 
-        try:
-            data = json.loads(data_str)
-        except json.JSONDecodeError:
-            continue
+            if not line.startswith('data: '):
+                continue
+            data_str = line[6:].strip()
+            if data_str == '[DONE]':
+                break
 
-        if data.get('object') != 'chat.completion.chunk':
-            continue
-        choices = data.get('choices', [])
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = choice.get('delta', {})
-        usage_chunk = data.get('usage')
-        if usage_chunk:
-            input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
-            output_tokens = usage_chunk.get('completion_tokens', output_tokens)
+            try:
+                data = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
 
-        # Text content
-        if delta.get('content'):
-            if not text_started:
-                yield 'event: content_block_start\n'
-                yield f'data: {json.dumps({"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}})}\n\n'
-                text_started = True
-                block_open = True
-            yield 'event: content_block_delta\n'
-            yield f'data: {json.dumps({"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": delta["content"]}})}\n\n'
+            if data.get('object') != 'chat.completion.chunk':
+                continue
+            choices = data.get('choices', [])
+            if not choices:
+                continue
+            choice = choices[0]
+            delta = choice.get('delta', {})
+            usage_chunk = data.get('usage')
+            if usage_chunk:
+                input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
+                output_tokens = usage_chunk.get('completion_tokens', output_tokens)
 
-        # Tool calls
-        if delta.get('tool_calls'):
-            for tc in delta['tool_calls']:
-                tc_idx = tc.get('index', 0)
-                fn = tc.get('function', {})
-                if tc_idx not in tool_call_blocks:
-                    # Close any open text block first.
-                    if block_open and text_started:
-                        yield 'event: content_block_stop\n'
-                        yield f'data: {json.dumps({"type": "content_block_stop", "index": block_index})}\n\n'
-                        block_index += 1
-                        text_started = False
-                        block_open = False
-                    tool_call_blocks[tc_idx] = block_index
-                    yield 'event: content_block_start\n'
-                    yield f'data: {json.dumps({"type": "content_block_start", "index": block_index, "content_block": {"type": "tool_use", "id": tc.get("id", f"toolu_{block_index}"), "name": fn.get("name", ""), "input": {}}})}\n\n'
+            # Text content
+            if delta.get('content'):
+                if not text_started:
+                    yield _sse('content_block_start', {
+                        'type': 'content_block_start', 'index': block_index,
+                        'content_block': {'type': 'text', 'text': ''},
+                    })
+                    text_started = True
                     block_open = True
-                if fn.get('arguments'):
-                    yield 'event: content_block_delta\n'
-                    yield f'data: {json.dumps({"type": "content_block_delta", "index": tool_call_blocks[tc_idx], "delta": {"type": "input_json_delta", "partial_json": fn["arguments"]}})}\n\n'
+                yield _sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': block_index,
+                    'delta': {'type': 'text_delta', 'text': delta['content']},
+                })
 
-        if choice.get('finish_reason'):
-            finish_reason = choice['finish_reason']
+            # Tool calls
+            if delta.get('tool_calls'):
+                for tc in delta['tool_calls']:
+                    tc_idx = tc.get('index', 0)
+                    fn = tc.get('function', {})
+                    if tc_idx not in tool_call_blocks:
+                        # Close any open text block first.
+                        if block_open and text_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': block_index,
+                            })
+                            block_index += 1
+                            text_started = False
+                            block_open = False
+                        tool_call_blocks[tc_idx] = block_index
+                        yield _sse('content_block_start', {
+                            'type': 'content_block_start', 'index': block_index,
+                            'content_block': {
+                                'type': 'tool_use',
+                                'id': tc.get('id', f'toolu_{block_index}'),
+                                'name': fn.get('name', ''),
+                                'input': {},
+                            },
+                        })
+                        block_open = True
+                    if fn.get('arguments'):
+                        yield _sse('content_block_delta', {
+                            'type': 'content_block_delta', 'index': tool_call_blocks[tc_idx],
+                            'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
+                        })
 
-    # Close any open block.
-    if block_open:
-        yield 'event: content_block_stop\n'
-        yield f'data: {json.dumps({"type": "content_block_stop", "index": block_index})}\n\n'
+            if choice.get('finish_reason'):
+                finish_reason = choice['finish_reason']
 
-    stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
-                   "content_filter": "end_turn"}.get(finish_reason, "end_turn")
+        # Close any open block.
+        if block_open:
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': block_index,
+            })
 
-    yield 'event: message_delta\n'
-    yield f'data: {json.dumps({"type": "message_delta", "delta": {"stop_reason": stop_reason, "stop_sequence": None}, "usage": {"output_tokens": output_tokens}})}\n\n'
+        stop_reason = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use',
+                       'content_filter': 'end_turn'}.get(finish_reason, 'end_turn')
 
-    yield 'event: message_stop\n'
-    yield f'data: {json.dumps({"type": "message_stop"})}\n\n'
+        yield _sse('message_delta', {
+            'type': 'message_delta',
+            'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
+            'usage': {'output_tokens': output_tokens},
+        })
+
+        yield _sse('message_stop', {'type': 'message_stop'})
+
+    except Exception as e:
+        logger.error(f'[openrouter] anthropic stream translation error: {e}')
+        # Ensure terminal events are always emitted so the client doesn't hang.
+        if block_open:
+            try:
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
+            except Exception:
+                pass
+        try:
+            yield _sse('message_delta', {
+                'type': 'message_delta',
+                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+                'usage': {'output_tokens': output_tokens},
+            })
+            yield _sse('message_stop', {'type': 'message_stop'})
+        except Exception:
+            pass
 
 
 # ══════════════════════════════════════════════════════════════════════════
