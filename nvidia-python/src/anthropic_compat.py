@@ -1102,15 +1102,22 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         capture['errored'] = True
         capture['errorMessage'] = error_message or 'upstream connection error'
         # Still close the Anthropic SSE cleanly so Claude Code / SDKs do not hang mid-turn
+        # B-13 fix: do NOT fabricate model text from a transport error. Emitting
+        # "[upstream stream error: ...]" as a text_delta made the client persist
+        # an infrastructure failure as the assistant's answer, with no way to
+        # detect it or retry. Emit a real Anthropic `error` event instead.
+        yield _sse('error', {
+            'type': 'error',
+            'error': {'type': 'api_error',
+                      'message': f'upstream stream error: {str(error_message)[:2000]}'},
+        })
         if not sent_text_or_tool_block:
+            # Still open+close an empty text block so SDKs that require at least
+            # one content block do not choke on the envelope.
             empty_idx = next_index
             yield _sse('content_block_start', {
                 'type': 'content_block_start', 'index': empty_idx,
                 'content_block': {'type': 'text', 'text': ''},
-            })
-            yield _sse('content_block_delta', {
-                'type': 'content_block_delta', 'index': empty_idx,
-                'delta': {'type': 'text_delta', 'text': f'[upstream stream error: {error_message}]'},
             })
             yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
         yield _sse('message_delta', {

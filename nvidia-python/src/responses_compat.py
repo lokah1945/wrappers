@@ -673,8 +673,25 @@ class ResponsesHandler:
                 import logging
                 logging.getLogger('responses').error(f"[responses:nim stream] {e}")
 
+            # B-13 fix: NEVER inject a transport error as model output. The old
+            # code emitted "[upstream stream error: ...]" as an
+            # output_text.delta, so an infrastructure failure was persisted by
+            # the client as a successful assistant answer and could not be
+            # retried. Emit response.failed instead (blackbox B20 parity).
+            if stream_error and not acc_text and not has_tool:
+                yield emit({
+                    'type': 'response.failed', 'sequence_number': next_seq(),
+                    'response': {
+                        'id': resp_id, 'object': 'response', 'model': model,
+                        'status': 'failed',
+                        'error': {'code': 'upstream_error',
+                                  'message': f'upstream stream error: {str(stream_error)[:2000]}'},
+                    },
+                })
+                yield 'data: [DONE]\n\n'
+                return
             if not acc_text and not has_tool:
-                acc_text = f"[upstream stream error: {stream_error}]" if stream_error else '[No text response; the model returned no visible text.]'
+                acc_text = '[No text response; the model returned no visible text.]'
                 yield emit({
                     'type': 'response.output_text.delta', 'sequence_number': next_seq(),
                     'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,

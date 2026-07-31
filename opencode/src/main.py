@@ -1860,8 +1860,21 @@ async def anthropic_messages(request: Request):
                     # upstream closed without [DONE]
                     for ev in state.force_done():
                         yield ev
+                except (GeneratorExit, asyncio.CancelledError):
+                    # B-09 parity: no yields during generator finalization.
+                    raise
                 except Exception as e:
                     logger.error(f'[anthropic stream] {e}')
+                    # B-07 fix: surface the failure instead of fabricating a
+                    # successful end_turn (nous N-05 parity).
+                    try:
+                        yield ('event: error\ndata: ' + json.dumps({
+                            'type': 'error',
+                            'error': {'type': 'api_error',
+                                      'message': f'upstream stream error: {str(e)[:2000]}'},
+                        }, ensure_ascii=False) + '\n\n')
+                    except Exception:
+                        pass
                     for ev in state.force_done():
                         yield ev
                 finally:

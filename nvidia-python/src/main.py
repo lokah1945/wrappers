@@ -2305,6 +2305,17 @@ class Server:
                 if len(stream_buffer) > max_buffer:
                     stream_buffer = stream_buffer[-max_buffer:]
 
+                # B-12 fix: this is an OpenAI-SSE surface. If the upstream (or
+                # a relay) emits Anthropic-style frames, forwarding them
+                # verbatim leaks protocol text into the client's rendered
+                # output (same failure class as the nous B-10 leak). Detect and
+                # drop foreign frames rather than passing them through.
+                if 'event:' in chunk_str and '"type"' in chunk_str and 'chat.completion' not in chunk_str:
+                    logger.warning(
+                        '[stream] dropping non-OpenAI SSE frame on chat surface: %r',
+                        chunk_str[:200])
+                    continue
+
                 yield chunk_str
         except Exception as e:
             stream_error = e

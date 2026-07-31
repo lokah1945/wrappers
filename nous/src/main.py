@@ -1263,6 +1263,29 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
 # --------------------------------------------------------------------------
 # STREAMING WITH HEARTBEAT + PROPER STATE MACHINES (FIXED for Hermes/Codex)
 # --------------------------------------------------------------------------
+def _responses_sse_serialize(x):
+    """B-11 fix: SSE serializer for the Responses surface.
+
+    Guarantees a well-formed frame for any event shape. The previous
+    `lambda x: x if isinstance(x, str) else str(x)` emitted a Python repr for
+    dict events — single-quoted, non-JSON — which Codex cannot parse and may
+    surface as raw text.
+    """
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        # Support both {"type":..., "data":{...}} and a bare event payload.
+        etype = x.get('type')
+        data = x.get('data') if isinstance(x.get('data'), dict) else x
+        if etype and 'type' not in data:
+            data = {**data, 'type': etype}
+        if etype:
+            return f"event: {etype}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    logger.warning(f"[responses] unexpected SSE event type {type(x).__name__}; dropping")
+    return ""
+
+
 async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                                 serialize_fn,
                                 state=None,
@@ -1530,9 +1553,15 @@ class AnthropicStreamState:
             if self.current_block is not None:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             fr = ch.get("finish_reason")
-            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
-                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
-            )
+            # B-06 fix: map STRICTLY from finish_reason. Forcing tool_use
+            # whenever any tool had been seen made Claude Code wait for a
+            # tool_result that would never be requested, and masked genuine
+            # max_tokens truncation as tool_use.
+            stop = {
+                "stop": "end_turn", "length": "max_tokens",
+                "tool_calls": "tool_use", "function_call": "tool_use",
+                "content_filter": "refusal",
+            }.get(fr, "end_turn")
             events.append({"type": "message_delta", "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -1554,10 +1583,14 @@ class AnthropicStreamState:
                 "content": [], "stop_reason": None, "stop_sequence": None,
                 "usage": self._usage(),
             }}})
+        # B-06: capture before clearing.
+        was_in_tool_block = (self.current_block == "tool_use")
         if self.current_block is not None:
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             self.current_block = None
-        stop = "tool_use" if self.tool_map else "end_turn"
+        # B-06: this is the no-finish_reason path, so inferring from tool state
+        # is legitimate — but narrow it to a tool block that was still open.
+        stop = "tool_use" if (self.tool_map and was_in_tool_block) else "end_turn"
         events.append({"type": "message_delta", "data": {
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -2512,7 +2545,11 @@ async def responses(request: Request):
             for ev in state.start():
                 yield ev
             try:
-                async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
+                # B-11 fix: the old serializer was `str(x)` for non-str events,
+                # which writes a Python repr ({'type': ...} with single quotes)
+                # into the SSE body — invalid JSON that Codex either ignores or
+                # renders as text. Emit a proper event:/data: frame instead.
+                async for line in stream_with_heartbeat(result, _responses_sse_serialize, state=state, key_entry=key_entry):
                     yield line
             finally:
                 # BUG-FIX: store conversation without blocking stream

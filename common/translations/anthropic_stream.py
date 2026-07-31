@@ -16,8 +16,24 @@ as the upstream stream transitions between them.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import List, Optional
+
+_log = logging.getLogger("wrapper-anthropic-stream")
+
+# B-06 fix: strict OpenAI finish_reason → Anthropic stop_reason mapping.
+# Previously `tool_use` was forced whenever ANY tool had been seen in the turn,
+# so a turn that called a tool and then finished with "stop" or "length" still
+# reported tool_use — Claude Code then waited forever for a tool_result that
+# would never be requested, and genuine max_tokens truncation was masked.
+_FINISH_TO_STOP = {
+    "stop": "end_turn",
+    "length": "max_tokens",
+    "tool_calls": "tool_use",
+    "function_call": "tool_use",
+    "content_filter": "refusal",
+}
 
 
 class AnthropicStreamState:
@@ -43,6 +59,8 @@ class AnthropicStreamState:
         # CM-6: retain the last usage seen so force_done can report real
         # numbers instead of zeros on abnormal termination.
         self.last_usage: dict = {}
+        # B-05: observability counter for content dropped after finish_reason.
+        self.dropped_after_finish: int = 0
         self.msg_id: str = f"msg_{int(time.time() * 1000)}"
 
     def _sse(self, event: str, data: dict) -> str:
@@ -95,6 +113,21 @@ class AnthropicStreamState:
         if self.finished:
             if isinstance(chunk, dict) and chunk.get("usage"):
                 self.last_usage = chunk.get("usage") or {}
+            # B-05 fix: dropping post-finish content is protocol-correct, but
+            # it was previously SILENT — a truncated answer was indistinguishable
+            # from a complete one. Count and log so truncation is observable.
+            try:
+                _d = ((chunk.get("choices") or [{}])[0].get("delta") or {}) if isinstance(chunk, dict) else {}
+                if _d.get("content") or _d.get("reasoning_content") or _d.get("reasoning") or _d.get("tool_calls"):
+                    self.dropped_after_finish += 1
+                    _log.warning(
+                        "[anthropic_stream] dropped content chunk received AFTER finish_reason "
+                        "(model=%s, total_dropped=%d) — upstream is still emitting past its own "
+                        "terminal signal; the client answer may be truncated.",
+                        self.model, self.dropped_after_finish,
+                    )
+            except Exception:
+                pass
             return []
         events = self.start_events()
         if not isinstance(chunk, dict) or "choices" not in chunk:
@@ -175,9 +208,9 @@ class AnthropicStreamState:
         if fr and not self.finished:
             self.finished = True
             events.extend(self._close_block())
-            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
-                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
-            )
+            # B-06 fix: map STRICTLY from finish_reason. Do not infer tool_use
+            # merely because self.tool_map is non-empty.
+            stop = _FINISH_TO_STOP.get(fr, "end_turn")
             usage = chunk.get("usage") or self.last_usage or {}
             events.append(self._sse("message_delta", {
                 "type": "message_delta",
@@ -201,8 +234,16 @@ class AnthropicStreamState:
         events: List[str] = []
         if not self.message_started:
             events.extend(self.start_events())
+        # Capture BEFORE _close_block() clears it.
+        was_in_tool_block = (self.current_block == "tool_use")
         events.extend(self._close_block())
-        if self.tool_map and stop == "end_turn":
+        # B-06 note: inferring tool_use from tool state is legitimate HERE and
+        # only here — force_done() runs when the upstream ended WITHOUT any
+        # finish_reason, so there is no authoritative signal to respect. The
+        # bug fixed in translate_chunk() was overriding an explicit
+        # finish_reason. Narrow the heuristic to the case where the stream died
+        # while a tool_use block was still open (arguments mid-flight).
+        if stop == "end_turn" and self.tool_map and was_in_tool_block:
             stop = "tool_use"
         usage = self.last_usage or {}
         events.append(self._sse("message_delta", {
