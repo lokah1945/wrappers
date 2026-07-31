@@ -1476,6 +1476,9 @@ class AnthropicStreamState:
         self.message_started = False
         self.current_block = None
         self.tool_map = {}
+        # R-02: Anthropic indices of tool_use blocks still open. Parallel tool
+        # calls must remain open CONCURRENTLY (see common/translations).
+        self.open_tool_blocks = set()
         self.finished = False
         self.msg_id = f"msg-{int(time.time()*1000)}"
 
@@ -1498,6 +1501,30 @@ class AnthropicStreamState:
             }}})
             self.message_started = True
 
+        # R-03: surface a mid-stream upstream error frame instead of silently
+        # dropping it and closing with a fabricated end_turn.
+        if isinstance(chunk, dict) and chunk.get("error") is not None and "choices" not in chunk:
+            err = chunk["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            etype = (err.get("type") if isinstance(err, dict) else None) or "api_error"
+            logger.error(f"[nous] upstream error frame mid-stream: {msg}")
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            self.open_tool_blocks.clear()
+            if self.current_block is not None and self.current_block != "tool_use":
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            self.current_block = None
+            events.append({"type": "error", "data": {
+                "type": "error",
+                "error": {"type": etype, "message": str(msg)[:2000]}}})
+            events.append({"type": "message_delta", "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": self._usage()}})
+            events.append({"type": "message_stop", "data": {"type": "message_stop"}})
+            self.finished = True
+            return events
+
         if "choices" not in chunk:
             return events
         ch = (chunk.get("choices") or [{}])[0]
@@ -1507,7 +1534,11 @@ class AnthropicStreamState:
         reason = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reason, str) and reason:
             if self.current_block != "thinking":
-                if self.current_block:
+                # R-02: close every open tool block before opening thinking.
+                for _ti in sorted(self.open_tool_blocks):
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+                self.open_tool_blocks.clear()
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
@@ -1528,7 +1559,11 @@ class AnthropicStreamState:
 
         if content:
             if self.current_block != "text":
-                if self.current_block:
+                # R-02: close every open tool block before opening text.
+                for _ti in sorted(self.open_tool_blocks):
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+                self.open_tool_blocks.clear()
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
@@ -1545,10 +1580,16 @@ class AnthropicStreamState:
             idx = tc.get("index", 0)
             fn = tc.get("function", {}) or {}
             if idx not in self.tool_map:
-                if self.current_block:
+                # R-02: close only a text/thinking block here. Closing the
+                # previous TOOL block orphaned its later argument fragments
+                # (content_block_delta on a closed index -> Claude Code drops
+                # the tool call and the agent turn stalls).
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                    self.current_block = None
                 self.index += 1
                 self.tool_map[idx] = self.index
+                self.open_tool_blocks.add(self.index)
                 tid = tc.get("id") or f"toolu_{self.index}"
                 events.append({"type": "content_block_start", "data": {
                     "type": "content_block_start", "index": self.index,
@@ -1564,7 +1605,12 @@ class AnthropicStreamState:
 
         if ch.get("finish_reason") and not self.finished:
             self.finished = True
-            if self.current_block is not None:
+            # R-02: close all open tool blocks, then any text/thinking block.
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            _had_tools = bool(self.open_tool_blocks)
+            self.open_tool_blocks.clear()
+            if self.current_block is not None and self.current_block != "tool_use":
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             fr = ch.get("finish_reason")
             # B-06 fix: map STRICTLY from finish_reason. Forcing tool_use
@@ -1598,10 +1644,14 @@ class AnthropicStreamState:
                 "usage": self._usage(),
             }}})
         # B-06: capture before clearing.
-        was_in_tool_block = (self.current_block == "tool_use")
-        if self.current_block is not None:
+        was_in_tool_block = (self.current_block == "tool_use") or bool(self.open_tool_blocks)
+        # R-02: close every open tool block first.
+        for _ti in sorted(self.open_tool_blocks):
+            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+        self.open_tool_blocks.clear()
+        if self.current_block is not None and self.current_block != "tool_use":
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            self.current_block = None
+        self.current_block = None
         # B-06: this is the no-finish_reason path, so inferring from tool state
         # is legitimate — but narrow it to a tool block that was still open.
         stop = "tool_use" if (self.tool_map and was_in_tool_block) else "end_turn"
@@ -2132,6 +2182,15 @@ app.add_middleware(
     expose_headers=['*'],
     allow_credentials=True,
 )
+
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
 
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)

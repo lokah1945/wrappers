@@ -55,12 +55,17 @@ class AnthropicStreamState:
         self.message_started: bool = False
         self.current_block: Optional[str] = None  # 'thinking' | 'text' | 'tool_use'
         self.tool_map: dict[int, int] = {}
+        # R-02: Anthropic block indices of tool_use blocks that are still open.
+        # Parallel tool calls must stay open concurrently.
+        self.open_tool_blocks: set[int] = set()
         self.finished: bool = False
         # CM-6: retain the last usage seen so force_done can report real
         # numbers instead of zeros on abnormal termination.
         self.last_usage: dict = {}
         # B-05: observability counter for content dropped after finish_reason.
         self.dropped_after_finish: int = 0
+        # R-03: set when the upstream reported a mid-stream error frame.
+        self.upstream_error: Optional[str] = None
         self.msg_id: str = f"msg_{int(time.time() * 1000)}"
 
     def _sse(self, event: str, data: dict) -> str:
@@ -94,8 +99,13 @@ class AnthropicStreamState:
         })]
 
     def _close_block(self) -> List[str]:
-        """Close the currently open content block."""
-        if self.current_block is None:
+        """Close the currently open non-tool content block.
+
+        Tool blocks are tracked separately in `open_tool_blocks` because
+        parallel tool calls must remain open CONCURRENTLY — see
+        `_close_all_tool_blocks`.
+        """
+        if self.current_block is None or self.current_block == "tool_use":
             return []
         ev = [self._sse("content_block_stop", {
             "type": "content_block_stop",
@@ -103,6 +113,36 @@ class AnthropicStreamState:
         })]
         self.current_block = None
         return ev
+
+    def _close_all_tool_blocks(self) -> List[str]:
+        """Close every open tool_use block, lowest index first.
+
+        RUNTIME FINDING R-02: the old code called `_close_block()` when opening
+        the *next* tool, so with two parallel tool calls the sequence was
+
+            start(0) delta(0) STOP(0) start(1) delta(1) delta(0) delta(1) stop(1)
+
+        i.e. `content_block_delta` arrived on index 0 AFTER it was closed. That
+        is an Anthropic protocol violation: the SDK/Claude Code either raises or
+        discards the block, so the first tool's arguments are lost and the
+        agent's tool call silently never executes. OpenAI interleaves argument
+        fragments across ALL active tool indices, so concurrent tool blocks are
+        the norm, not an edge case.
+        """
+        evs: List[str] = []
+        for idx in sorted(self.open_tool_blocks):
+            evs.append(self._sse("content_block_stop", {
+                "type": "content_block_stop",
+                "index": idx,
+            }))
+        self.open_tool_blocks.clear()
+        if self.current_block == "tool_use":
+            self.current_block = None
+        return evs
+
+    def _close_everything(self) -> List[str]:
+        """Close the open text/thinking block AND all open tool blocks."""
+        return self._close_block() + self._close_all_tool_blocks()
 
     def translate_chunk(self, chunk: dict) -> List[str]:
         """Translate one OpenAI chat SSE chunk into Anthropic events."""
@@ -130,6 +170,28 @@ class AnthropicStreamState:
                 pass
             return []
         events = self.start_events()
+
+        # RUNTIME FINDING R-03: an upstream that reports a mid-stream failure as
+        # a `{"error": {...}}` SSE frame was silently DISCARDED here (it has no
+        # "choices" key), and the stream then closed with a fabricated
+        # stop_reason:end_turn. The client saw a truncated answer as a complete,
+        # successful turn — it could neither detect the failure nor retry.
+        # Surface it as a real Anthropic `error` event and terminate.
+        if isinstance(chunk, dict) and chunk.get("error") is not None and "choices" not in chunk:
+            err = chunk["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            etype = (err.get("type") if isinstance(err, dict) else None) or "api_error"
+            self.upstream_error = msg or "upstream error"
+            _log.error("[anthropic_stream] upstream error frame (model=%s): %s", self.model, msg)
+            events.extend(self._close_everything())
+            events.append(self._sse("error", {
+                "type": "error",
+                "error": {"type": etype, "message": str(msg)[:2000]},
+            }))
+            events.extend(self._terminal_events("end_turn"))
+            self.finished = True
+            return events
+
         if not isinstance(chunk, dict) or "choices" not in chunk:
             if isinstance(chunk, dict) and chunk.get("usage"):
                 self.last_usage = chunk.get("usage") or {}
@@ -144,7 +206,7 @@ class AnthropicStreamState:
         reason = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reason, str) and reason:
             if self.current_block != "thinking":
-                events.extend(self._close_block())
+                events.extend(self._close_everything())
                 self.index += 1
                 events.append(self._sse("content_block_start", {
                     "type": "content_block_start",
@@ -162,7 +224,7 @@ class AnthropicStreamState:
         content = delta.get("content")
         if isinstance(content, str) and content:
             if self.current_block != "text":
-                events.extend(self._close_block())
+                events.extend(self._close_everything())
                 self.index += 1
                 events.append(self._sse("content_block_start", {
                     "type": "content_block_start",
@@ -181,9 +243,12 @@ class AnthropicStreamState:
             oi = tc.get("index", 0)
             fn = tc.get("function") or {}
             if oi not in self.tool_map:
+                # R-02: close only text/thinking here. Closing the previous
+                # TOOL block would orphan its later argument fragments.
                 events.extend(self._close_block())
                 self.index += 1
                 self.tool_map[oi] = self.index
+                self.open_tool_blocks.add(self.index)
                 tid = tc.get("id") or f"toolu_{self.index}"
                 events.append(self._sse("content_block_start", {
                     "type": "content_block_start",
@@ -207,24 +272,30 @@ class AnthropicStreamState:
         fr = ch.get("finish_reason")
         if fr and not self.finished:
             self.finished = True
-            events.extend(self._close_block())
+            events.extend(self._close_everything())
             # B-06 fix: map STRICTLY from finish_reason. Do not infer tool_use
             # merely because self.tool_map is non-empty.
             stop = _FINISH_TO_STOP.get(fr, "end_turn")
-            usage = chunk.get("usage") or self.last_usage or {}
-            events.append(self._sse("message_delta", {
+            events.extend(self._terminal_events(stop, chunk.get("usage")))
+
+        return events
+
+    def _terminal_events(self, stop: str, usage: Optional[dict] = None) -> List[str]:
+        """message_delta + message_stop, emitted exactly once."""
+        u = usage or self.last_usage or {}
+        return [
+            self._sse("message_delta", {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
                 "usage": {
-                    "input_tokens": usage.get("prompt_tokens", 0) or 0,
-                    "output_tokens": usage.get("completion_tokens", 0) or 0,
+                    "input_tokens": u.get("prompt_tokens", 0) or 0,
+                    "output_tokens": u.get("completion_tokens", 0) or 0,
                     "cache_creation_input_tokens": 0,
                     "cache_read_input_tokens": 0,
                 },
-            }))
-            events.append(self._sse("message_stop", {"type": "message_stop"}))
-
-        return events
+            }),
+            self._sse("message_stop", {"type": "message_stop"}),
+        ]
 
     def force_done(self, stop: str = "end_turn") -> List[str]:
         """Emit terminal events if stream ended without finish_reason."""
@@ -235,8 +306,8 @@ class AnthropicStreamState:
         if not self.message_started:
             events.extend(self.start_events())
         # Capture BEFORE _close_block() clears it.
-        was_in_tool_block = (self.current_block == "tool_use")
-        events.extend(self._close_block())
+        was_in_tool_block = (self.current_block == "tool_use") or bool(self.open_tool_blocks)
+        events.extend(self._close_everything())
         # B-06 note: inferring tool_use from tool state is legitimate HERE and
         # only here — force_done() runs when the upstream ended WITHOUT any
         # finish_reason, so there is no authoritative signal to respect. The

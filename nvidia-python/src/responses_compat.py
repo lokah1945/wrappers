@@ -578,6 +578,12 @@ class ResponsesHandler:
                                 continue
                             if c.get('usage'):
                                 usage = convert_usage(c['usage'])
+                            # R-03: surface upstream error frames instead of
+                            # dropping them and emitting response.completed.
+                            if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+                                _e = c['error']
+                                stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                                break
                             if not c.get('choices'):
                                 continue
                             ch = c['choices'][0]
@@ -678,7 +684,11 @@ class ResponsesHandler:
             # output_text.delta, so an infrastructure failure was persisted by
             # the client as a successful assistant answer and could not be
             # retried. Emit response.failed instead (blackbox B20 parity).
-            if stream_error and not acc_text and not has_tool:
+            # R-03: report failure whenever the upstream errored, even if some
+            # text already streamed. The old `and not acc_text` guard meant a
+            # failure AFTER partial output was reported as response.completed,
+            # so the client persisted a truncated answer as a successful turn.
+            if stream_error:
                 yield emit({
                     'type': 'response.failed', 'sequence_number': next_seq(),
                     'response': {

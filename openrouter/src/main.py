@@ -598,6 +598,15 @@ app.add_middleware(
     expose_headers=["x-request-id", "x-process-time"],
 )
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     # B-32 fix: align the request-size cap with every sibling wrapper
     # (common.middleware default = 10MB). openrouter previously allowed 50MB,

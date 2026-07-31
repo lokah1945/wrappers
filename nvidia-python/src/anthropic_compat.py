@@ -616,18 +616,34 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
 
     async def stop_open():
+        """Close the open TEXT/THINKING block only.
+
+        R-02 fix: this used to also close whichever tool block was open AND
+        delete it from `tool_map`. With parallel tool calls OpenAI interleaves
+        argument fragments across indices, so opening tool #2 closed tool #1
+        and forgot it; the next `{'index':0,...}` fragment then re-created a
+        PHANTOM tool_use block with an empty name and split the arguments
+        across four blocks (observed live: 4 blocks, none valid JSON).
+        Tool blocks now stay open concurrently and are closed together at the
+        terminal path via stop_all_tools().
+        """
         nonlocal open_idx, text_index, thinking_index
-        if open_idx is not None:
+        if open_idx is not None and open_idx not in set(tool_map.values()):
             yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
             if open_idx == text_index:
                 text_index = None
             if open_idx == thinking_index:
                 thinking_index = None
-            for k, v in list(tool_map.items()):
-                if v == open_idx:
-                    del tool_map[k]
-                    break
             open_idx = None
+
+    async def stop_all_tools():
+        """R-02: close every open tool_use block, lowest index first."""
+        nonlocal open_idx
+        for _ai in sorted(set(tool_map.values())):
+            yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ai})
+            if open_idx == _ai:
+                open_idx = None
+        tool_map.clear()
 
     async def emit_text(text):
         nonlocal completed_thinking, text_index, open_idx, sent_content_block_start, sent_text_or_tool_block, next_index
@@ -732,11 +748,14 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     current_tool_input = {}
 
                     if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
-                        async for chunk in emit_synthetic_thinking():
-                            yield chunk
+                        # R-04 (same class): use distinct loop vars so the
+                        # `chunk` PARAMETER is never overwritten with an SSE
+                        # frame string.
+                        async for _ev in emit_synthetic_thinking():
+                            yield _ev
                     sent_text_or_tool_block = True
-                    async for chunk in stop_open():
-                        yield chunk
+                    async for _ev in stop_open():
+                        yield _ev
                     open_idx = ai
                     next_index += 1
 
@@ -789,8 +808,9 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 after = dsml_buffer[match_idx + len(full_tag):]
                 dsml_buffer = ''
                 if after:
-                    async for chunk in parse_and_emit(after, False):
-                        yield chunk
+                    # R-04 (same class): distinct loop variable.
+                    async for _ev in parse_and_emit(after, False):
+                        yield _ev
                 continue
 
             start_tool_calls_match = re.search(r'\|DSML\|tool_calls>', normalized)
@@ -814,8 +834,18 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
             is_reasoning = False
 
         if not is_reasoning and in_think_tag and thinking_index is not None:
-            async for chunk in stop_open():
-                yield chunk
+            # RUNTIME FINDING R-04 (CRITICAL): the loop variable was `chunk`,
+            # SHADOWING this function's `chunk` parameter — the model's actual
+            # text. After the thinking->text transition, `chunk` held the last
+            # SSE frame emitted by stop_open(), so the literal string
+            #   'event: content_block_stop\ndata: {...}\n\n'
+            # was passed on and rendered to the user as assistant prose.
+            # This is the same visible defect as the nous B-10 leak, reached by
+            # a completely different route, and it only triggers when a
+            # reasoning model transitions from thinking to text — which is why
+            # no unit test caught it. Use a distinct loop variable.
+            async for _stop_ev in stop_open():
+                yield _stop_ev
             in_think_tag = False
             completed_thinking = True
 
@@ -990,6 +1020,14 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 if chunk.get('usage') and isinstance(chunk['usage'], dict) and chunk['usage']:
                     usage = chunk['usage']
                     capture['usage'] = chunk['usage']
+                # R-03: an upstream {"error": ...} frame has no "choices" and
+                # was silently dropped here, so the stream closed with a
+                # fabricated end_turn and the client could not detect or retry.
+                if isinstance(chunk, dict) and chunk.get('error') is not None and 'choices' not in chunk:
+                    _e = chunk['error']
+                    errored = True
+                    error_message = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                    break
                 if not chunk.get('choices'):
                     continue
                 ch = chunk['choices'][0]
@@ -1082,12 +1120,18 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         except Exception:
             pass
         if not client_gone:
-            if open_idx is not None:
+            if open_idx is not None and open_idx not in set(tool_map.values()):
                 try:
                     yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
                 except Exception:
                     pass
                 open_idx = None
+            # R-02: close every concurrently-open tool_use block.
+            try:
+                async for _c in stop_all_tools():
+                    yield _c
+            except Exception:
+                pass
 
             if current_tool_index is not None:
                 try:
@@ -1105,8 +1149,12 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
 
         _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop)
 
-    if open_idx is not None:
+    if open_idx is not None and open_idx not in set(tool_map.values()):
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
+        open_idx = None
+    # R-02: ensure no tool_use block is left unclosed.
+    async for _c in stop_all_tools():
+        yield _c
 
     if errored:
         capture['errored'] = True

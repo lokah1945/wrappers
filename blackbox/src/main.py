@@ -1106,6 +1106,15 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$', allow_methods=['*'], allow_headers=['*'], expose_headers=['*'], allow_credentials=True)
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
@@ -1438,6 +1447,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     rsn_index = None
     rsn_id = f"rsn_{int(time.time()*1000)}"
     acc_reason = ""
+    upstream_err: list[str] = []  # R-03: mid-stream upstream error frames
 
     def emit(etype, payload):
         return _emit_response_event(seq, etype, payload)
@@ -1471,6 +1481,15 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         try:
             c = json.loads(payload)
         except (json.JSONDecodeError, ValueError):
+            return
+        # R-03: an upstream {"error": ...} frame must NOT be dropped; record it
+        # so the stream terminates with response.failed instead of a fabricated
+        # response.completed carrying partial text.
+        if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+            _e = c['error']
+            nonlocal_err = _e.get('message') if isinstance(_e, dict) else str(_e)
+            logger.error(f'[responses] upstream error frame: {nonlocal_err}')
+            upstream_err.append(str(nonlocal_err or 'upstream error'))
             return
         if c.get('usage'):
             u = c['usage']
@@ -1550,6 +1569,15 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         pool.release(key)
 
     if failed:
+        return
+    # R-03: the upstream reported a mid-stream failure. Terminate with
+    # response.failed instead of fabricating a successful completion that the
+    # client would persist as the assistant's answer.
+    if upstream_err:
+        yield emit('response.failed', {'response': {
+            'id': rid, 'object': 'response', 'model': model, 'status': 'failed',
+            'error': {'code': 'upstream_error', 'message': upstream_err[0][:2000]}}})
+        yield 'data: [DONE]\n\n'
         return
     msg_item = {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
     if rsn_started:

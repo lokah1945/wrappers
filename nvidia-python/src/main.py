@@ -3092,6 +3092,14 @@ def create_app() -> FastAPI:
     if _HAS_SIZE_LIMITER:
         app.add_middleware(RequestSizeLimiter)
 
+    # R-01 fix: reject non-object JSON bodies with a shaped 400 instead of
+    # letting `body.get(...)` raise AttributeError -> HTTP 500.
+    try:
+        from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+        app.add_middleware(_JSONBodyGuard)
+    except ImportError:  # pragma: no cover
+        pass
+
     # ── Catalog + MCP Integration (MUST BE BEFORE server routes with catch-all) ──────────────────────
     try:
         from common.catalog_integration import setup_catalog_routes, setup_mcp_server, free_only_enabled as _cfe

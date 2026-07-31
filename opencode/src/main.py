@@ -1276,6 +1276,15 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
@@ -1618,6 +1627,7 @@ async def responses(request: Request):
                 rsn_index = None
                 rsn_id = f"rsn_{int(time.time()*1000)}"
                 acc_reason = ""
+                upstream_err: list = []  # R-03: mid-stream upstream error frames
 
                 def emit(etype, payload):
                     nonlocal seq
@@ -1654,6 +1664,14 @@ async def responses(request: Request):
                     try:
                         c = json.loads(payload)
                     except (json.JSONDecodeError, ValueError):
+                        return
+                    # R-03: record upstream error frames so the stream ends as
+                    # response.failed rather than a fabricated completion.
+                    if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+                        _e = c['error']
+                        _m = _e.get('message') if isinstance(_e, dict) else str(_e)
+                        logger.error(f'[responses] upstream error frame: {_m}')
+                        upstream_err.append(str(_m or 'upstream error'))
                         return
                     if c.get("usage"):
                         u = c["usage"]
@@ -1732,6 +1750,14 @@ async def responses(request: Request):
                         pass
                     pool.release(key)
 
+                # R-03: surface a mid-stream upstream failure as response.failed
+                # instead of a fabricated response.completed with partial text.
+                if upstream_err:
+                    yield emit("response.failed", {"response": {
+                        "id": rid, "object": "response", "model": model, "status": "failed",
+                        "error": {"code": "upstream_error", "message": str(upstream_err[0])[:2000]}}})
+                    yield "data: [DONE]\n\n"
+                    return
                 msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
                 if rsn_started:
                     yield emit("response.reasoning_text.done", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "text": acc_reason})
