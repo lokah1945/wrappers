@@ -73,6 +73,7 @@ from .metrics import Metrics
 try:
     from common.translations import (
         AnthropicStreamState,
+        is_anthropic_message_order_valid as _is_anthropic_message_order_valid,
         parse_dsml_from_text as _parse_dsml_from_text,
         normalize_upstream_error as _normalize_upstream_error,
         strip_cache_control as _strip_cache,
@@ -699,6 +700,14 @@ def _auth_headers(api_key: str, request: Request = None) -> dict:
 
 def anthropic_to_openai(body: dict) -> dict:
     _strip_cache(body)
+    # Phase 1.A fix: validate message order (is_anthropic_message_order_valid)
+    if not _is_anthropic_message_order_valid(body.get('messages', [])):
+        return {
+            'error': {
+                'type': 'invalid_request_error',
+                'message': 'Invalid message order: after a "tool" message, only "assistant" or "tool" messages are allowed.',
+            }
+        }
     model = _normalize_model(body.get('model') or '')
     msgs = []
     sys = body.get('system')
@@ -741,11 +750,17 @@ def anthropic_to_openai(body: dict) -> dict:
             elif t == 'thinking':
                 # Preserve as reasoning_content — never dump raw into text
                 pass
+            elif t == 'redacted_thinking':
+                # Preserve as reasoning_content
+                pass
         # Collect thinking blocks
         thinking_parts = []
         for b in (c if isinstance(c, list) else []):
-            if isinstance(b, dict) and b.get('type') == 'thinking':
-                thinking_parts.append(b.get('thinking') or '')
+            if isinstance(b, dict):
+                if b.get('type') == 'thinking':
+                    thinking_parts.append(b.get('thinking') or '')
+                elif b.get('type') == 'redacted_thinking':
+                    thinking_parts.append("[redacted]")
         if len(parts) > 1:
             final = parts
         elif parts:
@@ -1586,93 +1601,12 @@ async def responses(request: Request):
                 return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
             rid = f"resp_{int(time.time()*1000)}"
             async def gen():
-                seq = 0
-                acc_text = ""
-                acc_usage = None
+                state = ResponsesStreamState(rid, model)
                 buffer = b""
-                tool_accs = []
-                next_output_index = 1
-                rsn_started = False
-                rsn_index = None
-                rsn_id = f"rsn_{int(time.time()*1000)}"
-                acc_reason = ""
-
-                def emit(etype, payload):
-                    nonlocal seq
-                    seq += 1
-                    return f"event: {etype}\ndata: {json.dumps({'type': etype, 'sequence_number': seq, **payload})}\n\n"
-
-                def usage_obj():
-                    if acc_usage:
-                        return acc_usage
-                    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
-
-                def get_tool_acc(tc):
-                    nonlocal next_output_index
-                    idx = tc.get("index") if isinstance(tc.get("index"), int) else len(tool_accs)
-                    acc = tool_accs[idx] if idx < len(tool_accs) else None
-                    if acc is None:
-                        acc = {"call_id": tc.get("id") or f"call_{idx}_{int(time.time()*1000)}", "name": "", "args": "", "output_index": next_output_index, "added": False}
-                        next_output_index += 1
-                        while len(tool_accs) <= idx:
-                            tool_accs.append(None)
-                        tool_accs[idx] = acc
-                    if tc.get("id"):
-                        acc["call_id"] = tc["id"]
-                    return acc
-
-                async def process_payload(payload: bytes):
-                    nonlocal acc_text, acc_usage, acc_reason, rsn_started, rsn_index, next_output_index
-                    if payload in (b"[DONE]", b"", b'"[DONE]"'):
-                        return
-                    try:
-                        c = json.loads(payload)
-                    except (json.JSONDecodeError, ValueError):
-                        return
-                    if c.get("usage"):
-                        u = c["usage"]
-                        acc_usage = {"input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)) or 0,
-                                     "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)) or 0,
-                                     "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
-                    d = ((c.get("choices") or [{}])[0].get("delta") or {})
-                    if d.get("content"):
-                        content = d["content"]
-                        acc_text += content
-                        yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": content})
-                    # Reasoning (Nous/OpenCode reasoning_content) — MUST be streamed
-                    # so the client sees progress during thinking (Codex / OpenAI SDK
-                    # aborts a silent stream → "stops mid-way"). Mirror nvidia-python.
-                    reason_delta = d.get("reasoning_content") if isinstance(d.get("reasoning_content"), str) else (d.get("reasoning") if isinstance(d.get("reasoning"), str) else "")
-                    if reason_delta:
-                        if not rsn_started:
-                            rsn_started = True
-                            rsn_index = next_output_index
-                            next_output_index += 1
-                            yield emit("response.output_item.added", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "in_progress", "summary": "", "content": []}})
-                        acc_reason += reason_delta
-                        yield emit("response.reasoning_text.delta", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "delta": reason_delta})
-                    for tc in d.get("tool_calls") or []:
-                        acc = get_tool_acc(tc)
-                        fn = tc.get("function") or {}
-                        if not acc["added"]:
-                            acc["added"] = True
-                            yield emit("response.output_item.added", {"output_index": acc["output_index"], "item": {"id": acc["call_id"], "type": "function_call", "status": "in_progress", "call_id": acc["call_id"], "name": acc["name"], "arguments": ""}})
-                        if fn.get("name"):
-                            acc["name"] += fn["name"]
-                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
-                        if fn.get("arguments"):
-                            acc["args"] += fn["arguments"]
-                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
-
+                last_hb = time.time()
                 try:
-                    yield emit("response.created", {"response": {"id": rid, "model": model, "status": "in_progress"}})
-                    yield emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}})
-                    yield emit("response.output_item.added", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
-                    yield emit("response.content_part.added", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
-                    last_hb = time.time()
                     async for idle, chunk in _chunk_stream(resp):
                         if idle:
-                            # OC-4 / DR-1: heartbeat during upstream idle gaps.
                             if (time.time() - last_hb) > (HEARTBEAT_MS / 1000.0):
                                 yield ": heartbeat\n\n"
                                 last_hb = time.time()
@@ -1683,44 +1617,43 @@ async def responses(request: Request):
                             line = line.strip()
                             if not line.startswith(b"data:"):
                                 continue
-                            async for out in process_payload(line[5:].strip()):
-                                yield out
-                    # Flush final partial line if any.
+                            payload = line[5:].strip()
+                            if payload in (b"[DONE]", b""):
+                                break
+                            try:
+                                c = json.loads(payload)
+                                for ev in state.translate_chunk(c):
+                                    yield ev
+                                if state.completed:
+                                    break
+                            except Exception:
+                                continue
+                        if state.completed:
+                            break
+                    # Tail
                     tail = buffer.strip()
                     if tail.startswith(b"data:"):
-                        async for out in process_payload(tail[5:].strip()):
-                            yield out
+                        payload = tail[5:].strip()
+                        if payload not in (b"[DONE]", b""):
+                            try:
+                                c = json.loads(payload)
+                                for ev in state.translate_chunk(c):
+                                    yield ev
+                            except Exception:
+                                pass
                 except Exception as e:
                     logger.error(f"[responses stream] {e}")
-                    # OC-10 / O22: do NOT fabricate an error string as assistant
-                    # output (Codex would persist it as a successful answer). Emit
-                    # a proper failure event and stop.
-                    yield emit("response.failed", {"response": {"id": rid, "model": model, "status": "failed", "error": {"type": "api_error", "message": f"Upstream stream error: {e}"}}})
-                    return
+                    yield state._emit("response.failed", {"response": {"id": rid, "model": model, "status": "failed", "error": {"type": "api_error", "message": f"Upstream stream error: {e}"}}})
                 finally:
+                    for ev in state.force_done():
+                        yield ev
+                    yield "data: [DONE]\n\n"
                     try:
                         resp.release()
                     except Exception:
                         pass
                     pool.release(key)
-
-                msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
-                if rsn_started:
-                    yield emit("response.reasoning_text.done", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "text": acc_reason})
-                    yield emit("response.output_item.done", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": acc_reason}})
-                yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
-                yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": acc_text, "annotations": []}})
-                yield emit("response.output_item.done", {"output_index": 0, "item": msg_item})
-                outputs = [msg_item]
-                if rsn_started:
-                    outputs.append({"id": rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": acc_reason})
-                completed_tools = [a for a in tool_accs if a]
-                for acc in completed_tools:
-                    fc_item = {"id": acc["call_id"], "type": "function_call", "status": "completed", "call_id": acc["call_id"], "name": acc["name"], "arguments": acc["args"]}
-                    yield emit("response.output_item.done", {"output_index": acc["output_index"], "item": fc_item})
-                    outputs.append(fc_item)
-                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj()}})
-                _store_response(principal, rid, list(chat_body.get("messages", [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+                    _store_response(principal, rid, list(chat_body.get("messages", [])) + [state.get_assistant_message()])
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 

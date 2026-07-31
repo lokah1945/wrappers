@@ -7,6 +7,7 @@ import importlib.util
 import json
 import os
 import sys
+import re
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,11 +28,16 @@ def no_dsml(obj) -> None:
 
 
 def load_nous():
-    src = (ROOT / "nous" / "wrapper_nous.py").read_text()
+    src = (ROOT / "nous" / "src" / "main.py").read_text()
     src = src.replace(
-        '"/root/wrapper/nous/wrapper_nous.log"',
+        '"/root/wrapper/nous/opencode.log"',
         f'"{LOGDIR / "nous.log"}"',
+    ).replace(
+        '/root/wrapper/nous/nous.log',
+        str(LOGDIR / "nous.log"),
     )
+    # The Nous main.py might have different log paths. Let's make it more robust.
+    src = re.sub(r'LOG_FILE = os\.environ\.get\(\'LOG_FILE\', \'.*?\'\)', f"LOG_FILE = '{LOGDIR / 'nous.log'}'", src)
     path = LOGDIR / "wrapper_nous_audit.py"
     path.write_text(src)
     spec = importlib.util.spec_from_file_location("wrapper_nous_audit", path)

@@ -11,8 +11,9 @@ def test_agent_registry_detect():
 
 def test_key_router_never_blocks():
     router = KeyRouter()
-    router.select_key()
-    assert router.select_key() is not None or True
+    router.add_key("test-key")
+    # Phase 7.1 fix: remove tautological assertion 'or True'
+    assert router.select_key() is not None
 
 def test_protocol_translation():
     pt = ProtocolTranslator()

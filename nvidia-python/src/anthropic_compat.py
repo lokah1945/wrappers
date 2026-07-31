@@ -582,547 +582,103 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                                      input_tokens: int = 0, request_id: str = None,
                                      expect_thinking: bool = False,
                                      start_ms: float = None, **kwargs) -> AsyncGenerator[str, None]:
-    """Async generator: consume OpenAI SSE stream, emit Anthropic event stream."""
+    """Async generator: consume OpenAI SSE stream, emit Anthropic event stream.
+    
+    Phase 1.C/2.4 fix: Use shared AnthropicStreamState for consistency.
+    """
+    from common.translations import AnthropicStreamState
+    state = AnthropicStreamState(model)
+    
     if capture is None:
         capture = {}
     if start_ms is not None:
         capture['_startMs'] = int(start_ms)
-    msg_id = f'msg_{request_id}' if request_id else f'msg_{int(time.time() * 1000)}'
-    text_index = None
-    thinking_index = None
-    tool_map = {}
-    next_index = 0
-    open_idx = None
-    sent_content_block_start = False
-    sent_text_or_tool_block = False
-    final_stop = 'end_turn'
-    usage = {}
-    in_think_tag = False
-    completed_thinking = False
-    in_dsml_mode = False
-    dsml_buffer = ''
-    current_tool_index = None
-    current_tool_name = ''
-    current_tool_id = ''
-    current_tool_input = {}
-    generated_chars = 0
-    real_thinking_emitted = False
-    synthetic_thinking_emitted = False
-    errored = False
-    error_message = ''
-    client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
+    else:
+        capture['_startMs'] = int(time.time() * 1000)
 
-    async def stop_open():
-        nonlocal open_idx, text_index, thinking_index
-        if open_idx is not None:
-            yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
-            if open_idx == text_index:
-                text_index = None
-            if open_idx == thinking_index:
-                thinking_index = None
-            for k, v in list(tool_map.items()):
-                if v == open_idx:
-                    del tool_map[k]
-                    break
-            open_idx = None
-
-    async def emit_text(text):
-        nonlocal completed_thinking, text_index, open_idx, sent_content_block_start, sent_text_or_tool_block, next_index
-        completed_thinking = True
-        if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
-            async for chunk in emit_synthetic_thinking():
-                yield chunk
-        if text_index is None:
-            async for chunk in stop_open():
-                yield chunk
-            text_index = next_index
-            open_idx = text_index
-            next_index += 1
-            sent_content_block_start = True
-            sent_text_or_tool_block = True
-            yield _sse('content_block_start', {
-                'type': 'content_block_start', 'index': text_index,
-                'content_block': {'type': 'text', 'text': ''},
-            })
-        yield _sse('content_block_delta', {
-            'type': 'content_block_delta', 'index': text_index,
-            'delta': {'type': 'text_delta', 'text': text},
-        })
-
-    async def emit_thinking_start():
-        nonlocal thinking_index, open_idx, real_thinking_emitted, sent_content_block_start, next_index
-        if thinking_index is None:
-            async for chunk in stop_open():
-                yield chunk
-            thinking_index = next_index
-            open_idx = thinking_index
-            next_index += 1
-            real_thinking_emitted = True
-            sent_content_block_start = True
-            yield _sse('content_block_start', {
-                'type': 'content_block_start', 'index': thinking_index,
-                'content_block': {'type': 'thinking', 'thinking': ''},
-            })
-
-    async def emit_synthetic_thinking():
-        nonlocal synthetic_thinking_emitted, thinking_index, open_idx, completed_thinking, next_index
-        if synthetic_thinking_emitted or real_thinking_emitted:
-            return
-        # V25 fix: synthetic thinking is opt-in; default is to omit the block.
-        if not _env_flag('WRAPPER_SYNTHETIC_THINKING', '0'):
-            return
-        synthetic_thinking_emitted = True
-        async for chunk in stop_open():
-            yield chunk
-        thinking_index = next_index
-        open_idx = thinking_index
-        next_index += 1
-        yield _sse('content_block_start', {
-            'type': 'content_block_start', 'index': thinking_index,
-            'content_block': {'type': 'thinking', 'thinking': ''},
-        })
-        yield _sse('content_block_delta', {
-            'type': 'content_block_delta', 'index': thinking_index,
-            'delta': {'type': 'thinking_delta', 'thinking': '[Reasoning not supported by this model; responding directly.]'},
-        })
-        yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': thinking_index})
-        completed_thinking = True
-        if open_idx == thinking_index:
-            open_idx = None
-            thinking_index = None
-
-    async def emit_thinking_delta(text):
-        async for chunk in emit_thinking_start():
-            yield chunk
-        yield _sse('content_block_delta', {
-            'type': 'content_block_delta', 'index': thinking_index,
-            'delta': {'type': 'thinking_delta', 'thinking': text},
-        })
-
-    async def process_dsml(chunk):
-        nonlocal dsml_buffer, in_dsml_mode, current_tool_index, current_tool_name, current_tool_id, current_tool_input, next_index, open_idx, sent_content_block_start, sent_text_or_tool_block, real_thinking_emitted, synthetic_thinking_emitted
-        dsml_buffer += chunk
-
-        while True:
-            normalized = dsml_buffer.replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
-
-            invoke_pair = re.search(r'\|DSML\|invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|invoke>', normalized)
-            if invoke_pair:
-                tool_name = invoke_pair.group(1)
-                inner = invoke_pair.group(2)
-                pair_start = invoke_pair.start()
-                pair_end = pair_start + len(invoke_pair.group(0))
-
-                if current_tool_index is None:
-                    ai = next_index
-                    current_tool_index = ai
-                    current_tool_name = tool_name
-                    current_tool_id = f'toolu_dsml_{int(time.time() * 1000)}_{hash(tool_name) % 10000:04x}_{ai}'
-                    current_tool_input = {}
-
-                    if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
-                        async for chunk in emit_synthetic_thinking():
-                            yield chunk
-                    sent_text_or_tool_block = True
-                    async for chunk in stop_open():
-                        yield chunk
-                    open_idx = ai
-                    next_index += 1
-
-                    yield _sse('content_block_start', {
-                        'type': 'content_block_start',
-                        'index': ai,
-                        'content_block': {'type': 'tool_use', 'id': current_tool_id, 'name': current_tool_name, 'input': {}},
-                    })
-
-                params = {}
-                param_regex = re.compile(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/\|DSML\|parameter>')
-                for param_match in param_regex.finditer(inner):
-                    params[param_match.group(1)] = param_match.group(2)
-
-                if current_tool_index is not None:
-                    yield _sse('content_block_delta', {
-                        'type': 'content_block_delta', 'index': current_tool_index,
-                        'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(params)},
-                    })
-                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': current_tool_index})
-                    if open_idx == current_tool_index:
-                        open_idx = None
-
-                current_tool_index = None
-                current_tool_name = ''
-                current_tool_id = ''
-                current_tool_input = {}
-                dsml_buffer = dsml_buffer[pair_end:]
-                continue
-
-            end_tool_calls_match = re.search(r'</\|DSML\|tool_calls>', normalized)
-            if end_tool_calls_match:
-                full_tag = end_tool_calls_match.group(0)
-                match_idx = normalized.find(full_tag)
-
-                if current_tool_index is not None:
-                    yield _sse('content_block_delta', {
-                        'type': 'content_block_delta', 'index': current_tool_index,
-                        'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(current_tool_input)},
-                    })
-                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': current_tool_index})
-                    if open_idx == current_tool_index:
-                        open_idx = None
-                    current_tool_index = None
-                    current_tool_name = ''
-                    current_tool_id = ''
-                    current_tool_input = {}
-
-                in_dsml_mode = False
-                after = dsml_buffer[match_idx + len(full_tag):]
-                dsml_buffer = ''
-                if after:
-                    async for chunk in parse_and_emit(after, False):
-                        yield chunk
-                continue
-
-            start_tool_calls_match = re.search(r'\|DSML\|tool_calls>', normalized)
-            if start_tool_calls_match:
-                in_dsml_mode = True
-                dsml_buffer = dsml_buffer[start_tool_calls_match.end():]
-                continue
-
-            break
-
-    async def parse_and_emit(chunk, is_reasoning):
-        nonlocal in_dsml_mode, completed_thinking, in_think_tag, thinking_index, open_idx, next_index, sent_content_block_start, sent_text_or_tool_block, real_thinking_emitted, synthetic_thinking_emitted, generated_chars
-        if in_dsml_mode:
-            async for c in process_dsml(chunk):
-                yield c
-            return
-
-        if completed_thinking:
-            is_reasoning = False
-
-        if not is_reasoning and in_think_tag and thinking_index is not None:
-            async for chunk in stop_open():
-                yield chunk
-            in_think_tag = False
-            completed_thinking = True
-
-        if completed_thinking:
-            dsml_start_idx = chunk.find('<|DSML|tool_calls>')
-            if dsml_start_idx == -1:
-                dsml_start_idx = chunk.find('｜DSML｜tool_calls>')
-            if dsml_start_idx != -1:
-                before = chunk[:dsml_start_idx]
-                after = chunk[dsml_start_idx:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_dsml_mode = True
-                async for c in process_dsml(after):
-                    yield c
-                return
-            async for c in emit_text(chunk):
-                yield c
-            return
-
-        if is_reasoning and not in_think_tag and thinking_index is not None:
-            async for c in emit_text(chunk):
-                yield c
-            return
-        if is_reasoning and not in_think_tag:
-            in_think_tag = True
-            async for c in emit_thinking_start():
-                yield c
-
-        if in_think_tag:
-            end_idx = -1
-            tag_len = 0
-            end1 = chunk.find('</think>')
-            end2 = chunk.find('</thinking>')
-            end3 = chunk.find('<|DSML|tool_calls>')
-            if end3 == -1:
-                end3 = chunk.find('｜DSML｜tool_calls>')
-
-            if end1 != -1:
-                end_idx = end1
-                tag_len = 8
-            if end2 != -1 and (end_idx == -1 or end2 < end_idx):
-                end_idx = end2
-                tag_len = 11
-            if end3 != -1 and (end_idx == -1 or end3 < end_idx):
-                end_idx = end3
-                tag_len = 0
-
-            if end_idx != -1:
-                inside = chunk[:end_idx]
-                after = chunk[end_idx + tag_len:]
-                if inside:
-                    async for c in emit_thinking_delta(inside):
-                        yield c
-                async for c in stop_open():
-                    yield c
-                in_think_tag = False
-                completed_thinking = True
-                if after:
-                    async for c in parse_and_emit(after, False):
-                        yield c
-            else:
-                async for c in emit_thinking_delta(chunk):
-                    yield c
-        else:
-            dsml_start_idx = chunk.find('<|DSML|tool_calls>')
-            if dsml_start_idx == -1:
-                dsml_start_idx = chunk.find('｜DSML｜tool_calls>')
-            if dsml_start_idx != -1:
-                before = chunk[:dsml_start_idx]
-                after = chunk[dsml_start_idx:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_dsml_mode = True
-                async for c in process_dsml(after):
-                    yield c
-                return
-
-            start_idx = -1
-            tag_len = 0
-            start1 = chunk.find('<think>')
-            start2 = chunk.find('<thinking>')
-            if start1 != -1:
-                start_idx = start1
-                tag_len = 7
-            if start2 != -1 and (start_idx == -1 or start2 < start_idx):
-                start_idx = start2
-                tag_len = 10
-
-            if start_idx != -1:
-                before = chunk[:start_idx]
-                after = chunk[start_idx + tag_len:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_think_tag = True
-                async for c in emit_thinking_start():
-                    yield c
-                if after:
-                    async for c in parse_and_emit(after, False):
-                        yield c
-            else:
-                async for c in emit_text(chunk):
-                    yield c
-
-    yield _sse('message_start', {
-        'type': 'message_start',
-        'message': {
-            'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model,
-            'content': [], 'stop_reason': None, 'stop_sequence': None,
-            'usage': {'input_tokens': input_tokens, 'output_tokens': 0, 'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
-        },
-    })
-
-    # Consume either an async iterator of bytes/str OR an object with .content.iter_any()
     buffer = ''
     last_usage_chunk = ''
     is_first_read = True
-    capture = capture if isinstance(capture, dict) else {}
-    if 'start_ms' in (capture or {}) or capture.get('_startMs'):
-        pass
-    else:
-        capture.setdefault('_startMs', int(time.time() * 1000))
+    generated_chars = 0
+    usage = {}
+    final_stop = 'end_turn'
+    errored = False
+    error_message = ''
+    client_gone = False
 
     async def _iter_upstream():
-        """Normalize various stream shapes into async chunks of str/bytes."""
-        if stream is None:
-            return
-        # aiohttp-like response
+        if stream is None: return
         if hasattr(stream, 'content') and hasattr(stream.content, 'iter_any'):
-            async for chunk in stream.content.iter_any():
-                yield chunk
+            async for chunk in stream.content.iter_any(): yield chunk
             return
-        # async iterator / generator
         if hasattr(stream, '__aiter__'):
-            async for chunk in stream:
-                yield chunk
-            return
-        # sync iterable fallback
-        if hasattr(stream, '__iter__') and not isinstance(stream, (str, bytes)):
-            for chunk in stream:
-                yield chunk
+            async for chunk in stream: yield chunk
             return
 
     try:
         async for value in _iter_upstream():
             if is_first_read:
-                start_ms = capture.get('_startMs') or capture.get('start_ms') or 0
-                if start_ms:
-                    capture['ttftMs'] = int(time.time() * 1000) - int(start_ms)
+                start_ms = capture.get('_startMs')
+                capture['ttftMs'] = int(time.time() * 1000) - start_ms
                 is_first_read = False
+            
             chunk_text = value.decode('utf-8', errors='replace') if isinstance(value, (bytes, bytearray)) else str(value)
             buffer += chunk_text
             if '"usage"' in chunk_text:
                 last_usage_chunk = chunk_text
+            
             lines = buffer.split('\n')
             buffer = lines.pop() if lines else ''
 
             for line in lines:
                 trimmed = line.strip()
-                if not trimmed.startswith('data:'):
-                    continue
-                data = trimmed[5:].strip()
-                if data == '[DONE]':
-                    continue
+                if not trimmed.startswith('data:'): continue
+                data_str = trimmed[5:].strip()
+                if data_str == '[DONE]': continue
+                
                 try:
-                    chunk = json.loads(data)
-                except Exception:
-                    continue
-                if chunk.get('usage') and isinstance(chunk['usage'], dict) and chunk['usage']:
+                    chunk = json.loads(data_str)
+                except Exception: continue
+                
+                # Update local counters
+                if chunk.get('usage'):
                     usage = chunk['usage']
-                    capture['usage'] = chunk['usage']
-                if not chunk.get('choices'):
-                    continue
-                ch = chunk['choices'][0]
+                    capture['usage'] = usage
+                
+                ch = (chunk.get('choices') or [{}])[0]
                 delta = ch.get('delta', {})
-
-                content_text = delta.get('content', '') or ''
-                reasoning = delta.get('reasoning_content') or delta.get('reasoning')
-
-                if reasoning:
-                    generated_chars += len(reasoning)
-                    async for c in parse_and_emit(reasoning, True):
-                        yield c
-                if content_text:
-                    generated_chars += len(content_text)
-                    async for c in parse_and_emit(content_text, False):
-                        yield c
-
-                for tc in (delta.get('tool_calls') or []):
-                    oi = tc.get('index', 0)
-                    fn = tc.get('function', {})
-                    if oi not in tool_map:
-                        if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
-                            async for c in emit_synthetic_thinking():
-                                yield c
-                        async for c in stop_open():
-                            yield c
-                        ai = next_index
-                        tool_map[oi] = ai
-                        open_idx = ai
-                        sent_content_block_start = True
-                        tool_call_id = tc.get('id') or f'toolu_{int(time.time() * 1000)}_{hash(str(ai)) % 10000:04x}_{ai}'
-                        sent_text_or_tool_block = True
-                        yield _sse('content_block_start', {
-                            'type': 'content_block_start', 'index': ai,
-                            'content_block': {'type': 'tool_use', 'id': tool_call_id, 'name': fn.get('name', ''), 'input': {}},
-                        })
-                        next_index += 1
-                    ai = tool_map[oi]
-                    if fn.get('arguments'):
-                        generated_chars += len(fn['arguments'])
-                        yield _sse('content_block_delta', {
-                            'type': 'content_block_delta', 'index': ai,
-                            'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
-                        })
-
+                if delta.get('content'): generated_chars += len(delta['content'])
+                if delta.get('reasoning_content') or delta.get('reasoning'):
+                    generated_chars += len(delta.get('reasoning_content') or delta.get('reasoning') or '')
+                
                 if ch.get('finish_reason'):
-                    final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
+                    final_stop = ch['finish_reason']
+
+                # Translate chunk using shared state machine
+                for ev in state.translate_chunk(chunk):
+                    yield ev
+                    
+                if state.finished:
+                    break
     except (GeneratorExit, asyncio.CancelledError):
-        # V-15 fix (audit 2026-07-27): client disconnected / task cancelled.
-        # Async generator finalization forbids further yields — mark it so the
-        # finally block does cleanup only, then re-raise.
         client_gone = True
         raise
     except Exception as e:
         errored = True
-        error_message = str(e) if e else 'upstream connection error'
+        error_message = str(e)
     finally:
-        # Best-effort release for aiohttp responses
         try:
             if hasattr(stream, 'release'):
                 maybe = stream.release()
-                if hasattr(maybe, '__await__'):
-                    await maybe
-        except Exception:
-            pass
+                if hasattr(maybe, '__await__'): await maybe
+        except Exception: pass
+        
         if not client_gone:
-            if open_idx is not None:
-                try:
-                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
-                except Exception:
-                    pass
-                open_idx = None
-
-            if current_tool_index is not None:
-                try:
-                    yield _sse('content_block_delta', {
-                        'type': 'content_block_delta', 'index': current_tool_index,
-                        'delta': {'type': 'input_json_delta', 'partial_json': json.dumps(current_tool_input)},
-                    })
-                except Exception:
-                    pass
-                try:
-                    yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': current_tool_index})
-                except Exception:
-                    pass
-                current_tool_index = None
-
+            for ev in state.force_done():
+                yield ev
+        
+        # Finalize capture metadata for metrics
         _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop)
-
-    if open_idx is not None:
-        yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
-
-    if errored:
-        capture['errored'] = True
-        capture['errorMessage'] = error_message or 'upstream connection error'
-        # Still close the Anthropic SSE cleanly so Claude Code / SDKs do not hang mid-turn
-        if not sent_text_or_tool_block:
-            empty_idx = next_index
-            yield _sse('content_block_start', {
-                'type': 'content_block_start', 'index': empty_idx,
-                'content_block': {'type': 'text', 'text': ''},
-            })
-            yield _sse('content_block_delta', {
-                'type': 'content_block_delta', 'index': empty_idx,
-                'delta': {'type': 'text_delta', 'text': f'[upstream stream error: {error_message}]'},
-            })
-            yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
-        yield _sse('message_delta', {
-            'type': 'message_delta',
-            'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-            'usage': {'input_tokens': input_tokens or 0, 'output_tokens': 0,
-                      'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
-        })
-        yield _sse('message_stop', {'type': 'message_stop'})
-        return
-
-    if not sent_text_or_tool_block and not errored:
-        empty_idx = next_index
-        yield _sse('content_block_start', {
-            'type': 'content_block_start', 'index': empty_idx,
-            'content_block': {'type': 'text', 'text': ''},
-        })
-        yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
-
-    # Prefer tool_use stop when tools were emitted
-    if tool_map and final_stop == 'end_turn':
-        final_stop = 'tool_use'
-
-    estimated_output = max(1, (generated_chars + 3) // 4)
-    reported_input = usage.get('prompt_tokens', input_tokens or 0)
-    reported_output = usage.get('completion_tokens', estimated_output)
-    capture['reportedInputTokens'] = reported_input
-    capture['reportedOutputTokens'] = reported_output
-    yield _sse('message_delta', {
-        'type': 'message_delta',
-        'delta': {'stop_reason': final_stop, 'stop_sequence': None},
-        'usage': {
-            'input_tokens': reported_input,
-            'output_tokens': reported_output,
-            'cache_creation_input_tokens': 0,
-            'cache_read_input_tokens': (usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0),
-        },
-    })
-    yield _sse('message_stop', {'type': 'message_stop'})
-
-
 def _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop):
     if not capture.get('usage') or not capture['usage']:
         if last_usage_chunk:

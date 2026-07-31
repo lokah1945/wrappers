@@ -75,6 +75,54 @@ All combinations must pass before declaring production-ready.
 - **Incident response:** When a bug is found, check all wrappers within 24h
 - **Documentation:** Update this document with new examples
 
+### Example 4: Double Key Release (BUG-REL-1)
+**Found in:** common/base_wrapper.py and openrouter/src/main.py
+**Root cause:** `finally` block in `proxy_request` released key immediately upon returning `StreamingResponse`, while `stream_gen` also released it on completion.
+**Fix:** Guard `finally` block with `if not stream` (or `released` flag).
+
+**Cross-wrapper check required:**
+- ✅ nvidia-python: Correctly handles release in separate branches.
+- ✅ nous: Correctly uses `released` flag guard.
+- ✅ opencode: Correctly handles release in separate branches.
+- ✅ blackbox: Correctly handles release in separate branches.
+- ✅ openrouter: FIXED (was using unconditional finally).
+
+### Example 5: Invalid Anthropic Message Order (BUG-ORDER-1)
+**Found in:** openrouter/src/main.py (and others missing validation)
+**Root cause:** Upstream 400 when user messages followed tool results in `/v1/messages`.
+**Fix:** Implemented `is_anthropic_message_order_valid` validation in all wrappers.
+
+**Cross-wrapper check required:**
+- ✅ nvidia-python: Already had validation.
+- ✅ nous: FIXED.
+- ✅ opencode: FIXED.
+- ✅ blackbox: FIXED.
+- ✅ openrouter: FIXED.
+
+### Example 6: Heartbeat vs Timeout (BUG-HB-1)
+**Found in:** nvidia-python (and others using wait_for)
+**Root cause:** `asyncio.wait_for` on `aiter.__anext__()` cancels the task, making it impossible to distinguish between idle and genuine read timeout.
+**Fix:** Backported the `asyncio.wait` sentinel task pattern from `nous` to all wrappers.
+
+**Cross-wrapper check required:**
+- ✅ nvidia-python: FIXED (backported from nous).
+- ✅ nous: Already used better pattern.
+- ✅ opencode: Already used better pattern.
+- ✅ blackbox: Already used better pattern.
+- ✅ openrouter: FIXED.
+
+### Example 7: Orphan Tool Result (BUG-ORPHAN-1)
+**Found in:** openrouter/src/main.py
+**Root cause:** Process restart or missing history caused 400 at upstream for orphan tool results.
+**Fix:** Implemented `_repair_orphan_tool_messages` to convert orphans to user messages.
+
+**Cross-wrapper check required:**
+- ✅ nvidia-python: Already had fix.
+- ✅ nous: Already had fix.
+- ✅ opencode: Already had fix.
+- ✅ blackbox: Already had fix.
+- ✅ openrouter: FIXED.
+
 ## Contact
 
 If you find a bug that affects multiple wrappers, report it immediately and fix all affected wrappers before merging.

@@ -5,7 +5,9 @@ All wrappers now import from here instead of maintaining independent copies.
 """
 
 from .anthropic_stream import AnthropicStreamState
+from .responses_stream import ResponsesStreamState
 from .shared import (
+    is_anthropic_message_order_valid,
     parse_dsml_from_text,
     repair_orphan_tool_messages,
     strip_cache_control,
@@ -21,6 +23,8 @@ from .shared import (
 
 __all__ = [
     "AnthropicStreamState",
+    "ResponsesStreamState",
+    "is_anthropic_message_order_valid",
     "parse_dsml_from_text",
     "repair_orphan_tool_messages",
     "strip_cache_control",

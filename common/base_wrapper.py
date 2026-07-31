@@ -586,10 +586,11 @@ class BaseWrapper:
                 last_data = {'error': {'message': f'Upstream error: {type(e).__name__}: {str(e)[:500]}', 'type': 'api_error'}}
                 continue
             finally:
-                try:
-                    self.pool.release(key_obj)
-                except Exception:
-                    pass
+                if not stream:
+                    try:
+                        self.pool.release(key_obj)
+                    except Exception:
+                        pass
 
         # All keys exhausted → 429 (not 503) so SDKs auto-retry.
         retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))

@@ -14,6 +14,27 @@ import time
 from typing import Any, List
 
 
+def is_anthropic_message_order_valid(messages: list) -> bool:
+    """Validate Anthropic message order.
+
+    After a 'tool' message, only 'assistant' or 'tool' messages are allowed.
+    Other roles (user, system) following a tool message are invalid and
+    rejected by upstream.
+    """
+    has_tool_result = False
+    for msg in messages:
+        if not msg or not msg.get("role"):
+            continue
+        role = msg["role"]
+        if role == "system" or role == "developer":
+            continue
+        if role == "tool":
+            has_tool_result = True
+        elif has_tool_result and role not in ("assistant", "tool"):
+            return False
+    return True
+
+
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use blocks).
 

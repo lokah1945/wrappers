@@ -379,10 +379,12 @@ try:
         AnthropicStreamState as _SharedAnthropicStreamState,
         parse_dsml_from_text as _shared_parse_dsml,
         build_forward_headers as _build_forward_headers,
+        parse_retry_after as _parse_retry_after_shared,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
+    _parse_retry_after_shared = None
     # Fallback: minimal build_forward_headers so the wrapper still works
     # if common.translations is not importable (shouldn't happen in prod).
     def _build_forward_headers(client_headers, extra=None):
@@ -1297,12 +1299,16 @@ def pre_response_timeout_ms_for(model_id: str) -> int:
 
 
 
-def _parse_retry_after(value, default: int = 65) -> int:
+def _parse_retry_after(value, default: int = 65, body: Any = None) -> int:
     """V-12 fix: Retry-After may be an integer OR an RFC HTTP-date.
 
-    The previous bare int() raised on date format, silently skipping 429
-    registration (no cooldown) via the broad except around the request.
+    Phase 4.5 fix: use shared parse_retry_after if available for consistency.
     """
+    if _parse_retry_after_shared:
+        # Wrap headers in a dict if it's not already one (shared util expects dict-like)
+        headers = value if isinstance(value, dict) else {'Retry-After': value}
+        return _parse_retry_after_shared(headers, body, default)
+    
     if value is None:
         return default
     s = str(value).strip()
@@ -2543,7 +2549,7 @@ class Server:
                         timeout=req_timeout,
                     )
                     if resp.status == 429:
-                        ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
+                        ra = _parse_retry_after(resp.headers)  # V-12 fix
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
@@ -2577,27 +2583,38 @@ class Server:
 
                     async def stream_wrapper(resp=resp, key=key):
                         nonlocal released
-                        # Idle-aware heartbeat: uses sentinel-task pattern so
-                        # heartbeat fires EVEN when upstream is silent (reasoning
-                        # models thinking 30+ sec). Without this, client/LB idle
-                        # timeouts kill the stream mid-turn → "response berhenti".
+                        # Phase 3.1 fix: Idle-aware heartbeat using sentinel-task pattern
+                        # (backported from nous/blackbox). Fires EVEN when upstream is silent.
+                        # Using asyncio.wait instead of wait_for to distinguish idle from timeout.
                         last_hb = time.time()
                         at_line_boundary = True
                         saw_done = False
                         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+                        chunk_task = None
                         try:
                             aiter = resp.content.__aiter__()
                             while True:
-                                try:
-                                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
-                                except asyncio.TimeoutError:
+                                if chunk_task is None:
+                                    chunk_task = asyncio.create_task(aiter.__anext__())
+                                
+                                done_set, _pending = await asyncio.wait({chunk_task}, timeout=hb_interval)
+                                if not done_set:
                                     # Upstream idle — inject heartbeat at line boundary
-                                    if at_line_boundary:
+                                    if at_line_boundary and (time.time() - last_hb) > hb_interval:
                                         yield b': heartbeat\n\n'
                                         last_hb = time.time()
                                     continue
+                                
+                                finished, chunk_task = chunk_task, None
+                                try:
+                                    chunk = finished.result()
                                 except StopAsyncIteration:
                                     break
+                                except Exception as e:
+                                    # Phase 3.1: Genuine upstream error surfaces here
+                                    logger.warning(f"[stream] upstream error: {e}")
+                                    break
+
                                 # Check for [DONE] marker
                                 if isinstance(chunk, (bytes, bytearray)):
                                     if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
@@ -2605,6 +2622,7 @@ class Server:
                                 else:
                                     if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
                                         saw_done = True
+                                
                                 yield chunk
                                 if isinstance(chunk, (bytes, bytearray)) and len(chunk):
                                     at_line_boundary = chunk.endswith(b'\n')
@@ -2615,6 +2633,8 @@ class Server:
                             if not saw_done:
                                 yield b'data: [DONE]\n\n'
                         finally:
+                            if chunk_task is not None:
+                                chunk_task.cancel()
                             if not released:
                                 released = True
                                 try:
@@ -2635,7 +2655,7 @@ class Server:
                     )
 
                     if resp.status == 429:
-                        ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
+                        ra = _parse_retry_after(resp.headers)  # V-12 fix
                         self._in_flight = max(0, self._in_flight - 1)
                         key.decrement_in_flight()
                         body_text = await resp.text()
@@ -2725,7 +2745,7 @@ class Server:
                 )
 
                 if resp.status == 429:
-                    ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
+                    ra = _parse_retry_after(resp.headers)  # V-12 fix
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
@@ -2793,29 +2813,42 @@ class Server:
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
     async def _stream_proxy(self, resp, key):
-        # Idle-aware heartbeat: fires even when upstream is silent.
+        # Phase 3.1 fix: Idle-aware heartbeat using sentinel-task pattern
+        # (backported from nous/blackbox). Fires even when upstream is silent.
         last_hb = time.time()
         at_line_boundary = True
         saw_done = False
         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+        chunk_task = None
         try:
             aiter = resp.content.__aiter__()
             while True:
-                try:
-                    chunk = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
-                except asyncio.TimeoutError:
-                    if at_line_boundary:
+                if chunk_task is None:
+                    chunk_task = asyncio.create_task(aiter.__anext__())
+                
+                done_set, _pending = await asyncio.wait({chunk_task}, timeout=hb_interval)
+                if not done_set:
+                    if at_line_boundary and (time.time() - last_hb) > hb_interval:
                         yield b': heartbeat\n\n'
                         last_hb = time.time()
                     continue
+                
+                finished, chunk_task = chunk_task, None
+                try:
+                    chunk = finished.result()
                 except StopAsyncIteration:
                     break
+                except Exception as e:
+                    logger.warning(f"[_stream_proxy] upstream error: {e}")
+                    break
+
                 if isinstance(chunk, (bytes, bytearray)):
                     if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
                         saw_done = True
                 else:
                     if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
                         saw_done = True
+                
                 yield chunk
                 if isinstance(chunk, (bytes, bytearray)) and len(chunk):
                     at_line_boundary = chunk.endswith(b'\n')
@@ -2825,6 +2858,8 @@ class Server:
             if not saw_done:
                 yield b'data: [DONE]\n\n'
         finally:
+            if chunk_task is not None:
+                chunk_task.cancel()
             try:
                 resp.release()
             except Exception:
@@ -2909,7 +2944,7 @@ class Server:
                 )
 
                 if resp.status == 429:
-                    ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
+                    ra = _parse_retry_after(resp.headers)  # V-12 fix
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
                     body_text = await resp.text()
@@ -3085,6 +3120,17 @@ def create_app() -> FastAPI:
 
     app.router.lifespan_context = lifespan
     return app
+
+def main():
+    import uvicorn
+    # V-26 fix: provide a proper entrypoint for direct execution
+    uvicorn.run(
+        "src.main:app",
+        host=os.environ.get('LISTEN_HOST', BIND_HOST),
+        port=int(os.environ.get('LISTEN_PORT', str(LISTEN_PORT))),
+        log_level='info'
+    )
+
 
 if __name__ == "__main__":
     main()

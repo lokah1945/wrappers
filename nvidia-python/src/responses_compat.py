@@ -484,11 +484,11 @@ class ResponsesHandler:
         return False
 
     async def translate_to_nim(self, request: Any, body: dict, model: str) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]]]:
+        """Translate Responses → Chat body, proxy, and return Responses stream/obj."""
+        from common.translations import ResponsesStreamState
+
         chat_body = build_chat_body(body, model, self.translate_thinking_to_nim)
-        # BUG-SEC-RESPONSE-STORE fix: extract principal for tenant-isolated store.
         principal = _extract_principal(request)
-        # V7 fix: metric_path marks this as a translated path, where the wrapper
-        # itself needs stream usage (and metrics are attributed correctly).
         result = await self.proxy_openai(chat_body, self.forward_headers(request), model, request,
                                          metric_path='/v1/responses')
 
@@ -507,57 +507,10 @@ class ResponsesHandler:
 
         async def stream_gen() -> AsyncGenerator[str, None]:
             resp_id = _rand('resp')
-            msg_id = _rand('msg')
-            seq = 0
-            next_extra_index = 1
-            msg_index = 0
-            rsn_index = None
-            rsn_id = _rand('rsn')
-            rsn_started = False
-            acc_reason = ''
-            acc_text = ''
-            tool_accs: List[Optional[dict]] = []
-            has_tool = False
-            usage = _zero_usage()
+            state = ResponsesStreamState(resp_id, model)
             buffer = ''
-            stream_error = None
-
-            def next_seq() -> int:
-                nonlocal seq
-                seq += 1
-                return seq
-
-            def emit(obj: dict) -> str:
-                return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
-
-            def make_tool_acc(idx: int, tc: dict) -> dict:
-                nonlocal next_extra_index
-                acc = {
-                    'name': '', 'args': '',
-                    'call_id': tc.get('id') or _rand('call'),
-                    'output_index': next_extra_index,
-                    'added': False,
-                }
-                next_extra_index += 1
-                while len(tool_accs) <= idx:
-                    tool_accs.append(None)
-                tool_accs[idx] = acc
-                return acc
-
-            base = base_response(resp_id, model, 'in_progress')
-            yield emit({'type': 'response.created', 'sequence_number': next_seq(), 'response': base})
-            yield emit({'type': 'response.in_progress', 'sequence_number': next_seq(), 'response': base})
-            yield emit({
-                'type': 'response.output_item.added', 'sequence_number': next_seq(), 'output_index': msg_index,
-                'item': {'id': msg_id, 'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []},
-            })
-            yield emit({
-                'type': 'response.content_part.added', 'sequence_number': next_seq(),
-                'item_id': msg_id, 'output_index': msg_index, 'content_index': 0,
-                'part': {'type': 'output_text', 'text': '', 'annotations': []},
-            })
-
             stream = result.get('stream')
+            
             try:
                 if stream is not None:
                     async for raw in stream:
@@ -576,149 +529,37 @@ class ResponsesHandler:
                                 c = json.loads(payload)
                             except (json.JSONDecodeError, ValueError):
                                 continue
-                            if c.get('usage'):
-                                usage = convert_usage(c['usage'])
-                            if not c.get('choices'):
-                                continue
-                            ch = c['choices'][0]
-                            d = ch.get('delta') or {}
-                            if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
-                            reason_delta = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
-                            if reason_delta:
-                                if not rsn_started:
-                                    rsn_started = True
-                                    rsn_index = next_extra_index
-                                    next_extra_index += 1
-                                    yield emit({
-                                        'type': 'response.output_item.added', 'sequence_number': next_seq(),
-                                        'output_index': rsn_index,
-                                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': '', 'content': []},
-                                    })
-                                acc_reason += reason_delta
-                                yield emit({
-                                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
-                                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
-                                    'delta': reason_delta,
-                                })
-                            for tc in d.get('tool_calls') or []:
-                                idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
-                                acc = tool_accs[idx] if idx < len(tool_accs) else None
-                                if acc is None:
-                                    acc = make_tool_acc(idx, tc)
-                                fn = tc.get('function') or {}
-                                if tc.get('id') and (not acc.get('call_id') or acc['call_id'].startswith('call_')):
-                                    acc['call_id'] = tc['id']
-                                if not acc['added']:
-                                    acc['added'] = True
-                                    yield emit({
-                                        'type': 'response.output_item.added', 'sequence_number': next_seq(),
-                                        'output_index': acc['output_index'],
-                                        'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
-                                                 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
-                                    })
-                                if fn.get('name'):
-                                    acc['name'] += fn['name']
-                                    yield emit({
-                                        'type': 'response.function_call.delta', 'sequence_number': next_seq(),
-                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                                        'delta': fn['name'], 'name': acc['name'],
-                                    })
-                                if fn.get('arguments'):
-                                    acc['args'] += fn['arguments']
-                                    yield emit({
-                                        'type': 'response.function_call.delta', 'sequence_number': next_seq(),
-                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                                        'delta': fn['arguments'],
-                                    })
-                                has_tool = True
-                # V-16 fix: parse a final single-line data payload (upstream closed
-                # without a trailing newline) like a normal line — the common case
-                # is a last usage chunk or terminal text delta.
+                            
+                            for ev in state.translate_chunk(c):
+                                yield ev
+                                
+                            if state.completed:
+                                break
+                                
+                # Handle tail
                 tail = buffer.strip()
                 if tail.startswith('data:'):
                     payload = tail[5:].strip()
                     if payload not in ('[DONE]', '"[DONE]"', ''):
                         try:
                             c = json.loads(payload)
-                        except (json.JSONDecodeError, ValueError):
-                            c = None
-                        if isinstance(c, dict):
-                            if c.get('usage'):
-                                usage = convert_usage(c['usage'])
-                            ch = (c.get('choices') or [{}])[0]
-                            d = ch.get('delta') or {}
-                            if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
-                            reason_tail = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
-                            if reason_tail and rsn_started:
-                                acc_reason += reason_tail
-                                yield emit({
-                                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
-                                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
-                                    'delta': reason_tail,
-                                })
+                            for ev in state.translate_chunk(c):
+                                yield ev
+                        except Exception:
+                            pass
             except Exception as e:
-                stream_error = e
                 import logging
                 logging.getLogger('responses').error(f"[responses:nim stream] {e}")
 
-            if not acc_text and not has_tool:
-                acc_text = f"[upstream stream error: {stream_error}]" if stream_error else '[No text response; the model returned no visible text.]'
-                yield emit({
-                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                    'content_index': 0, 'delta': acc_text,
-                })
-
-            outputs_by_index = {
-                msg_index: {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant',
-                            'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
-            }
-
-            if rsn_started:
-                yield emit({'type': 'response.reasoning_text.done', 'sequence_number': next_seq(),
-                            'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason})
-                rsn_item = {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason}
-                yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(), 'output_index': rsn_index, 'item': rsn_item})
-                outputs_by_index[rsn_index] = make_reasoning_item(acc_reason)
-
-            yield emit({'type': 'response.output_text.done', 'sequence_number': next_seq(),
-                        'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                        'content_index': 0, 'text': acc_text})
-            yield emit({'type': 'response.content_part.done', 'sequence_number': next_seq(),
-                        'item_id': msg_id, 'output_index': msg_index, 'content_index': 0,
-                        'part': {'type': 'output_text', 'text': acc_text, 'annotations': []}})
-            yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(),
-                        'output_index': msg_index, 'item': outputs_by_index[msg_index]})
-
-            completed_tools = [acc for acc in tool_accs if acc]
-            for acc in completed_tools:
-                fc_item = {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed',
-                           'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']}
-                yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(),
-                            'output_index': acc['output_index'], 'item': fc_item})
-                outputs_by_index[acc['output_index']] = fc_item
-
-            outputs = [outputs_by_index[i] for i in sorted(outputs_by_index)]
-            yield emit({'type': 'response.completed', 'sequence_number': next_seq(),
-                        'response': base_response(resp_id, model, 'completed', outputs, usage)})
+            # Emit terminal events
+            for ev in state.force_done():
+                yield ev
+            
             yield 'data: [DONE]\n\n'
 
-            _bounded_store(principal, resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+            _bounded_store(principal, resp_id, chat_body.get('messages', []) + [state.get_assistant_message()])
 
         return None, stream_gen()
-
     async def handle_responses_api(self, request: Any, raw_body: bytes) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]], Optional[int]]:
         try:
             body = json.loads(raw_body)

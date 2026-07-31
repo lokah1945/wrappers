@@ -65,10 +65,11 @@ except ImportError:
 
 
 # Shared translation utilities from common/translations (deduplication).
-# Note: Nous uses a dict-based AnthropicStreamState (for stream_with_heartbeat),
-# so we only import the string-agnostic utilities here.
 try:
     from common.translations import (
+        AnthropicStreamState,
+        ResponsesStreamState,
+        is_anthropic_message_order_valid as _is_anthropic_message_order_valid,
         parse_dsml_from_text as _parse_dsml_from_text,
         repair_orphan_tool_messages as _repair_orphan_tool_messages,
         normalize_upstream_error as _normalize_upstream_error,
@@ -1114,6 +1115,14 @@ def chat_to_responses(model: str, chat: dict) -> dict:
 
 def anthropic_to_openai(req: dict) -> dict:
     strip_cache_control(req)
+    # Phase 1.A fix: validate message order (is_anthropic_message_order_valid)
+    if not _is_anthropic_message_order_valid(req.get('messages', [])):
+        return {
+            'error': {
+                'type': 'invalid_request_error',
+                'message': 'Invalid message order: after a "tool" message, only "assistant" or "tool" messages are allowed.',
+            }
+        }
     model = resolve_model(req.get("model"))
     # Transparent: do NOT force REASONING_MODEL when thinking is enabled.
     # Client/agent chooses the model; thinking flags are passed through upstream.
@@ -1139,6 +1148,7 @@ def anthropic_to_openai(req: dict) -> dict:
                 src = b.get("source", {})
                 parts.append({"type": "image_url", "image_url": {"url": f"data:{src.get('media_type','image/png')};base64,{src.get('data','')}"}})
             elif bt == "thinking": reasoning.append(b.get("thinking", ""))
+            elif bt == "redacted_thinking": reasoning.append("[redacted]")
             elif bt == "tool_use":
                 tools.append({"id": b.get("id"), "type": "function", "function": {"name": b.get("name"), "arguments": json.dumps(b.get("input", {}))}})
             elif bt == "tool_result":
@@ -1269,8 +1279,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
     terminated = False
 
     async def emit_state_done():
-        if state and hasattr(state, "done"):
-            done_evs = state.done()
+        # Phase 1.C: ensure terminal events are emitted (standardized)
+        method = getattr(state, "force_done", getattr(state, "done", None))
+        if state and method:
+            done_evs = method()
             if isinstance(done_evs, str):
                 done_evs = [done_evs]
             for ev in (done_evs or []):
@@ -1405,352 +1417,6 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
             KEY_POOL.release(key_entry)
 
 # Advanced streaming state machines
-class AnthropicStreamState:
-    def __init__(self, model):
-        self.model = model
-        self.index = -1  # first content block must be index 0 (Anthropic SDK)
-        self.message_started = False
-        self.current_block = None
-        self.tool_map = {}
-        self.finished = False
-        self.msg_id = f"msg-{int(time.time()*1000)}"
-
-    def _usage(self, raw=None):
-        raw = raw or {}
-        return {
-            "input_tokens": raw.get("prompt_tokens", raw.get("input_tokens", 0)) or 0,
-            "output_tokens": raw.get("completion_tokens", raw.get("output_tokens", 0)) or 0,
-            "cache_creation_input_tokens": raw.get("cache_creation_input_tokens", 0) or 0,
-            "cache_read_input_tokens": raw.get("cache_read_input_tokens", 0) or 0,
-        }
-
-    def translate_chunk(self, chunk):
-        events = []
-        if not self.message_started:
-            events.append({"type": "message_start", "data": {"type": "message_start", "message": {
-                "id": self.msg_id, "type": "message", "role": "assistant", "model": self.model,
-                "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": self._usage(),
-            }}})
-            self.message_started = True
-
-        if "choices" not in chunk:
-            return events
-        ch = (chunk.get("choices") or [{}])[0]
-        delta = ch.get("delta", {}) or {}
-
-        # reasoning / thinking delta
-        reason = delta.get("reasoning_content") or delta.get("reasoning")
-        if isinstance(reason, str) and reason:
-            if self.current_block != "thinking":
-                if self.current_block:
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-                self.index += 1
-                events.append({"type": "content_block_start", "data": {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "thinking", "thinking": ""},
-                }})
-                self.current_block = "thinking"
-            events.append({"type": "content_block_delta", "data": {
-                "type": "content_block_delta", "index": self.index,
-                "delta": {"type": "thinking_delta", "thinking": reason},
-            }})
-
-        # If content looks like DSML tool markup, do NOT emit as text_delta (prevent leak)
-        content = delta.get("content")
-        if isinstance(content, str) and content and "DSML" in content.replace("\uff5c", "|"):
-            # skip raw DSML text; structured tool_calls path should carry tools
-            content = None
-
-        if content:
-            if self.current_block != "text":
-                if self.current_block:
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-                self.index += 1
-                events.append({"type": "content_block_start", "data": {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "text", "text": ""},
-                }})
-                self.current_block = "text"
-            events.append({"type": "content_block_delta", "data": {
-                "type": "content_block_delta", "index": self.index,
-                "delta": {"type": "text_delta", "text": content},
-            }})
-
-        for tc in delta.get("tool_calls", []) or []:
-            idx = tc.get("index", 0)
-            fn = tc.get("function", {}) or {}
-            if idx not in self.tool_map:
-                if self.current_block:
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-                self.index += 1
-                self.tool_map[idx] = self.index
-                tid = tc.get("id") or f"toolu_{self.index}"
-                events.append({"type": "content_block_start", "data": {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "tool_use", "id": tid, "name": fn.get("name", "") or "", "input": {}},
-                }})
-                self.current_block = "tool_use"
-            tidx = self.tool_map[idx]
-            if "arguments" in fn and fn.get("arguments") is not None:
-                events.append({"type": "content_block_delta", "data": {
-                    "type": "content_block_delta", "index": tidx,
-                    "delta": {"type": "input_json_delta", "partial_json": fn.get("arguments") or ""},
-                }})
-
-        if ch.get("finish_reason") and not self.finished:
-            self.finished = True
-            if self.current_block is not None:
-                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            fr = ch.get("finish_reason")
-            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
-                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
-            )
-            events.append({"type": "message_delta", "data": {
-                "type": "message_delta",
-                "delta": {"stop_reason": stop, "stop_sequence": None},
-                "usage": self._usage(chunk.get("usage") or {}),
-            }})
-            events.append({"type": "message_stop", "data": {"type": "message_stop"}})
-            self.current_block = None
-        return events
-
-    def done(self):
-        """Emit terminal events if stream ended without finish_reason (prevent hang)."""
-        if self.finished:
-            return []
-        events = []
-        if not self.message_started:
-            self.message_started = True
-            events.append({"type": "message_start", "data": {"type": "message_start", "message": {
-                "id": self.msg_id, "type": "message", "role": "assistant", "model": self.model,
-                "content": [], "stop_reason": None, "stop_sequence": None,
-                "usage": self._usage(),
-            }}})
-        if self.current_block is not None:
-            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            self.current_block = None
-        stop = "tool_use" if self.tool_map else "end_turn"
-        events.append({"type": "message_delta", "data": {
-            "type": "message_delta",
-            "delta": {"stop_reason": stop, "stop_sequence": None},
-            "usage": self._usage(),
-        }})
-        events.append({"type": "message_stop", "data": {"type": "message_stop"}})
-        self.finished = True
-        return events
-
-
-class ResponsesStreamState:
-    """Full Responses streaming state (for Codex / Claude Code / OpenAI Responses SDK)"""
-    def __init__(self, rid, model):
-        self.rid = rid
-        self.model = model
-        self.seq = 0
-        self.text_idx = 1
-        self.tool_acc = {}
-        self._next_tool_index = 1
-        self.reasoning_started = False
-        self.rsn_index = None
-        self.rsn_id = f"rsn-{int(time.time()*1000)}"
-        self.acc_reason = ""
-        self.started = False
-        self._active_tool_id = None
-        self._completed = False
-        self._finished = False
-        self.accum_usage = {}
-
-    def next_seq(self):
-        self.seq += 1
-        return self.seq
-
-    def emit(self, etype, data):
-        payload = {"type": etype, "sequence_number": self.next_seq(), **data}
-        return f"event: {etype}\ndata: {json.dumps(payload)}\n\n"
-
-    def start(self):
-        if self.started:
-            return []
-        self.started = True
-        rid = self.rid
-        # OpenAI Responses API requires the output item to be "added" (made active)
-        # BEFORE any output_text.delta is sent, otherwise clients like Codex v0.145
-        # emit "OutputTextDelta without active item" and hang.
-        return [
-            self.emit("response.created", {"response": {"id": rid, "model": self.model, "status": "in_progress"}}),
-            self.emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}}),
-            self.emit("response.output_item.added", {
-                "output_index": 0,
-                "item": {"id": "msg-1", "type": "message", "status": "in_progress",
-                         "role": "assistant", "content": []},
-            }),
-            self.emit("response.content_part.added", {
-                "item_id": "msg-1", "output_index": 0, "content_index": 0,
-                "part": {"type": "output_text", "text": ""},
-            }),
-        ]
-
-    def delta(self, text):
-        self.final_text = getattr(self, "final_text", "") + text
-        return self.emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": text})
-
-    def tool_delta(self, call_id, name, args):
-        events = []
-        if call_id not in self.tool_acc:
-            self.tool_acc[call_id] = {"name": name, "args": "", "output_index": self._next_tool_index}
-            self._next_tool_index += 1
-            # Make the tool item active BEFORE sending its delta (Codex requires this).
-            events.append(self.emit("response.output_item.added", {
-                "output_index": self.tool_acc[call_id]["output_index"],
-                "item": {
-                    "id": call_id, "type": "function_call", "status": "in_progress",
-                    "call_id": call_id, "name": name, "arguments": "",
-                },
-            }))
-        self.tool_acc[call_id]["name"] = self.tool_acc[call_id]["name"] or name
-        self.tool_acc[call_id]["args"] += args
-        events.append(self.emit("response.function_call.delta", {
-            "item_id": call_id, "output_index": self.tool_acc[call_id]["output_index"], "delta": args,
-        }))
-        return events
-
-    def _normalize_usage(self, u):
-        if not u:
-            u = self.accum_usage or {}
-        else:
-            self.accum_usage.update(u)
-        prompt = u.get("prompt_tokens") or u.get("input_tokens") or 0
-        completion = u.get("completion_tokens") or u.get("output_tokens") or 0
-        # OpenAI Responses API schema requires total_tokens alongside input/output.
-        return {
-            "input_tokens": int(prompt),
-            "output_tokens": int(completion),
-            "total_tokens": int(prompt) + int(completion),
-        }
-
-    def done(self, usage=None):
-        # MUST return a list — stream_with_heartbeat iterates this.
-        # Idempotent: emit response.completed exactly once.
-        if self._completed:
-            return []
-        self._completed = True
-        norm = self._normalize_usage(usage)
-        rid = self.rid
-        text = getattr(self, "final_text", "")
-        events = [
-            self.emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": text}),
-            self.emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text}}),
-            self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
-        ]
-        # Close the reasoning item opened during thinking (if any).
-        if self.reasoning_started:
-            events.append(self.emit("response.reasoning_text.done", {
-                "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "text": self.acc_reason,
-            }))
-            events.append(self.emit("response.output_item.done", {
-                "output_index": self.rsn_index,
-                "item": {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason},
-            }))
-        # Close every tool item that was opened (Codex hangs if a function_call
-        # item is added but never marked done).
-        for call_id, info in self.tool_acc.items():
-            events.append(self.emit("response.output_item.done", {
-                "output_index": info.get("output_index", 1),
-                "item": {
-                    "id": call_id, "type": "function_call", "status": "completed",
-                    "call_id": call_id, "name": info.get("name", ""),
-                    "arguments": info.get("args", ""),
-                },
-            }))
-        # Build the final output array sorted by output_index (0=text, 1=reasoning,
-        # 2+ = tools) so the client's response.completed parse is well-ordered.
-        outputs_by_index = {
-            0: {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
-        }
-        if self.reasoning_started:
-            outputs_by_index[self.rsn_index] = {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason}
-        for call_id, info in self.tool_acc.items():
-            outputs_by_index[info.get("output_index", 1)] = {"id": call_id, "type": "function_call", "status": "completed", "call_id": call_id, "name": info.get("name", ""), "arguments": info.get("args", "")}
-        output = [outputs_by_index[i] for i in sorted(outputs_by_index)]
-        events.append(self.emit("response.completed", {"response": {"id": rid, "model": self.model, "status": "completed", "output": output, "usage": norm}}))
-        return events
-
-    def assistant_message(self):
-        text = getattr(self, "final_text", "")
-        msg = {"role": "assistant", "content": text or (None if self.tool_acc else "")}
-        if self.tool_acc:
-            msg["tool_calls"] = [
-                {"id": call_id, "type": "function", "function": {"name": info.get("name", ""), "arguments": info.get("args", "")}}
-                for call_id, info in self.tool_acc.items()
-            ]
-        return msg
-
-    def translate_chunk(self, chunk):
-        """Convert OpenAI chat chunk → Responses events"""
-        events = []
-        if not self.started:
-            events.extend(self.start())
-
-        # Accumulate usage from any chunk (Nous sends it separately from finish_reason)
-        if isinstance(chunk, dict) and chunk.get("usage"):
-            self.accum_usage.update(chunk["usage"])
-
-        if "choices" not in chunk:
-            return events
-
-        ch = chunk["choices"][0]
-        delta = ch.get("delta", {})
-
-        # Text
-        if delta.get("content"):
-            events.append(self.delta(delta["content"]))
-
-        # Reasoning (Nous reasoning_content / reasoning) — MUST be streamed so the
-        # client keeps receiving progress during the model's thinking phase.
-        # The previous behavior DROPPED reasoning, leaving a multi-second silent
-        # gap on the SSE stream that tripped client-side idle timeouts (Codex /
-        # OpenAI SDK "stops mid-way"). Mirror reference nvidia-python
-        # responses_compat: open a 'reasoning' output item then stream deltas.
-        reason_delta = (
-            delta.get("reasoning_content") if isinstance(delta.get("reasoning_content"), str)
-            else (delta.get("reasoning") if isinstance(delta.get("reasoning"), str) else "")
-        )
-        if reason_delta:
-            if not self.reasoning_started:
-                self.reasoning_started = True
-                self.rsn_index = self._next_tool_index
-                self._next_tool_index += 1
-                events.append(self.emit("response.output_item.added", {
-                    "output_index": self.rsn_index,
-                    "item": {"id": self.rsn_id, "type": "reasoning", "status": "in_progress", "summary": "", "content": []},
-                }))
-            self.acc_reason += reason_delta
-            events.append(self.emit("response.reasoning_text.delta", {
-                "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "delta": reason_delta,
-            }))
-
-        # Tool calls (parallel support)
-        for tc in delta.get("tool_calls", []):
-            fn = tc.get("function", {})
-            raw_id = tc.get("id")
-            if raw_id:
-                self._active_tool_id = raw_id
-            call_id = self._active_tool_id or (tc.get("id") or f"call_{len(self.tool_acc)}")
-            name = fn.get("name", "")
-            args = fn.get("arguments", "")
-            if name or args:
-                events.extend(self.tool_delta(call_id, name, args))
-
-        # Completion event is emitted exactly once at [DONE] in stream_with_heartbeat.
-        # This avoids a double response.completed (one with empty usage) that breaks
-        # OpenAI Responses SDK / Codex parsing ("missing field input_tokens").
-        if ch.get("finish_reason"):
-            self._finished = True
-        return events
-
-# --------------------------------------------------------------------------
-# METRICS
-# --------------------------------------------------------------------------
 class Metrics:
     def __init__(self):
         self.requests = 0
@@ -2458,10 +2124,10 @@ async def responses(request: Request):
         state = ResponsesStreamState(rid, chat_body["model"])
         async def gen():
             # Codex requires output_item.added BEFORE first delta.
-            for ev in state.start():
+            for ev in state.start_events():
                 yield ev
             try:
-                async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
+                async for line in stream_with_heartbeat(result, lambda x: x, state=state, key_entry=key_entry):
                     yield line
             finally:
                 # BUG-FIX: store conversation without blocking stream
@@ -2476,7 +2142,7 @@ async def responses(request: Request):
                 # let it be GC'd mid-flight, and log its exceptions.
                 try:
                     _fire_and_forget(
-                        store_conversation(principal, rid, list(chat_body.get("messages", [])) + [state.assistant_message()]),
+                        store_conversation(principal, rid, list(chat_body.get("messages", [])) + [state.get_assistant_message()]),
                         "store-conversation",
                     )
                 except Exception as e:
@@ -2549,7 +2215,7 @@ async def messages(request: Request):
     if is_stream:
         state = AnthropicStreamState(chat_body["model"])
         async def gen():
-            async for line in stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state, key_entry=key_entry):
+            async for line in stream_with_heartbeat(result, lambda x: x, state=state, key_entry=key_entry):
                 yield line
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 

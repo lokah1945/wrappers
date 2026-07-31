@@ -135,6 +135,8 @@ from .metrics import Metrics
 try:
     from common.translations import (
         AnthropicStreamState,
+        is_anthropic_message_order_valid as _is_anthropic_message_order_valid,
+        parse_dsml_from_text as _parse_dsml_from_text,
     )
     from common.translations import (
         normalize_upstream_error as _normalize_upstream_error,
@@ -612,6 +614,8 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
         if headers:
             fwd.update(headers)
 
+        # hand-off flag to ensure exactly-once release (Phase 3.2 fix)
+        released = False
         try:
             agent = await get_agent()
             timeout = aiohttp.ClientTimeout(
@@ -632,7 +636,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                       retry_after=retry_after)
                     error_text = await resp.text()
                     resp.release()
-                    pool.release(key_obj)
+                    # Released will be True at end of outer finally
                     last_status = resp.status
                     try:
                         last_data = json.loads(error_text)
@@ -642,16 +646,14 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     if _is_retriable_status(resp.status):
                         continue  # retry with next key
                     return JSONResponse(last_data, status_code=resp.status)
-                pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
-
-                # Heartbeat-aware streaming passthrough — keeps idle LBs/agents alive.
-                heartbeat_ms = HEARTBEAT_MS
-                heartbeat_bytes = b': heartbeat\n\n'
+                
+                # Hand over key ownership to the stream generator
+                released = True
                 resp_ref = resp
-                released = False
 
                 async def stream_gen():
-                    nonlocal released
+                    # Local released flag for this generator to ensure idempotency
+                    gen_released = False
                     try:
                         async for line in resp_ref.content:
                             yield line
@@ -660,8 +662,8 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     except asyncio.CancelledError:
                         raise
                     finally:
-                        if not released:
-                            released = True
+                        if not gen_released:
+                            gen_released = True
                             try:
                                 resp_ref.release()
                             except Exception:
@@ -676,22 +678,40 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     at_line_boundary = True
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
                     inner = stream_gen()
+                    chunk_task = None
                     while True:
+                        if chunk_task is None:
+                            chunk_task = asyncio.create_task(inner.__anext__())
+                        
                         try:
-                            chunk = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-                        except asyncio.TimeoutError:
-                            if at_line_boundary:
-                                yield b': heartbeat\n\n'
-                                last_hb = time.time()
-                            continue
-                        except StopAsyncIteration:
-                            break
-                        yield chunk
-                        if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                            at_line_boundary = chunk.endswith(b'\n')
-                        elif chunk:
-                            at_line_boundary = str(chunk).endswith('\n')
-                        last_hb = time.time()
+                            done_set, _pending = await asyncio.wait({chunk_task}, timeout=hb_interval)
+                            if not done_set:
+                                if at_line_boundary and (time.time() - last_hb) > hb_interval:
+                                    yield b': heartbeat\n\n'
+                                    last_hb = time.time()
+                                continue
+                            
+                            finished, chunk_task = chunk_task, None
+                            try:
+                                chunk = finished.result()
+                            except StopAsyncIteration:
+                                break
+                            except Exception as e:
+                                logger.warning(f"[stream] upstream error: {e}")
+                                break
+                            
+                            yield chunk
+                            if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                                at_line_boundary = chunk.endswith(b'\n')
+                            elif chunk:
+                                at_line_boundary = str(chunk).endswith('\n')
+                            last_hb = time.time()
+                        finally:
+                            if done_set and chunk_task is None:
+                                pass # correctly finished
+                    
+                    if chunk_task is not None:
+                        chunk_task.cancel()
 
                 return StreamingResponse(
                     stream_with_heartbeat(),
@@ -751,11 +771,11 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                     "type": "api_error"}}
             continue
         finally:
-            # Ensure key is released for non-stream paths (stream path releases in stream_gen finally).
-            try:
-                pool.release(key_obj)
-            except Exception:
-                pass
+            if not released:
+                try:
+                    pool.release(key_obj)
+                except Exception:
+                    pass
 
     # All keys exhausted — return 429 (not 503) so SDKs auto-retry with backoff.
     retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))
@@ -867,219 +887,80 @@ async def responses(request: Request):
 async def _translate_openai_stream_to_responses(openai_gen, model: str):
     """Translate OpenAI Chat Completions SSE stream → Responses API SSE stream.
 
-    Emits the full Responses event lifecycle:
-      response.created → response.in_progress → response.output_item.added →
-      response.content_part.added → response.output_text.delta →
-      response.output_text.done → response.content_part.done →
-      response.output_item.done → response.completed → [DONE]
-
-    CRITICAL: each SSE event MUST be yielded as a SINGLE string with the
-    `\n\n` terminator inline. Splitting `event:` and `data:` into separate
-    yields causes Starlette to flush them as separate HTTP chunks; the client
-    receives a partial frame and surfaces it as raw text.
+    Phase 1.D/2.4 fix: Use shared ResponsesStreamState which handles DSML
+    stripping and robust event lifecycle (output_item added before delta).
     """
     resp_id = f"resp_{int(time.time()*1000)}"
-    created_at = int(time.time())
-    msg_id = f"msg_{int(time.time()*1000)}"
-    text_started = False
-    full_text = ''
+    state = ResponsesStreamState(resp_id, model)
 
-    def _sse(event_type: str, payload: dict) -> str:
-        """Build a complete SSE frame: event:\ndata:\n\n"""
-        return f'event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
-
+    buffer = b''
+    hb_interval = float(HEARTBEAT_MS) / 1000.0
+    done = False
+    inner = openai_gen.__aiter__()
+    chunk_task = None
+    
     try:
-        # response.created
-        yield _sse('response.created', {
-            'type': 'response.created',
-            'response': {
-                'id': resp_id, 'object': 'response', 'created_at': created_at,
-                'model': model, 'status': 'in_progress', 'output': [],
-            },
-        })
-
-        # response.in_progress
-        yield _sse('response.in_progress', {
-            'type': 'response.in_progress',
-            'response': {'id': resp_id, 'status': 'in_progress'},
-        })
-
-        # Buffer accumulator: upstream chunks may contain multiple SSE lines
-        # or partial lines split across chunk boundaries. Accumulate and split
-        # on \n to parse complete lines only.
-        buffer = b''
-        hb_interval = float(HEARTBEAT_MS) / 1000.0
-        done = False
-
-        def _parse_line(line_str: str):
-            """Parse one complete SSE line. Returns (events_list, is_done)."""
-            nonlocal text_started, full_text
-            events = []
-            if not line_str.startswith('data: '):
-                return events, False
-            data_str = line_str[6:].strip()
-            if data_str == '[DONE]':
-                return events, True
-            try:
-                data = json.loads(data_str)
-            except json.JSONDecodeError:
-                return events, False
-            if data.get('object') != 'chat.completion.chunk':
-                return events, False
-            choices = data.get('choices', [])
-            if not choices:
-                return events, False
-            choice = choices[0]
-            delta = choice.get('delta', {})
-            if delta.get('content'):
-                if not text_started:
-                    events.append(_sse('response.output_item.added', {
-                        'type': 'response.output_item.added', 'output_index': 0,
-                        'item': {
-                            'id': msg_id, 'type': 'message', 'status': 'in_progress',
-                            'role': 'assistant', 'content': [],
-                        },
-                    }))
-                    events.append(_sse('response.content_part.added', {
-                        'type': 'response.content_part.added', 'item_id': msg_id,
-                        'output_index': 0, 'content_index': 0,
-                        'part': {'type': 'output_text', 'text': '', 'annotations': []},
-                    }))
-                    text_started = True
-                full_text += delta['content']
-                events.append(_sse('response.output_text.delta', {
-                    'type': 'response.output_text.delta', 'item_id': msg_id,
-                    'output_index': 0, 'content_index': 0, 'delta': delta['content'],
-                }))
-            if choice.get('finish_reason'):
-                return events, True
-            return events, False
-
-        # Idle-aware iteration with heartbeat
-        inner = openai_gen.__aiter__()
         while not done:
+            if chunk_task is None:
+                chunk_task = asyncio.create_task(inner.__anext__())
             try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
-                # Upstream idle — inject heartbeat
-                yield ': heartbeat\n\n'
-                continue
-            except StopAsyncIteration:
-                break
-            if isinstance(raw, str):
-                raw = raw.encode('utf-8', errors='replace')
-            buffer += raw
-            # Split on \n, process complete lines, retain tail in buffer
-            while b'\n' in buffer:
-                line_bytes, buffer = buffer.split(b'\n', 1)
-                line_str = line_bytes.decode('utf-8', errors='replace').strip()
-                if not line_str:
+                done_set, _pending = await asyncio.wait({chunk_task}, timeout=hb_interval)
+                if not done_set:
+                    yield ': heartbeat\n\n'
                     continue
-                events, is_done = _parse_line(line_str)
-                for ev in events:
-                    yield ev
-                if is_done:
-                    done = True
+                
+                finished, chunk_task = chunk_task, None
+                try:
+                    raw = finished.result()
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    logger.warning(f"[stream] upstream error: {e}")
                     break
 
-        if text_started:
-            # output_text.done
-            yield _sse('response.output_text.done', {
-                'type': 'response.output_text.done', 'item_id': msg_id,
-                'output_index': 0, 'content_index': 0, 'text': full_text,
-            })
-            # content_part.done
-            yield _sse('response.content_part.done', {
-                'type': 'response.content_part.done', 'item_id': msg_id,
-                'output_index': 0, 'content_index': 0,
-                'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
-            })
-            # output_item.done
-            yield _sse('response.output_item.done', {
-                'type': 'response.output_item.done', 'output_index': 0,
-                'item': {
-                    'id': msg_id, 'type': 'message', 'status': 'completed',
-                    'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                },
-            })
+                if isinstance(raw, str):
+                    raw = raw.encode('utf-8', errors='replace')
+                buffer += raw
+                while b'\n' in buffer:
+                    line_bytes, buffer = buffer.split(b'\n', 1)
+                    line_str = line_bytes.decode('utf-8', errors='replace').strip()
+                    if not line_str:
+                        continue
+                    if not line_str.startswith('data: '):
+                        continue
+                    data_str = line_str[6:].strip()
+                    if data_str == '[DONE]':
+                        done = True
+                        break
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
+                    
+                    for ev in state.translate_chunk(data):
+                        yield ev
+                        
+                    if state.completed:
+                        done = True
+                        break
+            finally:
+                if done and chunk_task is not None:
+                    chunk_task.cancel()
 
-        # response.completed
-        yield _sse('response.completed', {
-            'type': 'response.completed',
-            'response': {
-                'id': resp_id, 'object': 'response', 'created_at': created_at,
-                'model': model, 'status': 'completed',
-                'output': [{
-                    'id': msg_id, 'type': 'message', 'status': 'completed',
-                    'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                }],
-            },
-        })
+        # Emit terminal events if not already done
+        for ev in state.force_done():
+            yield ev
 
         yield 'data: [DONE]\n\n'
 
     except Exception as e:
         logger.error(f'[openrouter] responses stream translation error: {e}')
-        # Ensure terminal events are always emitted.
-        try:
-            if text_started:
-                yield _sse('response.output_text.done', {
-                    'type': 'response.output_text.done', 'item_id': msg_id,
-                    'output_index': 0, 'content_index': 0, 'text': full_text,
-                })
-                yield _sse('response.content_part.done', {
-                    'type': 'response.content_part.done', 'item_id': msg_id,
-                    'output_index': 0, 'content_index': 0,
-                    'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
-                })
-                yield _sse('response.output_item.done', {
-                    'type': 'response.output_item.done', 'output_index': 0,
-                    'item': {
-                        'id': msg_id, 'type': 'message', 'status': 'completed',
-                        'role': 'assistant',
-                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                    },
-                })
-            yield _sse('response.completed', {
-                'type': 'response.completed',
-                'response': {
-                    'id': resp_id, 'object': 'response', 'created_at': created_at,
-                    'model': model, 'status': 'completed',
-                    'output': [{
-                        'id': msg_id, 'type': 'message', 'status': 'completed',
-                        'role': 'assistant',
-                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                    }],
-                },
-            })
-            yield 'data: [DONE]\n\n'
-        except Exception:
-            pass
-
-
-@app.post("/v1/embeddings")
-async def embeddings(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
-                            status_code=400)
-    return await _proxy_request("POST", "embeddings", body, request=request)
-
-
-@app.post("/v1/images/generations")
-async def images_generations(request: Request):
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
-                            status_code=400)
-    return await _proxy_request("POST", "images/generations", body, request=request)
-
-
-@app.get("/v1/models")
+        for ev in state.force_done():
+            yield ev
+        yield 'data: [DONE]\n\n'
+    finally:
+        if chunk_task is not None:
+            chunk_task.cancel()
 async def list_models(request: Request):
     """List models from OpenRouter, optionally augmented with catalog."""
     try:
@@ -1322,6 +1203,10 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             msgs[0]['content'] = body['instructions'] + '\n\n' + str(msgs[0].get('content') or '')
         else:
             msgs.insert(0, {'role': 'system', 'content': body['instructions']})
+    
+    # Phase 1.D fix: repair orphan tool results (per contract I7/I9)
+    msgs = _repair_orphan_tool_messages(msgs)
+    
     out = {'model': model, 'messages': msgs, 'stream': bool(body.get('stream', False))}
     # Forward client params verbatim (transparent proxy — no mutation).
     if body.get('max_output_tokens') is not None:
@@ -1390,7 +1275,17 @@ def _anthropic_to_openai(body: dict) -> dict:
       - tool_result blocks as content of user messages → emitted as {role:'tool', tool_call_id, content}.
       - tool_use blocks in assistant messages → tool_calls array.
       - image blocks → image_url (base64 data URI).
+      - Phase 1.A fix: thinking blocks → reasoning_content.
+      - Phase 1.A fix: validate message order (is_anthropic_message_order_valid).
     """
+    if not is_anthropic_message_order_valid(body.get('messages', [])):
+        return {
+            'error': {
+                'type': 'invalid_request_error',
+                'message': 'Invalid message order: after a "tool" message, only "assistant" or "tool" messages are allowed.',
+            }
+        }
+
     messages = []
     system = body.get("system", "")
     if system:
@@ -1409,12 +1304,17 @@ def _anthropic_to_openai(body: dict) -> dict:
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
+                reasoning_parts = []
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get("type")
                     if btype == "text":
                         text_parts.append(block.get("text", ""))
+                    elif btype == "thinking":
+                        reasoning_parts.append(block.get("thinking", ""))
+                    elif btype == "redacted_thinking":
+                        reasoning_parts.append("[redacted]")
                     elif btype == "tool_use":
                         tool_calls.append({
                             "id": block.get("id", ""),
@@ -1431,6 +1331,8 @@ def _anthropic_to_openai(body: dict) -> dict:
                     msg_obj["content"] = None
                 if tool_calls:
                     msg_obj["tool_calls"] = tool_calls
+                if reasoning_parts:
+                    msg_obj["reasoning_content"] = "\n".join(reasoning_parts)
                 messages.append(msg_obj)
             else:
                 messages.append({"role": "assistant", "content": content})
@@ -1538,13 +1440,31 @@ def _anthropic_to_openai(body: dict) -> dict:
 
 
 def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict:
-    """Convert OpenAI ChatCompletion response → Anthropic Message response."""
+    """Convert OpenAI ChatCompletion response → Anthropic Message response.
+
+    Correctly handles:
+      - Phase 1.B fix: Extract reasoning/thinking from reasoning_content or reasoning field.
+      - Phase 1.B fix: Parse DSML tool calls leaked into content.
+      - Phase 1.B fix: Proper tool_use content blocks.
+    """
     choices = openai_resp.get("choices", [])
     choice = choices[0] if choices else {}
     message = choice.get("message", {})
+    text = message.get("content") or ""
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+
     content_blocks = []
-    if message.get("content"):
-        content_blocks.append({"type": "text", "text": message["content"]})
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
+
+    # Parse DSML tool calls from content
+    dsml_tools = []
+    if isinstance(text, str) and 'DSML' in text.replace('\uff5c', '|'):
+        text, dsml_tools = _parse_dsml_from_text(text)
+
+    if text or (not message.get("tool_calls") and not dsml_tools):
+        content_blocks.append({"type": "text", "text": text})
+
     if message.get("tool_calls"):
         for tc in message["tool_calls"]:
             fn = tc.get("function", {})
@@ -1558,12 +1478,14 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
                 "name": fn.get("name", ""),
                 "input": input_obj,
             })
-    if not content_blocks:
-        content_blocks.append({"type": "text", "text": ""})
+
+    content_blocks.extend(dsml_tools)
 
     finish_reason = choice.get("finish_reason", "stop")
     stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                    "content_filter": "end_turn"}.get(finish_reason, "end_turn")
+    if message.get("tool_calls") or dsml_tools:
+        stop_reason = "tool_use"
 
     usage = openai_resp.get("usage", {})
     return {
@@ -1584,173 +1506,79 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
 async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     """Translate OpenAI SSE stream → Anthropic SSE stream with proper event lifecycle.
 
-    Emits: message_start → content_block_start → content_block_delta(s) →
-    content_block_stop → message_delta → message_stop.
-
-    CRITICAL: each SSE event MUST be yielded as a SINGLE string with the
-    `\n\n` terminator inline. Splitting `event:` and `data:` into separate
-    yields causes Starlette to flush them as separate HTTP chunks; the client
-    receives a partial frame (`event: ...\n` with no data and no blank-line
-    terminator) and surfaces it as raw text (Claude Code bug).
+    Phase 1.C/2.4 fix: Use shared AnthropicStreamState which handles DSML
+    stripping and robust event state machine.
     """
-    msg_id = f"msg_{int(time.time()*1000)}"
     model = request_body.get("model", "")
+    state = AnthropicStreamState(model)
 
-    def _sse(event_type: str, payload: dict) -> str:
-        """Build a complete SSE frame: event:\ndata:\n\n"""
-        return f'event: {event_type}\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n'
-
-    block_open = False
-    block_index = 0
-    text_started = False
-    tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
-    finish_reason = None
-    output_tokens = 0
-    input_tokens = 0
-
+    buffer = b''
+    hb_interval = float(HEARTBEAT_MS) / 1000.0
+    done = False
+    inner = openai_gen.__aiter__()
+    chunk_task = None
+    
     try:
-        # message_start (always first)
-        yield _sse('message_start', {
-            'type': 'message_start',
-            'message': {
-                'id': msg_id, 'type': 'message', 'role': 'assistant',
-                'model': model, 'content': [],
-                'stop_reason': None, 'stop_sequence': None,
-                'usage': {'input_tokens': 0, 'output_tokens': 0},
-            },
-        })
-
-        # Buffer accumulator + idle-aware heartbeat.
-        # Upstream chunks may contain multiple SSE lines or partial lines split
-        # across chunk boundaries. Accumulate and split on \n to parse complete
-        # lines only. Heartbeat fires on idle so reasoning models don't timeout.
-        buffer = b''
-        hb_interval = float(HEARTBEAT_MS) / 1000.0
-        done = False
-        inner = openai_gen.__aiter__()
         while not done:
+            if chunk_task is None:
+                chunk_task = asyncio.create_task(inner.__anext__())
             try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
-                yield ': heartbeat\n\n'
-                continue
-            except StopAsyncIteration:
-                break
-            if isinstance(raw, str):
-                raw = raw.encode('utf-8', errors='replace')
-            buffer += raw
-            while b'\n' in buffer:
-                line_bytes, buffer = buffer.split(b'\n', 1)
-                line = line_bytes.decode('utf-8', errors='replace').strip()
-                if not line:
+                done_set, _pending = await asyncio.wait({chunk_task}, timeout=hb_interval)
+                if not done_set:
+                    yield ': heartbeat\n\n'
                     continue
-
-                if not line.startswith('data: '):
-                    continue
-                data_str = line[6:].strip()
-                if data_str == '[DONE]':
-                    done = True
+                
+                finished, chunk_task = chunk_task, None
+                try:
+                    raw = finished.result()
+                except StopAsyncIteration:
+                    break
+                except Exception as e:
+                    logger.warning(f"[stream] upstream error: {e}")
                     break
 
-                try:
-                    data = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
+                if isinstance(raw, str):
+                    raw = raw.encode('utf-8', errors='replace')
+                buffer += raw
+                while b'\n' in buffer:
+                    line_bytes, buffer = buffer.split(b'\n', 1)
+                    line = line_bytes.decode('utf-8', errors='replace').strip()
+                    if not line:
+                        continue
 
-                if data.get('object') != 'chat.completion.chunk':
-                    continue
-                choices = data.get('choices', [])
-                if not choices:
-                    continue
-                choice = choices[0]
-                delta = choice.get('delta', {})
-                usage_chunk = data.get('usage')
-                if usage_chunk:
-                    input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
-                    output_tokens = usage_chunk.get('completion_tokens', output_tokens)
+                    if not line.startswith('data: '):
+                        continue
+                    data_str = line[6:].strip()
+                    if data_str == '[DONE]':
+                        done = True
+                        break
 
-                # Text content
-                if delta.get('content'):
-                    if not text_started:
-                        yield _sse('content_block_start', {
-                            'type': 'content_block_start', 'index': block_index,
-                            'content_block': {'type': 'text', 'text': ''},
-                        })
-                        text_started = True
-                        block_open = True
-                    yield _sse('content_block_delta', {
-                        'type': 'content_block_delta', 'index': block_index,
-                        'delta': {'type': 'text_delta', 'text': delta['content']},
-                    })
+                    try:
+                        data = json.loads(data_str)
+                    except json.JSONDecodeError:
+                        continue
 
-                # Tool calls
-                if delta.get('tool_calls'):
-                    for tc in delta['tool_calls']:
-                        tc_idx = tc.get('index', 0)
-                        fn = tc.get('function', {})
-                        if tc_idx not in tool_call_blocks:
-                            # Close any open text block first.
-                            if block_open and text_started:
-                                yield _sse('content_block_stop', {
-                                    'type': 'content_block_stop', 'index': block_index,
-                                })
-                                block_index += 1
-                                text_started = False
-                                block_open = False
-                            tool_call_blocks[tc_idx] = block_index
-                        yield _sse('content_block_start', {
-                            'type': 'content_block_start', 'index': block_index,
-                            'content_block': {
-                                'type': 'tool_use',
-                                'id': tc.get('id', f'toolu_{block_index}'),
-                                'name': fn.get('name', ''),
-                                'input': {},
-                            },
-                        })
-                        block_open = True
-                    if fn.get('arguments'):
-                        yield _sse('content_block_delta', {
-                            'type': 'content_block_delta', 'index': tool_call_blocks[tc_idx],
-                            'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
-                        })
+                    for ev in state.translate_chunk(data):
+                        yield ev
+                        
+                    if state.finished:
+                        done = True
+                        break
+            finally:
+                if done and chunk_task is not None:
+                    chunk_task.cancel()
 
-                if choice.get('finish_reason'):
-                    finish_reason = choice['finish_reason']
-
-        # Close any open block.
-        if block_open:
-            yield _sse('content_block_stop', {
-                'type': 'content_block_stop', 'index': block_index,
-            })
-
-        stop_reason = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use',
-                       'content_filter': 'end_turn'}.get(finish_reason, 'end_turn')
-
-        yield _sse('message_delta', {
-            'type': 'message_delta',
-            'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
-            'usage': {'output_tokens': output_tokens},
-        })
-
-        yield _sse('message_stop', {'type': 'message_stop'})
+        # Emit terminal events if not already done
+        for ev in state.force_done():
+            yield ev
 
     except Exception as e:
         logger.error(f'[openrouter] anthropic stream translation error: {e}')
-        # Ensure terminal events are always emitted so the client doesn't hang.
-        if block_open:
-            try:
-                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
-            except Exception:
-                pass
-        try:
-            yield _sse('message_delta', {
-                'type': 'message_delta',
-                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-                'usage': {'output_tokens': output_tokens},
-            })
-            yield _sse('message_stop', {'type': 'message_stop'})
-        except Exception:
-            pass
+        for ev in state.force_done():
+            yield ev
+    finally:
+        if chunk_task is not None:
+            chunk_task.cancel()
 
 
 # ══════════════════════════════════════════════════════════════════════════
