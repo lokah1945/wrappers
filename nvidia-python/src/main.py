@@ -722,6 +722,18 @@ MODEL_REFRESH_SEC = int(os.environ.get('MODEL_REFRESH_SEC', '600'))
 MAX_STREAM_BUFFER_KB = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512'))
 MAX_STREAM_BUFFER = MAX_STREAM_BUFFER_KB * 1024
 BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
+
+
+def _bearer_token() -> str:
+    """B-29 fix: re-read BEARER_TOKEN on every call so .env hot-reload and
+    credential rotation/revocation take effect without a restart (blackbox /
+    opencode parity). Falls back to the import-time value if unset later."""
+    return (os.environ.get('BEARER_TOKEN') or '').strip()
+
+
+def _require_auth() -> bool:
+    """B-28 fix: default to failing CLOSED when no token is configured."""
+    return (os.environ.get('REQUIRE_AUTH') or '').strip().lower() not in ('0', 'false', 'no', 'off', 'n')
 try:
     import importlib.metadata
     VERSION = f"{importlib.metadata.version('wrapper-nvidia')}-py"
@@ -1663,7 +1675,18 @@ class Server:
             if not check_rate_limit(_client_ip):
                 return JSONResponse(status_code=429, content={'error': {'message': 'Too many requests', 'type': 'rate_limit_error'}})
 
-            if BEARER_TOKEN and not is_public and not os.environ.get('DISABLE_AUTH'):
+            # B-28 fix: fail CLOSED when no token is configured. Previously the
+            # `BEARER_TOKEN and ...` guard meant an unset token silently
+            # disabled auth for every inference endpoint.
+            _tok = _bearer_token()
+            if not is_public and not os.environ.get('DISABLE_AUTH') and not _tok:
+                if _require_auth():
+                    logger.error('[auth] BEARER_TOKEN unset and REQUIRE_AUTH=true — refusing %s', path)
+                    return JSONResponse(status_code=503, content={'error': {
+                        'message': 'Server auth not configured', 'type': 'authentication_error'}})
+                logger.warning('[auth] BEARER_TOKEN unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
+
+            if _tok and not is_public and not os.environ.get('DISABLE_AUTH'):
                 # V-19 fix: constant-time comparison; check authorization and
                 # x-api-key independently (a garbage Authorization header must
                 # not mask a valid x-api-key).
@@ -1674,7 +1697,11 @@ class Server:
                     candidates.append(auth_header[7:].strip() if auth_header.lower().startswith('bearer ') else auth_header)
                 if api_key_header:
                     candidates.append(api_key_header)
-                authorized = any(hmac.compare_digest(t, BEARER_TOKEN) for t in candidates)
+                # B-30 parity: compare as bytes so a non-ASCII token yields a
+                # clean 401 instead of TypeError -> 500.
+                authorized = any(
+                    hmac.compare_digest(t.encode('utf-8'), _tok.encode('utf-8'))
+                    for t in candidates)
                 if not authorized:
                     # D11: unknown paths return 404, not 401 (don't leak route info)
                     known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',

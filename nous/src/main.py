@@ -54,7 +54,7 @@ try:
     # path, since the systemd service sets PYTHONPATH=.../nous only.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common.middleware import sanitize_header_value as _sanitize_header_value
-except ImportError:
+except ImportError:  # noqa: E722 - fallback defined below
     # Fallback sanitizer: upstream common.middleware is missing from the
     # repo, so provide the BUG-SEC2 header-injection guard inline.
     def _sanitize_header_value(value):
@@ -345,6 +345,13 @@ try:
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
+
+# B-28/B-29/B-30 fix: shared, fail-closed auth (see common/auth.py).
+try:
+    from common.auth import check_auth as _shared_check_auth
+    _HAS_SHARED_AUTH = True
+except ImportError:  # pragma: no cover
+    _HAS_SHARED_AUTH = False
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -1301,7 +1308,17 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
         try:
             parsed = json.loads(data)
         except Exception:
-            parsed = {"choices": [{"delta": {"content": data.decode(errors='replace')}}]}
+            # B-10 fix (CRITICAL): NEVER synthesise assistant content from a
+            # frame we failed to parse. The old fallback wrapped the raw line
+            # as {"delta": {"content": <raw bytes>}}, so when the upstream (or
+            # any relay) spoke Anthropic SSE on this surface the wrapper
+            # re-emitted `event: content_block_stop` / `data: {...}` as
+            # text_delta — i.e. protocol frames were printed to the user as
+            # model prose in Claude Code. Log and drop, matching the
+            # opencode/blackbox/openrouter behaviour.
+            _preview = data[:200].decode('utf-8', errors='replace')
+            logger.warning(f"[stream] dropping unparsable SSE frame ({len(data)}B): {_preview!r}")
+            return
 
         if state and hasattr(state, "translate_chunk"):
             for ev in state.translate_chunk(parsed):
@@ -1310,7 +1327,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 else:
                     yield serialize_fn(ev) if callable(serialize_fn) else ev
         else:
-            yield f"data: {data.decode(errors='replace')}\n\n"
+            # B-10 fix (second leak path): re-serialise the PARSED object rather
+            # than echoing raw upstream bytes, so a non-OpenAI frame can never
+            # be forwarded verbatim onto an OpenAI-SSE surface.
+            yield f"data: {json.dumps(parsed, ensure_ascii=False)}\n\n"
 
     # BUG-FIX: heartbeats fire even when upstream is idle. N-05 fix: instead of
     # asyncio.wait_for (whose TimeoutError is indistinguishable from a genuine
@@ -2025,13 +2045,35 @@ if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
 async def _auth_check(request: Request):
+    """B-28/B-29/B-30 fix: fail-closed, rotation-aware, byte-safe auth.
+
+    Three defects fixed here:
+      B-28 — `if not BEARER_TOKEN: return` allowed ALL requests when the token
+             was unset (open relay on a truncated/failed .env reload).
+      B-29 — comparing against the module-level BEARER_TOKEN captured at import
+             meant rotation (and revocation) required a full restart.
+      B-30 — hmac.compare_digest on two `str` raises TypeError on non-ASCII
+             input, surfacing as an unhandled 500 instead of a clean 401.
+    """
     if request.method == 'OPTIONS':
         return  # CORS preflight passes without auth
-    if not BEARER_TOKEN: return
-    if os.environ.get('DISABLE_AUTH'): return
+    if _HAS_SHARED_AUTH:
+        res = _shared_check_auth(request.headers, surface=request.url.path)
+        if not res.ok:
+            raise HTTPException(res.status, detail={"error": {
+                "type": "authentication_error", "message": res.message}})
+        return
+    if os.environ.get('DISABLE_AUTH'):
+        return
+    # B-29: re-read from the environment so .env rotation takes effect.
+    token_cfg = (os.environ.get('BEARER_TOKEN') or '').strip()
+    if not token_cfg:
+        raise HTTPException(503, detail={"error": {
+            "type": "authentication_error", "message": "Server auth not configured"}})
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     token = auth.replace("Bearer ", "", 1).strip()
-    if not hmac.compare_digest(token, BEARER_TOKEN):
+    if not token or not hmac.compare_digest(
+            token.encode('utf-8'), token_cfg.encode('utf-8')):
         raise HTTPException(401, detail={"error": {"type": "authentication_error", "message": "Unauthorized"}})
 
 @app.get("/health")
@@ -2634,6 +2676,12 @@ async def embeddings(request: Request):
     a 404 catch-all. Operators who need embeddings should use nvidia-python
     or openrouter wrappers which DO support embeddings.
     """
+    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
+    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
+    # anyone who can hit the port. Gate it like every other POST surface.
+    await _auth_check(request)
+    if not check_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception:

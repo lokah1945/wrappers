@@ -44,6 +44,13 @@ try:
 except ImportError:
     _HAS_SIZE_LIMITER = False
 
+# B-28/B-29/B-30 fix: shared, fail-closed auth (see common/auth.py).
+try:
+    from common.auth import check_auth as _shared_check_auth
+    _HAS_SHARED_AUTH = True
+except ImportError:  # pragma: no cover - common/ always present in-repo
+    _HAS_SHARED_AUTH = False
+
     def sanitize_header_value(value):
         # Fallback sanitizer: upstream common.middleware is missing from the
         # repo, so provide the BUG-SEC2 header-injection guard inline.
@@ -1104,20 +1111,31 @@ if _HAS_SIZE_LIMITER:
 
 
 def _auth_check(request: Request):
+    """B-28/B-29/B-30 fix: delegate to the shared, fail-closed implementation.
+
+    Previously this returned early (allowing ALL requests) when BEARER_TOKEN
+    was unset, and compared `str` operands with hmac.compare_digest — which
+    raises TypeError → 500 on non-ASCII tokens instead of a clean 401.
+    """
     if request.method == 'OPTIONS':
+        return  # CORS preflight passes without auth
+    if _HAS_SHARED_AUTH:
+        res = _shared_check_auth(request.headers, surface=request.url.path)
+        if not res.ok:
+            raise HTTPException(res.status, {'error': {
+                'type': 'authentication_error', 'message': res.message}})
         return
+    # Fallback (common/ unavailable): still fail closed.
     if os.environ.get('DISABLE_AUTH'):
-        return  # pre-auth mode: allow all (LAN/open)
-    token = _bearer_token()  # re-read so .env rotation takes effect
-    if not token:
-        # BB-3/DR-10: never fail silently open — log loudly (opencode parity).
-        if request.headers.get('authorization') or request.headers.get('x-api-key'):
-            logger.warning('[auth] BEARER_TOKEN unset but client sent credentials — accepting open (insecure)')
         return
+    token = _bearer_token()
+    if not token:
+        raise HTTPException(503, {'error': {
+            'type': 'authentication_error', 'message': 'Server auth not configured'}})
     auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
     client_token = auth.replace('Bearer ', '', 1).strip()
-    # SEC-5: constant-time comparison to avoid timing side-channels.
-    if not client_token or not hmac.compare_digest(client_token, token):
+    if not client_token or not hmac.compare_digest(
+            client_token.encode('utf-8'), token.encode('utf-8')):
         raise HTTPException(401, {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}})
 
 
@@ -1442,7 +1460,12 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
 
     async def process_payload(payload: bytes):
         nonlocal acc_text, acc_usage, acc_reason, rsn_started, rsn_index, next_output_index
-        if payload in (b'[DONE]', b'', b'"[DONE]"'):
+        # B-01 fix: an empty `data:` payload is a valid SSE keep-alive /
+        # empty event, NOT end-of-stream (nous N-09 parity). Treating it as a
+        # terminator ended turns mid-generation.
+        if payload == b'':
+            return
+        if payload in (b'[DONE]', b'"[DONE]"'):
             return
         try:
             c = json.loads(payload)
@@ -1618,7 +1641,10 @@ async def anthropic_messages(request: Request):
                             if not line.startswith(b'data:'):
                                 continue
                             payload = line[5:].strip()
-                            if payload in (b'[DONE]', b'', b'"[DONE]"'):
+                            # B-01 fix: empty `data:` is a keep-alive, not EOF.
+                            if payload == b'':
+                                continue
+                            if payload in (b'[DONE]', b'"[DONE]"'):
                                 for ev in state.force_done():
                                     yield ev
                                 return
@@ -1719,6 +1745,12 @@ async def embeddings(request: Request):
     a 404 catch-all. Operators who need embeddings should use nvidia-python
     or openrouter wrappers which DO support embeddings.
     """
+    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
+    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
+    # anyone who can hit the port. Gate it like every other POST surface.
+    _auth_check(request)
+    if not check_rate_limit(_client_ip(request)):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await request.json()
     except Exception:

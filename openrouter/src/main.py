@@ -505,18 +505,61 @@ app.add_middleware(
 )
 
 if _HAS_SIZE_LIMITER:
-    app.add_middleware(RequestSizeLimiter, max_bytes=50 * 1024 * 1024)
+    # B-32 fix: align the request-size cap with every sibling wrapper
+    # (common.middleware default = 10MB). openrouter previously allowed 50MB,
+    # 5x the fleet-wide memory-exhaustion headroom.
+    app.add_middleware(RequestSizeLimiter)
 
 
 # ── Auth Middleware ────────────────────────────────────────────────────────
 
 DISABLE_AUTH = os.environ.get('DISABLE_AUTH', '').strip().lower() in ('1', 'true', 'yes')
-PUBLIC_PATHS = {'/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
-                '/catalog/health', '/catalog/ready', '/catalog/metrics',
-                '/mcp/sse', '/mcp/messages', '/mcp',
-                # Public model discovery (Ollama + OpenAI compatible) — agents
-                # need to list models before authenticating.
-                '/api/tags', '/v1/models', '/version'}
+
+# B-28 fix: fail CLOSED when no bearer token is configured. A truncated/empty
+# .env previously turned the proxy into an open relay burning upstream credit.
+# Set REQUIRE_AUTH=false only for deliberately open LAN deployments.
+REQUIRE_AUTH = os.environ.get('REQUIRE_AUTH', 'true').strip().lower() not in ('0', 'false', 'no', 'off')
+
+# B-27 fix: exact-match public paths + explicit method gating. The previous
+# `startswith` test made '/v1/models' match '/v1/models-anything' and ignored
+# the HTTP method, so any future route sharing a public prefix (or a POST to a
+# GET-only discovery path) was silently unauthenticated.
+PUBLIC_PATHS_ANY = frozenset({
+    '/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
+    '/catalog/health', '/catalog/ready', '/catalog/metrics',
+    '/mcp/sse', '/mcp/messages', '/mcp',
+})
+# Public model discovery (Ollama + OpenAI compatible) — agents need to list
+# models before authenticating. GET only.
+PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version'})
+
+# B-26 fix: the OpenRouter *Provisioning* API (create/delete/rotate keys) is
+# privileged and must never share the bypass with read-only catalog routes.
+MANAGEMENT_PREFIX = '/openrouter/'
+
+
+def _management_token() -> str:
+    """Dedicated token for the key-management surface (B-26).
+
+    Falls back to the inference bearer token so existing single-token
+    deployments keep working, but the management routes are NEVER public.
+    """
+    return (os.environ.get('OPENROUTER_MANAGEMENT_TOKEN')
+            or os.environ.get('MANAGEMENT_TOKEN')
+            or _bearer_token()
+            or '').strip()
+
+
+def _is_public_path(path: str, method: str) -> bool:
+    """Exact-match public-path test (B-27)."""
+    if path in PUBLIC_PATHS_ANY:
+        return True
+    if method == 'GET' and path in PUBLIC_PATHS_GET:
+        return True
+    # Read-only catalog browsing stays public (GET only).
+    if method == 'GET' and path.startswith('/catalog/'):
+        return True
+    return False
 
 # Headers forwarded upstream (transparent passthrough to preserve client identity
 # and beta-feature flags for OpenAI/Anthropic SDKs).
@@ -535,11 +578,14 @@ async def auth_middleware(request: Request, call_next):
     # (Anthropic SDK uses x-api-key, OpenAI SDK uses Authorization).
     if not DISABLE_AUTH:
         path = request.url.path
-        is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
-        if not is_public and not path.startswith('/catalog/') and not path.startswith('/openrouter/'):
+        method = request.method
+        is_management = path.startswith(MANAGEMENT_PREFIX)
+        # B-26 fix: management routes are NEVER public, regardless of prefix.
+        if is_management or not _is_public_path(path, method):
             auth = request.headers.get('Authorization', '')
             x_api_key = request.headers.get('x-api-key', '')
-            token = _bearer_token()
+            # B-26: privileged provisioning surface uses its own token.
+            token = _management_token() if is_management else _bearer_token()
             client_token = ''
             if auth.lower().startswith('bearer '):
                 client_token = auth[7:].strip()
@@ -547,12 +593,31 @@ async def auth_middleware(request: Request, call_next):
                 client_token = x_api_key.strip()
             elif auth:
                 client_token = auth.strip()
-            if token and (not client_token or not hmac.compare_digest(client_token, token)):
-                return JSONResponse(
-                    {"error": {"message": "Unauthorized", "type": "authentication_error"}},
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer'},
-                )
+
+            # B-28 fix: fail CLOSED when no token is configured instead of
+            # silently allowing every request through.
+            if not token:
+                if REQUIRE_AUTH:
+                    logger.error(
+                        '[auth] no %s token configured and REQUIRE_AUTH=true — refusing request to %s',
+                        'management' if is_management else 'bearer', path,
+                    )
+                    return JSONResponse(
+                        {"error": {"message": "Server auth not configured", "type": "authentication_error"}},
+                        status_code=503,
+                    )
+                logger.warning('[auth] token unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
+            else:
+                # B-30 parity: compare as bytes so a non-ASCII token yields a
+                # clean 401 instead of a TypeError → 500.
+                ok = bool(client_token) and hmac.compare_digest(
+                    client_token.encode('utf-8'), token.encode('utf-8'))
+                if not ok:
+                    return JSONResponse(
+                        {"error": {"message": "Unauthorized", "type": "authentication_error"}},
+                        status_code=401,
+                        headers={"WWW-Authenticate": 'Bearer'},
+                    )
 
     # Rate limit
     ip = _client_ip(request)
@@ -934,9 +999,12 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             """Parse one complete SSE line. Returns (events_list, is_done)."""
             nonlocal text_started, full_text
             events = []
-            if not line_str.startswith('data: '):
+            # B-02 fix: the space after `data:` is OPTIONAL in SSE. Requiring
+            # it silently discarded 100% of chunks from upstreams that emit
+            # `data:{...}`, producing an empty answer with no log or error.
+            if not line_str.startswith('data:'):
                 return events, False
-            data_str = line_str[6:].strip()
+            data_str = line_str[5:].strip()
             if data_str == '[DONE]':
                 return events, True
             try:
@@ -1039,9 +1107,15 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
 
         yield 'data: [DONE]\n\n'
 
+    except (GeneratorExit, asyncio.CancelledError):
+        # B-09 parity: never yield during async-generator finalization.
+        raise
     except Exception as e:
         logger.error(f'[openrouter] responses stream translation error: {e}')
-        # Ensure terminal events are always emitted.
+        # B-07 fix: a transport failure must surface as response.failed, NOT as
+        # a fabricated response.completed carrying partial text — the client
+        # otherwise persists a truncated answer as a successful turn and
+        # cannot retry. (blackbox B20 parity.)
         try:
             if text_started:
                 yield _sse('response.output_text.done', {
@@ -1061,19 +1135,25 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                         'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
                     },
                 })
-            yield _sse('response.completed', {
-                'type': 'response.completed',
+            # B-07 fix: report FAILURE, not a fabricated success.
+            yield _sse('response.failed', {
+                'type': 'response.failed',
                 'response': {
                     'id': resp_id, 'object': 'response', 'created_at': created_at,
-                    'model': model, 'status': 'completed',
-                    'output': [{
-                        'id': msg_id, 'type': 'message', 'status': 'completed',
-                        'role': 'assistant',
-                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                    }],
+                    'model': model, 'status': 'failed',
+                    'error': {'code': 'upstream_error',
+                              'message': f'upstream stream error: {str(e)[:2000]}'},
                 },
             })
             yield 'data: [DONE]\n\n'
+        except Exception:
+            pass
+    finally:
+        # B-09 fix: deterministically release the upstream response + pool key.
+        try:
+            aclose = getattr(openai_gen, 'aclose', None)
+            if aclose is not None:
+                await aclose()
         except Exception:
             pass
 
@@ -1628,6 +1708,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     finish_reason = None
     output_tokens = 0
     input_tokens = 0
+    upstream_error = None  # B-07: set when upstream reports a mid-stream error
 
     try:
         # message_start (always first)
@@ -1666,9 +1747,14 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if not line:
                     continue
 
-                if not line.startswith('data: '):
+                # B-02 fix: accept `data:{...}` as well as `data: {...}` — the
+                # space is optional per the SSE spec.
+                if not line.startswith('data:'):
                     continue
-                data_str = line[6:].strip()
+                data_str = line[5:].strip()
+                # B-01 parity: an empty `data:` is a keep-alive, not EOF.
+                if not data_str:
+                    continue
                 if data_str == '[DONE]':
                     done = True
                     break
@@ -1678,6 +1764,18 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 except json.JSONDecodeError:
                     continue
 
+                # B-02 (compounding) fix: surface mid-stream upstream errors
+                # instead of silently dropping them. Previously any payload
+                # without object=="chat.completion.chunk" was discarded, so an
+                # upstream {"error": {...}} vanished and the stream closed with
+                # a fabricated end_turn.
+                if isinstance(data.get('error'), (dict, str)):
+                    err = data['error']
+                    emsg = err.get('message') if isinstance(err, dict) else str(err)
+                    logger.error(f'[openrouter] upstream error mid-stream: {emsg}')
+                    upstream_error = emsg or 'upstream error'
+                    done = True
+                    break
                 if data.get('object') != 'chat.completion.chunk':
                     continue
                 choices = data.get('choices', [])
@@ -1705,71 +1803,122 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     })
 
                 # Tool calls
-                if delta.get('tool_calls'):
-                    for tc in delta['tool_calls']:
-                        tc_idx = tc.get('index', 0)
-                        fn = tc.get('function', {})
-                        if tc_idx not in tool_call_blocks:
-                            # Close any open text block first.
-                            if block_open and text_started:
-                                yield _sse('content_block_stop', {
-                                    'type': 'content_block_stop', 'index': block_index,
-                                })
-                                block_index += 1
-                                text_started = False
-                                block_open = False
-                            tool_call_blocks[tc_idx] = block_index
+                # B-03 fix (CRITICAL): three compounded defects previously
+                # corrupted every tool call on this surface —
+                #   1. content_block_start was emitted OUTSIDE the
+                #      "first time we see this tool" guard, so it repeated on
+                #      every delta chunk (and injected phantom unnamed blocks).
+                #   2. the `if fn.get('arguments')` emit sat OUTSIDE the `for`
+                #      loop, so with N parallel tools only the LAST tool's
+                #      arguments were forwarded — the rest were lost entirely.
+                #   3. block_index was never incremented for a tool block, so
+                #      all parallel tools collided on the same index.
+                # Verified by harness: 2 parallel tools produced 4 starts, all
+                # at index 0, and dropped one tool's arguments completely.
+                for tc in (delta.get('tool_calls') or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_idx = tc.get('index', 0)
+                    fn = tc.get('function') or {}
+                    if tc_idx not in tool_call_blocks:
+                        # Close whatever block is currently open (text or a
+                        # previous tool) before opening a new one.
+                        if block_open:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': block_index,
+                            })
+                            block_index += 1
+                            text_started = False
+                            block_open = False
+                        tool_call_blocks[tc_idx] = block_index
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {
                                 'type': 'tool_use',
-                                'id': tc.get('id', f'toolu_{block_index}'),
-                                'name': fn.get('name', ''),
+                                'id': tc.get('id') or f'toolu_{block_index}',
+                                'name': fn.get('name', '') or '',
                                 'input': {},
                             },
                         })
                         block_open = True
+                    # Emit arguments for THIS tool (inside the loop).
                     if fn.get('arguments'):
                         yield _sse('content_block_delta', {
-                            'type': 'content_block_delta', 'index': tool_call_blocks[tc_idx],
-                            'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
+                            'type': 'content_block_delta',
+                            'index': tool_call_blocks[tc_idx],
+                            'delta': {'type': 'input_json_delta',
+                                      'partial_json': fn['arguments']},
                         })
 
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
-        # Close any open block.
+        # B-04 fix: close the block that is ACTUALLY open. block_index is now
+        # maintained correctly by the tool-call path above, so this no longer
+        # tells the client to close a block it never opened.
         if block_open:
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
+            block_open = False
 
+        # B-07 fix: an upstream error must NOT be reported as a successful
+        # end_turn — the client would persist a truncated answer and could not
+        # retry. Emit a real Anthropic `error` event first.
+        if upstream_error:
+            yield _sse('error', {
+                'type': 'error',
+                'error': {'type': 'api_error', 'message': str(upstream_error)[:2000]},
+            })
+
+        # B-06 parity: map strictly from finish_reason; never infer tool_use
+        # merely because a tool was seen earlier in the turn.
         stop_reason = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use',
-                       'content_filter': 'end_turn'}.get(finish_reason, 'end_turn')
+                       'content_filter': 'refusal'}.get(finish_reason, 'end_turn')
 
         yield _sse('message_delta', {
             'type': 'message_delta',
             'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
-            'usage': {'output_tokens': output_tokens},
+            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
         })
 
         yield _sse('message_stop', {'type': 'message_stop'})
 
+    except (GeneratorExit, asyncio.CancelledError):
+        # B-09 parity: client disconnected. An async generator must not yield
+        # during finalization — re-raise so cleanup happens in `finally` only.
+        raise
     except Exception as e:
         logger.error(f'[openrouter] anthropic stream translation error: {e}')
-        # Ensure terminal events are always emitted so the client doesn't hang.
+        # B-07 fix: surface the failure instead of fabricating a clean turn.
         if block_open:
             try:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
             except Exception:
                 pass
         try:
+            yield _sse('error', {
+                'type': 'error',
+                'error': {'type': 'api_error',
+                          'message': f'upstream stream error: {str(e)[:2000]}'},
+            })
             yield _sse('message_delta', {
                 'type': 'message_delta',
                 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-                'usage': {'output_tokens': output_tokens},
+                'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
             })
             yield _sse('message_stop', {'type': 'message_stop'})
+        except Exception:
+            pass
+    finally:
+        # B-09 fix: deterministically close the inner generator so the upstream
+        # response is released and the pool key returned exactly once, even on
+        # client disconnect. Previously this was left to GC, leaking in-flight
+        # slots until the pool starved.
+        try:
+            aclose = getattr(openai_gen, 'aclose', None)
+            if aclose is not None:
+                await aclose()
         except Exception:
             pass
 
