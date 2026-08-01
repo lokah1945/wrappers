@@ -14,6 +14,7 @@
 | `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` | **AI Gateway Translation Layer audit** — OpenAI↔Anthropic / Responses↔Chat round-trip matrix (F1–F7) |
 | `docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md` | **SDK-compat audit** — last Codex bug: every wrapper's Responses output must parse with the official openai SDK (CODEX-RESP-02) |
 | `docs/COMPATIBILITY_LAYER.md` | **COMPATIBILITY_LAYER design** — operator-declared upstream dialect (1=OpenAI, 2=Anthropic, 3=Auto) |
+| `docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md` | **Full matrix audit** — 240/240 checks, 5 wrappers × 2 upstreams × 3 surfaces × params × agents, with JSON evidence |
 
 ---
 
@@ -92,6 +93,26 @@ All items previously listed as remaining debt were **re-verified against the cod
 | B-20: Blocking `subprocess` git calls | **Hardened this cycle**: every git subprocess call in all 5 wrappers + model-registry now carries `timeout=3` (the calls run once at import, but were unbounded). **New guard:** `test_b20_git_subprocess_calls_are_timeout_bounded`. |
 
 ---
+
+## Fifth Pass — Full Matrix End-to-End Audit (2026-08-01)
+
+Systematic audit harness (`tests/e2e_runtime/full_matrix_audit.py`) booting all
+5 wrappers against the OpenAI mock (layer 1) and the Anthropic mock (layer 2),
+driven with REAL SDK clients (anthropic SDK = Claude Code, openai SDK = Codex /
+generic OpenAI, plus raw protocol checks). **240/240 checks PASS** (evidence:
+`docs/audits/FULL_MATRIX_AUDIT_2026-08-01.json`).
+
+Five real defects found and fixed (each locked by `tests/test_full_matrix_regressions.py`):
+| ID | Wrapper(s) | Finding | Contract |
+|---|---|---|---|
+| F-1 | openrouter | chat `max_tokens` negative/non-int accepted | §4 |
+| F-2 | openrouter | responses `max_output_tokens` cap missing | §4 |
+| F-3 | nous, opencode, openrouter, nvidia-python | messages surface accepted unknown roles / orphan tools | §4 |
+| F-4 | nvidia-python | responses `max_output_tokens` cap missing | §4 |
+| F-5 | nous, opencode, blackbox | `X-Request-ID` logged but never returned on responses | §10 |
+
+Verification: 241 unit tests (was 229), 445/445 runtime E2E, SDK-compat gate,
+COMPATIBILITY_LAYER E2E, soak ~20.1k requests 0 failures — all green.
 
 ## Fourth Pass — COMPATIBILITY_LAYER: Operator-Declared Upstream Dialect (2026-08-01)
 

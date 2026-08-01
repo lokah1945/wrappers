@@ -29,8 +29,11 @@ import time
 
 from aiohttp import web
 
+_HTTP429_ONCE = 0
+
+
 MODES = (
-    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
+    'normal', 'echo', 'error', 'http429once', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
     'nofinish', 'noterminator', 'midstream_error', 'abrupt', 'slow', 'usage_after',
     'empty', 'unicode',
     # Round-2 adversarial modes
@@ -78,8 +81,38 @@ async def chat_completions(request: web.Request):
     stream = bool(body.get('stream'))
 
     if not stream:
+        if mode == 'error':
+            return web.json_response({'error': {'message': 'mock exploded', 'type': 'server_error'}}, status=500)
+        if mode == 'http500':
+            return web.json_response({'error': {'message': 'mock 500', 'type': 'server_error'}}, status=500)
+        if mode == 'http429':
+            return web.json_response({'error': {'message': 'mock 429', 'type': 'rate_limit_error'}}, status=429)
+        if mode == 'http429once':
+            # First request 429, subsequent requests succeed — simulates a
+            # transient upstream rate limit so the audit can prove the wrapper
+            # retries with the next key and succeeds.
+            global _HTTP429_ONCE
+            _HTTP429_ONCE = _HTTP429_ONCE + 1
+            if _HTTP429_ONCE <= 1:
+                return web.json_response({'error': {'message': 'mock 429 once', 'type': 'rate_limit_error'}}, status=429)
+        if mode == 'echo':
+            # Parameter-passthrough probe: echo back what the wrapper sent so
+            # the audit can prove temperature/top_p/max_tokens/system/tools/
+            # response_format/images reached the upstream untouched.
+            return web.json_response({
+                'id': 'chatcmpl-mock', 'object': 'chat.completion',
+                'created': int(time.time()), 'model': model,
+                'choices': [{'index': 0,
+                             'message': {'role': 'assistant',
+                                         'content': json.dumps(body, ensure_ascii=False)},
+                             'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 11, 'completion_tokens': 7, 'total_tokens': 18},
+            })
         if mode == 'empty':
             msg = {'role': 'assistant', 'content': None}
+        elif mode in ('reasoning', 'reasoning_only'):
+            msg = {'role': 'assistant', 'content': None if mode == 'reasoning_only' else 'Hello from mock upstream.',
+                   'reasoning_content': 'Let me think...'}
         elif mode == 'tools':
             msg = {'role': 'assistant', 'content': None, 'tool_calls': [
                 {'id': 'call_a', 'type': 'function',
@@ -384,6 +417,11 @@ async def anthropic_messages(request: web.Request):
     mode = _mode(model)
     stream = bool(body.get('stream'))
     msg_id = f"msg_anthropic_{int(time.time()*1000)}"
+
+    if mode == 'error':
+        return web.json_response({'type': 'error', 'error': {
+            'type': 'api_error', 'message': 'anthropic mock exploded'}},
+            status=500)
 
     if not stream:
         content = []

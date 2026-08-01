@@ -1133,7 +1133,12 @@ async def add_latency_tracking(request: Request, call_next):
         f"latency={latency_ms:.2f}ms status={response.status_code}"
     )
     
+
     response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
+    # WRAPPER_CONTRACT §10: every response carries X-Request-ID and
+    # X-Process-Time. The request id was logged but never returned, breaking
+    # distributed tracing for clients that correlate by header.
+    response.headers["X-Request-ID"] = request_id
     return response
 
 

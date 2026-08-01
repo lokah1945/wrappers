@@ -591,11 +591,11 @@ def test_r05_openrouter_translates_non_streaming_responses():
     and Responses surfaces — `return response` fired before the translation."""
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     i = src.index('async def messages(')
-    block = src[i:i + 3000]
+    block = src[i:i + 4500]
     assert '_openai_to_anthropic_response(payload, body)' in block, \
         'openrouter /v1/messages does not translate non-streaming replies'
     j = src.index('async def responses(')
-    rblock = src[j:j + 3000]
+    rblock = src[j:j + 4500]
     assert 'chat_to_responses(' in rblock, \
         'openrouter /v1/responses does not translate non-streaming replies'
 

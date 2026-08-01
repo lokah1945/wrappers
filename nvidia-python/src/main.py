@@ -2119,6 +2119,17 @@ class Server:
         @app.post('/v1/responses')
         async def responses_api(request: Request):
             raw = await request.body()
+            # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens positive + capped.
+            try:
+                _rb = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                _rb = {}
+            for _mt_key in ('max_output_tokens', 'max_tokens'):
+                _mtv = _rb.get(_mt_key) if isinstance(_rb, dict) else None
+                if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
+                    return JSONResponse(status_code=400, content={'error': {'message': f'{_mt_key} must be a positive integer', 'type': 'invalid_request_error'}})
+                if isinstance(_mtv, int) and _mtv > 1_000_000:
+                    return JSONResponse(status_code=400, content={'error': {'message': f'{_mt_key} exceeds maximum allowed value of 1000000', 'type': 'invalid_request_error'}})
             # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the
             # Responses request to Anthropic Messages and translate back.
             if _is_anthropic_upstream():
@@ -2537,6 +2548,13 @@ class Server:
         for t in body.get('tools', []) or []:
             if not isinstance(t.get('input_schema'), dict):
                 return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool.input_schema must be an object'))
+
+        # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages rejected.
+        for _m in body.get('messages', []) or []:
+            if isinstance(_m, dict) and _m.get('role') not in (None, 'user', 'assistant', 'tool', 'system', 'developer'):
+                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f"Invalid role: {_m.get('role')!r}"))
+            if isinstance(_m, dict) and _m.get('role') == 'tool' and not _m.get('tool_use_id') and not _m.get('tool_call_id'):
+                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool message requires tool_use_id'))
 
         model_id = resolve_target_model(body.get('model', ''))
         body['model'] = model_id

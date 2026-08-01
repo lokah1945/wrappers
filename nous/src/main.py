@@ -2313,7 +2313,12 @@ async def add_latency_tracking(request: Request, call_next):
         f"latency={latency_ms:.2f}ms status={response.status_code}"
     )
     
+
     response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
+    # WRAPPER_CONTRACT §10: every response carries X-Request-ID and
+    # X-Process-Time. The request id was logged but never returned, breaking
+    # distributed tracing for clients that correlate by header.
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
@@ -2930,6 +2935,12 @@ async def messages(request: Request):
     for t in body.get('tools', []) or []:
         if not isinstance(t.get('input_schema'), dict):
             return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'tool.input_schema must be an object'}})
+    # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
+    for _m in body.get('messages', []) or []:
+        if isinstance(_m, dict) and _m.get('role') not in (None, 'user', 'assistant', 'tool', 'system', 'developer'):
+            return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f"Invalid role: {_m.get('role')!r}"}})
+        if isinstance(_m, dict) and _m.get('role') == 'tool' and not _m.get('tool_use_id') and not _m.get('tool_call_id'):
+            return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': 'tool message requires tool_use_id'}})
     requested = body.get("model")
     if free_only_enabled() and requested:
         resolved = resolve_model(requested)

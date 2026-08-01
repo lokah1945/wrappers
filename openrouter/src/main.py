@@ -1109,6 +1109,23 @@ async def chat_completions(request: Request):
                             status_code=400)
     model = body.get("model", "")
 
+    # WRAPPER_CONTRACT §4: max_tokens MUST be a positive integer capped at 1M.
+    mt = body.get("max_tokens")
+    if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
+        return _error_response({"error": {"message": "max_tokens must be a positive integer",
+                                          "type": "invalid_request_error"}}, status_code=400)
+    if isinstance(mt, int) and mt > 1_000_000:
+        return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
+                                          "type": "invalid_request_error"}}, status_code=400)
+    # WRAPPER_CONTRACT §4: unknown roles and orphan tool messages are rejected.
+    for _m in body.get("messages") or []:
+        if isinstance(_m, dict) and _m.get("role") not in (None, "system", "user", "assistant", "tool", "developer", "function"):
+            return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_call_id"):
+            return _error_response({"error": {"message": "tool role requires tool_call_id",
+                                              "type": "invalid_request_error"}}, status_code=400)
+
     # FREE_ONLY check
     blocked = _check_free_only(model)
     if blocked:
@@ -1173,6 +1190,17 @@ async def responses(request: Request):
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     model = body.get("model", "")
+
+    # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens capped at 1M and
+    # positive on the Responses surface too.
+    for _mt_key in ("max_output_tokens", "max_tokens"):
+        _mtv = body.get(_mt_key)
+        if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
+            return _error_response({"error": {"message": f"{_mt_key} must be a positive integer",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_mtv, int) and _mtv > 1_000_000:
+            return _error_response({"error": {"message": f"{_mt_key} exceeds maximum allowed value of 1000000",
+                                              "type": "invalid_request_error"}}, status_code=400)
 
     blocked = _check_free_only(model)
     if blocked:
@@ -1813,6 +1841,15 @@ async def messages(request: Request):
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     model = body.get("model", "")
+
+    # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
+    for _m in body.get("messages") or []:
+        if isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
+            return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_use_id") and not _m.get("tool_call_id"):
+            return _error_response({"error": {"message": "tool message requires tool_use_id",
+                                              "type": "invalid_request_error"}}, status_code=400)
 
     blocked = _check_free_only(model)
     if blocked:
