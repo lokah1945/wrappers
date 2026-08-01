@@ -329,12 +329,21 @@ def base_response(resp_id: str, model: str, status: str, output: list = None, us
         'model': model,
         'status': status,
         'output': output or [],
+        # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+        # parallel_tool_calls / tool_choice / tools; include them everywhere
+        # so every response shape (created/completed/failed) parses cleanly.
+        'parallel_tool_calls': True,
+        'tool_choice': 'auto',
+        'tools': [],
         'usage': usage if usage is not None else _zero_usage(),
     }
 
 
 def make_reasoning_item(text: str) -> dict:
-    return {'id': _rand('rsn'), 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': text}
+    # CODEX-RESP-02: the SDK's ResponseReasoningItem expects summary/content
+    # as lists — `text` alone or summary:'' triggers serializer warnings.
+    return {'id': _rand('rsn'), 'type': 'reasoning', 'status': 'completed', 'summary': [],
+            'content': [{'type': 'reasoning_text', 'text': text}]}
 
 
 def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs: Optional[list] = None) -> dict:
@@ -396,6 +405,12 @@ def respond_non_streaming(data: dict, model: str) -> dict:
         'model': data.get('model') or model,
         'status': 'completed',
         'output': output,
+        # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+        # parallel_tool_calls / tool_choice / tools — missing them fails
+        # non-streaming client.responses.create() parsing.
+        'parallel_tool_calls': True,
+        'tool_choice': 'auto',
+        'tools': [],
         'usage': convert_usage(data.get('usage')),
     }
 
@@ -616,7 +631,7 @@ class ResponsesHandler:
                                     yield emit({
                                         'type': 'response.output_item.added', 'sequence_number': next_seq(),
                                         'output_index': rsn_index,
-                                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': '', 'content': []},
+                                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': [], 'content': []},
                                     })
                                 acc_reason += reason_delta
                                 yield emit({
@@ -643,14 +658,14 @@ class ResponsesHandler:
                                 if fn.get('name'):
                                     acc['name'] += fn['name']
                                     yield emit({
-                                        'type': 'response.function_call.delta', 'sequence_number': next_seq(),
+                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
                                         'item_id': acc['call_id'], 'output_index': acc['output_index'],
                                         'delta': fn['name'], 'name': acc['name'],
                                     })
                                 if fn.get('arguments'):
                                     acc['args'] += fn['arguments']
                                     yield emit({
-                                        'type': 'response.function_call.delta', 'sequence_number': next_seq(),
+                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
                                         'item_id': acc['call_id'], 'output_index': acc['output_index'],
                                         'delta': fn['arguments'],
                                     })
@@ -738,7 +753,8 @@ class ResponsesHandler:
             if rsn_started:
                 yield emit({'type': 'response.reasoning_text.done', 'sequence_number': next_seq(),
                             'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason})
-                rsn_item = {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason}
+                rsn_item = {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [],
+                           'content': [{'type': 'reasoning_text', 'text': acc_reason}]}
                 yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(), 'output_index': rsn_index, 'item': rsn_item})
                 outputs_by_index[rsn_index] = make_reasoning_item(acc_reason)
 
@@ -755,6 +771,11 @@ class ResponsesHandler:
             for acc in completed_tools:
                 fc_item = {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed',
                            'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']}
+                # CODEX-RESP-02: standard OpenAI Responses event finalising
+                # tool arguments before the item is closed.
+                yield emit({'type': 'response.function_call_arguments.done', 'sequence_number': next_seq(),
+                            'item_id': acc['call_id'], 'output_index': acc['output_index'],
+                            'name': acc['name'], 'arguments': acc['args']})
                 yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(),
                             'output_index': acc['output_index'], 'item': fc_item})
                 outputs_by_index[acc['output_index']] = fc_item

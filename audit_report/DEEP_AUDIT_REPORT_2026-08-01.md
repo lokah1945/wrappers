@@ -393,6 +393,38 @@ trips and a streaming thinking-block assertion.
 
 ---
 
+## 7e. CODEX-RESP-02 — Responses Output Must Parse With the Official SDK (2026-08-01, third pass)
+
+The reported last Codex bug (Codex + wrapper-nous) was traced to
+`/v1/responses` output being **unparseable by the official openai SDK** (the
+parser Codex uses) on all five wrappers. Reproduced with real servers and
+`client.responses.stream()`; four defects fixed fleet-wide:
+
+| # | Defect | Fix |
+|---|---|---|
+| R2-1 | `response.created` minimal `{id,model,status}` → SDK snapshot `output=None` → `AttributeError` on first `output_item.added` | full response object (`object`, `created_at`, `output: []`, `usage`) in nous/opencode/blackbox |
+| R2-2 | `response.function_call.delta` (nonstandard name) → SDK never accumulated tool arguments | standard `response.function_call_arguments.delta` + new `.done` event before each tool's `output_item.done` (all 5) |
+| R2-3 | reasoning items `summary: ""` (string) → SDK serializer failures | `summary: []` + `content: [{type: "reasoning_text", text}]` (all 5) |
+| R2-4 | non-streaming Responses missing required `parallel_tool_calls`/`tool_choice`/`tools` → `APIResponseValidationError` | added to `chat_to_responses`/`respond_non_streaming` (all 5; nvidia also via `base_response`) |
+
+**Proof:** `tests/e2e_runtime/sdk_codex_compat.py` — all five wrappers ×
+`tools` / `reasoning_only` / `reasoning` (streaming) + `tools` (non-streaming)
+parse cleanly with the official SDK; tool arguments stream via
+`function_call_arguments.delta`/`.done`. Five unit guards added to
+`tests/test_translation_matrix.py`; `openai>=1.40,<3` added to
+`tests/requirements.txt`.
+
+| Gate | Result |
+|---|---|
+| Unit + Regression Suite | **209 passed** (was 204) |
+| SDK Compatibility (Codex parser) | **5 wrappers × 4 modes — all OK** (new gate) |
+| Streaming Regression Suite | **63 passed** |
+| Translation Layer gate | **63 passed** |
+| Runtime E2E | **445/445 checks** |
+| Sustained Soak | **~20,800 requests, 0 failures** |
+
+---
+
 ## 8. Boundaries & Known Limits
 
 - The live E2E harness validates protocol/runtime behavior with real HTTP servers and a **deterministic mock upstream**. It does not call paid external providers.

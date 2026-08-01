@@ -405,6 +405,174 @@ def test_nvidia_chat_to_responses_full_roundtrip():
     assert out.get('usage', {}).get('total_tokens') == 7, f'nvidia: {out.get("usage")}'
 
 
+# ── CODEX-RESP-02 — Responses streaming must parse with the openai SDK ─────
+#
+# The 2026-08-01 deep audit found the last Codex bug: ALL five wrappers
+# emitted a Responses stream the openai SDK (the parser Codex uses) cannot
+# handle:
+#   1. response.created carried a minimal {id, model, status} — the SDK
+#      snapshot's `output` was None, so the FIRST output_item.added crashed
+#      with AttributeError: 'NoneType' object has no attribute 'append'.
+#   2. tool arguments were streamed as response.function_call.delta — the
+#      standard event is response.function_call_arguments.delta/.done, so the
+#      SDK never accumulated the arguments.
+#   3. reasoning items used summary:"" (string) — the SDK expects lists.
+#   4. non-streaming responses lacked the required top-level
+#      parallel_tool_calls / tool_choice / tools fields.
+# Verified fixed by tests/e2e_runtime/sdk_codex_compat.py, which drives real
+# servers and parses their output with the SDK; the tests below lock the
+# shapes statically and at the unit level.
+
+
+def test_codex_resp02_response_created_carries_full_response_object():
+    """response.created must include object/created_at/output/usage so the
+    SDK's stream snapshot has a real `output` list to append items to."""
+    for wname in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wname / 'src' / 'main.py').read_text()
+        assert '"output": []' in src or "'output': []" in src, \
+            f'{wname}: response.created missing output:[] (Codex snapshot crash)'
+    nsrc = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    assert "'output': output or []" in nsrc or '"output": output or []' in nsrc
+
+
+def test_codex_resp02_no_nonstandard_function_call_event_names():
+    """The Responses API standard event is response.function_call_arguments.delta
+    / .done — response.function_call.delta is unknown to the openai SDK.
+    AST-based: comments mentioning the old name are fine; emitted event-name
+    string constants are not."""
+    import ast
+    BAD = 'response.function_call.delta'
+    GOOD_DELTA = 'response.function_call_arguments.delta'
+    GOOD_DONE = 'response.function_call_arguments.done'
+
+    def emitted_strings(path):
+        tree = ast.parse(path.read_text())
+        return {n.value for n in ast.walk(tree)
+                if isinstance(n, ast.Constant) and isinstance(n.value, str)}
+
+    for wname in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        consts = emitted_strings(ROOT / wname / 'src' / 'main.py')
+        assert BAD not in consts, \
+            f'{wname}: nonstandard response.function_call.delta event still emitted'
+        assert GOOD_DELTA in consts, f'{wname}: missing standard function_call_arguments.delta'
+        assert GOOD_DONE in consts, f'{wname}: missing standard function_call_arguments.done'
+    nconsts = emitted_strings(ROOT / 'nvidia-python' / 'src' / 'responses_compat.py')
+    assert BAD not in nconsts
+    assert GOOD_DELTA in nconsts and GOOD_DONE in nconsts
+
+
+def test_codex_resp02_reasoning_summary_is_a_list():
+    """The SDK's ResponseReasoningItem.summary must be a list, never a string."""
+    for wname in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wname / 'src' / 'main.py').read_text()
+        assert "'summary': ''" not in src and '"summary": ""' not in src, \
+            f'{wname}: reasoning summary still an empty string'
+        assert "'summary': []" in src or '"summary": []' in src, \
+            f'{wname}: no list-typed reasoning summary'
+    nsrc = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    assert "'summary': ''" not in nsrc and "'summary': []," in nsrc
+
+
+def test_codex_resp02_nonstreaming_response_has_sdk_required_fields():
+    """client.responses.create() (non-streaming) requires top-level
+    parallel_tool_calls / tool_choice / tools on the Response object."""
+    for wname in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wname / 'src' / 'main.py').read_text()
+        assert 'parallel_tool_calls' in src, \
+            f'{wname}: non-streaming response missing parallel_tool_calls'
+        assert "'tool_choice': 'auto'" in src or '"tool_choice": "auto"' in src, \
+            f'{wname}: non-streaming response missing tool_choice'
+        assert "'tools': []" in src or '"tools": []' in src, \
+            f'{wname}: non-streaming response missing tools'
+    nsrc = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    assert 'parallel_tool_calls' in nsrc and 'tool_choice' in nsrc and 'tools' in nsrc
+
+
+def test_codex_resp02_sdk_parses_wrapper_stream_unit():
+    """Unit-level SDK parse: the openai SDK stream parser must accept a stream
+    shaped exactly like the wrappers now emit (full created + standard tool
+    events + reasoning list summary), for text, tool-call and reasoning-only
+    turns."""
+    pytest.importorskip('openai')
+    import httpx
+    from openai import OpenAI
+
+    def ev(e, **kw):
+        return f'event: {e}\ndata: {json.dumps({"type": e, **kw})}\n\n'
+
+    created = ev('response.created', response={'id': 'resp_1', 'object': 'response',
+                'created_at': 1785600000, 'model': 'm', 'status': 'in_progress',
+                'output': [], 'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}})
+    inprog = ev('response.in_progress', response={'id': 'resp_1', 'status': 'in_progress'})
+    msgadd = ev('response.output_item.added', output_index=0,
+                item={'id': 'msg-1', 'type': 'message', 'status': 'in_progress',
+                      'role': 'assistant', 'content': []})
+    partadd = ev('response.content_part.added', item_id='msg-1', output_index=0,
+                 content_index=0, part={'type': 'output_text', 'text': ''})
+    fcadd = ev('response.output_item.added', output_index=1,
+               item={'id': 'call_1', 'type': 'function_call', 'status': 'in_progress',
+                     'call_id': 'call_1', 'name': 'lookup', 'arguments': ''})
+    fcd1 = ev('response.function_call_arguments.delta', item_id='call_1',
+              output_index=1, delta='{"x":')
+    fcd2 = ev('response.function_call_arguments.delta', item_id='call_1',
+              output_index=1, delta=':1}')
+    fcdone = ev('response.function_call_arguments.done', item_id='call_1',
+                output_index=1, name='lookup', arguments='{"x":1}')
+    fcdone_item = ev('response.output_item.done', output_index=1,
+                     item={'id': 'call_1', 'type': 'function_call', 'status': 'completed',
+                           'call_id': 'call_1', 'name': 'lookup', 'arguments': '{"x":1}'})
+    txtdone = ev('response.output_text.done', item_id='msg-1', output_index=0,
+                 content_index=0, text='')
+    partdone = ev('response.content_part.done', item_id='msg-1', output_index=0,
+                  content_index=0, part={'type': 'output_text', 'text': '', 'annotations': []})
+    msgdone = ev('response.output_item.done', output_index=0,
+                 item={'id': 'msg-1', 'type': 'message', 'status': 'completed',
+                       'role': 'assistant',
+                       'content': [{'type': 'output_text', 'text': '', 'annotations': []}]})
+    rsnadd = ev('response.output_item.added', output_index=1,
+                item={'id': 'rsn_1', 'type': 'reasoning', 'status': 'in_progress',
+                      'summary': [], 'content': []})
+    rsnd = ev('response.reasoning_text.delta', item_id='rsn_1', output_index=1,
+              content_index=0, delta='think')
+    rsndone = ev('response.reasoning_text.done', item_id='rsn_1', output_index=1,
+                 content_index=0, text='think')
+    rsnitem = ev('response.output_item.done', output_index=1,
+                 item={'id': 'rsn_1', 'type': 'reasoning', 'status': 'completed',
+                       'summary': [], 'content': [{'type': 'reasoning_text', 'text': 'think'}]})
+    comp = ev('response.completed', response={'id': 'resp_1', 'object': 'response',
+              'created_at': 1785600000, 'model': 'm', 'status': 'completed',
+              'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
+              'output': [], 'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}})
+
+    def run(body, label):
+        def make_transport(b):
+            def handler(request):
+                return httpx.Response(200, headers={'Content-Type': 'text/event-stream'},
+                                      content=b.encode())
+            return httpx.MockTransport(handler)
+        client = OpenAI(api_key='sk-test', http_client=httpx.Client(transport=make_transport(body)))
+        try:
+            with client.responses.stream(model='m', input='hi') as stream:
+                return list(stream)
+        except Exception as e:  # pragma: no cover - assertion below reports
+            raise AssertionError(f'{label}: openai SDK rejected stream: {type(e).__name__}: {e}') from e
+
+    # tools turn
+    evs = run(created + inprog + msgadd + partadd + fcadd + fcd1 + fcd2 + fcdone
+              + fcdone_item + txtdone + partdone + msgdone + comp + 'data: [DONE]\n\n',
+              'tools')
+    names = [type(e).__name__ for e in evs]
+    assert any('FunctionCallArgumentsDelta' in n for n in names), names
+    assert any('FunctionCallArgumentsDone' in n for n in names), names
+    # reasoning-only turn
+    evs = run(created + inprog + msgadd + partadd + rsnadd + rsnd + rsndone
+              + rsnitem + txtdone + partdone + msgdone + comp + 'data: [DONE]\n\n',
+              'reasoning_only')
+    names = [type(e).__name__ for e in evs]
+    assert any('ReasoningTextDelta' in n for n in names), names
+    assert any('ReasoningTextDone' in n for n in names), names
+
+
 # ── Same-protocol passthrough ─────────────────────────────────────────────
 
 def test_openai_chat_body_not_mutated_by_translators():

@@ -1184,7 +1184,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
       response.output_item.done → response.completed → [DONE]
 
     Reasoning and tool-call deltas are streamed as their own output items
-    (`response.reasoning_text.delta` / `response.function_call.delta`) so
+    (`response.reasoning_text.delta` / `response.function_call_arguments.delta`) so
     Codex keeps receiving progress during the model's thinking phase and can
     act on structured tool calls.
 
@@ -1346,7 +1346,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     events.append(_sse('response.output_item.added', {
                         'type': 'response.output_item.added', 'output_index': rsn_index,
                         'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress',
-                                 'summary': '', 'content': []},
+                                 'summary': [], 'content': []},
                     }))
                 acc_reason += reason_delta
                 events.append(_sse('response.reasoning_text.delta', {
@@ -1373,14 +1373,14 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     }))
                 if isinstance(fn.get('name'), str) and fn['name']:
                     acc['name'] += fn['name']
-                    events.append(_sse('response.function_call.delta', {
-                        'type': 'response.function_call.delta', 'item_id': acc['call_id'],
+                    events.append(_sse('response.function_call_arguments.delta', {
+                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
                         'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name'],
                     }))
                 if isinstance(fn.get('arguments'), str) and fn['arguments']:
                     acc['args'] += fn['arguments']
-                    events.append(_sse('response.function_call.delta', {
-                        'type': 'response.function_call.delta', 'item_id': acc['call_id'],
+                    events.append(_sse('response.function_call_arguments.delta', {
+                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
                         'output_index': acc['output_index'], 'delta': fn['arguments'],
                     }))
 
@@ -1427,7 +1427,8 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             yield _sse('response.output_item.done', {
                 'type': 'response.output_item.done', 'output_index': rsn_index,
                 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed',
-                         'summary': '', 'text': acc_reason},
+                         'summary': [],
+                         'content': [{'type': 'reasoning_text', 'text': acc_reason}]},
             })
         # output_text.done
         yield _sse('response.output_text.done', {
@@ -1451,9 +1452,15 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         })
         # Close every function_call item that was opened (Codex hangs if a
         # function_call item is added but never marked done).
+        # CODEX-RESP-02: emit the standard `response.function_call_arguments.done`
+        # before closing the item so the SDK finalizes the parsed arguments.
         for acc in tool_accs:
             if not acc:
                 continue
+            yield _sse('response.function_call_arguments.done', {
+                'type': 'response.function_call_arguments.done', 'item_id': acc['call_id'],
+                'output_index': acc['output_index'], 'name': acc['name'], 'arguments': acc['args'],
+            })
             yield _sse('response.output_item.done', {
                 'type': 'response.output_item.done', 'output_index': acc['output_index'],
                 'item': {
@@ -1485,7 +1492,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         }
         if reasoning_started:
             outputs_by_index[rsn_index] = {'id': rsn_id, 'type': 'reasoning',
-                                           'status': 'completed', 'summary': '', 'text': acc_reason}
+                                           'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]}
         for acc in tool_accs:
             if not acc:
                 continue
@@ -1499,6 +1506,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             'response': {
                 'id': resp_id, 'object': 'response', 'created_at': created_at,
                 'model': model, 'status': 'completed', 'output': output,
+                'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
             },
         })
 
@@ -1523,7 +1531,8 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     yield _sse('response.output_item.done', {
                         'type': 'response.output_item.done', 'output_index': rsn_index,
                         'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed',
-                                 'summary': '', 'text': acc_reason},
+                                 'summary': [],
+                                 'content': [{'type': 'reasoning_text', 'text': acc_reason}]},
                     })
                 yield _sse('response.output_text.done', {
                     'type': 'response.output_text.done', 'item_id': msg_id,
@@ -1963,10 +1972,13 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
     text = msg.get('content') or ''
     output = []
     # Surface upstream reasoning_content as a reasoning output item.
+    # CODEX-RESP-02: the SDK's ResponseReasoningItem expects summary/content
+    # as lists — `text` alone parses with serializer warnings.
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
     if reasoning:
         output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning',
-                       'status': 'completed', 'text': reasoning})
+                       'status': 'completed', 'summary': [],
+                       'content': [{'type': 'reasoning_text', 'text': reasoning}]})
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call',
@@ -1977,9 +1989,13 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
                    'status': 'completed', 'role': 'assistant',
                    'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
     u = data.get('usage') or {}
+    # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+    # parallel_tool_calls / tool_choice / tools — missing them fails
+    # non-streaming client.responses.create() parsing.
     resp = {'id': data.get('id') or f"resp_{int(time.time()*1000)}",
             'object': 'response', 'created_at': int(time.time()),
             'model': model, 'status': 'completed', 'output': output,
+            'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
             'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0,
                       'output_tokens': u.get('completion_tokens', 0) or 0,
                       'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}

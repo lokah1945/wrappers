@@ -21,3 +21,8 @@ pydantic>=2.9,<3
 # MCP must stay <2 — the wrappers import mcp.server.fastmcp, which was
 # restructured in 2.x.
 mcp>=1.2,<2
+
+# CODEX-RESP-02: the SDK-compat gate boots wrappers and parses their
+# /v1/responses output with the official openai SDK stream parser (the exact
+# code path Codex uses). Requires the SDK.
+openai>=1.40,<3

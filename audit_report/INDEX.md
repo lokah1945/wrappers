@@ -11,6 +11,8 @@
 |---|---|
 | `DEEP_AUDIT_REPORT_2026-08-01.md` | **Main comprehensive audit report** — post-fix verification across all 5 wrappers, common/, tests/ (updated with the CODEX-RESP-01 fix + re-audit §7c) |
 | `docs/audits/CODEX_RESP_REAUDIT_2026-08-01.md` | **Tracked re-audit report** — the fix cycle for the critical Codex/Responses bug and the debt items, with reproducible gates |
+| `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` | **AI Gateway Translation Layer audit** — OpenAI↔Anthropic / Responses↔Chat round-trip matrix (F1–F7) |
+| `docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md` | **SDK-compat audit** — last Codex bug: every wrapper's Responses output must parse with the official openai SDK (CODEX-RESP-02) |
 
 ---
 
@@ -18,11 +20,12 @@
 
 | Gate | Command | Result |
 |---|---|---|
-| Unit + Regression Suite | `python -m pytest tests -q` | **204 passed** (142 + 62 new translation-matrix cases) |
+| Unit + Regression Suite | `python -m pytest tests -q` | **209 passed** (204 + 5 CODEX-RESP-02 SDK-compat guards) |
 | Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **63 passed** |
-| **AI Gateway Translation Layer** | `python -m pytest tests/test_translation_matrix.py -q` | **58 passed** (all 5 wrappers incl. nvidia) |
+| **AI Gateway Translation Layer** | `python -m pytest tests/test_translation_matrix.py -q` | **63 passed** (all 5 wrappers incl. nvidia) |
+| **SDK Compatibility (Codex parser)** | `python tests/e2e_runtime/sdk_codex_compat.py` | **5 wrappers × 4 modes — all parse with the official openai SDK** |
 | Runtime E2E (5 wrappers × 3 surfaces × 22 modes + cross-translation probes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **445/445 checks passed** (incl. `reasoning_only`, `anthropic_tools`, `responses_tools`, thinking-block assertion) |
-| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~19,600 requests, 0 failures**, flat RSS/latency |
+| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~20,800 requests, 0 failures**, flat RSS/latency |
 | Contract Conformance | `pytest tests/test_sse_streaming_regressions.py::test_contract_all_wrappers_expose_required_surfaces` | **All 10 surfaces on all 5 wrappers** |
 | Cross-Wrapper Parity Guards | `pytest tests/test_sse_streaming_regressions.py -k parity` | **4/4 pass** |
 | Codex reasoning-only regression | `pytest tests/test_sse_streaming_regressions.py -k codex_resp01` | **3/3 pass** (openrouter emits full item lifecycle + `response.completed` for reasoning-only streams) |
@@ -87,6 +90,24 @@ All items previously listed as remaining debt were **re-verified against the cod
 | B-20: Blocking `subprocess` git calls | **Hardened this cycle**: every git subprocess call in all 5 wrappers + model-registry now carries `timeout=3` (the calls run once at import, but were unbounded). **New guard:** `test_b20_git_subprocess_calls_are_timeout_bounded`. |
 
 ---
+
+## Third Deep Pass — CODEX-RESP-02: Responses Must Parse With the Official SDK (2026-08-01)
+
+The reported "last bug" (Codex + wrapper-nous) traced to the /v1/responses
+output being unparseable by the openai SDK (Codex's parser) on **all five
+wrappers**. Proven with real servers + `client.responses.stream()`; fixed:
+
+| # | Finding | Fix |
+|---|---|---|
+| R2-1 | `response.created` minimal → SDK snapshot `output` None → crash on first `output_item.added` | full response object (`object`, `created_at`, `output: []`, `usage`) in nous/opencode/blackbox |
+| R2-2 | `response.function_call.delta` (nonstandard) → SDK never accumulated tool args | `response.function_call_arguments.delta` + added `.done` before each `output_item.done` (all 5) |
+| R2-3 | reasoning `summary: ""` (string) → SDK serializer failures | `summary: []` + `content: [{type: reasoning_text}]` (all 5) |
+| R2-4 | non-streaming Responses missing `parallel_tool_calls`/`tool_choice`/`tools` → SDK validation error | added to all 5 (nvidia via `base_response`) |
+
+**New gate:** `tests/e2e_runtime/sdk_codex_compat.py` (real servers, official
+SDK parse) + 5 unit guards in `test_translation_matrix.py`. `openai` added to
+`tests/requirements.txt`. See
+`docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md`.
 
 ## Second Deep Pass — AI Gateway Translation Layer (2026-08-01)
 

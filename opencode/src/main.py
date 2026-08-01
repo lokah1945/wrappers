@@ -1025,7 +1025,10 @@ def chat_to_responses(model: str, data: dict) -> dict:
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
     output = []
     if reasoning:
-        output.append({"id": f"rsn_{int(time.time()*1000)}", "type": "reasoning", "status": "completed", "text": reasoning})
+        # CODEX-RESP-02: SDK ResponseReasoningItem expects summary/content as
+        # lists (text alone triggers serializer warnings in the openai SDK).
+        output.append({"id": f"rsn_{int(time.time()*1000)}", "type": "reasoning", "status": "completed",
+                       "summary": [], "content": [{"type": "reasoning_text", "text": reasoning}]})
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({"id": tc.get('id') or f"fc_{len(output)}", "type": "function_call", "status": "completed",
@@ -1033,8 +1036,12 @@ def chat_to_responses(model: str, data: dict) -> dict:
     output.append({"id": f"msg_{int(time.time()*1000)}", "type": "message", "status": "completed", "role": "assistant",
                    "content": [{"type": "output_text", "text": text, "annotations": []}]})
     u = data.get('usage') or {}
+    # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+    # parallel_tool_calls / tool_choice / tools — missing them fails
+    # non-streaming client.responses.create() parsing.
     return {"id": data.get('id') or f"resp_{int(time.time()*1000)}", "object": "response",
             "created_at": int(time.time()), "model": model, "status": "completed", "output": output,
+            "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
             "usage": {"input_tokens": u.get('prompt_tokens', 0) or 0,
                       "output_tokens": u.get('completion_tokens', 0) or 0,
                       "total_tokens": u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
@@ -1722,7 +1729,7 @@ async def responses(request: Request):
                             rsn_started = True
                             rsn_index = next_output_index
                             next_output_index += 1
-                            yield emit("response.output_item.added", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "in_progress", "summary": "", "content": []}})
+                            yield emit("response.output_item.added", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "in_progress", "summary": [], "content": []}})
                         acc_reason += reason_delta
                         yield emit("response.reasoning_text.delta", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "delta": reason_delta})
                     for tc in d.get("tool_calls") or []:
@@ -1733,13 +1740,16 @@ async def responses(request: Request):
                             yield emit("response.output_item.added", {"output_index": acc["output_index"], "item": {"id": acc["call_id"], "type": "function_call", "status": "in_progress", "call_id": acc["call_id"], "name": acc["name"], "arguments": ""}})
                         if fn.get("name"):
                             acc["name"] += fn["name"]
-                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
+                            yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
                         if fn.get("arguments"):
                             acc["args"] += fn["arguments"]
-                            yield emit("response.function_call.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
+                            yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
 
                 try:
-                    yield emit("response.created", {"response": {"id": rid, "model": model, "status": "in_progress"}})
+                    yield emit("response.created", {"response": {
+                        "id": rid, "object": "response", "created_at": int(time.time()),
+                        "model": model, "status": "in_progress", "output": [],
+                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}})
                     yield emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}})
                     yield emit("response.output_item.added", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
                     yield emit("response.content_part.added", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
@@ -1791,19 +1801,22 @@ async def responses(request: Request):
                 msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
                 if rsn_started:
                     yield emit("response.reasoning_text.done", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "text": acc_reason})
-                    yield emit("response.output_item.done", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": acc_reason}})
+                    yield emit("response.output_item.done", {"output_index": rsn_index, "item": {"id": rsn_id, "type": "reasoning", "status": "completed", "summary": [], "content": [{"type": "reasoning_text", "text": acc_reason}]}})
                 yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
                 yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": acc_text, "annotations": []}})
                 yield emit("response.output_item.done", {"output_index": 0, "item": msg_item})
                 outputs = [msg_item]
                 if rsn_started:
-                    outputs.append({"id": rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": acc_reason})
+                    outputs.append({"id": rsn_id, "type": "reasoning", "status": "completed", "summary": [], "content": [{"type": "reasoning_text", "text": acc_reason}]})
                 completed_tools = [a for a in tool_accs if a]
                 for acc in completed_tools:
                     fc_item = {"id": acc["call_id"], "type": "function_call", "status": "completed", "call_id": acc["call_id"], "name": acc["name"], "arguments": acc["args"]}
+                    # CODEX-RESP-02: standard OpenAI Responses event finalising
+                    # tool arguments before the item is closed.
+                    yield emit("response.function_call_arguments.done", {"item_id": acc["call_id"], "output_index": acc["output_index"], "name": acc["name"], "arguments": acc["args"]})
                     yield emit("response.output_item.done", {"output_index": acc["output_index"], "item": fc_item})
                     outputs.append(fc_item)
-                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj()}})
+                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj(), "parallel_tool_calls": True, "tool_choice": "auto", "tools": []}})
                 _store_response(principal, rid, list(chat_body.get("messages", [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})

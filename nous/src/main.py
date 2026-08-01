@@ -1143,17 +1143,25 @@ def chat_to_responses(model: str, chat: dict) -> dict:
     # item (opencode/blackbox/openrouter parity) instead of dropping it.
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
     if reasoning:
+        # CODEX-RESP-02: the SDK's ResponseReasoningItem expects
+        # summary/content as lists — `text` alone parses with serializer
+        # warnings in the openai SDK.
         output.append({"id": f"rsn_{int(time.time()*1000)}", "type": "reasoning",
-                       "status": "completed", "text": reasoning})
+                       "status": "completed", "summary": [],
+                       "content": [{"type": "reasoning_text", "text": reasoning}]})
     for tc in tool_calls:
         fn = tc.get("function", {})
         output.append({"id": tc.get("id"), "type": "function_call", "call_id": tc.get("id"), "name": fn.get("name"), "arguments": fn.get("arguments", ""), "status": "completed"})
     output.append({"id": "msg-local", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
     u = chat.get("usage", {})
+    # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+    # parallel_tool_calls / tool_choice / tools — a response missing them
+    # fails non-streaming client.responses.create() parsing.
     return {
         "id": chat.get("id", f"resp-{int(time.time()*1000)}"),
         "object": "response", "created_at": int(time.time()), "model": model,
         "output": output, "status": "completed",
+        "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
         "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0),
                   "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
     }
@@ -1754,8 +1762,18 @@ class ResponsesStreamState:
         # OpenAI Responses API requires the output item to be "added" (made active)
         # BEFORE any output_text.delta is sent, otherwise clients like Codex v0.145
         # emit "OutputTextDelta without active item" and hang.
+        # CODEX-RESP-02: response.created MUST carry a FULL response object —
+        # the openai SDK (Codex) builds its stream snapshot from it and
+        # appends output_item.added events to `response.output`; with the
+        # minimal {id, model, status} the snapshot's `output` is None and the
+        # first output_item.added crashes the parser
+        # (AttributeError: 'NoneType' object has no attribute 'append').
         return [
-            self.emit("response.created", {"response": {"id": rid, "model": self.model, "status": "in_progress"}}),
+            self.emit("response.created", {"response": {
+                "id": rid, "object": "response", "created_at": int(time.time()),
+                "model": self.model, "status": "in_progress", "output": [],
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            }}),
             self.emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}}),
             self.emit("response.output_item.added", {
                 "output_index": 0,
@@ -1787,7 +1805,11 @@ class ResponsesStreamState:
             }))
         self.tool_acc[call_id]["name"] = self.tool_acc[call_id]["name"] or name
         self.tool_acc[call_id]["args"] += args
-        events.append(self.emit("response.function_call.delta", {
+        # CODEX-RESP-02: the OpenAI Responses API streams tool arguments as
+        # `response.function_call_arguments.delta` (NOT response.function_call.delta).
+        # The openai SDK (Codex) rejects the wrong name, so tool arguments were
+        # never accumulated and tool-calling turns hung/broke.
+        events.append(self.emit("response.function_call_arguments.delta", {
             "item_id": call_id, "output_index": self.tool_acc[call_id]["output_index"], "delta": args,
         }))
         return events
@@ -1832,17 +1854,27 @@ class ResponsesStreamState:
             self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
         ]
         # Close the reasoning item opened during thinking (if any).
+        # CODEX-RESP-02: the reasoning item's `summary` MUST be a list (the SDK
+        # model expects list[Summary]); an empty string triggers serializer
+        # failures in the openai SDK.
         if self.reasoning_started:
             events.append(self.emit("response.reasoning_text.done", {
                 "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "text": self.acc_reason,
             }))
             events.append(self.emit("response.output_item.done", {
                 "output_index": self.rsn_index,
-                "item": {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason},
+                "item": {"id": self.rsn_id, "type": "reasoning", "status": "completed",
+                         "summary": [], "content": [{"type": "reasoning_text", "text": self.acc_reason}]},
             }))
         # Close every tool item that was opened (Codex hangs if a function_call
-        # item is added but never marked done).
+        # item is added but never marked done). CODEX-RESP-02: emit the
+        # standard `response.function_call_arguments.done` before closing the
+        # item so the SDK finalizes the parsed arguments.
         for call_id, info in self.tool_acc.items():
+            events.append(self.emit("response.function_call_arguments.done", {
+                "item_id": call_id, "output_index": info.get("output_index", 1),
+                "name": info.get("name", ""), "arguments": info.get("args", ""),
+            }))
             events.append(self.emit("response.output_item.done", {
                 "output_index": info.get("output_index", 1),
                 "item": {
@@ -1857,11 +1889,15 @@ class ResponsesStreamState:
             0: {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
         }
         if self.reasoning_started:
-            outputs_by_index[self.rsn_index] = {"id": self.rsn_id, "type": "reasoning", "status": "completed", "summary": "", "text": self.acc_reason}
+            outputs_by_index[self.rsn_index] = {"id": self.rsn_id, "type": "reasoning", "status": "completed",
+                                                "summary": [], "content": [{"type": "reasoning_text", "text": self.acc_reason}]}
         for call_id, info in self.tool_acc.items():
             outputs_by_index[info.get("output_index", 1)] = {"id": call_id, "type": "function_call", "status": "completed", "call_id": call_id, "name": info.get("name", ""), "arguments": info.get("args", "")}
         output = [outputs_by_index[i] for i in sorted(outputs_by_index)]
-        events.append(self.emit("response.completed", {"response": {"id": rid, "model": self.model, "status": "completed", "output": output, "usage": norm}}))
+        events.append(self.emit("response.completed", {"response": {
+            "id": rid, "object": "response", "created_at": int(time.time()),
+            "model": self.model, "status": "completed", "output": output, "usage": norm,
+        }}))
         return events
 
     def assistant_message(self):
@@ -1939,7 +1975,7 @@ class ResponsesStreamState:
                 self._next_tool_index += 1
                 events.append(self.emit("response.output_item.added", {
                     "output_index": self.rsn_index,
-                    "item": {"id": self.rsn_id, "type": "reasoning", "status": "in_progress", "summary": "", "content": []},
+                    "item": {"id": self.rsn_id, "type": "reasoning", "status": "in_progress", "summary": [], "content": []},
                 }))
             self.acc_reason += reason_delta
             events.append(self.emit("response.reasoning_text.delta", {
