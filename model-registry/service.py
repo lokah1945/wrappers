@@ -47,7 +47,7 @@ def _resolve_git_commit() -> str:
     try:
         import subprocess
         return subprocess.check_output(
-            ["git", "rev-parse", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL, text=True
+            ["git", "rev-parse", "HEAD"], cwd=str(ROOT), stderr=subprocess.DEVNULL, text=True, timeout=3
         ).strip()
     except Exception:
         return "unknown"

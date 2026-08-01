@@ -729,6 +729,199 @@ def test_b06_openrouter_non_streaming_content_filter_maps_to_refusal():
     assert '"content_filter": "end_turn"' not in block
 
 
+# ── CODEX-RESP-01 — reasoning-only Responses streams must complete ─────────
+#
+# CRITICAL finding from the 2026-08-01 deep audit: openrouter's Responses
+# translator gated its completion events behind `if text_started:`. A model
+# that emits ONLY reasoning_content (no text) left `text_started=False`, so
+# `response.output_text.done` / `response.content_part.done` /
+# `response.output_item.done` were never emitted and Codex waited forever for
+# the terminal events — appearing to "stop mid-process" with no final
+# response. Reference fix: nous `ResponsesStreamState.done()` / opencode
+# inline `gen()` always emit completion events.
+
+def _run_openrouter_responses_translator(lines):
+    """Run the openrouter Responses translator over raw upstream SSE lines and
+    return parsed (event, payload) frames."""
+    f = load_openrouter_translator('_translate_openai_stream_to_responses')
+
+    async def run():
+        return [e async for e in f(agen(lines), 'mock-model')]
+
+    return parse_frames(asyncio.run(run()))
+
+
+def test_codex_resp01_reasoning_only_stream_emits_full_completion_lifecycle():
+    """A model that outputs ONLY reasoning (no text content) must still emit
+    the full item lifecycle and a terminal response.completed, or Codex hangs
+    indefinitely."""
+    frames = _run_openrouter_responses_translator([
+        chunk({'role': 'assistant', 'content': ''}),
+        chunk({'reasoning_content': 'Let me think... '}),
+        chunk({'reasoning_content': 'still thinking.'}),
+        chunk(finish='stop'),
+        'data: [DONE]\n',
+    ])
+    types = [p.get('type') if isinstance(p, dict) else p for _e, p in frames]
+    # Terminal events MUST be present (Codex hangs without them).
+    assert 'response.completed' in types, \
+        f'reasoning-only stream missing response.completed: {types}'
+    assert any(d == '[DONE]' for _e, d in frames), 'missing data: [DONE]'
+    # The full item lifecycle must be present — added AND closed.
+    for ev in ('response.output_item.added', 'response.content_part.added',
+               'response.reasoning_text.delta', 'response.reasoning_text.done',
+               'response.output_text.done', 'response.content_part.done',
+               'response.output_item.done'):
+        assert ev in types, f'reasoning-only stream missing {ev}: {types}'
+    # The completed response's output array must reference the reasoning item.
+    completed = next(d for _e, d in frames
+                     if isinstance(d, dict) and d.get('type') == 'response.completed')
+    out_types = [o.get('type') for o in completed['response']['output']]
+    assert 'reasoning' in out_types, \
+        f'reasoning item missing from completed output: {out_types}'
+
+
+def test_codex_resp01_reasoning_stream_with_text_still_completes():
+    """Sanity: a normal reasoning-then-text stream keeps working (deltas are
+    streamed, then completion events fire exactly once)."""
+    frames = _run_openrouter_responses_translator([
+        chunk({'role': 'assistant', 'content': ''}),
+        chunk({'reasoning_content': 'hmm '}),
+        chunk({'content': 'The answer is 42.'}),
+        chunk(finish='stop'),
+        'data: [DONE]\n',
+    ])
+    types = [p.get('type') if isinstance(p, dict) else p for _e, p in frames]
+    text = ''.join(p.get('delta', '') for _e, p in frames
+                   if isinstance(p, dict) and p.get('type') == 'response.output_text.delta')
+    assert text == 'The answer is 42.', f'text deltas corrupted: {text!r}'
+    assert types.count('response.completed') == 1, f'duplicate completion: {types}'
+    assert types.count('response.output_item.done') == 2  # message + reasoning
+
+
+def test_codex_resp01_openrouter_no_text_started_guard_on_completion_events():
+    """Static parity guard: the openrouter Responses translator MUST NOT gate
+    its completion events behind a text_started flag — that exact guard made
+    Codex hang on reasoning-only outputs (CODEX-RESP-01)."""
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    i = src.index('async def _translate_openai_stream_to_responses')
+    j = src.index('\n# ══', i)
+    block = src[i:j]
+    assert 'text_started' not in block, (
+        'openrouter Responses translator still gates completion events on '
+        'text_started (CODEX-RESP-01)')
+    # Completion events must be emitted unconditionally, before the terminal.
+    assert "yield _sse('response.output_text.done'" in block
+    assert "yield _sse('response.content_part.done'" in block
+    assert "yield _sse('response.output_item.done'" in block
+    assert "yield _sse('response.completed'" in block
+
+
+# ── B-39 — local error responses must increment the error counter ──────────
+
+def test_b39_openrouter_local_error_responses_count_in_metrics():
+    """B-39: openrouter's `record_error()` was dead code — no caller invoked
+    it, so auth rejections, invalid JSON, FREE_ONLY blocks and pool exhaustion
+    never incremented the dashboard error counter, and error_rate reported
+    false health. Every local error response must route through
+    `_error_response`, which records the error before returning."""
+    import re
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    assert 'def _error_response(' in src
+    assert 'metrics.record_error(status_code=status_code)' in src
+    # No `return JSONResponse(...)` with a literal 4xx/5xx may remain — they
+    # must all go through _error_response so the counter actually increments.
+    offenders = []
+    for m in re.finditer(r'return JSONResponse\(', src):
+        depth = 0
+        j = m.end() - 1
+        while j < len(src):
+            if src[j] == '(':
+                depth += 1
+            elif src[j] == ')':
+                depth -= 1
+                if depth == 0:
+                    break
+            j += 1
+        call = src[m.start():j + 1]
+        sm = re.search(r'status_code=(\d{3})', call)
+        if sm and int(sm.group(1)) >= 400:
+            offenders.append(call[:120])
+    assert not offenders, (
+        'local error responses bypassing _error_response (B-39):\n  '
+        + '\n  '.join(offenders))
+
+
+# ── B-36 — pool record() must not fold in in-flight accounting ────────────
+
+def test_b36_pool_record_is_telemetry_only_not_in_flight():
+    """B-36: folding `record()` (telemetry) into in-flight accounting lets any
+    unpaired path permanently inflate `in_flight`, skewing least-effective-load
+    selection away from healthy keys. `record()` must not touch `in_flight`;
+    `acquire()` must call `record()` AND `increment_in_flight()` separately."""
+    import ast
+    for rel in ('blackbox/src/key_pool.py', 'nous/src/main.py',
+                'opencode/src/key_pool.py', 'openrouter/src/key_pool.py',
+                'nvidia-python/src/key_pool.py'):
+        src = (ROOT / rel).read_text()
+        tree = ast.parse(src)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == 'record':
+                body = [n for n in node.body if not (
+                    isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant))]
+                code = ast.get_source_segment(src, node)
+                if body:
+                    # drop the docstring statement from the source segment
+                    doc = ast.get_source_segment(src, body[0])
+                    start = code.index(doc) if doc in code else 0
+                    real = code[start:]
+                else:
+                    real = code
+                assert 'in_flight' not in real, \
+                    f'{rel}: record() mutates in_flight (B-36)'
+        # acquire() must keep the two calls explicit (nvidia does this inside
+        # its _acquire_slot helper called from acquire).
+        all_attrs: set = set()
+        for fn in ast.walk(tree):
+            if isinstance(fn, (ast.AsyncFunctionDef, ast.FunctionDef)) and 'acquire' in fn.name:
+                calls = [n for n in ast.walk(fn)
+                         if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+                         and n.func.attr in ('record', 'increment_in_flight')]
+                all_attrs |= {n.func.attr for n in calls}
+        assert {'record', 'increment_in_flight'} <= all_attrs, \
+            f'{rel}: acquire() must call record() and increment_in_flight() separately'
+
+
+# ── B-20 — git identity resolution must be timeout-bounded ─────────────────
+
+def test_b20_git_subprocess_calls_are_timeout_bounded():
+    """B-20: git identity resolution runs blocking subprocesses. Without a
+    timeout a hung git repo stalls startup (the audit flagged this as
+    /health blocking the event loop; it actually runs at import, but it was
+    unbounded). Every git subprocess call must carry an explicit timeout."""
+    import re
+    offenders = []
+    for rel in ('nvidia-python/src/main.py', 'nous/src/main.py',
+                'opencode/src/main.py', 'blackbox/src/main.py',
+                'openrouter/src/main.py', 'model-registry/service.py'):
+        src = (ROOT / rel).read_text()
+        for m in re.finditer(r'subprocess\.check_output\(', src):
+            depth = 0
+            j = m.end() - 1
+            while j < len(src):
+                if src[j] == '(':
+                    depth += 1
+                elif src[j] == ')':
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            call = src[m.start():j + 1]
+            if 'git' in call and 'timeout=' not in call:
+                offenders.append(f'{rel}: {call[:100]}')
+    assert not offenders, 'git subprocess calls without timeout:\n  ' + '\n  '.join(offenders)
+
+
 def test_b26_openrouter_management_is_loopback_only_and_never_fails_open():
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     auth_block = src[src.index('@app.middleware("http")'):src.index('# ══════════════════════════════════════════════════════════════════════════', src.index('@app.middleware("http")'))]

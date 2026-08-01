@@ -30,9 +30,9 @@ import time
 from aiohttp import web
 
 MODES = (
-    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'nofinish',
-    'noterminator', 'midstream_error', 'abrupt', 'slow', 'usage_after', 'empty',
-    'unicode',
+    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
+    'nofinish', 'noterminator', 'midstream_error', 'abrupt', 'slow', 'usage_after',
+    'empty', 'unicode',
     # Round-2 adversarial modes
     'bigchunk',      # one huge multi-line write (many events in a single TCP read)
     'bytesplit',     # every frame split byte-by-byte across writes
@@ -146,6 +146,19 @@ async def chat_completions(request: web.Request):
             await _write(resp, _chunk({'reasoning_content': 'Let me think... '}), space=space, crlf=crlf)
             await _write(resp, _chunk({'reasoning_content': 'still thinking.'}), space=space, crlf=crlf)
             await _write(resp, _chunk({'content': 'The answer is 42.'}), space=space, crlf=crlf)
+            await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
+            return resp
+
+        if mode == 'reasoning_only':
+            # CODEX-RESP-01 regression: a model that emits ONLY reasoning
+            # (reasoning_content deltas, NO text content) must still produce a
+            # terminal response.completed. The old openrouter translator
+            # skipped the completion events for such streams (guarded on
+            # `if text_started:`), so Codex hung waiting for them.
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'reasoning_content': 'Let me think... '}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'reasoning_content': 'still thinking.'}), space=space, crlf=crlf)
             await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
             await _write(resp, '[DONE]', space=space, crlf=crlf)
             return resp

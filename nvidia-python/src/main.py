@@ -753,7 +753,7 @@ def _resolve_git_root():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', '--show-toplevel'],
-            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         # fallback: walk up to find .git
@@ -769,7 +769,7 @@ def _resolve_git_commit():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
-            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL
+            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         return 'unknown'

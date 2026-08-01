@@ -48,8 +48,9 @@ BASE_FOR = {
 }
 
 STREAM_MODES = [
-    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'nofinish',
-    'noterminator', 'midstream_error', 'usage_after', 'empty', 'unicode', 'slow',
+    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
+    'nofinish', 'noterminator', 'midstream_error', 'usage_after', 'empty', 'unicode',
+    'slow',
     # Round-2 adversarial framing / protocol modes
     'bigchunk', 'bytesplit', 'comments', 'dupfinish', 'nullcontent',
     'emptychoices', 'toolnoid', 'longtool',
@@ -305,6 +306,27 @@ def check_responses_stream(evs, mode) -> list[str]:
         errs.append('no terminal response.completed/failed event (Codex hangs)')
     if mode == 'midstream_error' and 'response.completed' in types:
         errs.append('upstream error reported as response.completed')
+    # CODEX-RESP-01 guard: a *completed* turn must have a complete item
+    # lifecycle — every output_item.added must be matched by an
+    # output_item.done. The openrouter translator used to skip the done
+    # events when the model emitted only reasoning (no text), so Codex never
+    # saw its output items close and hung waiting for the terminal events.
+    # Failure paths (response.failed) are exempt: siblings close items only
+    # on success, matching the OpenAI Responses error shape.
+    if 'response.completed' in types:
+        added = {(d.get('output_index'), (d.get('item') or {}).get('id'))
+                 for _e, d in evs
+                 if isinstance(d, dict) and d.get('type') == 'response.output_item.added'}
+        done = {(d.get('output_index'), (d.get('item') or {}).get('id'))
+                for _e, d in evs
+                if isinstance(d, dict) and d.get('type') == 'response.output_item.done'}
+        if not added:
+            errs.append('no response.output_item.added before response.completed '
+                        '(Codex has no active item — hangs)')
+        for idx, iid in sorted(added):
+            if (idx, iid) not in done:
+                errs.append(f'output item {iid} (index {idx}) added but never done '
+                            '(Codex hangs waiting for item close)')
     # Sequence numbers, when present, must be strictly increasing.
     seqs = [d['sequence_number'] for _e, d in evs
             if isinstance(d, dict) and isinstance(d.get('sequence_number'), int)]
