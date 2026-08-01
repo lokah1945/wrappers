@@ -79,7 +79,7 @@ The following issues from the prior audit (2026-07-31) were verified as **fixed*
 |---|---|---|
 | Required surfaces (§2.1) | **PASS** | `test_contract_all_wrappers_expose_required_surfaces` |
 | OpenAI Chat streaming | **PASS** | Live E2E + `test_r06_no_duplicate_done_terminator`, `test_b01_*`, `test_b02_*` |
-| OpenAI Responses streaming | **PASS** | Live E2E + `test_b11_*` (implied by Responses tests) |
+| **OpenAI Responses streaming** | **⚠️ PARTIAL** | Live E2E + `test_b11_*` (implied by Responses tests); **openrouter has critical bug for reasoning-only responses** |
 | Anthropic Messages streaming | **PASS** | Live E2E + `test_r02_*`, `test_r03_*`, `test_b03_*`, `test_b06_*`, `test_b07_*`, `test_b10_*` |
 | SSE framing (`data:`, keepalive, CRLF, comments, split bytes, duplicate finish) | **PASS** | `test_b01_*`, `test_b02_*`, `test_b08_crlf_framing_normalised`, `test_r06_*` |
 | Parallel tools | **PASS** | `test_r02_*`, `test_b03_*` |
@@ -175,7 +175,7 @@ python -m compileall -q common blackbox nous opencode openrouter nvidia-python m
 |---|---|---|
 | Streaming | ✅ | Uses `common/sse.py` + shared `AnthropicStreamState` |
 | Anthropic emission | ✅ | Shared translator — **only wrapper with correct B-06 non-streaming** |
-| Responses emission | ✅ | Full lifecycle, `response.failed` on error |
+| Responses emission | ❌ **CRITICAL BUG** | `if text_started:` guard skips completion events for reasoning-only responses; Codex hangs indefinitely |
 | Auth | ✅ | Middleware-based, management routes separate + loopback-only |
 | KeyPool | ✅ | Separate accounting, `asyncio.Lock` |
 | Response Store | ✅ | Bounded on count + bytes + TTL (B-33 fixed) |
@@ -196,6 +196,102 @@ python -m compileall -q common blackbox nous opencode openrouter nvidia-python m
 | **B-20** Blocking `subprocess` git calls in `/health` | all 5 + model-registry | LOW | Health checks block event loop |
 
 **These do not cause runtime failures under the tested contract but should be addressed in the next hardening pass.**
+
+---
+
+## 7b. Codex / OpenAI Responses API Streaming — Critical Issue Found
+
+During deep code review of the Responses API streaming implementations across all three wrappers that support the OpenAI Responses API (`openrouter`, `nous`, `opencode`), a **critical bug was found in `openrouter`** that would cause **Codex to hang indefinitely** for models that output only reasoning/thinking without text content.
+
+### Root Cause: `if text_started:` Guard Skips Completion Events
+
+**File:** `openrouter/src/main.py`, function `_translate_openai_stream_to_responses`, **line 1287**
+
+```python
+if text_started:
+    # output_text.done
+    yield _sse('response.output_text.done', {...})
+    # content_part.done
+    yield _sse('response.content_part.done', {...})
+    # output_item.done
+    yield _sse('response.output_item.done', {...})
+    # ... response.completed
+```
+
+**The Bug:** The completion events (`response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`) are **only emitted if `text_started` is True**. 
+
+`text_started` is only set to `True` when the first `delta['content']` (text delta) is received. If a model outputs **only reasoning/thinking** (e.g., a "thinking" model that emits `reasoning_content`/`reasoning` deltas but no text content), `text_started` remains `False`, and **all completion events are skipped**.
+
+### Impact on Codex
+
+- Codex (OpenAI Responses API client) expects the full event lifecycle: `response.created` → `response.in_progress` → `response.output_item.added` → ... → `response.completed` → `data: [DONE]`
+- When completion events are missing, **Codex waits indefinitely** for the terminal events, appearing as "stops mid-process" to the user
+- This affects any model that emits reasoning/thinking without subsequent text content (common for reasoning models like `o1`, `o3-mini`, deep thinking modes)
+
+### Comparison Across Wrappers
+
+| Wrapper | Implementation | Completion Events for Reasoning-Only? | Status |
+|---|---|---|---|
+| **openrouter** | `_translate_openai_stream_to_responses` | ❌ **BROKEN** — guarded by `if text_started:` | **CRITICAL BUG** |
+| **nous** | `ResponsesStreamState.done()` | ✅ Always emits completion events | ✅ Correct |
+| **opencode** | Inline `gen()` function | ✅ Always emits completion events | ✅ Correct |
+
+### Evidence
+
+**openrouter/src/main.py:1287-1337** (only emits if `text_started`):
+```python
+if text_started:
+    # output_text.done
+    yield _sse('response.output_text.done', {...})
+    # content_part.done
+    yield _sse('response.content_part.done', {...})
+    # output_item.done
+    yield _sse('response.output_item.done', {...})
+    # response.completed
+    yield _sse('response.completed', {...})
+yield 'data: [DONE]\n\n'
+```
+
+**nous/src/main.py:1770-1826** (`ResponsesStreamState.done()` - always emits):
+```python
+def done(self, usage=None):
+    # ... always emits completion events regardless of text content
+    events = [
+        self.emit("response.output_text.done", {...}),
+        self.emit("response.content_part.done", {...}),
+        self.emit("response.output_item.done", {...}),
+        # reasoning done if applicable
+        # function_call done if applicable
+        self.emit("response.completed", {...}),
+    ]
+    return events
+```
+
+**opencode/src/main.py:1756-1779** (always emits):
+```python
+# Always emits completion events regardless of text content
+msg_item = {"id": "msg-1", "type": "message", "status": "completed", ...}
+yield emit("response.output_text.done", {...})
+yield emit("response.content_part.done", {...})
+yield emit("response.output_item.done", {...})
+# reasoning done if applicable
+# function_call done if applicable
+yield emit("response.completed", {...})
+```
+
+### Required Regression Test (Must Add)
+
+```python
+def test_codex_responses_reasoning_only_completes():
+    """A model that outputs ONLY reasoning (no text) must still emit
+    response.completed so Codex doesn't hang."""
+    # Test with mock upstream that emits only reasoning_content deltas
+    # Verify response.completed is emitted
+```
+
+This bug **only affects `openrouter`** and **only for models that output reasoning without text**. It would not be caught by the current test suite because the mock upstream in the E2E harness always emits text content. This explains why the user observed "Codex stops mid-process" while "Claude Code works fine" — they may be using different wrappers or different models.
+
+**Priority: CRITICAL — Must fix before production use with Codex.**
 
 ---
 
@@ -241,15 +337,15 @@ All findings backed by executable proofs in `tests/test_sse_streaming_regression
 
 ## 10. Final Verdict
 
-After this re-audit and patch pass, the wrapper fleet satisfies the runtime contract for the listed agents/SDKs under the tested conditions:
+After this re-audit and patch pass, the wrapper fleet satisfies the runtime contract for the listed agents/SDKs under the tested conditions, **with one critical exception**: **openrouter's OpenAI Responses API streaming has a critical bug** (`if text_started:` guard at line 1287 in `openrouter/src/main.py`) that causes **Codex to hang indefinitely for reasoning-only model outputs** (models that emit only `reasoning_content`/`thinking` deltas without text content). All other agents/SDKs work correctly across all wrappers. This bug is not caught by the current test suite because the mock upstream in the E2E harness always emits text content.
 
 - **136/136 unit + regression tests passed**
 - **57/57 streaming regression tests passed**
-- **420/420 live E2E checks passed**
-- **~20,806 soak requests, 0 failures**
-- **No stream lifecycle, auth, tool-call, or error-transparency regression detected**
+- **420/420 live E2E checks passed** (mock upstream always emits text, so bug not triggered)
+- **~20,806 soak requests, 0 failures** (same limitation)
+- **No stream lifecycle, auth, tool-call, or error-transparency regression detected** (except the openrouter Responses reasoning-only bug)
 
-**The project is fit for use as a backend for Claude Code, Codex, OpenClaw, Hermes Agent, OpenCode, OpenHands, generic OpenAI/Anthropic clients, Ollama discovery clients, and authenticated MCP/catalog clients within the verified contract.**
+**The project is fit for use as a backend for Claude Code, OpenClaw, Hermes Agent, OpenCode, OpenHands, generic OpenAI/Anthropic clients, Ollama discovery clients, and authenticated MCP/catalog clients within the verified contract. Codex (OpenAI Responses API) works correctly on `nous` and `opencode`, but **has a critical hang bug on `openrouter` for reasoning-only model outputs** — must fix before production use with Codex.**
 
 ---
 

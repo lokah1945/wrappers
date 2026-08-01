@@ -31,7 +31,7 @@
 | Agent / SDK | Status |
 |---|---|
 | Claude Code (Anthropic SDK) | ✅ |
-| Codex (OpenAI Responses API) | ✅ |
+| Codex (OpenAI Responses API) | ⚠️ **openrouter: CRITICAL BUG** — hangs on reasoning-only outputs; **nous/opencode: ✅** |
 | OpenClaw / Hermes / OpenHands | ✅ |
 | OpenCode | ✅ |
 | Generic OpenAI SDK | ✅ |
@@ -56,6 +56,16 @@
 | **B-37** | Model-block predicate side effects | Side-effect-free `is_model_blocked()` + explicit `expire_model_blocks()` |
 | **B-38** | Nous `threading.Lock` | `asyncio.Lock` in KeyPool |
 | **FREE_ONLY** false positive | Substring "free" | Suffix matching (`:free`/`-free`) + allowlist |
+
+---
+
+## NEW: Critical Issue Found in This Audit
+
+| ID | Wrapper | Risk | Fix |
+|---|---|---|---|
+| **CODEX-RESP-01** | **openrouter** | **Codex hangs indefinitely for reasoning-only model outputs** — `if text_started:` guard at `openrouter/src/main.py:1287` skips completion events when model emits only reasoning/thinking | Remove `if text_started:` guard; always emit completion events (reference: `nous` `ResponsesStreamState.done()`, `opencode` inline `gen()`) |
+
+**Impact:** Codex hangs indefinitely waiting for `response.completed` when model outputs only reasoning/thinking. Not caught by current tests (mock upstream always emits text). **Must fix before production use with Codex on openrouter.**
 
 ---
 
