@@ -13,10 +13,11 @@
 
 | Gate | Result | Evidence |
 |---|---|---|
-| **Unit + Regression Suite** | **142 passed** | `pytest tests -q` |
+| **Unit + Regression Suite** | **204 passed** | `pytest tests -q` |
 | **Streaming Regression Suite** | **63 passed** | `pytest tests/test_sse_streaming_regressions.py -q` |
-| **Runtime E2E** (5 wrappers × 3 surfaces × 22 upstream modes) | **435/435 checks passed** | `tests/e2e_runtime/run_runtime_e2e.py` |
-| **Sustained Soak** (all 5 wrappers, concurrent load) | **~19,700 requests, 0 failures** | `tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` |
+| **AI Gateway Translation Layer** | **58 passed** | `pytest tests/test_translation_matrix.py -q` (new gate) |
+| **Runtime E2E** (5 wrappers × 3 surfaces × 22 upstream modes + cross-translation probes) | **445/445 checks passed** | `tests/e2e_runtime/run_runtime_e2e.py` |
+| **Sustained Soak** (all 5 wrappers, concurrent load) | **~19,600 requests, 0 failures** | `tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` |
 | **Contract Conformance** (WRAPPER_CONTRACT v3.0) | **All 10 required surfaces on all 5 wrappers** | `test_contract_all_wrappers_expose_required_surfaces` |
 | **Cross-Wrapper Parity Guards** | **4/4 CI guards pass** | Loop-var shadowing, unguarded `choices[0]`, `wait_for` heartbeat, shadowed cooldown helper |
 | **Codex reasoning-only regression (CODEX-RESP-01)** | **3/3 pass — fixed** | `pytest tests/test_sse_streaming_regressions.py -k codex_resp01` |
@@ -24,7 +25,7 @@
 | **Memory Under Load** | **Flat RSS (+1–5 MB/wrapper)** | Soak results |
 | **p95 Latency First vs Last Quarter** | **Flat (no degradation)** | Soak results |
 
-**Verdict:** The wrapper fleet satisfies the runtime contract for all listed agents/SDKs under the tested conditions — **including Codex on openrouter with reasoning-only model outputs (CODEX-RESP-01 fixed)**. **Zero runtime errors across 435 protocol checks and ~19,700 live requests.**
+**Verdict:** The wrapper fleet satisfies the runtime contract for all listed agents/SDKs under the tested conditions — **including Codex on openrouter with reasoning-only model outputs (CODEX-RESP-01 fixed)** and **lossless OpenAI↔Anthropic cross-translation / Responses↔Chat round trips across all 5 wrappers (AI Gateway Translation Layer verified, F1–F7 fixed)**. **Zero runtime errors across 445 protocol checks and ~19,600 live requests.**
 
 ---
 
@@ -356,6 +357,42 @@ this cycle before/after.
 
 ---
 
+## 7d. AI Gateway Translation Layer — Second Deep Pass (2026-08-01)
+
+A bit-level audit of the API Translation / Compatibility / Gateway layer
+across all 5 wrappers (see `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md`).
+Drove every wrapper's real converters with realistic client payloads and
+fixed 7 findings:
+
+| # | Finding | Wrapper(s) |
+|---|---|---|
+| F1 | single-image message crashed `KeyError: 'text'` | nous, blackbox |
+| F2 | `reasoning` items in Responses input became empty user messages (Codex multi-turn 400) | nous, opencode, blackbox, openrouter |
+| F3 | `tool_choice` dropped on Anthropic surface | nous |
+| F4 | `stop_sequences` dropped; `tool_choice` forwarded in Anthropic shape | opencode |
+| F5 | thinking/reasoning dropped in request + non-stream + streaming Anthropic response | openrouter |
+| F6 | URL-source images broken/dropped | nous, openrouter |
+| F7 | `chat_to_responses` missing reasoning item + `total_tokens`; `output_text` parts dropped; `str()` repr tool output | nous |
+
+**Result:** lossless OpenAI↔Anthropic cross-translation (both directions,
+streaming + non-streaming, tools, images, reasoning, tool_choice,
+stop_sequences, usage); OpenAI↔OpenAI verbatim passthrough; Responses↔Chat
+round trips complete (incl. reasoning-input skip, `usage.total_tokens`).
+
+**New gates:** `tests/test_translation_matrix.py` (58 tests, all 5 wrappers
+incl. nvidia); E2E `anthropic_tools` / `responses_tools` non-streaming round
+trips and a streaming thinking-block assertion.
+
+| Gate | Result |
+|---|---|
+| Unit + Regression Suite | **204 passed** (was 142) |
+| Streaming Regression Suite | **63 passed** |
+| Translation Layer gate | **58 passed** (new) |
+| Runtime E2E | **445/445 checks** (was 435) |
+| Sustained Soak | **~19,600 requests, 0 failures** |
+
+---
+
 ## 8. Boundaries & Known Limits
 
 - The live E2E harness validates protocol/runtime behavior with real HTTP servers and a **deterministic mock upstream**. It does not call paid external providers.
@@ -416,13 +453,14 @@ and are **already fixed in code**; B-39 (dead `record_error()`) and B-20
 (unbounded git subprocess) were **fixed this cycle**, each with a new
 regression guard.
 
-- **142/142 unit + regression tests passed** (+6 new: CODEX-RESP-01 ×3, B-39, B-20, B-36)
-- **63/63 streaming regression tests passed** (+6 new)
-- **435/435 live E2E checks passed** (incl. `reasoning_only` mode on all 5 wrappers × 3 surfaces)
-- **~19,700 soak requests, 0 failures**; flat RSS and p95 latency
+- **204/204 unit + regression tests passed** (+62: translation matrix incl. F1–F7)
+- **63/63 streaming regression tests passed**
+- **58/58 AI Gateway Translation Layer tests passed** (new gate)
+- **445/445 live E2E checks passed** (incl. `reasoning_only`, `anthropic_tools`, `responses_tools`, thinking-block assertion)
+- **~19,600 soak requests, 0 failures**; flat RSS and p95 latency
 - **No stream lifecycle, auth, tool-call, or error-transparency regression detected**
 
-**The wrapper fleet now satisfies the runtime contract for Claude Code, Codex, OpenClaw, Hermes Agent, OpenCode, OpenHands, generic OpenAI/Anthropic clients, Ollama discovery clients, and authenticated MCP/catalog clients — including Codex on openrouter with reasoning-only models.**
+**The wrapper fleet now satisfies the runtime contract for Claude Code, Codex, OpenClaw, Hermes Agent, OpenCode, OpenHands, generic OpenAI/Anthropic clients, Ollama discovery clients, and authenticated MCP/catalog clients — including Codex on openrouter with reasoning-only models. OpenAI↔Anthropic cross-translation is lossless in both directions on every wrapper; OpenAI↔OpenAI passes through verbatim; Anthropic↔Anthropic round-trips without degradation.**
 
 ---
 

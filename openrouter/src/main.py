@@ -1897,6 +1897,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             if not isinstance(it, dict):
                 continue
             t = it.get('type')
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == 'function_call_output':
                 outv = it.get('output', '')
                 msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id') or '',
@@ -2011,12 +2013,18 @@ def _anthropic_to_openai(body: dict) -> dict:
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
+                reasoning_parts = []
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get("type")
                     if btype == "text":
                         text_parts.append(block.get("text", ""))
+                    elif btype in ("thinking", "reasoning"):
+                        # Transparent passthrough: keep multi-turn reasoning
+                        # context (parity with nous/opencode/blackbox, which
+                        # map thinking blocks to reasoning_content).
+                        reasoning_parts.append(block.get("thinking") or block.get("reasoning") or "")
                     elif btype == "tool_use":
                         tool_calls.append({
                             "id": block.get("id", ""),
@@ -2033,6 +2041,8 @@ def _anthropic_to_openai(body: dict) -> dict:
                     msg_obj["content"] = None
                 if tool_calls:
                     msg_obj["tool_calls"] = tool_calls
+                if reasoning_parts:
+                    msg_obj["reasoning_content"] = "\n".join(reasoning_parts)
                 messages.append(msg_obj)
             else:
                 messages.append({"role": "assistant", "content": content})
@@ -2071,6 +2081,13 @@ def _anthropic_to_openai(body: dict) -> dict:
                                 "type": "image_url",
                                 "image_url": {"url": f"data:{media_type};base64,{data}"},
                             })
+                        else:
+                            url = src.get("url", "")
+                            if url:
+                                image_parts.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": url},
+                                })
                 # Emit tool_result messages BEFORE the user text message (OpenAI requires tool results
                 # to immediately follow the assistant's tool_calls).
                 for tr in tool_results:
@@ -2147,6 +2164,12 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     choice = choices[0] if choices else {}
     message = choice.get("message", {})
     content_blocks = []
+    # Transparent passthrough: surface reasoning_content as a thinking block
+    # (parity with nous/opencode/blackbox/shared translators). Dropping it
+    # silently removes part of the model's output.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
     if message.get("content"):
         content_blocks.append({"type": "text", "text": message["content"]})
     if message.get("tool_calls"):
@@ -2207,6 +2230,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     block_open = False
     block_index = 0
     text_started = False
+    thinking_started = False
+    thinking_index = None
     tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
     open_tool_blocks: set = set()  # R-02: concurrently-open tool_use blocks
     finish_reason = None
@@ -2292,9 +2317,51 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
                     output_tokens = usage_chunk.get('completion_tokens', output_tokens)
 
+                # Reasoning / thinking content — streamed as a thinking block
+                # (parity with the shared AnthropicStreamState used by
+                # nous/opencode/blackbox). Previously dropped entirely, so a
+                # reasoning model's thinking never reached Claude Code on this
+                # surface — part of the model's output silently vanished.
+                reason_delta = (
+                    delta.get('reasoning_content') if isinstance(delta.get('reasoning_content'), str)
+                    else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else '')
+                )
+                if reason_delta:
+                    if not thinking_started:
+                        # Close only an open TEXT block (tool blocks stay open
+                        # concurrently — R-02). The next block gets a fresh
+                        # index.
+                        if block_open and text_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': block_index,
+                            })
+                            block_index += 1
+                            text_started = False
+                            block_open = False
+                        thinking_index = block_index
+                        yield _sse('content_block_start', {
+                            'type': 'content_block_start', 'index': thinking_index,
+                            'content_block': {'type': 'thinking', 'thinking': ''},
+                        })
+                        thinking_started = True
+                        block_open = True
+                        block_index += 1
+                    yield _sse('content_block_delta', {
+                        'type': 'content_block_delta', 'index': thinking_index,
+                        'delta': {'type': 'thinking_delta', 'thinking': reason_delta},
+                    })
+
                 # Text content
                 if delta.get('content'):
                     if not text_started:
+                        # Close an open thinking block if any (tool blocks stay
+                        # open concurrently — R-02).
+                        if block_open and thinking_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': thinking_index,
+                            })
+                            thinking_started = False
+                            block_open = False
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {'type': 'text', 'text': ''},
@@ -2325,19 +2392,26 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     tc_idx = tc.get('index', 0)
                     fn = tc.get('function') or {}
                     if tc_idx not in tool_call_blocks:
-                        # R-02: close only a TEXT block here. Closing the
-                        # previous TOOL block orphaned its later argument
-                        # fragments (OpenAI interleaves fragments across all
-                        # active tool indices), so `content_block_delta`
-                        # arrived on a closed index and Claude Code dropped
-                        # the tool call. Tool blocks stay open concurrently
-                        # and are all closed at the terminal path.
+                        # R-02: close only a TEXT or THINKING block here.
+                        # Closing the previous TOOL block orphaned its later
+                        # argument fragments (OpenAI interleaves fragments
+                        # across all active tool indices), so
+                        # `content_block_delta` arrived on a closed index and
+                        # Claude Code dropped the tool call. Tool blocks stay
+                        # open concurrently and are all closed at the
+                        # terminal path.
                         if block_open and text_started:
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': block_index,
                             })
                             block_index += 1
                             text_started = False
+                            block_open = False
+                        elif block_open and thinking_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': thinking_index,
+                            })
+                            thinking_started = False
                             block_open = False
                         tool_call_blocks[tc_idx] = block_index
                         open_tool_blocks.add(block_index)
@@ -2364,13 +2438,18 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
-        # B-04 / R-02: close the open TEXT block (if any), then every
+        # B-04 / R-02: close the open TEXT/THINKING block (if any), then every
         # concurrently-open tool_use block, lowest index first.
         if block_open and text_started:
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
             text_started = False
+        if block_open and thinking_started:
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': thinking_index,
+            })
+            thinking_started = False
         for _ti in sorted(open_tool_blocks):
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': _ti,
@@ -2410,6 +2489,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
         try:
             if block_open and text_started:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
+            if block_open and thinking_started:
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': thinking_index})
             for _ti in sorted(open_tool_blocks):
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ti})
             open_tool_blocks.clear()

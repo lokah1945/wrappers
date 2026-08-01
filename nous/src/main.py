@@ -987,8 +987,12 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
         for it in raw:
             if not isinstance(it, dict): continue
             t = it.get("type")
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == "function_call_output":
-                msgs.append({"role": "tool", "tool_call_id": it.get("call_id"), "content": str(it.get("output", ""))})
+                outv = it.get("output", "")
+                msgs.append({"role": "tool", "tool_call_id": it.get("call_id"),
+                             "content": outv if isinstance(outv, str) else json.dumps(outv, ensure_ascii=False)})
             elif t == "function_call":
                 raw_args = it.get("arguments", "")
                 # Codex sends arguments as a JSON STRING; json.dumps would
@@ -1002,7 +1006,7 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
                 role = it.get("role", "user")
                 c = it.get("content", "")
                 if isinstance(c, list):
-                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") == "input_text")
+                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") in ("input_text", "text", "output_text"))
                 msgs.append({"role": role, "content": c})
 
     if body.get("instructions"):
@@ -1135,6 +1139,12 @@ def chat_to_responses(model: str, chat: dict) -> dict:
     text = msg.get("content") or ""
     tool_calls = msg.get("tool_calls") or []
     output = []
+    # B18 parity: surface upstream reasoning_content as a reasoning output
+    # item (opencode/blackbox/openrouter parity) instead of dropping it.
+    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    if reasoning:
+        output.append({"id": f"rsn_{int(time.time()*1000)}", "type": "reasoning",
+                       "status": "completed", "text": reasoning})
     for tc in tool_calls:
         fn = tc.get("function", {})
         output.append({"id": tc.get("id"), "type": "function_call", "call_id": tc.get("id"), "name": fn.get("name"), "arguments": fn.get("arguments", ""), "status": "completed"})
@@ -1144,7 +1154,8 @@ def chat_to_responses(model: str, chat: dict) -> dict:
         "id": chat.get("id", f"resp-{int(time.time()*1000)}"),
         "object": "response", "created_at": int(time.time()), "model": model,
         "output": output, "status": "completed",
-        "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0)}
+        "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0),
+                  "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
     }
 
 def anthropic_to_openai(req: dict) -> dict:
@@ -1172,7 +1183,12 @@ def anthropic_to_openai(req: dict) -> dict:
             if bt == "text": parts.append({"type": "text", "text": b.get("text", "")})
             elif bt == "image":
                 src = b.get("source", {})
-                parts.append({"type": "image_url", "image_url": {"url": f"data:{src.get('media_type','image/png')};base64,{src.get('data','')}"}})
+                if src.get("type") == "base64":
+                    url = f"data:{src.get('media_type','image/png')};base64,{src.get('data','')}"
+                else:
+                    url = src.get("url", "")
+                if url:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
             elif bt == "thinking": reasoning.append(b.get("thinking", ""))
             elif bt == "tool_use":
                 tools.append({"id": b.get("id"), "type": "function", "function": {"name": b.get("name"), "arguments": json.dumps(b.get("input", {}))}})
@@ -1182,7 +1198,13 @@ def anthropic_to_openai(req: dict) -> dict:
                 txt = rc if isinstance(rc, str) else "\n".join(x.get("text","") for x in rc if isinstance(x, dict))
                 msgs.append({"role": "tool", "tool_call_id": tc, "content": txt})
 
-        final_c = parts if len(parts) > 1 else (parts[0]["text"] if parts else None)
+        # NB-7/DR-5 parity (opencode): a single non-text part (e.g. one image
+        # block) must be wrapped in a list — indexing parts[0]["text"] on an
+        # image_url part raised KeyError, crashing every vision request that
+        # sent exactly one image with no accompanying text; and OpenAI chat
+        # content must be a string or an ARRAY, never a bare part dict.
+        final_c = parts if len(parts) > 1 else (
+            parts[0]["text"] if parts and parts[0].get("type") == "text" else ([parts[0]] if parts else None))
         # Skip empty user shells (e.g. message was only tool_result blocks already emitted)
         if role == "user" and not parts and not tools and not reasoning:
             continue
@@ -1217,6 +1239,23 @@ def anthropic_to_openai(req: dict) -> dict:
     ]
     for src, dst in param_map:
         if req.get(src) is not None: out[dst] = req[src]
+    # Anthropic tool_choice → OpenAI tool_choice (parity with blackbox /
+    # openrouter). Anthropic sends {"type":"auto"|"any"|"tool","name":...};
+    # OpenAI expects "auto"/"required"/"none" or a function-choice object.
+    tc = req.get("tool_choice")
+    if tc is not None:
+        if isinstance(tc, dict):
+            t = tc.get("type")
+            if t == "auto":
+                out["tool_choice"] = "auto"
+            elif t == "any":
+                out["tool_choice"] = "required"
+            elif t == "tool" and tc.get("name"):
+                out["tool_choice"] = {"type": "function", "function": {"name": tc["name"]}}
+            else:
+                out["tool_choice"] = tc
+        else:
+            out["tool_choice"] = tc
     if req.get("tools"):
         out["tools"] = [{"type": "function", "function": {"name": t["name"], "description": t.get("description", ""), "parameters": normalize_schema(t.get("input_schema", {}))}} for t in req["tools"] if t.get("name")]
     return out

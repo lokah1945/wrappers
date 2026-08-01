@@ -675,7 +675,13 @@ def anthropic_to_openai(body: dict) -> dict:
                 rc = b.get('content')
                 txt = rc if isinstance(rc, str) else '\n'.join(x.get('text', '') for x in (rc or []) if isinstance(x, dict))
                 msgs.append({'role': 'tool', 'tool_call_id': b.get('tool_use_id') or b.get('id') or '', 'content': txt})
-        final = parts if len(parts) > 1 else (parts[0]['text'] if parts else ('' if tools else None))
+        # NB-7/DR-5 parity (opencode): a single non-text part (e.g. one image
+        # block) must be wrapped in a list — indexing parts[0]['text'] on an
+        # image_url part raised KeyError, crashing every vision request that
+        # sent exactly one image with no accompanying text; and OpenAI chat
+        # content must be a string or an ARRAY, never a bare part dict.
+        final = parts if len(parts) > 1 else (
+            parts[0]['text'] if parts and parts[0].get('type') == 'text' else ([parts[0]] if parts else ('' if tools else None)))
         if role == 'user' and not parts and not tools and not reasoning:
             continue
         if role == 'assistant' and not parts and not tools and not reasoning:
@@ -831,6 +837,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             if not isinstance(it, dict):
                 continue
             t = it.get('type')
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == 'function_call_output':
                 outv = it.get('output', '')
                 msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id') or '', 'content': outv if isinstance(outv, str) else json.dumps(outv, ensure_ascii=False)})

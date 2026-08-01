@@ -792,11 +792,36 @@ def anthropic_to_openai(body: dict) -> dict:
             "name": t['name'], "description": t.get('description', ''),
             "parameters": t.get('input_schema') or {},
         }} for t in body['tools'] if t.get('name')]
+    # Anthropic stop_sequences → OpenAI stop (parity with nous/blackbox/
+    # openrouter): Anthropic names the field stop_sequences; OpenAI calls it
+    # stop. Forwarding it verbatim would silently drop the client's stops.
+    if body.get('stop_sequences') is not None and body.get('stop') is None:
+        out['stop'] = body['stop_sequences']
+    # Anthropic tool_choice → OpenAI tool_choice (parity with blackbox /
+    # openrouter). Anthropic sends {"type":"auto"|"any"|"tool","name":...};
+    # OpenAI expects "auto"/"required"/"none" or a function-choice object.
+    # Forwarding the Anthropic shape verbatim 400s or is ignored upstream.
+    tc = body.get('tool_choice')
+    if tc is not None:
+        if isinstance(tc, dict):
+            t = tc.get('type')
+            if t == 'auto':
+                out['tool_choice'] = 'auto'
+            elif t == 'any':
+                out['tool_choice'] = 'required'
+            elif t == 'tool' and tc.get('name'):
+                out['tool_choice'] = {'type': 'function', 'function': {'name': tc['name']}}
+            else:
+                out['tool_choice'] = tc
+        else:
+            out['tool_choice'] = tc
     # Forward all other client params verbatim (transparent proxy).
+    # tool_choice is handled explicitly above (mapped from the Anthropic
+    # shape) — it must NOT be re-forwarded verbatim here.
     for k in ('temperature', 'top_p', 'stop', 'seed', 'parallel_tool_calls',
               'stream_options', 'user', 'metadata', 'frequency_penalty',
               'presence_penalty', 'logit_bias', 'logprobs', 'top_logprobs',
-              'response_format', 'service_tier', 'tool_choice'):
+              'response_format', 'service_tier'):
         if body.get(k) is not None:
             out[k] = body[k]
     return out
@@ -936,6 +961,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             if not isinstance(it, dict):
                 continue
             t = it.get('type')
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == 'function_call_output':
                 outv = it.get('output', '')
                 msgs.append({"role": "tool", "tool_call_id": it.get('call_id'),

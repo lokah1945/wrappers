@@ -18,10 +18,11 @@
 
 | Gate | Command | Result |
 |---|---|---|
-| Unit + Regression Suite | `python -m pytest tests -q` | **142 passed** (136 + 6 new regression tests) |
-| Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **63 passed** (57 + 6 new) |
-| Runtime E2E (5 wrappers × 3 surfaces × 22 modes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **435/435 checks passed** (420 + new `reasoning_only` mode × 3 surfaces × 5 wrappers) |
-| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~19,700 requests, 0 failures**, flat RSS/latency |
+| Unit + Regression Suite | `python -m pytest tests -q` | **204 passed** (142 + 62 new translation-matrix cases) |
+| Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **63 passed** |
+| **AI Gateway Translation Layer** | `python -m pytest tests/test_translation_matrix.py -q` | **58 passed** (all 5 wrappers incl. nvidia) |
+| Runtime E2E (5 wrappers × 3 surfaces × 22 modes + cross-translation probes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **445/445 checks passed** (incl. `reasoning_only`, `anthropic_tools`, `responses_tools`, thinking-block assertion) |
+| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~19,600 requests, 0 failures**, flat RSS/latency |
 | Contract Conformance | `pytest tests/test_sse_streaming_regressions.py::test_contract_all_wrappers_expose_required_surfaces` | **All 10 surfaces on all 5 wrappers** |
 | Cross-Wrapper Parity Guards | `pytest tests/test_sse_streaming_regressions.py -k parity` | **4/4 pass** |
 | Codex reasoning-only regression | `pytest tests/test_sse_streaming_regressions.py -k codex_resp01` | **3/3 pass** (openrouter emits full item lifecycle + `response.completed` for reasoning-only streams) |
@@ -32,12 +33,12 @@
 
 | Agent / SDK | Status |
 |---|---|
-| Claude Code (Anthropic SDK) | ✅ |
-| Codex (OpenAI Responses API) | ✅ **all wrappers** — openrouter reasoning-only hang **fixed** (CODEX-RESP-01) |
-| OpenClaw / Hermes / OpenHands | ✅ |
+| Claude Code (Anthropic SDK) | ✅ — thinking blocks, parallel tools, strict stop_reason, tool_use round trips (F1–F7) |
+| Codex (OpenAI Responses API) | ✅ **all wrappers** — openrouter reasoning-only hang **fixed** (CODEX-RESP-01); reasoning-input items skipped (F2); `usage.total_tokens` present (F7) |
+| OpenClaw / Hermes / OpenHands | ✅ — tool_choice mapped (F3/F4), stop_sequences forwarded (F4) |
 | OpenCode | ✅ |
-| Generic OpenAI SDK | ✅ |
-| Generic Anthropic SDK | ✅ |
+| Generic OpenAI SDK | ✅ — passthrough verbatim |
+| Generic Anthropic SDK | ✅ — full request/response translation incl. images (F1/F6), reasoning (F5) |
 | Ollama clients | ✅ |
 | MCP/catalog clients | ✅ |
 
@@ -87,11 +88,34 @@ All items previously listed as remaining debt were **re-verified against the cod
 
 ---
 
+## Second Deep Pass — AI Gateway Translation Layer (2026-08-01)
+
+See `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` for the full
+bit-level findings. This pass verified OpenAI↔Anthropic cross-translation
+(both directions, streaming + non-streaming) and Responses↔Chat round trips
+across all 5 wrappers and fixed 7 findings:
+
+| # | Finding | Wrapper(s) | Impact |
+|---|---|---|---|
+| F1 | single-image message → `KeyError: 'text'` crash | nous, blackbox | vision requests HTTP 500 |
+| F2 | `reasoning` input items → empty user message | nous, opencode, blackbox, openrouter | Codex multi-turn 400 |
+| F3 | `tool_choice` dropped | nous | forced tool choice silently auto |
+| F4 | `stop_sequences` dropped; `tool_choice` verbatim Anthropic shape | opencode | stops lost / upstream 400 |
+| F5 | thinking dropped in request + non-stream + streaming response | openrouter | reasoning vanished on Anthropic surface |
+| F6 | URL-source images broken/dropped | nous, openrouter | vision with URL images broken |
+| F7 | reasoning item + `total_tokens` missing in `chat_to_responses`; `output_text` parts dropped; `str()` repr tool output | nous | Codex SDK usage error / continuity loss |
+
+**New gate:** `tests/test_translation_matrix.py` — 58 tests locking every
+round trip (incl. nvidia via its own modules).
+
 ## Reproduction Commands
 
 ```bash
-# Unit + regression suite (142 tests)
+# Unit + regression suite (204 tests)
 python -m pytest tests -q
+
+# AI Gateway Translation Layer gate (58 tests)
+python -m pytest tests/test_translation_matrix.py -q
 
 # Streaming regressions (63 tests)
 python -m pytest tests/test_sse_streaming_regressions.py -q
@@ -99,7 +123,7 @@ python -m pytest tests/test_sse_streaming_regressions.py -q
 # Codex reasoning-only regression (3 tests)
 python -m pytest tests/test_sse_streaming_regressions.py -k codex_resp01 -v
 
-# Live agent-traffic E2E (435 checks)
+# Live agent-traffic E2E (445 checks)
 python tests/e2e_runtime/run_runtime_e2e.py
 
 # Sustained load (~20k requests)
