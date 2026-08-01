@@ -56,7 +56,6 @@ PRINCIPLES HONORED:
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -65,9 +64,9 @@ import threading
 import time
 import uuid
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -78,13 +77,14 @@ from common.sse import (
     IDLE as _IDLE,
     iter_chunks_with_idle as _iter_chunks_with_idle,
 )
+from common.auth import (
+    check_auth as _shared_check_auth,
+    is_public_path as _shared_is_public_path,
+)
 from common.translations import (
     parse_retry_after,
     is_retriable_status,
-    should_cooldown_key,
     build_forward_headers,
-    sanitize_header_value,
-    normalize_upstream_error,
 )
 
 logger = logging.getLogger(__name__)
@@ -144,17 +144,27 @@ class KeyEntry:
     def is_hard_blocked(self) -> bool:
         return time.time() < self.hard_blocked_until
 
+    def expire_block(self) -> None:
+        """Clear elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
+            self.hard_blocked_until = 0.0
+
     def is_model_blocked(self, model: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model:
             return False
         entry = self.model_blocks.get(model)
         if not entry:
             return False
         blocked_until, _reason = entry
-        if time.time() < blocked_until:
-            return True
-        del self.model_blocks[model]
-        return False
+        return time.time() < blocked_until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
+        now = time.time()
+        for model, (blocked_until, _reason) in list(self.model_blocks.items()):
+            if blocked_until <= now:
+                self.model_blocks.pop(model, None)
 
     def block(self, seconds: int, reason: str):
         self.hard_blocked_until = time.time() + max(1, seconds)
@@ -178,7 +188,7 @@ class KeyEntry:
             'current_rpm': self.current_rpm(),
             'in_flight': self.in_flight,
             'hard_blocked': self.is_hard_blocked(),
-            'model_blocks': {m: {'until': t, 'reason': r} for m, (t, r) in self.model_blocks.items()},
+            'model_blocks': {m: {'until': t, 'reason': r} for m, (t, r) in self.model_blocks.items() if t > time.time()},
             'total_requests': self.total_requests,
             'total_429s': self.total_429s,
             'total_failures': self.total_failures,
@@ -238,6 +248,11 @@ class KeyPool:
                 if sum(k.in_flight for k in self.keys) >= self.config.inflight_soft_cap:
                     logger.warning(f'[{self.config.provider_name}] Load shedding: in-flight >= {self.config.inflight_soft_cap}')
                     return None
+            # B-37 parity: expiry is explicit and lock-protected; predicates
+            # used by stats()/health must stay side-effect-free.
+            for k in self.keys:
+                k.expire_block()
+                k.expire_model_blocks()
             candidates = [k for k in self.keys
                           if not k.is_hard_blocked()
                           and not (model and k.is_model_blocked(model))
@@ -389,16 +404,18 @@ class BaseWrapper:
             return await call_next(request)
         path = request.url.path
         method = request.method
-        # Public paths: no auth required (dashboard, metrics, model discovery).
-        # B-17/B-27 fix: `method` was computed and then IGNORED here, so a POST
-        # to a discovery-only path was treated as public exactly like a GET.
-        # Read-only surfaces are now gated to safe methods.
-        _safe = method in ('GET', 'HEAD')
-        is_public = (
-            (path in self.PUBLIC_PATHS and _safe)
-            or (_safe and (path.startswith('/metrics/')
-                           or path.startswith('/catalog/')
-                           or path.startswith('/mcp/')))
+        # Public paths: exact-match + method-gated (B-27). HEAD is treated as
+        # GET for discovery/metrics purposes; unsafe methods are protected by
+        # default. Keep this reference base fail-closed just like real wrappers.
+        method_for_public = 'GET' if method == 'HEAD' else method
+        public_any = frozenset({
+            '/health', '/ready', '/metrics', '/metrics/prom', '/dashboard',
+            '/dashboard.html', '/stats', '/api/version', '/', '/favicon.ico',
+        })
+        public_get = frozenset({'/version', '/api/tags', '/v1/models'})
+        is_public = _shared_is_public_path(
+            path, method_for_public, public_any, public_get,
+            get_prefixes=('/metrics/', '/catalog/', '/mcp/'),
         )
         # Per-IP rate limiting (applies to all requests; 0 disables).
         client_ip = getattr(request.client, 'host', '') or 'unknown'
@@ -407,21 +424,16 @@ class BaseWrapper:
                 {'error': {'message': 'Too many requests', 'type': 'rate_limit_error'}},
                 status_code=429, headers={'Retry-After': '60'},
             )
-        # Auth check: accept BOTH Authorization: Bearer AND x-api-key.
-        if not is_public and not os.environ.get('DISABLE_AUTH') and self._bearer_token:
-            auth = request.headers.get('authorization', '')
-            x_api_key = request.headers.get('x-api-key', '')
-            client_token = ''
-            if auth.lower().startswith('bearer '):
-                client_token = auth[7:].strip()
-            elif x_api_key:
-                client_token = x_api_key.strip()
-            elif auth:
-                client_token = auth.strip()
-            if not client_token or not hmac.compare_digest(client_token, self._bearer_token):
+        # Auth check: B-28/B-29/B-30 parity via common.auth — fail closed by
+        # default when BEARER_TOKEN is unset, re-read env every request for
+        # rotation/revocation, and compare bytes safely for non-ASCII tokens.
+        if not is_public:
+            auth_result = _shared_check_auth(request.headers, surface=path)
+            if not auth_result.ok:
                 return JSONResponse(
-                    {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}},
-                    status_code=401, headers={'WWW-Authenticate': 'Bearer'},
+                    {'error': {'message': auth_result.message, 'type': 'authentication_error'}},
+                    status_code=auth_result.status,
+                    headers={'WWW-Authenticate': 'Bearer'} if auth_result.status == 401 else None,
                 )
         # Process + track latency.
         start = time.time()
@@ -668,7 +680,7 @@ class BaseWrapper:
         """Run with uvicorn. Call from __main__ or console script."""
         import uvicorn
         uvicorn.run(
-            f'src.main:app',
+            'src.main:app',
             host=os.environ.get('LISTEN_HOST', self.config.listen_host),
             port=int(os.environ.get('LISTEN_PORT', str(self.config.listen_port))),
             log_level='info',

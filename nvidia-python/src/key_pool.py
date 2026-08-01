@@ -113,25 +113,28 @@ class KeyEntry:
         return time.time() < self.hard_blocked_until
 
     def is_model_blocked(self, model: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model:
             return False
         until = self.model_blocks.get(model)
         if not until:
             return False
-        if time.time() < until:
-            return True
-        del self.model_blocks[model]
-        return False
+        return time.time() < until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
+        now = time.time()
+        for model, until in list(self.model_blocks.items()):
+            if until <= now:
+                self.model_blocks.pop(model, None)
 
     def active_model_blocks(self) -> dict:
         now = time.time()
         out = {}
-        for m, until in list(self.model_blocks.items()):
+        for m, until in self.model_blocks.items():
             rem = until - now
             if rem > 0:
                 out[m] = round(rem * 10) / 10
-            else:
-                del self.model_blocks[m]
         return out
 
     def record(self):
@@ -489,6 +492,10 @@ class KeyPool:
                         self._waiting[my_ticket] = model
 
                     now = time.time()
+                    # B-37 parity: expiry is explicit and lock-protected;
+                    # is_model_blocked()/is_hard_blocked() stay predicates.
+                    for _key in self.keys:
+                        _key.expire_model_blocks()
                     avail = [s for s in self.keys if not s.is_hard_blocked() and not s.is_model_blocked(model)]
 
                     # Saturation checks

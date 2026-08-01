@@ -204,23 +204,23 @@ def free_only_enabled() -> bool:
     return v in ('yes', 'true', '1', 'on', 'y')
 
 def is_free_model(model_id: str) -> bool:
-    """True if model id contains 'free', or is listed in FREE_MODEL_ALLOWLIST.
+    """True if model id has a free suffix, or is in FREE_MODEL_ALLOWLIST.
 
     OpenCode Zen free catalog mostly uses *-free ids; `big-pickle` is free but
-    has no 'free' substring — add it via FREE_MODEL_ALLOWLIST=big-pickle if needed.
+    has no free suffix — add it via FREE_MODEL_ALLOWLIST=big-pickle if needed.
     """
     if not model_id:
         return False
     mid = str(model_id).lower().strip()
     if mid.startswith('opencode/'):
         mid = mid.split('/', 1)[1]
-    if 'free' in mid:
+    bare = mid.split('/')[-1] if '/' in mid else mid
+    if mid.endswith((':free', '-free')) or bare.endswith((':free', '-free')):
         return True
     allow = (os.environ.get('FREE_MODEL_ALLOWLIST') or '').strip()
     if not allow:
         return False
     extras = {x.strip().lower() for x in allow.split(',') if x.strip()}
-    bare = mid.split('/')[-1] if '/' in mid else mid
     return mid in extras or bare in extras
 
 def model_allowed(model_id: str) -> bool:
@@ -842,10 +842,13 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     if not content:
         content.append({"type": "text", "text": ""})
     fr = (data.get('choices') or [{}])[0].get('finish_reason')
-    if tool_calls or dsml_tools:
-        stop = "tool_use"
+    if fr is not None:
+        # B-06 parity for non-streaming replies: explicit finish_reason wins
+        # even when tool calls/DSML tools are present.
+        stop = {"tool_calls": "tool_use", "function_call": "tool_use", "stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
     else:
-        stop = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens"}.get(fr, "end_turn")
+        # Only infer tool_use when upstream omitted finish_reason entirely.
+        stop = "tool_use" if (tool_calls or dsml_tools) else "end_turn"
     u = data.get('usage') or {}
     return {"id": data.get('id') or f"msg_{int(time.time()*1000)}", "type": "message", "role": "assistant",
             "model": model, "content": content, "stop_reason": stop, "stop_sequence": None,
@@ -2017,6 +2020,12 @@ async def embeddings(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
+    # B-31 parity: unknown POST surfaces must not bypass auth/rate limiting.
+    # GET 404s stay cheap/public for discovery typos and catalog probes.
+    if request.method == "POST":
+        _auth_check(request)
+        if not check_rate_limit(_client_ip(request)):
+            return _jr(429, {"error": {"message": "Too many requests", "type": "rate_limit_error"}})
     # Skip catalog/mcp paths - they have dedicated handlers
     if path.startswith("catalog/") or path.startswith("mcp/"):
         return _jr(404, {"error": {"message": f"Unknown endpoint: /{path}", "type": "invalid_request_error"}})

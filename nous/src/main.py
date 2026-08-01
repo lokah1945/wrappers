@@ -190,15 +190,20 @@ class KeyEntry:
         logger.warning(f"[key_pool] Nous key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})")
 
     def is_model_blocked(self, model_id: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model_id:
             return False
         until = self.model_blocked_until.get(model_id, 0.0)
         if not until:
             return False
-        if time.time() < until:
-            return True
-        self.model_blocked_until.pop(model_id, None)
-        return False
+        return time.time() < until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
+        now = time.time()
+        for model_id, until in list(self.model_blocked_until.items()):
+            if until <= now:
+                self.model_blocked_until.pop(model_id, None)
 
     def stats(self) -> dict:
         now = time.time()
@@ -222,7 +227,9 @@ class KeyPool:
 
     def __init__(self):
         self.keys: List[KeyEntry] = []
-        self._lock = threading.Lock()  # N-11 fix: use threading.Lock for sync methods
+        # B-38 fix: asyncio.Lock in async request paths. The old threading.Lock
+        # blocked the event loop and diverged from every sibling pool.
+        self._lock = asyncio.Lock()
         self._rr = 0
         self.hard_limit = int(os.environ.get("NOUS_HARD_LIMIT_RPM", os.environ.get("HARD_LIMIT_RPM", "60")))
 
@@ -245,17 +252,18 @@ class KeyPool:
         logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s) hard={self.hard_limit}rpm")
         return self
 
-    def acquire(self, model_id: str = None, exclude: Optional[Set[str]] = None) -> Optional[KeyEntry]:
+    async def acquire(self, model_id: str = None, exclude: Optional[Set[str]] = None) -> Optional[KeyEntry]:
         """Least-loaded selection.
 
         N-10 fix: `exclude` lets retry loops skip labels already tried for the
         same client request. N-12 fix: keys cooled down for `model_id` only are
         skipped for that model but stay usable for other models.
         """
-        with self._lock:
+        async with self._lock:
             # B-37: expire elapsed blocks explicitly, under the lock.
             for k in self.keys:
                 k.expire_block()
+                k.expire_model_blocks()
             candidates = [
                 k for k in self.keys
                 if not k.is_blocked() and k.current_rpm() < self.hard_limit
@@ -273,36 +281,37 @@ class KeyPool:
             entry.increment_in_flight()
             return entry
 
-    def release(self, entry: Optional[KeyEntry]):
+    async def release(self, entry: Optional[KeyEntry]):
         if entry is None:
             return
-        with self._lock:
+        async with self._lock:
             entry.decrement_in_flight()
 
-    def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None, model_id: str = None, model_scoped: bool = False):
+    async def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None, model_id: str = None, model_scoped: bool = False):
         if entry is None:
             return
-        # N-12 fix: model-specific failures (capacity / broken model 5xx) cool
-        # down only the key+model pair instead of the whole key so healthy
-        # models keep rotating.
-        if model_scoped and model_id:
+        async with self._lock:
+            # N-12 fix: model-specific failures (capacity / broken model 5xx) cool
+            # down only the key+model pair instead of the whole key so healthy
+            # models keep rotating.
+            if model_scoped and model_id:
+                if status_code == 429:
+                    entry.block_model(model_id, retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "model_rate_limit")
+                else:
+                    entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
+                return
             if status_code == 429:
-                entry.block_model(model_id, retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "model_rate_limit")
-            else:
-                entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
-            return
-        if status_code == 429:
-            entry.block(retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "rate_limit")
-        elif status_code in (401, 402, 403):
-            entry.block(retry_after or int(os.environ.get("AUTH_KEY_COOLDOWN_SEC", "300")), "auth_or_quota")
-        elif status_code >= 500 or status_code in (408, 409):
-            if model_id and status_code >= 500:
-                # 5xx tied to a specific model → per-model block (N-12).
-                entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
-            else:
-                entry.block(retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "transient")
+                entry.block(retry_after or int(os.environ.get("RATE_LIMIT_COOLDOWN_SEC", "65")), "rate_limit")
+            elif status_code in (401, 402, 403):
+                entry.block(retry_after or int(os.environ.get("AUTH_KEY_COOLDOWN_SEC", "300")), "auth_or_quota")
+            elif status_code >= 500 or status_code in (408, 409):
+                if model_id and status_code >= 500:
+                    # 5xx tied to a specific model → per-model block (N-12).
+                    entry.block_model(model_id, retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "model_transient")
+                else:
+                    entry.block(retry_after or int(os.environ.get("TRANSIENT_KEY_COOLDOWN_SEC", "15")), "transient")
 
-    def heal_in_flight(self) -> int:
+    async def heal_in_flight(self) -> int:
         """N-01 fix: reset in_flight counters stuck by leaked release paths.
 
         Mirrors nvidia-python's KeyPool.heal_in_flight — a key whose in_flight
@@ -313,7 +322,7 @@ class KeyPool:
         threshold = int(os.environ.get("HEAL_INFLIGHT_THRESHOLD_SEC", "600"))
         now = time.time()
         fixed = 0
-        with self._lock:
+        async with self._lock:
             for k in self.keys:
                 if k.in_flight > 0 and k.last_used > 0 and (now - k.last_used) > threshold:
                     logger.warning(f"[key_pool] heal_in_flight: {k.label} in_flight {k.in_flight} stuck since last_used {round(now - k.last_used)}s ago -> 0")
@@ -327,9 +336,11 @@ class KeyPool:
             logger.info(f"[key_pool] heal_in_flight: {fixed} key(s) corrected")
         return fixed
 
-    def peek(self) -> Optional[KeyEntry]:
-        with self._lock:
+    async def peek(self) -> Optional[KeyEntry]:
+        async with self._lock:
             for k in self.keys:
+                k.expire_block()
+                k.expire_model_blocks()
                 if not k.is_blocked():
                     return k
             return self.keys[0] if self.keys else None
@@ -499,21 +510,21 @@ def free_only_enabled() -> bool:
     return v in ("yes", "true", "1", "on", "y")
 
 def is_free_model(model_id: str) -> bool:
-    """True if model name/id contains 'free' (case-insensitive).
+    """True if model name/id has a free suffix (case-insensitive).
 
     Optional FREE_MODEL_ALLOWLIST=comma,separated,ids for free models whose
-    ids do not contain the substring (e.g. niche upstream names).
+    ids do not carry a :free/-free suffix (e.g. niche upstream names).
     """
     if not model_id:
         return False
     mid = str(model_id).lower().strip()
-    if "free" in mid:
+    bare = mid.split("/")[-1] if "/" in mid else mid
+    if mid.endswith((":free", "-free")) or bare.endswith((":free", "-free")):
         return True
     allow = (os.environ.get("FREE_MODEL_ALLOWLIST") or "").strip()
     if not allow:
         return False
     extras = {x.strip().lower() for x in allow.split(",") if x.strip()}
-    bare = mid.split("/", 1)[-1] if "/" in mid else mid
     return mid in extras or bare in extras
 
 def model_allowed(model_id: str) -> bool:
@@ -831,7 +842,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     tried_labels: Set[str] = set()
     retry_backoff_base = float(os.environ.get("RETRY_BACKOFF_BASE_SEC", "0.25"))
     for attempt_i in range(attempts):
-        entry = KEY_POOL.acquire(model_id=model_id, exclude=tried_labels)
+        entry = await KEY_POOL.acquire(model_id=model_id, exclude=tried_labels)
         if not entry:
             break
         tried_labels.add(entry.label)
@@ -854,15 +865,15 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             last_status, last_result = status, result
             if _is_retriable_upstream_status(status, result):
                 if _should_cooldown_key(status, result):
-                    KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result), model_id=model_id)
+                    await KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result), model_id=model_id)
                 elif _looks_model_capacity_error(result) and model_id:
                     # N-12 fix: model-capacity failure blocks only this key+model.
-                    KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result, default=15), model_id=model_id, model_scoped=True)
+                    await KEY_POOL.mark_failure(entry, status, _retry_after_seconds(result, default=15), model_id=model_id, model_scoped=True)
                 continue
             return status, result, None
         finally:
             if not released:
-                KEY_POOL.release(entry)
+                await KEY_POOL.release(entry)
 
     if tried >= max(1, KEY_POOL.total_keys + (1 if oauth_token else 0)) and isinstance(last_result, dict) and isinstance(last_result.get("error"), dict):
         msg = last_result["error"].get("message", "")
@@ -899,7 +910,7 @@ async def get_nous_json_with_retries(path: str) -> tuple:
         except Exception as e:
             last_status, last_data = 502, {"error": {"message": str(e), "type": "api_error"}}
     for _ in range(max(1, KEY_POOL.total_keys)):
-        entry = KEY_POOL.acquire()
+        entry = await KEY_POOL.acquire()
         if not entry:
             break
         try:
@@ -910,19 +921,19 @@ async def get_nous_json_with_retries(path: str) -> tuple:
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 if r.status == 200:
-                    KEY_POOL.release(entry)
+                    await KEY_POOL.release(entry)
                     return r.status, data
                 last_status, last_data = r.status, _normalize_upstream_error(r.status, text)
                 if _is_retriable_upstream_status(r.status, last_data):
                     if _should_cooldown_key(r.status, last_data):
-                        KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
-                    KEY_POOL.release(entry)
+                        await KEY_POOL.mark_failure(entry, r.status, _retry_after_seconds(last_data))
+                    await KEY_POOL.release(entry)
                     continue
-                KEY_POOL.release(entry)
+                await KEY_POOL.release(entry)
                 return last_status, last_data
         except Exception as e:
-            KEY_POOL.mark_failure(entry, 503, 15)
-            KEY_POOL.release(entry)
+            await KEY_POOL.mark_failure(entry, 503, 15)
+            await KEY_POOL.release(entry)
             last_status, last_data = 502, {"error": {"message": str(e), "type": "api_error"}}
     return last_status, last_data
 
@@ -1257,9 +1268,13 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     u = chat.get("usage", {}) or {}
     fr = (chat.get("choices") or [{}])[0].get("finish_reason")
     stop_map = {"tool_calls": "tool_use", "stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}
-    stop_reason = stop_map.get(fr, "end_turn")
-    if tool_calls or dsml_tools:
-        stop_reason = "tool_use"
+    if fr is not None:
+        # B-06 parity for non-streaming replies: respect the explicit
+        # finish_reason even if the response contains tool calls/DSML tools.
+        stop_reason = stop_map.get(fr, "end_turn")
+    else:
+        # Only infer tool_use when the upstream omitted finish_reason entirely.
+        stop_reason = "tool_use" if (tool_calls or dsml_tools) else "end_turn"
     return {
         "id": chat.get("id", "msg_proxy"),
         "type": "message",
@@ -1466,7 +1481,7 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 upstream_resp.release()
             except Exception:
                 pass
-            KEY_POOL.release(key_entry)
+            await KEY_POOL.release(key_entry)
 
 # Advanced streaming state machines
 class AnthropicStreamState:
@@ -2116,7 +2131,7 @@ async def _heal_in_flight_loop():
     while True:
         await asyncio.sleep(max(30, interval))
         try:
-            KEY_POOL.heal_in_flight()
+            await KEY_POOL.heal_in_flight()
         except Exception as e:
             logger.warning(f"[key_pool] heal_in_flight loop error: {e}")
 
@@ -2392,7 +2407,7 @@ async def get_token():
     if token:
         return token
     # Priority 2: Use KeyPool (NOUS_API_KEY, NOUS_API_KEY_1, etc.)
-    entry = KEY_POOL.peek()
+    entry = await KEY_POOL.peek()
     if entry:
         return entry.api_key
     logger.warning("[auth] No API key configured! Set NOUS_API_KEY* or AUTH_PATH.")
@@ -2894,6 +2909,12 @@ async def embeddings(request: Request):
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):
+    # B-31 parity: unknown POST surfaces are still POST surfaces — authenticate
+    # and rate-limit before doing any work. GET 404 discovery remains cheap.
+    if request.method == "POST":
+        await _auth_check(request)
+        if not check_rate_limit(request.client.host if request.client else "unknown"):
+            return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     return JSONResponse(status_code=404, content={"error": {"message": f"Unsupported: {path}", "type": "not_found_error"}})
 
 

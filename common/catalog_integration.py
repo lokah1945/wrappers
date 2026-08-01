@@ -143,6 +143,7 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
         import anyio
         from mcp.server.fastmcp import FastMCP
         from mcp.server.sse import SseServerTransport
+        from common.auth import check_auth as _check_auth
         from starlette.responses import JSONResponse, StreamingResponse
 
         mcp = FastMCP(
@@ -239,6 +240,12 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
 
         @app.get("/mcp/sse")
         async def mcp_sse(request):
+            # B-31 parity: MCP transports can expose tools; protect them like
+            # every other non-discovery agent surface. This still accepts both
+            # Authorization: Bearer and x-api-key through common.auth.
+            auth = _check_auth(request.headers, surface='/mcp/sse')
+            if not auth.ok:
+                return JSONResponse({"error": {"message": auth.message, "type": "authentication_error"}}, status_code=auth.status)
             async def event_gen():
                 async with anyio.create_task_group() as tg:
                     async with sse_transport.connect_sse(
@@ -252,6 +259,9 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
 
         @app.post("/mcp/messages")
         async def mcp_messages(request):
+            auth = _check_auth(request.headers, surface='/mcp/messages')
+            if not auth.ok:
+                return JSONResponse({"error": {"message": auth.message, "type": "authentication_error"}}, status_code=auth.status)
             return await sse_transport.handle_post_message(
                 request.scope, request._receive, request._send
             )

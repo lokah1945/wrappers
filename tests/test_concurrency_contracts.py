@@ -123,10 +123,10 @@ def test_nous_key_pool_concurrent_acquire_release_no_leak():
         wn.KEY_POOL.load_from_env()
 
         async def one():
-            entry = await asyncio.to_thread(wn.KEY_POOL.acquire)
+            entry = await wn.KEY_POOL.acquire()
             assert entry is not None
             await asyncio.sleep(0)
-            wn.KEY_POOL.release(entry)
+            await wn.KEY_POOL.release(entry)
 
         async def main():
             await asyncio.gather(*(one() for _ in range(100)))

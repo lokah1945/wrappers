@@ -96,16 +96,21 @@ class KeyEntry:
         logger.warning(f'[opencode] key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})')
 
     def is_model_blocked(self, model_id: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model_id:
             return False
         entry = self.model_blocks.get(model_id)
         if not entry:
             return False
         blocked_until, _reason = entry
-        if time.time() < blocked_until:
-            return True
-        del self.model_blocks[model_id]
-        return False
+        return time.time() < blocked_until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
+        now = time.time()
+        for model_id, (blocked_until, _reason) in list(self.model_blocks.items()):
+            if blocked_until <= now:
+                self.model_blocks.pop(model_id, None)
 
     def is_hard_blocked(self) -> bool:
         """B-37 fix: side-effect-free predicate.
@@ -203,6 +208,7 @@ class KeyPool:
             # B-37: expire elapsed blocks explicitly, under the lock.
             for _k in self.keys:
                 _k.expire_block()
+                _k.expire_model_blocks()
             # NO MODEL FALLBACK: filter candidates by model-scoped blocks.
             # Error on model A at key1 blocks key1 ONLY for model A —
             # model B can still use key1 because it's a different model.

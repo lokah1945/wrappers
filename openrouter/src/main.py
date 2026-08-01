@@ -630,11 +630,11 @@ REQUIRE_AUTH = os.environ.get('REQUIRE_AUTH', 'true').strip().lower() not in ('0
 PUBLIC_PATHS_ANY = frozenset({
     '/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
     '/catalog/health', '/catalog/ready', '/catalog/metrics',
-    '/mcp/sse', '/mcp/messages', '/mcp',
 })
 # Public model discovery (Ollama + OpenAI compatible) — agents need to list
-# models before authenticating. GET only.
-PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version'})
+# models before authenticating. GET only. MCP POST messages are deliberately
+# absent here so every POST surface remains authenticated (B-31 parity).
+PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version', '/mcp/sse', '/mcp'})
 
 # B-26 fix: the OpenRouter *Provisioning* API (create/delete/rotate keys) is
 # privileged and must never share the bypass with read-only catalog routes.
@@ -664,6 +664,12 @@ def _is_public_path(path: str, method: str) -> bool:
         return True
     return False
 
+
+def _is_loopback_client(request: Request) -> bool:
+    """Management API hardening (B-26): only local clients may administer keys."""
+    host = getattr(request.client, 'host', '') if request.client else ''
+    return host in ('127.0.0.1', '::1', 'localhost', 'testclient')
+
 # Headers forwarded upstream (transparent passthrough to preserve client identity
 # and beta-feature flags for OpenAI/Anthropic SDKs).
 _FORWARD_HEADER_ALLOWLIST = (
@@ -679,48 +685,58 @@ async def auth_middleware(request: Request, call_next):
 
     # Auth check — accepts both Authorization: Bearer <token> AND x-api-key: <token>
     # (Anthropic SDK uses x-api-key, OpenAI SDK uses Authorization).
-    if not DISABLE_AUTH:
-        path = request.url.path
-        method = request.method
-        is_management = path.startswith(MANAGEMENT_PREFIX)
-        # B-26 fix: management routes are NEVER public, regardless of prefix.
-        if is_management or not _is_public_path(path, method):
-            auth = request.headers.get('Authorization', '')
-            x_api_key = request.headers.get('x-api-key', '')
-            # B-26: privileged provisioning surface uses its own token.
-            token = _management_token() if is_management else _bearer_token()
-            client_token = ''
-            if auth.lower().startswith('bearer '):
-                client_token = auth[7:].strip()
-            elif x_api_key:
-                client_token = x_api_key.strip()
-            elif auth:
-                client_token = auth.strip()
+    path = request.url.path
+    method = request.method
+    is_management = path.startswith(MANAGEMENT_PREFIX)
+    if is_management and not _is_loopback_client(request):
+        logger.warning('[auth] rejecting non-loopback management request from %s to %s',
+                       getattr(request.client, 'host', None) if request.client else None, path)
+        return JSONResponse(
+            {"error": {"message": "OpenRouter management API is loopback-only", "type": "authentication_error"}},
+            status_code=403,
+        )
+    # B-26 fix: management routes are NEVER public and NEVER inherit the
+    # inference DISABLE_AUTH bypass. B-27/B-28 continue to apply to normal
+    # inference routes unless the operator explicitly disables inference auth.
+    if is_management or (not DISABLE_AUTH and not _is_public_path(path, method)):
+        auth = request.headers.get('Authorization', '')
+        x_api_key = request.headers.get('x-api-key', '')
+        # B-26: privileged provisioning surface uses its own token.
+        token = _management_token() if is_management else _bearer_token()
+        client_token = ''
+        if auth.lower().startswith('bearer '):
+            client_token = auth[7:].strip()
+        elif x_api_key:
+            client_token = x_api_key.strip()
+        elif auth:
+            client_token = auth.strip()
 
-            # B-28 fix: fail CLOSED when no token is configured instead of
-            # silently allowing every request through.
-            if not token:
-                if REQUIRE_AUTH:
-                    logger.error(
-                        '[auth] no %s token configured and REQUIRE_AUTH=true — refusing request to %s',
-                        'management' if is_management else 'bearer', path,
-                    )
-                    return JSONResponse(
-                        {"error": {"message": "Server auth not configured", "type": "authentication_error"}},
-                        status_code=503,
-                    )
-                logger.warning('[auth] token unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
-            else:
-                # B-30 parity: compare as bytes so a non-ASCII token yields a
-                # clean 401 instead of a TypeError → 500.
-                ok = bool(client_token) and hmac.compare_digest(
-                    client_token.encode('utf-8'), token.encode('utf-8'))
-                if not ok:
-                    return JSONResponse(
-                        {"error": {"message": "Unauthorized", "type": "authentication_error"}},
-                        status_code=401,
-                        headers={"WWW-Authenticate": 'Bearer'},
-                    )
+        # B-28 fix: fail CLOSED when no token is configured instead of
+        # silently allowing every request through.
+        if not token:
+            if is_management or REQUIRE_AUTH:
+                logger.error(
+                    '[auth] no %s token configured%s — refusing request to %s',
+                    'management' if is_management else 'bearer',
+                    ' (management never fails open)' if is_management else ' and REQUIRE_AUTH=true',
+                    path,
+                )
+                return JSONResponse(
+                    {"error": {"message": "Server auth not configured", "type": "authentication_error"}},
+                    status_code=503,
+                )
+            logger.warning('[auth] token unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
+        else:
+            # B-30 parity: compare as bytes so a non-ASCII token yields a
+            # clean 401 instead of a TypeError → 500.
+            ok = bool(client_token) and hmac.compare_digest(
+                client_token.encode('utf-8'), token.encode('utf-8'))
+            if not ok:
+                return JSONResponse(
+                    {"error": {"message": "Unauthorized", "type": "authentication_error"}},
+                    status_code=401,
+                    headers={"WWW-Authenticate": 'Bearer'},
+                )
 
     # Rate limit
     ip = _client_ip(request)
@@ -1972,7 +1988,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
 
     finish_reason = choice.get("finish_reason", "stop")
     stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
-                   "content_filter": "end_turn"}.get(finish_reason, "end_turn")
+                   "function_call": "tool_use", "content_filter": "refusal"}.get(finish_reason, "end_turn")
 
     usage = openai_resp.get("usage", {})
     return {

@@ -99,16 +99,20 @@ class KeyEntry:
             self.block_reason = ''
 
     def is_model_blocked(self, model_id: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model_id:
             return False
         until = self.model_blocked_until.get(model_id, 0.0)
         if not until:
             return False
+        return time.time() < until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
         now = time.time()
-        if now < until:
-            return True
-        self.model_blocked_until.pop(model_id, None)
-        return False
+        for model_id, until in list(self.model_blocked_until.items()):
+            if until <= now:
+                self.model_blocked_until.pop(model_id, None)
 
     def stats(self, soft: int, hard: int) -> dict:
         rpm = self.current_rpm()
@@ -197,6 +201,7 @@ class KeyPool:
             # B-37: expire elapsed blocks explicitly, under the lock.
             for _k in self.keys:
                 _k.expire_block()
+                _k.expire_model_blocks()
             candidates = [
                 k for k in self.keys
                 if not k.is_hard_blocked()
