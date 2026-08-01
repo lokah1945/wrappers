@@ -11,7 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
-from typing import Any, List, AsyncGenerator
+from typing import Any
 
 try:
     from common.model.errors import looks_anti_bot_challenge
@@ -574,7 +574,15 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
         "content_filter": "refusal",
     }
     finish_reason = choice.get("finish_reason")
-    stop_reason = "tool_use" if any(c.get("type") == "tool_use" for c in content) else finish_map.get(finish_reason, "end_turn")
+    if finish_reason is not None:
+        # B-06 parity for non-streaming translation: an explicit upstream
+        # finish_reason is authoritative even if the turn contains tool_use
+        # blocks. Forcing tool_use whenever a tool was present masks
+        # max_tokens/refusal/normal-stop and makes agents wait for tool_result.
+        stop_reason = finish_map.get(finish_reason, "end_turn")
+    else:
+        # Only infer tool_use when the upstream omitted finish_reason entirely.
+        stop_reason = "tool_use" if any(c.get("type") == "tool_use" for c in content) else "end_turn"
 
     u = o_resp.get("usage") or {}
     prompt_tok = u.get("prompt_tokens") or u.get("input_tokens") or 0

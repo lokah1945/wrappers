@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from common.auth import (  # noqa: E402
-    AuthResult, check_auth, is_public_path, tokens_match,
+    check_auth, is_public_path, tokens_match,
 )
 from common.sse import (  # noqa: E402
     IDLE, iter_chunks_with_idle, normalize_sse_newlines,
@@ -679,6 +679,128 @@ def test_r08_no_unguarded_choices_indexing():
                 offenders.append(f'{wrapper}/{py.name}:{n}: {stripped[:90]}')
     assert not offenders, ('unguarded choices[0] indexing:\n  '
                            + '\n  '.join(offenders))
+
+
+def test_b06_non_streaming_openai_to_anthropic_respects_finish_reason_after_tool():
+    """B-06 applies to non-streaming conversion too: explicit finish_reason wins.
+
+    A ChatCompletion can contain tool_calls while still finishing with stop,
+    length, or content_filter. The wrapper must not force tool_use merely
+    because a tool block is present.
+    """
+    from common.translations.shared import openai_to_anthropic_response
+
+    base = {
+        'id': 'chatcmpl_x',
+        'model': 'm',
+        'choices': [{
+            'message': {'role': 'assistant', 'content': '', 'tool_calls': [
+                {'id': 'call_1', 'type': 'function',
+                 'function': {'name': 'f', 'arguments': '{}'}}]},
+        }],
+    }
+    for finish, expected in (
+        ('stop', 'end_turn'),
+        ('length', 'max_tokens'),
+        ('tool_calls', 'tool_use'),
+        ('content_filter', 'refusal'),
+    ):
+        payload = json.loads(json.dumps(base))
+        payload['choices'][0]['finish_reason'] = finish
+        converted = openai_to_anthropic_response(payload, model='m')
+        assert converted['stop_reason'] == expected
+
+
+def test_b06_local_non_streaming_translators_use_strict_finish_mapping():
+    for wrapper in ('nous', 'opencode', 'blackbox'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        i = src.index('def openai_to_anthropic(')
+        block = src[i:i + 2600]
+        assert 'if fr is not None:' in block, f'{wrapper}: no strict finish_reason branch'
+        assert 'else:' in block and 'tool_use" if (tool_calls or dsml_tools) else "end_turn"' in block.replace("'", '"')
+        assert 'if tool_calls or dsml_tools:\n        stop' not in block
+
+
+def test_b06_openrouter_non_streaming_content_filter_maps_to_refusal():
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    i = src.index('def _openai_to_anthropic_response(')
+    block = src[i:i + 1800]
+    assert '"content_filter": "refusal"' in block
+    assert '"content_filter": "end_turn"' not in block
+
+
+def test_b26_openrouter_management_is_loopback_only_and_never_fails_open():
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    auth_block = src[src.index('@app.middleware("http")'):src.index('# ══════════════════════════════════════════════════════════════════════════', src.index('@app.middleware("http")'))]
+    assert '_is_loopback_client' in src
+    assert 'OpenRouter management API is loopback-only' in auth_block
+    assert 'management never fails open' in auth_block
+    assert 'if is_management or (not DISABLE_AUTH and not _is_public_path(path, method))' in auth_block
+    assert 'management routes are NEVER public and NEVER inherit' in auth_block
+
+
+def test_b31_catch_all_post_paths_are_authenticated_and_rate_limited():
+    for wrapper in ('nous', 'opencode', 'blackbox'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        i = src.index('async def catch_all')
+        block = src[i:i + 700]
+        assert 'request.method' in block and 'POST' in block, f'{wrapper}: catch_all does not gate POSTs'
+        assert '_auth_check(request)' in block, f'{wrapper}: catch_all POST bypasses auth'
+        assert 'check_rate_limit' in block, f'{wrapper}: catch_all POST bypasses rate limit'
+
+
+def test_b31_mcp_post_messages_are_not_public():
+    """MCP transports are agent surfaces; POST /mcp/messages must be gated."""
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    any_block = src[src.index('PUBLIC_PATHS_ANY'):src.index('PUBLIC_PATHS_GET')]
+    assert '/mcp/messages' not in any_block
+    assert '/mcp/sse' in src[src.index('PUBLIC_PATHS_GET'):src.index('MANAGEMENT_PREFIX')]
+
+    csrc = (ROOT / 'common' / 'catalog_integration.py').read_text()
+    for route in ("surface='/mcp/sse'", "surface='/mcp/messages'"):
+        assert route in csrc, f'common catalog MCP route lacks auth check: {route}'
+
+
+def test_b37_model_block_predicates_are_side_effect_free():
+    """Model-scoped block predicates must not mutate without the pool lock."""
+    import ast
+    offenders = []
+    for rel in (
+        'blackbox/src/key_pool.py', 'opencode/src/key_pool.py',
+        'openrouter/src/key_pool.py', 'nvidia-python/src/key_pool.py',
+        'common/base_wrapper.py', 'nous/src/main.py',
+    ):
+        tree = ast.parse((ROOT / rel).read_text())
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == 'is_model_blocked':
+                for sub in ast.walk(node):
+                    if isinstance(sub, ast.Delete):
+                        offenders.append(f'{rel}:{sub.lineno} del in is_model_blocked')
+                    if isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
+                        if sub.func.attr in {'pop', 'clear', 'popitem'}:
+                            offenders.append(f'{rel}:{sub.lineno} mutating {sub.func.attr} in is_model_blocked')
+    assert not offenders, 'side-effecting is_model_blocked predicates:\n  ' + '\n  '.join(offenders)
+
+
+def test_b38_nous_key_pool_uses_asyncio_lock():
+    src = (ROOT / 'nous' / 'src' / 'main.py').read_text()
+    i = src.index('class KeyPool:')
+    block = src[i:i + 4200]
+    assert 'self._lock = asyncio.Lock()' in block
+    assert 'self._lock = threading.Lock()' not in block
+    assert 'async def acquire' in block
+    assert 'async def release' in block
+
+
+def test_free_model_detection_uses_suffix_or_allowlist_not_substring():
+    """B-34 from the root bug report: 'freemium' must not pass FREE_ONLY."""
+    for wrapper in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        i = src.index('def is_free_model')
+        block = src[i:i + 900]
+        assert 'endswith' in block, f'{wrapper}: free detection must use suffix matching'
+        assert "'free' in mid" not in block
+        assert '"free" in mid' not in block
 
 
 # ══════════════════════════════════════════════════════════════════════════

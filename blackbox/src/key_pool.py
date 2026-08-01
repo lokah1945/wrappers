@@ -110,16 +110,21 @@ class KeyEntry:
         logger.warning(f'[blackbox] key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})')
 
     def is_model_blocked(self, model_id: str) -> bool:
+        """Side-effect-free model-block predicate (B-37 parity)."""
         if not model_id:
             return False
         entry = self.model_blocks.get(model_id)
         if not entry:
             return False
         blocked_until, _reason = entry
-        if time.time() < blocked_until:
-            return True
-        del self.model_blocks[model_id]
-        return False
+        return time.time() < blocked_until
+
+    def expire_model_blocks(self) -> None:
+        """Clear elapsed model-scoped blocks. Caller must hold the pool lock."""
+        now = time.time()
+        for model_id, (blocked_until, _reason) in list(self.model_blocks.items()):
+            if blocked_until <= now:
+                self.model_blocks.pop(model_id, None)
 
     def stats(self) -> dict:
         now = time.time()
@@ -208,6 +213,7 @@ class KeyPool:
             # of relying on is_blocked() mutating state as a side effect.
             for k in self.keys:
                 k.expire_block()
+                k.expire_model_blocks()
             candidates = [k for k in self.keys
                           if not k.is_blocked()
                           and not (model and k.is_model_blocked(model))
