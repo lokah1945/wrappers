@@ -309,6 +309,8 @@ Port 9105 is intentionally unused.
 | `METRICS_PERSIST_SEC` | `60` | Metrics snapshot interval. |
 | `FREE_ONLY` / `FREE_MODEL_ALLOWLIST` | `no` | Restrict to free models. |
 | `DYNAMIC_ALIAS_TARGET` | *(none)* | Operator-bound alias target. |
+| `COMPATIBILITY_LAYER` | `1` | **Upstream dialect, declared by the operator** — `1` OpenAI Compatible (default, current behaviour), `2` Anthropic Compatible (upstream speaks the Messages API; surfaces are translated to/from Anthropic, `/v1/messages` passes through verbatim), `3` Auto Discovery (probe upstream once per base URL, cache with `COMPATIBILITY_PROBE_TTL_SEC`, fall back to `1`). Invalid values fail fast in `validate_config()`. See `docs/COMPATIBILITY_LAYER.md`. |
+| `COMPATIBILITY_PROBE_TTL_SEC` | `300` | Cache TTL for auto-discovery probes (layer 3). |
 | `LOAD_SHEDDING_ENABLED` | `false` | Shed load above `INFLIGHT_SOFT_CAP`. |
 | `OPENROUTER_MANAGEMENT_TOKEN` | falls back to `BEARER_TOKEN` | Provisioning-API credential (openrouter). |
 

@@ -163,6 +163,15 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        openai_chat_to_anthropic_request,
+    )
+    from common.compat import (
+        is_anthropic_upstream as _is_anthropic_upstream,
+        is_auto_discovery as _is_auto_discovery,
+        passthrough_anthropic_sse as _passthrough_anthropic_sse,
+        translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+        translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
+        probe_upstream_compatibility as _probe_upstream_compatibility,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -214,6 +223,17 @@ VERSION = '1.0.0'
 # ── Validate Config ──────────────────────────────────────────────────────
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup. Fail-fast on missing required env vars."""
     missing = []
     for var in ['OPENROUTER_API_KEY_1', 'BEARER_TOKEN']:
@@ -785,11 +805,16 @@ async def auth_middleware(request: Request, call_next):
 
 async def _proxy_request(method: str, path: str, body: dict | None = None,
                          headers: dict | None = None, stream: bool = False,
-                         request: Request | None = None) -> Response:
+                         request: Request | None = None,
+                         terminal_done: bool = True) -> Response:
     """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
     Iterates over all available keys on retriable failures (429, 5xx, network errors).
     Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
+
+    terminal_done: COMPATIBILITY_LAYER=2 (Anthropic upstream) streams end with
+    message_stop, not [DONE]; pass terminal_done=False to skip the synthesized
+    [DONE] terminator.
     """
     model_id = (body or {}).get("model", "") if body else ""
 
@@ -916,14 +941,19 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                     saw_done = True
                                 ends_newline = line.endswith(b'\n')
                             yield line
-                        # Only synthesize [DONE] if upstream never sent one.
-                        if not saw_done:
-                            if not ends_newline:
+                        # COMPATIBILITY_LAYER=2: an Anthropic upstream ends its
+                        # stream with message_stop, never [DONE] — appending
+                        # [DONE] would corrupt the Anthropic SSE. Only
+                        # synthesize [DONE] when terminal_done is requested.
+                        if terminal_done:
+                            # Only synthesize [DONE] if upstream never sent one.
+                            if not saw_done:
+                                if not ends_newline:
+                                    yield b'\n\n'
+                                yield b'data: [DONE]\n\n'
+                            elif not ends_newline:
+                                # Upstream's [DONE] lacked its frame terminator.
                                 yield b'\n\n'
-                            yield b'data: [DONE]\n\n'
-                        elif not ends_newline:
-                            # Upstream's [DONE] lacked its frame terminator.
-                            yield b'\n\n'
                     except asyncio.CancelledError:
                         raise
                     finally:
@@ -1085,6 +1115,37 @@ async def chat_completions(request: Request):
         return blocked
 
     stream = body.get("stream", False)
+
+    # COMPATIBILITY_LAYER=2: upstream speaks Anthropic Messages — translate the
+    # OpenAI chat request once and translate the Anthropic response back.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(body)
+        anthro_body["stream"] = stream
+        res = await _proxy_request("POST", "messages", anthro_body, stream=stream,
+                                   request=request, terminal_done=False)
+        if isinstance(res, StreamingResponse):
+            return StreamingResponse(
+                _translate_anthropic_stream_to_openai_chat(
+                    res.body_iterator, model, float(HEARTBEAT_MS) / 1000.0),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": res.headers.get("x-request-id", ""),
+                },
+            )
+        if isinstance(res, JSONResponse):
+            try:
+                payload = json.loads(res.body)
+            except Exception:
+                return res
+            if isinstance(payload, dict) and payload.get('error'):
+                return res
+            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
+                oai_resp = anthropic_to_openai_response(payload, model)
+                return JSONResponse(oai_resp, status_code=res.status_code)
+        return res
+
     res = await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
     if isinstance(res, JSONResponse) and res.status_code == 200:
         try:
@@ -1121,6 +1182,41 @@ async def responses(request: Request):
     principal = _request_principal(request)
     chat_body = responses_to_chat(body, principal=principal)
     is_stream = bool(chat_body.get("stream", False))
+
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat → Anthropic
+    # request; translate the Anthropic response back through OpenAI Chat to
+    # Responses.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(chat_body)
+        response = await _proxy_request("POST", "messages", anthro_body, stream=is_stream,
+                                        request=request, terminal_done=False)
+        if isinstance(response, StreamingResponse):
+            chat_sse = _translate_anthropic_stream_to_openai_chat(
+                response.body_iterator, model, float(HEARTBEAT_MS) / 1000.0)
+            return StreamingResponse(
+                _translate_openai_chat_sse_to_responses(chat_sse, model),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": response.headers.get("x-request-id", ""),
+                },
+            )
+        if isinstance(response, JSONResponse):
+            try:
+                payload = json.loads(response.body)
+            except Exception:
+                return response
+            if isinstance(payload, dict) and 'error' in payload:
+                return response
+            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
+                oai_chat = anthropic_to_openai_response(payload, model)
+                resp_obj = chat_to_responses(model, oai_chat, body)
+                rid = resp_obj.get('id')
+                if rid and principal:
+                    _store_response(principal, rid, chat_body.get('messages', []))
+                return JSONResponse(resp_obj, status_code=response.status_code)
+        return response
 
     response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
 
@@ -1721,6 +1817,25 @@ async def messages(request: Request):
     blocked = _check_free_only(model)
     if blocked:
         return blocked
+
+    # COMPATIBILITY_LAYER=2: upstream speaks Anthropic — the /v1/messages
+    # surface passes through verbatim (model alias only); no translation.
+    if _is_anthropic_upstream():
+        response = await _proxy_request("POST", "messages", body,
+                                        stream=bool(body.get("stream", False)),
+                                        request=request, terminal_done=False)
+        if isinstance(response, StreamingResponse):
+            return StreamingResponse(
+                _passthrough_anthropic_sse(response.body_iterator,
+                                           float(HEARTBEAT_MS) / 1000.0),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": response.headers.get("x-request-id", ""),
+                },
+            )
+        return response
 
     # Translate Anthropic → OpenAI
     openai_body = _anthropic_to_openai(body)

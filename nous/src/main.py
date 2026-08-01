@@ -81,6 +81,13 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        openai_chat_to_anthropic_request,
+    )
+    from common.compat import (
+        is_anthropic_upstream as _is_anthropic_upstream,
+        passthrough_anthropic_sse as _passthrough_anthropic_sse,
+        translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+        translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -92,6 +99,17 @@ except ImportError:
 # ============================================================================
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup."""
     import os
     import sys
@@ -705,14 +723,15 @@ def get_model_meta(mid):
 
 
 
-async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None) -> tuple:
+async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None,
+                     path: str = 'v1/chat/completions') -> tuple:
     """Transparent proxy: forward chat/completions to Nous upstream.
 
     On 429, parses the HTTP Retry-After header and embeds it in the error
     dict so post_nous_with_retries can cool down the key for the correct
     duration (anti rate-limit).
     """
-    url = f"{NOUS_BASE}/v1/chat/completions"
+    url = f"{NOUS_BASE}/{path}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     if stream:
         headers["Accept"] = "text/event-stream"
@@ -794,7 +813,8 @@ def _looks_model_capacity_error(data) -> bool:
 # directly (imported above as _should_cooldown_key).
 
 
-async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None, client_surface: str = "openai_chat") -> tuple:
+async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None,
+                                   client_surface: str = "openai_chat", path: str = "v1/chat/completions") -> tuple:
     """Post to Nous using every available credential before surfacing failure.
 
     OAuth AUTH_PATH remains supported. If that single token fails with a
@@ -821,7 +841,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
 
     oauth_token = _read_token_from_auth_path()
     if oauth_token:
-        status, result = await post_nous(payload, oauth_token, stream=stream, extra_headers=extra_headers)
+        status, result = await post_nous(payload, oauth_token, stream=stream, extra_headers=extra_headers, path=path)
         if status == 200:
             return status, result, None
         tried += 1
@@ -855,7 +875,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             # N-01 fix: the key's in_flight slot is always released via finally
             # (except the successful-stream case where the stream generator owns
             # the release). post_nous itself shapes network errors into a 502.
-            status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers)
+            status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers, path=path)
             if status == 200:
                 if stream:
                     released = True  # ownership transferred to the stream generator
@@ -2721,6 +2741,27 @@ async def chat_completions(request: Request):
     is_stream = body.get("stream", False)
     extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
 
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI chat
+    # request to Anthropic Messages and translate the response back.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(body)
+        anthro_body["stream"] = is_stream
+        status, result, key_entry = await post_nous_with_retries(
+            anthro_body, stream=is_stream, extra_headers=extra_h, path="v1/messages")
+        _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
+        metrics.record(error=(status != 200))
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if is_stream:
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(result, body.get("model", ""), HEARTBEAT_MS / 1000.0):
+                        yield frame
+                finally:
+                    await KEY_POOL.release(key_entry)
+            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        return JSONResponse(anthropic_to_openai_response(result, body.get("model", "")))
+
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
     # F3 round-2 fix: model-state persistence must not delay the response;
     # fire-and-forget with a retained reference (_BG_TASKS pattern).
@@ -2776,6 +2817,38 @@ async def responses(request: Request):
         return JSONResponse(status_code=400, content=free_only_error(chat_body.get("model") or requested or ""))
     is_stream = body.get("stream", False)
     extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
+
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat → Anthropic
+    # request; translate the Anthropic response back through OpenAI Chat to
+    # Responses.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(chat_body)
+        anthro_body["stream"] = is_stream
+        status, result, key_entry = await post_nous_with_retries(
+            anthro_body, stream=is_stream, extra_headers=extra_h,
+            client_surface="openai_responses", path="v1/messages")
+        _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
+        metrics.record(error=(status != 200))
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if is_stream:
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(result, chat_body.get("model", ""), HEARTBEAT_MS / 1000.0):
+                        yield frame
+                finally:
+                    await KEY_POOL.release(key_entry)
+            return StreamingResponse(
+                _translate_openai_chat_sse_to_responses(gen(), chat_body.get("model", "")),
+                media_type="text/event-stream",
+                headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        oai_chat = anthropic_to_openai_response(result, chat_body.get("model", ""))
+        resp = chat_to_responses(chat_body.get("model", ""), oai_chat)
+        _amsg = (oai_chat.get("choices") or [{}])[0].get("message", {})
+        await store_conversation(principal, resp["id"], list(chat_body.get("messages", [])) + [
+            {"role": "assistant", "content": _amsg.get("content"),
+             "tool_calls": _amsg.get("tool_calls") or None}])
+        return resp
 
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
@@ -2862,6 +2935,29 @@ async def messages(request: Request):
         resolved = resolve_model(requested)
         if not model_allowed(requested) and not model_allowed(resolved):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested))
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
+    # passes through verbatim (model alias already applied above).
+    if _is_anthropic_upstream():
+        if free_only_enabled() and body.get("model") and not model_allowed(body.get("model", "")):
+            return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or body.get("model") or ""))
+        is_stream = body.get("stream", False)
+        extra_h = _build_forward_headers(request.headers)
+        status, result, key_entry = await post_nous_with_retries(
+            body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages", path="v1/messages")
+        _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
+        metrics.record(error=(status != 200))
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if is_stream:
+            async def gen():
+                try:
+                    async for frame in _passthrough_anthropic_sse(result, HEARTBEAT_MS / 1000.0):
+                        yield frame
+                finally:
+                    await KEY_POOL.release(key_entry)
+            return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        return JSONResponse(result)
+
     chat_body = anthropic_to_openai(body)
     # Note: anthropic_to_openai may map thinking→REASONING_MODEL (pre-existing);
     # FREE_ONLY still enforces the *outgoing* model is free when enabled.

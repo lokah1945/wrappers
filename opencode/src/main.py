@@ -92,6 +92,13 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        openai_chat_to_anthropic_request,
+    )
+    from common.compat import (
+        is_anthropic_upstream as _is_anthropic_upstream,
+        passthrough_anthropic_sse as _passthrough_anthropic_sse,
+        translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+        translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -149,6 +156,17 @@ VERSION = '1.0.5-anthropic-tools'
 # Build identity (H-04/H-02): resolve git root + source root from __file__, portable
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup."""
     import os
     import sys
@@ -1563,6 +1581,33 @@ async def chat_completions(request: Request):
     # key. Route it through the OpenAI-compatible chat endpoint like the rest.
     url = f"{OPENCODE_BASE}/chat/completions"
 
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI chat
+    # request to Anthropic Messages and translate the response back.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(body)
+        anthro_body["stream"] = is_stream
+        url = f"{OPENCODE_BASE}/messages"
+        if is_stream:
+            status, resp, key = await proxy_request_with_pool("POST", url, anthro_body, request, is_stream=True)
+            if status != 200:
+                return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(resp, body.get('model', ''), HEARTBEAT_MS / 1000.0):
+                        yield frame
+                finally:
+                    try:
+                        resp.release()
+                    except Exception:
+                        pass
+                    pool.release(key)
+            return StreamingResponse(gen(), media_type="text/event-stream",
+                                     headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+        status, data, _ = await proxy_request_with_pool("POST", url, anthro_body, request)
+        if status != 200:
+            return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
+        return JSONResponse(anthropic_to_openai_response(data, body.get("model", "")))
+
     try:
         if is_stream:
             status, resp, key = await proxy_request_with_pool("POST", url, body, request, is_stream=True)
@@ -1619,6 +1664,40 @@ async def responses(request: Request):
     family = _zen_family(model)
 
     try:
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat →
+        # Anthropic request; translate the Anthropic response back through
+        # OpenAI Chat to Responses.
+        if _is_anthropic_upstream():
+            chat_body = responses_to_chat(body, principal)
+            chat_body["stream"] = is_stream
+            anthro_body = openai_chat_to_anthropic_request(chat_body)
+            url = f"{OPENCODE_BASE}/messages"
+            if is_stream:
+                status, resp, key = await proxy_request_with_pool("POST", url, anthro_body, request, is_stream=True)
+                if status != 200:
+                    return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
+                async def gen():
+                    try:
+                        async for frame in _translate_anthropic_stream_to_openai_chat(resp, body.get('model', ''), HEARTBEAT_MS / 1000.0):
+                            yield frame
+                    finally:
+                        try:
+                            resp.release()
+                        except Exception:
+                            pass
+                        pool.release(key)
+                return StreamingResponse(
+                    _translate_openai_chat_sse_to_responses(gen(), model),
+                    media_type="text/event-stream",
+                    headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+            status, data, _ = await proxy_request_with_pool("POST", url, anthro_body, request)
+            if status != 200:
+                return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
+            oai_chat = anthropic_to_openai_response(data, model)
+            resp_obj = chat_to_responses(model, oai_chat)
+            _store_response(principal, resp_obj.get('id'), list(chat_body.get("messages", [])) + [_assistant_message_from_chat(oai_chat)])
+            return JSONResponse(resp_obj)
+
         if family == "responses":
             # Native Zen Responses passthrough
             url = f"{OPENCODE_BASE}/responses"
@@ -1870,6 +1949,31 @@ async def anthropic_messages(request: Request):
     family = _zen_family(model)
 
     try:
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
+        # passes through verbatim (model alias already applied above).
+        if _is_anthropic_upstream():
+            url = f"{OPENCODE_BASE}/messages"
+            if is_stream:
+                status, resp, key = await proxy_request_with_pool("POST", url, body, request, is_stream=True)
+                if status != 200:
+                    return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(resp)}})
+                async def gen():
+                    try:
+                        async for frame in _passthrough_anthropic_sse(resp, HEARTBEAT_MS / 1000.0):
+                            yield frame
+                    finally:
+                        try:
+                            resp.release()
+                        except Exception:
+                            pass
+                        pool.release(key)
+                return StreamingResponse(gen(), media_type="text/event-stream",
+                                         headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
+            status, data, _ = await proxy_request_with_pool("POST", url, body, request)
+            if status != 200:
+                return _jr(status, {"type": "error", "error": {"type": "api_error", "message": str(data)}})
+            return JSONResponse(data)
+
         if family == "messages":
             url = f"{OPENCODE_BASE}/messages"
             if is_stream:

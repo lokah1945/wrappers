@@ -367,7 +367,102 @@ def build_app() -> web.Application:
     return app
 
 
+
+# ── Anthropic-native upstream (COMPATIBILITY_LAYER=2 / =3 auto) ───────────
+# Serves ONLY the Anthropic Messages API (+ /messages alias for base styles
+# that already include /v1). No /chat/completions — auto-discovery must detect
+# Anthropic.
+
+async def _anthropic_chunk(text, delta_kind='text_delta', key='text'):
+    return json.dumps({'type': 'content_block_delta', 'index': 0,
+                       'delta': {'type': delta_kind, key: text}})
+
+
+async def anthropic_messages(request: web.Request):
+    body = await request.json()
+    model = body.get('model', '')
+    mode = _mode(model)
+    stream = bool(body.get('stream'))
+    msg_id = f"msg_anthropic_{int(time.time()*1000)}"
+
+    if not stream:
+        content = []
+        if mode in ('reasoning', 'reasoning_only'):
+            content.append({'type': 'thinking', 'thinking': 'Let me think...'})
+        if mode == 'tools':
+            content.append({'type': 'text', 'text': ''})
+            content.append({'type': 'tool_use', 'id': 'toolu_a', 'name': 'alpha',
+                            'input': {'x': 1}})
+            content.append({'type': 'tool_use', 'id': 'toolu_b', 'name': 'beta',
+                            'input': {'y': 2}})
+            stop_reason = 'tool_use'
+        else:
+            if mode != 'reasoning_only':
+                content.append({'type': 'text', 'text': 'Hello from anthropic mock.'})
+            stop_reason = 'end_turn'
+        return web.json_response({
+            'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model,
+            'content': content, 'stop_reason': stop_reason, 'stop_sequence': None,
+            'usage': {'input_tokens': 12, 'output_tokens': 8},
+        })
+
+    resp = web.StreamResponse(status=200, headers={
+        'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+        'Connection': 'close'})
+    resp.force_close()
+    await resp.prepare(request)
+
+    async def _write(obj):
+        await resp.write(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n".encode())
+
+    await _write({'type': 'message_start', 'message': {
+        'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model,
+        'content': [], 'stop_reason': None, 'stop_sequence': None,
+        'usage': {'input_tokens': 12, 'output_tokens': 0}}})
+    idx = 0
+    if mode in ('reasoning', 'reasoning_only'):
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'thinking', 'thinking': ''}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'thinking_delta', 'thinking': 'Let me think...'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+    if mode == 'tools':
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'tool_use', 'id': 'toolu_a', 'name': 'alpha', 'input': {}}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'input_json_delta', 'partial_json': '{"x":1}'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'tool_use', 'id': 'toolu_b', 'name': 'beta', 'input': {}}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'input_json_delta', 'partial_json': '{"y":2}'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+    if mode != 'reasoning_only':
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'text', 'text': ''}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'text_delta', 'text': 'Hello from anthropic mock.'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+    stop_reason = 'tool_use' if mode == 'tools' else 'end_turn'
+    await _write({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
+                  'usage': {'input_tokens': 12, 'output_tokens': 8}})
+    await _write({'type': 'message_stop'})
+    await resp.write_eof()
+    return resp
+
+
+def build_anthropic_app():
+    app = web.Application()
+    app.router.add_post('/v1/messages', anthropic_messages)
+    app.router.add_post('/messages', anthropic_messages)
+    return app
+
 if __name__ == '__main__':
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
-    web.run_app(build_app(), host='127.0.0.1', port=port, print=None)
+    mode = sys.argv[2] if len(sys.argv) > 2 else 'openai'
+    app = build_anthropic_app() if mode == 'anthropic' else build_app()
+    web.run_app(app, host='127.0.0.1', port=port, print=None)

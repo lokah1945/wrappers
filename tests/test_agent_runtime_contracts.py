@@ -172,7 +172,7 @@ def test_nous_retries_next_key_on_rate_limit_before_returning_error():
     old_post = wn.post_nous
     old_auth = wn._read_token_from_auth_path
 
-    async def fake_post(payload, token, stream=False, extra_headers=None):
+    async def fake_post(payload, token, stream=False, extra_headers=None, path="v1/chat/completions"):
         calls.append(token)
         if token == "bad-token":
             return 429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}

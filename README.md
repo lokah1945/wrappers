@@ -388,6 +388,29 @@ open http://localhost:XXXX/dashboard
 
 ---
 
+## 🌐 Upstream Compatibility Layer (COMPATIBILITY_LAYER)
+
+Every wrapper speaks **all three client surfaces** (OpenAI Chat, OpenAI
+Responses, Anthropic Messages) regardless of what protocol the **upstream**
+speaks. The upstream dialect is **operator-declared**, never guessed:
+
+```
+# .env — same variable in every wrapper
+COMPATIBILITY_LAYER=1   # 1 = OpenAI Compatible (default), 2 = Anthropic Compatible,
+                        # 3 = Auto Discovery (probe upstream once, cache, fall back to 1)
+```
+
+| Layer | Upstream speaks | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat translate | Anthropic↔OpenAI translate |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI translate | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once per base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`) | same | same |
+
+Setting `COMPATIBILITY_LAYER=2` makes an Anthropic-native upstream work with
+OpenAI SDK clients *and* Claude Code with **zero translation on the Anthropic
+surface** — more precise than guessing. Invalid values fail fast at startup.
+Full design: [`docs/COMPATIBILITY_LAYER.md`](docs/COMPATIBILITY_LAYER.md).
+
 ## 🎓 Key Design Decisions
 
 1. **Multi-key rotation** - Distributes load and provides redundancy

@@ -13,6 +13,7 @@
 | `docs/audits/CODEX_RESP_REAUDIT_2026-08-01.md` | **Tracked re-audit report** — the fix cycle for the critical Codex/Responses bug and the debt items, with reproducible gates |
 | `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` | **AI Gateway Translation Layer audit** — OpenAI↔Anthropic / Responses↔Chat round-trip matrix (F1–F7) |
 | `docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md` | **SDK-compat audit** — last Codex bug: every wrapper's Responses output must parse with the official openai SDK (CODEX-RESP-02) |
+| `docs/COMPATIBILITY_LAYER.md` | **COMPATIBILITY_LAYER design** — operator-declared upstream dialect (1=OpenAI, 2=Anthropic, 3=Auto) |
 
 ---
 
@@ -20,10 +21,11 @@
 
 | Gate | Command | Result |
 |---|---|---|
-| Unit + Regression Suite | `python -m pytest tests -q` | **209 passed** (204 + 5 CODEX-RESP-02 SDK-compat guards) |
+| Unit + Regression Suite | `python -m pytest tests -q` | **229 passed** (209 + 20 COMPATIBILITY_LAYER tests) |
 | Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **63 passed** |
 | **AI Gateway Translation Layer** | `python -m pytest tests/test_translation_matrix.py -q` | **63 passed** (all 5 wrappers incl. nvidia) |
 | **SDK Compatibility (Codex parser)** | `python tests/e2e_runtime/sdk_codex_compat.py` | **5 wrappers × 4 modes — all parse with the official openai SDK** |
+| **COMPATIBILITY_LAYER E2E** | `python tests/e2e_runtime/compat_layer_e2e.py` | **5 wrappers × layer=2 × all surfaces + layer=3 auto-discovery — all green** |
 | Runtime E2E (5 wrappers × 3 surfaces × 22 modes + cross-translation probes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **445/445 checks passed** (incl. `reasoning_only`, `anthropic_tools`, `responses_tools`, thinking-block assertion) |
 | Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~20,800 requests, 0 failures**, flat RSS/latency |
 | Contract Conformance | `pytest tests/test_sse_streaming_regressions.py::test_contract_all_wrappers_expose_required_surfaces` | **All 10 surfaces on all 5 wrappers** |
@@ -90,6 +92,29 @@ All items previously listed as remaining debt were **re-verified against the cod
 | B-20: Blocking `subprocess` git calls | **Hardened this cycle**: every git subprocess call in all 5 wrappers + model-registry now carries `timeout=3` (the calls run once at import, but were unbounded). **New guard:** `test_b20_git_subprocess_calls_are_timeout_bounded`. |
 
 ---
+
+## Fourth Pass — COMPATIBILITY_LAYER: Operator-Declared Upstream Dialect (2026-08-01)
+
+New feature per user request: a `COMPATIBILITY_LAYER` env var in every
+wrapper's `.env` — the operator declares what protocol the UPSTREAM speaks so
+the wrapper never guesses:
+
+| Value | Meaning | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat | Anthropic↔OpenAI |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once/base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`=300) | same | same |
+
+Implemented:
+- `common/compat.py` — resolver, fail-fast validation, auto-discovery probe + cache, three shared layer-2 stream adapters (Anthropic SSE→OpenAI chat SSE, passthrough w/o `[DONE]`, OpenAI chat SSE→Responses SSE)
+- `common/translations/shared.py::openai_chat_to_anthropic_request` — system, base64 images, tool_calls→tool_use, tool results, tools→input_schema, tool_choice, stop→stop_sequences
+- Layer-2 wiring in all 3 surfaces × all 5 wrappers (default layer=1 untouched)
+- `.env.example` × 5, `validate_config()` fail-fast × 5, README + WRAPPER_CONTRACT §9.2
+- New gates: `tests/test_compat_layer.py` (21 tests) + `tests/e2e_runtime/compat_layer_e2e.py` (5 wrappers × layer=2 × all surfaces + layer=3 auto-discovery vs both mocks)
+
+**Verification:** 229 unit tests (was 209), 445/445 E2E (layer-1 unchanged),
+SDK-compat gate green, COMPATIBILITY_LAYER E2E green for all 5 wrappers,
+soak ~20.3k requests 0 failures.
 
 ## Third Deep Pass — CODEX-RESP-02: Responses Must Parse With the Official SDK (2026-08-01)
 
