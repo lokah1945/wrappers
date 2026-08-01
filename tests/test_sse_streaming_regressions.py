@@ -1,0 +1,756 @@
+#!/usr/bin/env python3
+"""SSE streaming regression suite — the 10 scenarios from the 2026-08-01 audit.
+
+B-40 fix: before this file, NO test fed an SSE byte stream through any
+wrapper's translator. Every CRITICAL streaming bug found in the audit
+(B-01/B-02/B-03/B-05/B-06/B-07/B-10) passed CI unnoticed.
+
+These tests exercise the real parsing layer, not hand-built event dicts:
+they feed raw upstream bytes in and assert on the emitted SSE frames.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from common.auth import (  # noqa: E402
+    AuthResult, check_auth, is_public_path, tokens_match,
+)
+from common.sse import (  # noqa: E402
+    IDLE, iter_chunks_with_idle, normalize_sse_newlines,
+)
+from common.translations.anthropic_stream import AnthropicStreamState  # noqa: E402
+
+
+# ── helpers ────────────────────────────────────────────────────────────────
+
+def chunk(delta: dict | None = None, finish: str | None = None,
+          usage: dict | None = None, space: bool = True) -> str:
+    """Build one OpenAI chat SSE line."""
+    payload: dict = {"object": "chat.completion.chunk", "choices": [
+        {"index": 0, "delta": delta or {}, "finish_reason": finish}
+    ]}
+    if usage:
+        payload["usage"] = usage
+    return ("data: " if space else "data:") + json.dumps(payload) + "\n"
+
+
+async def agen(lines):
+    for line in lines:
+        yield line.encode() if isinstance(line, str) else line
+
+
+def load_openrouter_translator(name: str):
+    """Exec one translator out of openrouter/src/main.py with stubbed deps.
+
+    Importing the whole module needs mcp/dotenv/etc.; the translators are pure
+    functions over an async byte iterator, so we isolate them.
+    """
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    start = src.index(f"async def {name}")
+    end = src.index("\n# ══", start)
+    ns = {
+        'json': json, 'time': __import__('time'), 'asyncio': asyncio,
+        'HEARTBEAT_MS': 100000,
+        'logger': types.SimpleNamespace(error=lambda *a, **k: None,
+                                        warning=lambda *a, **k: None,
+                                        info=lambda *a, **k: None),
+        '_iter_chunks_with_idle': iter_chunks_with_idle,
+        '_IDLE': IDLE,
+        '_normalize_sse_newlines': normalize_sse_newlines,
+    }
+    exec(compile(src[start:end], 'openrouter_translator', 'exec'), ns)
+    return ns[name]
+
+
+def parse_frames(frames: list[str]) -> list[tuple[str, dict]]:
+    """Split emitted SSE strings into (event_name, payload) pairs."""
+    out = []
+    for f in frames:
+        if not f or f.startswith(':'):
+            continue
+        ev = None
+        data = None
+        for line in f.split('\n'):
+            if line.startswith('event: '):
+                ev = line[7:].strip()
+            elif line.startswith('data: '):
+                raw = line[6:].strip()
+                if raw == '[DONE]':
+                    data = '[DONE]'
+                else:
+                    try:
+                        data = json.loads(raw)
+                    except json.JSONDecodeError:
+                        data = raw
+        if data is not None:
+            out.append((ev or (data.get('type') if isinstance(data, dict) else None), data))
+    return out
+
+
+# ── 1. B-01 — empty `data:` keep-alive must not end the stream ─────────────
+
+def test_b01_empty_data_line_is_keepalive_not_terminator():
+    """A bare `data:` is a legal empty SSE event, not end-of-stream.
+
+    blackbox+opencode listed b'' in their terminator tuple, so a keep-alive
+    ended the turn mid-generation.
+    """
+    for wrapper in ('blackbox', 'opencode'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert "b'', b'\"[DONE]\"'" not in src, (
+            f"{wrapper}: empty payload is back in the DONE terminator tuple")
+        assert 'b"[DONE]", b""' not in src, (
+            f"{wrapper}: empty payload is back in the DONE terminator tuple")
+
+
+def test_b01_state_machine_survives_blank_delta():
+    """An empty content delta mid-stream must not terminate the state machine."""
+    st = AnthropicStreamState(model='m')
+    list(st.translate_chunk(json.loads(chunk({'content': 'A'})[6:])))
+    list(st.translate_chunk({}))                      # empty/keep-alive frame
+    evs = st.translate_chunk(json.loads(chunk({'content': 'B'})[6:]))
+    assert any('text_delta' in e and 'B' in e for e in evs), \
+        'content after a blank frame was dropped'
+    assert not st.finished
+
+
+# ── 2. B-02 — `data:{...}` without a space must parse ──────────────────────
+
+@pytest.mark.parametrize('space', [True, False], ids=['data: ', 'data:'])
+def test_b02_sse_space_after_data_is_optional(space):
+    f = load_openrouter_translator('_translate_openai_stream_to_anthropic')
+
+    async def run():
+        lines = [chunk({'content': 'HELLO WORLD'}, space=space),
+                 chunk(finish='stop', space=space), 'data: [DONE]\n']
+        return [e async for e in f(agen(lines), {'model': 'm'})]
+
+    frames = parse_frames(asyncio.run(run()))
+    text = ''.join(p['delta']['text'] for _e, p in frames
+                   if isinstance(p, dict) and p.get('type') == 'content_block_delta'
+                   and p['delta'].get('type') == 'text_delta')
+    assert text == 'HELLO WORLD', f'space={space}: upstream content was discarded'
+
+
+# ── 3. B-03 — parallel tool calls ──────────────────────────────────────────
+
+def test_b03_parallel_tool_calls_distinct_blocks_and_all_arguments():
+    """Two parallel tools => 2 starts, distinct indices, all 4 arg fragments.
+
+    The old code emitted content_block_start per chunk (4 starts + phantoms),
+    collided every tool on index 0, and dropped all but the last tool's
+    arguments because the emit sat outside the for-loop.
+    """
+    f = load_openrouter_translator('_translate_openai_stream_to_anthropic')
+
+    async def run():
+        lines = [
+            chunk({'tool_calls': [
+                {'index': 0, 'id': 'call_a', 'function': {'name': 'alpha', 'arguments': '{"x'}},
+                {'index': 1, 'id': 'call_b', 'function': {'name': 'beta', 'arguments': '{"y'}},
+            ]}),
+            chunk({'tool_calls': [
+                {'index': 0, 'function': {'arguments': '":1}'}},
+                {'index': 1, 'function': {'arguments': '":2}'}},
+            ]}),
+            chunk(finish='tool_calls'),
+            'data: [DONE]\n',
+        ]
+        return [e async for e in f(agen(lines), {'model': 'm'})]
+
+    frames = parse_frames(asyncio.run(run()))
+    starts = [p for _e, p in frames if isinstance(p, dict) and p.get('type') == 'content_block_start']
+    args = [p for _e, p in frames if isinstance(p, dict)
+            and p.get('type') == 'content_block_delta'
+            and p['delta'].get('type') == 'input_json_delta']
+
+    assert len(starts) == 2, f'expected exactly 2 tool blocks, got {len(starts)}'
+    idxs = [s['index'] for s in starts]
+    assert len(set(idxs)) == 2, f'tool blocks collided on the same index: {idxs}'
+    assert all(s['content_block']['name'] for s in starts), 'phantom unnamed tool block emitted'
+    assert len(args) == 4, f'expected 4 argument fragments, got {len(args)}'
+
+    # Reassemble each tool's arguments and confirm they are valid JSON.
+    by_idx: dict[int, str] = {}
+    for a in args:
+        by_idx[a['index']] = by_idx.get(a['index'], '') + a['delta']['partial_json']
+    reassembled = [json.loads(v) for v in by_idx.values()]
+    assert {'x': 1} in reassembled and {'y': 2} in reassembled, (
+        f'tool arguments were lost or interleaved: {reassembled}')
+
+
+# ── 4. B-06 — stop_reason maps strictly from finish_reason ─────────────────
+
+@pytest.mark.parametrize('finish,expected', [
+    ('stop', 'end_turn'),
+    ('length', 'max_tokens'),
+    ('tool_calls', 'tool_use'),
+    ('content_filter', 'refusal'),
+])
+def test_b06_stop_reason_strict_mapping_even_after_a_tool_call(finish, expected):
+    """A turn that used a tool then finished with stop/length must NOT report
+    tool_use — Claude Code would wait forever for a tool_result, and genuine
+    max_tokens truncation was masked."""
+    st = AnthropicStreamState(model='m')
+    list(st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'id': 't1', 'function': {'name': 'f', 'arguments': '{}'}}]}}]}))
+    evs = st.translate_chunk({'choices': [{'delta': {}, 'finish_reason': finish}]})
+    md = [json.loads(e.split('data: ')[1]) for e in evs if 'message_delta' in e]
+    assert md and md[0]['delta']['stop_reason'] == expected
+
+
+def test_b06_force_done_still_infers_tool_use_when_block_open():
+    """force_done() has no finish_reason to respect, so inferring tool_use from
+    a still-open tool block remains correct."""
+    st = AnthropicStreamState(model='m')
+    list(st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'id': 't1', 'function': {'name': 'f', 'arguments': '{"a'}}]}}]}))
+    evs = st.force_done()
+    md = [json.loads(e.split('data: ')[1]) for e in evs if 'message_delta' in e]
+    assert md and md[0]['delta']['stop_reason'] == 'tool_use'
+
+
+# ── 5. B-05 — post-finish truncation is observable ─────────────────────────
+
+def test_b05_content_after_finish_is_counted_not_silently_dropped():
+    st = AnthropicStreamState(model='m')
+    list(st.translate_chunk({'choices': [{'delta': {'content': 'a'}, 'finish_reason': 'stop'}]}))
+    assert st.dropped_after_finish == 0
+    dropped = st.translate_chunk({'choices': [{'delta': {'content': 'LOST'}}]})
+    assert dropped == [], 'must not emit content after message_stop'
+    assert st.dropped_after_finish == 1, 'truncation must be counted for observability'
+
+
+# ── 6. B-07 — upstream errors must not become a successful end_turn ────────
+
+def test_b07_mid_stream_upstream_error_surfaces_as_error_event():
+    f = load_openrouter_translator('_translate_openai_stream_to_anthropic')
+
+    async def run():
+        lines = [
+            chunk({'content': 'partial'}),
+            'data: ' + json.dumps({'error': {'message': 'upstream exploded',
+                                             'type': 'server_error'}}) + '\n',
+            'data: [DONE]\n',
+        ]
+        return [e async for e in f(agen(lines), {'model': 'm'})]
+
+    raw = asyncio.run(run())
+    assert any('event: error' in e for e in raw), \
+        'upstream error was swallowed and reported as a clean end_turn'
+
+
+def test_b07_wrappers_do_not_fabricate_end_turn_on_exception():
+    """blackbox/opencode Anthropic handlers must emit an error event before
+    force_done() in their exception path."""
+    for wrapper in ('blackbox', 'opencode'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        i = src.index("logger.error(f'[anthropic stream] {e}')")
+        window = src[i:i + 600]
+        assert 'event: error' in window, (
+            f'{wrapper}: exception path still fabricates a successful turn')
+
+
+# ── 7. B-10 — unparsable frames must never be rendered as model text ───────
+
+def test_b10_nous_does_not_synthesise_content_from_unparsable_frames():
+    """The exact bug from the user's terminal: Anthropic protocol frames were
+    re-emitted as assistant prose."""
+    src = (ROOT / 'nous' / 'src' / 'main.py').read_text()
+    assert 'parsed = {"choices": [{"delta": {"content": data.decode' not in src, \
+        'nous is synthesising assistant content from unparsable SSE frames again'
+    i = src.index('parsed = json.loads(data)')
+    window = src[i:i + 900]
+    assert 'dropping unparsable SSE frame' in window
+
+
+def test_b10_no_wrapper_wraps_raw_bytes_as_content():
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert '{"delta": {"content": data.decode' not in src
+        assert "{'delta': {'content': data.decode" not in src
+
+
+# ── 8. B-08 — heartbeat: idle vs dead upstream ─────────────────────────────
+
+def test_b08_idle_upstream_yields_sentinel_then_recovers():
+    class SlowResp:
+        class content:
+            @staticmethod
+            def iter_any():
+                async def gen():
+                    await asyncio.sleep(0.15)
+                    yield b'data: {"a":1}\n'
+                return gen()
+
+    async def run():
+        seen = []
+        async for c in iter_chunks_with_idle(SlowResp(), 0.05):
+            seen.append(c)
+        return seen
+
+    seen = asyncio.run(run())
+    assert IDLE in seen, 'no heartbeat sentinel during an idle gap'
+    assert seen[-1] == b'data: {"a":1}\n', 'real chunk was lost after idling'
+
+
+def test_b08_dead_upstream_raises_instead_of_heartbeating_forever():
+    """The core B-08 defect: asyncio.wait_for could not tell an idle upstream
+    from a failed one, so a dead stream was heartbeated indefinitely."""
+    class BrokenResp:
+        class content:
+            @staticmethod
+            def iter_any():
+                async def gen():
+                    raise ConnectionResetError('upstream died')
+                    yield b''  # pragma: no cover
+                return gen()
+
+    async def run():
+        async for _c in iter_chunks_with_idle(BrokenResp(), 0.05):
+            pass
+
+    with pytest.raises(ConnectionResetError):
+        asyncio.run(run())
+
+
+def test_b08_crlf_framing_normalised():
+    assert normalize_sse_newlines(b'data: 1\r\n\r\n') == b'data: 1\n\n'
+    assert normalize_sse_newlines(b'data: 1\n\n') == b'data: 1\n\n'
+
+
+# ── 9. B-26/B-27/B-28 — auth must fail closed ──────────────────────────────
+
+def test_b26_openrouter_management_routes_are_not_public():
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    assert "not path.startswith('/openrouter/')" not in src, \
+        'the /openrouter/* key-management API is publicly reachable again'
+    assert 'MANAGEMENT_PREFIX' in src and '_management_token' in src
+
+
+def test_b27_public_paths_are_exact_and_method_gated():
+    public_any = frozenset({'/health'})
+    public_get = frozenset({'/v1/models'})
+    assert is_public_path('/health', 'GET', public_any, public_get)
+    assert is_public_path('/v1/models', 'GET', public_any, public_get)
+    # prefix-matching must NOT leak a lookalike route
+    assert not is_public_path('/v1/models-internal', 'GET', public_any, public_get)
+    # method gating: POST to a discovery-only path is not public
+    assert not is_public_path('/v1/models', 'POST', public_any, public_get)
+
+
+def test_b28_auth_fails_closed_when_token_unset(monkeypatch):
+    monkeypatch.delenv('BEARER_TOKEN', raising=False)
+    monkeypatch.delenv('DISABLE_AUTH', raising=False)
+    monkeypatch.delenv('REQUIRE_AUTH', raising=False)
+    res = check_auth({}, surface='/v1/chat/completions')
+    assert not res.ok and res.status == 503, \
+        'unset BEARER_TOKEN must NOT silently serve an open relay'
+
+
+def test_b28_explicit_opt_out_still_serves_open(monkeypatch):
+    monkeypatch.delenv('BEARER_TOKEN', raising=False)
+    monkeypatch.delenv('DISABLE_AUTH', raising=False)
+    monkeypatch.setenv('REQUIRE_AUTH', 'false')
+    assert check_auth({}).ok
+
+
+def test_b28_valid_and_invalid_tokens(monkeypatch):
+    monkeypatch.setenv('BEARER_TOKEN', 'secret-token')
+    monkeypatch.delenv('DISABLE_AUTH', raising=False)
+    assert check_auth({'authorization': 'Bearer secret-token'}).ok
+    assert check_auth({'x-api-key': 'secret-token'}).ok
+    bad = check_auth({'authorization': 'Bearer wrong'})
+    assert not bad.ok and bad.status == 401
+    assert not check_auth({}).ok
+
+
+def test_b29_token_rotation_takes_effect_without_restart(monkeypatch):
+    monkeypatch.setenv('BEARER_TOKEN', 'old')
+    monkeypatch.delenv('DISABLE_AUTH', raising=False)
+    assert check_auth({'authorization': 'Bearer old'}).ok
+    monkeypatch.setenv('BEARER_TOKEN', 'new')
+    assert not check_auth({'authorization': 'Bearer old'}).ok, \
+        'a REVOKED token still works — the value is cached at import'
+    assert check_auth({'authorization': 'Bearer new'}).ok
+
+
+def test_b30_non_ascii_token_yields_401_not_500():
+    """hmac.compare_digest raises TypeError on non-ASCII str; it must be
+    handled as a clean auth failure rather than escaping as a 500."""
+    assert tokens_match('tökén', 'tökén') is True
+    assert tokens_match('tökén', 'other') is False
+    assert tokens_match('', 'x') is False
+    assert tokens_match('x', '') is False
+
+
+# ── 10. B-33 — response stores must stay bounded ───────────────────────────
+
+def test_b33_openrouter_response_store_is_bounded():
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    assert '_prune_response_store' in src, 'openrouter response store has no eviction'
+    assert '_RESPONSE_STORE_MAX_ENTRIES' in src
+    assert '_RESPONSE_STORE_MAX_BYTES' in src
+    assert '_RESPONSE_STORE_TTL_SEC' in src
+
+
+def test_b33_blackbox_response_store_bounded_on_all_axes():
+    src = (ROOT / 'blackbox' / 'src' / 'main.py').read_text()
+    assert '_RESPONSE_STORE_TTL_SEC' in src, 'blackbox store still has no TTL'
+    assert '_RESPONSE_STORE_MAX_BYTES' in src, 'blackbox store still has no byte cap'
+
+
+def test_b33_all_wrappers_declare_store_bounds():
+    for wrapper, path in (
+        ('nous', 'src/main.py'),
+        ('opencode', 'src/main.py'),
+        ('blackbox', 'src/main.py'),
+        ('openrouter', 'src/main.py'),
+        ('nvidia-python', 'src/responses_compat.py'),
+    ):
+        src = (ROOT / wrapper / path).read_text()
+        assert 'RESPONSE_STORE' in src
+        has_bound = any(tok in src for tok in
+                        ('MAX_ENTRIES', 'MAX_CHARS', 'MAX_BYTES', '_STORE_MAX_BYTES', '> 200'))
+        assert has_bound, f'{wrapper}: response store has no size bound'
+
+
+# ── cross-wrapper parity guards ────────────────────────────────────────────
+
+def test_parity_no_wrapper_shadows_shared_cooldown_helper():
+    """B-21: a local _should_cooldown_key silently overrode the shared import,
+    letting cooldown policy diverge per wrapper."""
+    for wrapper in ('nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert 'def _should_cooldown_key(' not in src, (
+            f'{wrapper} redefines _should_cooldown_key, shadowing '
+            f'common.translations.should_cooldown_key')
+
+
+def test_parity_all_wrappers_use_sentinel_heartbeat_not_wait_for():
+    """B-08: asyncio.wait_for on the upstream iterator cannot distinguish an
+    idle upstream from a dead one."""
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert 'asyncio.wait_for(aiter.__anext__()' not in src, \
+            f'{wrapper} still uses wait_for for heartbeats'
+        assert 'asyncio.wait_for(inner.__anext__()' not in src, \
+            f'{wrapper} still uses wait_for for heartbeats'
+    base = (ROOT / 'common' / 'base_wrapper.py').read_text()
+    assert 'asyncio.wait_for(aiter.__anext__()' not in base
+
+
+def test_parity_shared_cooldown_skips_model_capacity_errors():
+    from common.translations.shared import should_cooldown_key
+    capacity = {'error': {'message': 'No deployments available for selected model'}}
+    assert should_cooldown_key(429, capacity) is False, \
+        'a model-capacity 429 must not cool down the credential'
+    assert should_cooldown_key(429, {'error': {'message': 'rate limit exceeded'}}) is True
+    assert should_cooldown_key(401, {}) is True
+    assert should_cooldown_key(503, {}) is True
+    assert should_cooldown_key(400, {}) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RUNTIME FINDINGS (R-01..R-07) — 2026-08-01
+# Found by tests/runtime/run_runtime_e2e.py, which boots each wrapper as a REAL
+# server and drives it with agent-shaped traffic. Every one of these passed the
+# unit suite before being fixed, so they are locked down here too.
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_r01_non_object_json_body_guard_registered_everywhere():
+    """A valid-but-non-object JSON body ([1,2,3]) caused HTTP 500 in all five
+    wrappers: handlers call body.get() and list.get raises AttributeError."""
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert 'JSONBodyGuard' in src, f'{wrapper}: JSON body-shape guard not registered'
+
+
+def test_r01_body_guard_rejects_non_objects_and_passes_objects():
+    from common.body_guard import _is_anthropic_surface
+    assert _is_anthropic_surface('/v1/messages')
+    assert not _is_anthropic_surface('/v1/chat/completions')
+
+
+def test_r01_body_guard_replay_delegates_after_body():
+    """Regression: synthesising http.disconnect after the body broke EVERY
+    streaming response (StreamingResponse's disconnect-watcher cancelled the
+    stream after one event). The replay must delegate to the real receive()."""
+    import inspect
+    from common import body_guard
+    src = inspect.getsource(body_guard._replay)
+    assert 'original_receive' in src
+    assert 'await original_receive()' in src
+
+
+def test_r02_parallel_tool_blocks_stay_open_concurrently():
+    """Opening tool #2 must NOT close tool #1 — OpenAI interleaves argument
+    fragments across all active tool indices."""
+    st = AnthropicStreamState(model='m')
+    frames = []
+    frames += st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'id': 'a', 'function': {'name': 'alpha', 'arguments': '{"x'}},
+        {'index': 1, 'id': 'b', 'function': {'name': 'beta', 'arguments': '{"y'}},
+    ]}}]})
+    frames += st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'function': {'arguments': '":1}'}},
+        {'index': 1, 'function': {'arguments': '":2}'}},
+    ]}}]})
+    frames += st.translate_chunk({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})
+
+    open_blocks, errs, args = set(), [], {}
+    for f in frames:
+        d = json.loads(f.split('data: ')[1])
+        t = d.get('type')
+        if t == 'content_block_start':
+            open_blocks.add(d['index'])
+        elif t == 'content_block_delta':
+            if d['index'] not in open_blocks:
+                errs.append(f"delta on closed/unopened index {d['index']}")
+            if d['delta'].get('type') == 'input_json_delta':
+                args[d['index']] = args.get(d['index'], '') + d['delta']['partial_json']
+        elif t == 'content_block_stop':
+            open_blocks.discard(d['index'])
+    assert not errs, errs
+    assert not open_blocks, f'unclosed blocks: {open_blocks}'
+    assert len(args) == 2
+    for blob in args.values():
+        json.loads(blob)  # must be valid JSON
+
+
+def test_r02_no_wrapper_closes_previous_tool_block_on_new_tool():
+    """nvidia's stop_open() also DELETED the tool from tool_map, so the next
+    fragment re-created a phantom unnamed block."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'anthropic_compat.py').read_text()
+    assert 'stop_all_tools' in src, 'nvidia has no concurrent tool-block close'
+    i = src.index('async def stop_open')
+    body = src[i:i + 1400]
+    assert 'del tool_map[k]' not in body, 'stop_open still deletes tools from tool_map'
+
+
+def test_r03_upstream_error_frame_surfaces_not_swallowed():
+    """A mid-stream {"error": ...} frame has no "choices" and used to be
+    dropped, closing the turn with a fabricated end_turn."""
+    st = AnthropicStreamState(model='m')
+    st.translate_chunk({'choices': [{'delta': {'content': 'partial'}}]})
+    evs = st.translate_chunk({'error': {'message': 'boom', 'type': 'server_error'}})
+    types = [json.loads(e.split('data: ')[1])['type'] for e in evs]
+    assert 'error' in types, 'upstream error frame was swallowed'
+    assert types[-1] == 'message_stop'
+    assert st.upstream_error == 'boom'
+    # nothing may be emitted afterwards
+    assert st.translate_chunk({'choices': [{'delta': {'content': 'more'}}]}) == []
+
+
+def test_r03_all_wrappers_handle_upstream_error_frames():
+    for wrapper, path in (
+        ('nous', 'src/main.py'),
+        ('opencode', 'src/main.py'),
+        ('blackbox', 'src/main.py'),
+        ('openrouter', 'src/main.py'),
+        ('nvidia-python', 'src/anthropic_compat.py'),
+        ('nvidia-python', 'src/responses_compat.py'),
+    ):
+        src = (ROOT / wrapper / path).read_text()
+        assert "get('error') is not None" in src or 'get("error") is not None' in src, \
+            f'{wrapper}/{path}: does not detect mid-stream upstream error frames'
+
+
+def test_r04_no_loop_variable_shadows_a_function_parameter():
+    """`async for chunk in stop_open()` overwrote the `chunk` PARAMETER holding
+    the model's text, so an SSE frame string was rendered as assistant prose."""
+    import ast
+    offenders = []
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        for py in (ROOT / wrapper / 'src').glob('*.py'):
+            tree = ast.parse(py.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                params = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+                for node in ast.walk(fn):
+                    if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
+                        if node.target.id in params:
+                            offenders.append(f'{py.name}:{node.lineno} {fn.name}() '
+                                             f"loop var '{node.target.id}' shadows a parameter")
+    assert not offenders, 'loop variables shadowing parameters:\n  ' + '\n  '.join(offenders)
+
+
+def test_r05_openrouter_translates_non_streaming_responses():
+    """openrouter returned the RAW OpenAI ChatCompletion body on the Anthropic
+    and Responses surfaces — `return response` fired before the translation."""
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    i = src.index('async def messages(')
+    block = src[i:i + 3000]
+    assert '_openai_to_anthropic_response(payload, body)' in block, \
+        'openrouter /v1/messages does not translate non-streaming replies'
+    j = src.index('async def responses(')
+    rblock = src[j:j + 3000]
+    assert 'chat_to_responses(' in rblock, \
+        'openrouter /v1/responses does not translate non-streaming replies'
+
+
+def test_r06_no_duplicate_done_terminator():
+    """Appending [DONE] unconditionally produced the corrupt frame
+    '[DONE]data: [DONE]' when upstream already sent one without a blank line.
+
+    Every site that SYNTHESISES a terminator must be guarded. nous is exempt
+    from the `saw_done` idiom because it only echoes [DONE] on the branch that
+    just consumed one, and its `terminated` flag makes that path single-shot —
+    verified explicitly below rather than by keyword.
+    """
+    for wrapper in ('nvidia-python', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        if 'data: [DONE]' in src:
+            assert 'saw_done' in src, f'{wrapper}: [DONE] emitted without a saw_done guard'
+    base = (ROOT / 'common' / 'base_wrapper.py').read_text()
+    assert 'saw_done' in base, 'common/base_wrapper.py appends [DONE] unconditionally'
+
+    # nous: every emission site must sit inside the pass-through branch
+    # (`state is None`), and the path must be single-shot via `terminated`.
+    nsrc = (ROOT / 'nous' / 'src' / 'main.py').read_text()
+    marker = 'yield "data: [DONE]'
+    positions = []
+    at = nsrc.find(marker)
+    while at != -1:
+        positions.append(at)
+        at = nsrc.find(marker, at + 1)
+    assert positions, 'nous no longer emits a [DONE] terminator at all'
+    for idx in positions:
+        window = nsrc[max(0, idx - 240):idx]
+        assert 'if state is None:' in window, (
+            'nous emits [DONE] outside the pass-through branch (duplicate risk)')
+    assert 'terminated = True' in nsrc
+
+
+def test_r07_nvidia_responses_closes_upstream_generator():
+    """Breaking out of `async for raw in stream` left the generator suspended,
+    so its finally (which releases the response AND the pool key) never ran."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    assert "_ac = getattr(stream, 'aclose', None)" in src, \
+        'responses_compat does not deterministically close the upstream generator'
+
+
+def test_r08_empty_choices_array_does_not_crash():
+    """A frame with `"choices": []` is legal (usage-only frames, provider
+    keep-alives). `chunk["choices"][0]` raised IndexError, which escaped as
+    HTTP 500 mid-stream and killed the turn."""
+    st = AnthropicStreamState(model='m')
+    st.translate_chunk({'choices': [{'delta': {'content': 'a'}}]})
+    # must not raise
+    st.translate_chunk({'id': 'x', 'object': 'chat.completion.chunk', 'choices': []})
+    evs = st.translate_chunk({'choices': [{'delta': {'content': 'b'}}]})
+    assert any('text_delta' in e and '"b"' in e for e in evs)
+
+
+def test_r08_no_unguarded_choices_indexing():
+    """No wrapper may index choices[0] without first proving it is non-empty.
+
+    A frame carrying `"choices": []` is legal, and the resulting IndexError
+    escaped as an HTTP 500 in the middle of a stream.
+    """
+    import re
+    offenders = []
+    pattern = re.compile(r"""\[["']choices["']\]\[0\]""")
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        for py in sorted((ROOT / wrapper / 'src').glob('*.py')):
+            lines = py.read_text().splitlines()
+            for n, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue                       # comment describing the bug
+                if not pattern.search(line):
+                    continue
+                if 'or [{}]' in line or 'or []' in line:
+                    continue                       # inline default guard
+                ctx = ' '.join(lines[max(0, n - 3):n - 1])
+                if 'len(' in ctx and '> 0' in ctx:
+                    continue                       # explicit length check above
+                offenders.append(f'{wrapper}/{py.name}:{n}: {stripped[:90]}')
+    assert not offenders, ('unguarded choices[0] indexing:\n  '
+                           + '\n  '.join(offenders))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WRAPPER_CONTRACT v3.0 conformance
+# ══════════════════════════════════════════════════════════════════════════
+
+# WRAPPER_CONTRACT.md §2.1 — surfaces every wrapper MUST expose.
+CONTRACT_REQUIRED_SURFACES = (
+    '/v1/chat/completions',
+    '/v1/responses',
+    '/v1/messages',
+    '/v1/messages/count_tokens',
+    '/v1/embeddings',
+    '/v1/models',
+    '/api/tags',
+    '/v1/capabilities',
+    '/health',
+    '/ready',
+    '/metrics',
+    '/metrics/prom',
+    '/dashboard',
+    '/version',
+)
+
+
+def test_contract_all_wrappers_expose_required_surfaces():
+    """§2.1: the mandated surface set must exist on all five wrappers.
+
+    Found by this check on 2026-08-01: openrouter was missing
+    /v1/capabilities — a real parity gap surfaced by verifying the contract
+    against the code rather than trusting the contract's own claims.
+    """
+    missing = []
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        for ep in CONTRACT_REQUIRED_SURFACES:
+            if f'"{ep}"' not in src and f"'{ep}'" not in src:
+                missing.append(f'{wrapper}: {ep}')
+    assert not missing, ('wrappers missing contract-required surfaces:\n  '
+                         + '\n  '.join(missing))
+
+
+def test_contract_ports_match_wrappers_json():
+    """§9.1: wrappers.json is the machine-readable source of truth for ports."""
+    cfg = json.loads((ROOT / 'wrappers.json').read_text())['wrappers']
+    expected = {'nvidia-python': 9101, 'nous': 9102, 'opencode': 9103,
+                'blackbox': 9104, 'openrouter': 9106, 'model-registry': 9200}
+    for name, port in expected.items():
+        assert cfg[name]['port'] == port, f'{name}: wrappers.json port drifted'
+    # The contract states 9105 is intentionally unused.
+    assert 9105 not in {w['port'] for w in cfg.values()}
+
+
+def test_contract_entry_points_match_systemd():
+    """§1.1: the documented run command must match the shipped systemd units."""
+    cfg = json.loads((ROOT / 'wrappers.json').read_text())['wrappers']
+    for name in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        assert cfg[name]['entry_point'] == 'src.main:app', \
+            f'{name}: entry_point drifted from src.main:app'
+        unit = ROOT / name / 'systemd' / f'wrapper-{name}.service'
+        if unit.exists():
+            text = unit.read_text()
+            assert 'src.main:app' in text, f'{name}: systemd unit does not use src.main:app'
+            assert f"--port {cfg[name]['port']}" in text, \
+                f'{name}: systemd port disagrees with wrappers.json'
+
+
+def test_contract_shared_modules_exist():
+    """§7: the parity mechanism depends on these shared modules existing."""
+    for rel in ('common/auth.py', 'common/sse.py', 'common/body_guard.py',
+                'common/middleware.py', 'common/model_state.py',
+                'common/base_wrapper.py',
+                'common/translations/anthropic_stream.py',
+                'common/translations/shared.py'):
+        assert (ROOT / rel).exists(), f'shared module missing: {rel}'

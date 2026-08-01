@@ -263,13 +263,43 @@ def is_retriable_status(status: int) -> bool:
     return status == 429 or status >= 500 or status in (408, 409)
 
 
+_MODEL_CAPACITY_MARKERS = (
+    'no deployments available', 'selected model', 'cooldown_list',
+    'invalid model name', 'model unavailable',
+)
+
+
+def looks_model_capacity_error(body: Any) -> bool:
+    """True when the upstream error is about the MODEL, not the credential.
+
+    B-21: promoted from four divergent per-wrapper copies. Cooling down a key
+    for a model-capacity error wrongly removes a healthy credential from
+    rotation for every other model it could still serve.
+    """
+    try:
+        blob = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, dict) else str(body).lower()
+    except (TypeError, ValueError):
+        blob = str(body).lower()
+    return any(marker in blob for marker in _MODEL_CAPACITY_MARKERS)
+
+
 def should_cooldown_key(status: int, body: Any) -> bool:
     """Heuristic: should this response trigger a per-key cooldown?
 
     True for 429 (rate limit) and 401/403 (auth/quota) — these are
     per-credential failures that won't be fixed by retrying the same key.
+
+    B-21 fix: the model-capacity carve-out (previously duplicated as a local
+    `_should_cooldown_key` in nous and blackbox, which SHADOWED this shared
+    import) is now part of the canonical implementation, so all five wrappers
+    share one cooldown policy instead of silently diverging.
     """
+    # A 429/404 caused by model capacity must NOT cool the credential.
+    if status in (429, 404) and looks_model_capacity_error(body):
+        return False
     if status in (429, 401, 402, 403):
+        return True
+    if status in (408, 409) or status >= 500:
         return True
     # Some upstreams return 200 with an error envelope (rare but happens)
     if isinstance(body, dict):

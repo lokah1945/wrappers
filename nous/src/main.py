@@ -54,7 +54,7 @@ try:
     # path, since the systemd service sets PYTHONPATH=.../nous only.
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from common.middleware import sanitize_header_value as _sanitize_header_value
-except ImportError:
+except ImportError:  # noqa: E722 - fallback defined below
     # Fallback sanitizer: upstream common.middleware is missing from the
     # repo, so provide the BUG-SEC2 header-injection guard inline.
     def _sanitize_header_value(value):
@@ -144,23 +144,32 @@ class KeyEntry:
         return self.current_rpm() + self.in_flight
 
     def is_blocked(self) -> bool:
-        if time.time() < self.hard_blocked_until:
-            return True
-        if self.hard_blocked_until:
+        """B-37 fix: side-effect-free predicate (see blackbox key_pool)."""
+        return time.time() < self.hard_blocked_until
+
+    def expire_block(self) -> None:
+        """Clear an elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
             self.hard_blocked_until = 0.0
             self.block_reason = ""
-        return False
 
     def record(self):
+        """B-36 fix: telemetry only; in-flight accounting is now explicit."""
         now = time.time()
         self.timestamps.append(now)
         self.total_requests += 1
         self.last_used = now
+
+    def increment_in_flight(self):
         self.in_flight += 1
 
-    def release(self):
+    def decrement_in_flight(self):
         if self.in_flight > 0:
             self.in_flight -= 1
+
+    def release(self):
+        # Backwards-compatible alias.
+        self.decrement_in_flight()
 
     def block(self, seconds: int, reason: str):
         seconds = max(1, min(int(seconds or 1), int(os.environ.get("KEY_COOLDOWN_MAX_SEC", "300"))))
@@ -244,6 +253,9 @@ class KeyPool:
         skipped for that model but stay usable for other models.
         """
         with self._lock:
+            # B-37: expire elapsed blocks explicitly, under the lock.
+            for k in self.keys:
+                k.expire_block()
             candidates = [
                 k for k in self.keys
                 if not k.is_blocked() and k.current_rpm() < self.hard_limit
@@ -256,14 +268,16 @@ class KeyPool:
             best = [k for k in candidates if k.effective_load == min_load]
             entry = best[self._rr % len(best)]
             self._rr += 1
+            # B-36: telemetry and in-flight accounting are now explicit.
             entry.record()
+            entry.increment_in_flight()
             return entry
 
     def release(self, entry: Optional[KeyEntry]):
         if entry is None:
             return
         with self._lock:
-            entry.release()
+            entry.decrement_in_flight()
 
     def mark_failure(self, entry: Optional[KeyEntry], status_code: int, retry_after: int = None, model_id: str = None, model_scoped: bool = False):
         if entry is None:
@@ -345,6 +359,13 @@ try:
     _HAS_SIZE_LIMITER = True
 except ImportError:
     _HAS_SIZE_LIMITER = False
+
+# B-28/B-29/B-30 fix: shared, fail-closed auth (see common/auth.py).
+try:
+    from common.auth import check_auth as _shared_check_auth
+    _HAS_SHARED_AUTH = True
+except ImportError:  # pragma: no cover
+    _HAS_SHARED_AUTH = False
 
 # --------------------------------------------------------------------------
 # CONFIG
@@ -754,12 +775,12 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` that used to live here SHADOWED
+# the `should_cooldown_key` imported from common.translations, so cooldown
+# policy silently diverged per wrapper — exactly the drift
+# CROSS_WRAPPER_BUG_POLICY.md exists to prevent. The model-capacity carve-out
+# has been promoted into the shared implementation; this module now uses it
+# directly (imported above as _should_cooldown_key).
 
 
 async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None, client_surface: str = "openai_chat") -> tuple:
@@ -1256,6 +1277,29 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
 # --------------------------------------------------------------------------
 # STREAMING WITH HEARTBEAT + PROPER STATE MACHINES (FIXED for Hermes/Codex)
 # --------------------------------------------------------------------------
+def _responses_sse_serialize(x):
+    """B-11 fix: SSE serializer for the Responses surface.
+
+    Guarantees a well-formed frame for any event shape. The previous
+    `lambda x: x if isinstance(x, str) else str(x)` emitted a Python repr for
+    dict events — single-quoted, non-JSON — which Codex cannot parse and may
+    surface as raw text.
+    """
+    if isinstance(x, str):
+        return x
+    if isinstance(x, dict):
+        # Support both {"type":..., "data":{...}} and a bare event payload.
+        etype = x.get('type')
+        data = x.get('data') if isinstance(x.get('data'), dict) else x
+        if etype and 'type' not in data:
+            data = {**data, 'type': etype}
+        if etype:
+            return f"event: {etype}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+        return f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    logger.warning(f"[responses] unexpected SSE event type {type(x).__name__}; dropping")
+    return ""
+
+
 async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                                 serialize_fn,
                                 state=None,
@@ -1301,7 +1345,17 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
         try:
             parsed = json.loads(data)
         except Exception:
-            parsed = {"choices": [{"delta": {"content": data.decode(errors='replace')}}]}
+            # B-10 fix (CRITICAL): NEVER synthesise assistant content from a
+            # frame we failed to parse. The old fallback wrapped the raw line
+            # as {"delta": {"content": <raw bytes>}}, so when the upstream (or
+            # any relay) spoke Anthropic SSE on this surface the wrapper
+            # re-emitted `event: content_block_stop` / `data: {...}` as
+            # text_delta — i.e. protocol frames were printed to the user as
+            # model prose in Claude Code. Log and drop, matching the
+            # opencode/blackbox/openrouter behaviour.
+            _preview = data[:200].decode('utf-8', errors='replace')
+            logger.warning(f"[stream] dropping unparsable SSE frame ({len(data)}B): {_preview!r}")
+            return
 
         if state and hasattr(state, "translate_chunk"):
             for ev in state.translate_chunk(parsed):
@@ -1310,7 +1364,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 else:
                     yield serialize_fn(ev) if callable(serialize_fn) else ev
         else:
-            yield f"data: {data.decode(errors='replace')}\n\n"
+            # B-10 fix (second leak path): re-serialise the PARSED object rather
+            # than echoing raw upstream bytes, so a non-OpenAI frame can never
+            # be forwarded verbatim onto an OpenAI-SSE surface.
+            yield f"data: {json.dumps(parsed, ensure_ascii=False)}\n\n"
 
     # BUG-FIX: heartbeats fire even when upstream is idle. N-05 fix: instead of
     # asyncio.wait_for (whose TimeoutError is indistinguishable from a genuine
@@ -1419,6 +1476,9 @@ class AnthropicStreamState:
         self.message_started = False
         self.current_block = None
         self.tool_map = {}
+        # R-02: Anthropic indices of tool_use blocks still open. Parallel tool
+        # calls must remain open CONCURRENTLY (see common/translations).
+        self.open_tool_blocks = set()
         self.finished = False
         self.msg_id = f"msg-{int(time.time()*1000)}"
 
@@ -1441,6 +1501,30 @@ class AnthropicStreamState:
             }}})
             self.message_started = True
 
+        # R-03: surface a mid-stream upstream error frame instead of silently
+        # dropping it and closing with a fabricated end_turn.
+        if isinstance(chunk, dict) and chunk.get("error") is not None and "choices" not in chunk:
+            err = chunk["error"]
+            msg = err.get("message") if isinstance(err, dict) else str(err)
+            etype = (err.get("type") if isinstance(err, dict) else None) or "api_error"
+            logger.error(f"[nous] upstream error frame mid-stream: {msg}")
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            self.open_tool_blocks.clear()
+            if self.current_block is not None and self.current_block != "tool_use":
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            self.current_block = None
+            events.append({"type": "error", "data": {
+                "type": "error",
+                "error": {"type": etype, "message": str(msg)[:2000]}}})
+            events.append({"type": "message_delta", "data": {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": self._usage()}})
+            events.append({"type": "message_stop", "data": {"type": "message_stop"}})
+            self.finished = True
+            return events
+
         if "choices" not in chunk:
             return events
         ch = (chunk.get("choices") or [{}])[0]
@@ -1450,7 +1534,11 @@ class AnthropicStreamState:
         reason = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reason, str) and reason:
             if self.current_block != "thinking":
-                if self.current_block:
+                # R-02: close every open tool block before opening thinking.
+                for _ti in sorted(self.open_tool_blocks):
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+                self.open_tool_blocks.clear()
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
@@ -1471,7 +1559,11 @@ class AnthropicStreamState:
 
         if content:
             if self.current_block != "text":
-                if self.current_block:
+                # R-02: close every open tool block before opening text.
+                for _ti in sorted(self.open_tool_blocks):
+                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+                self.open_tool_blocks.clear()
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
@@ -1488,10 +1580,16 @@ class AnthropicStreamState:
             idx = tc.get("index", 0)
             fn = tc.get("function", {}) or {}
             if idx not in self.tool_map:
-                if self.current_block:
+                # R-02: close only a text/thinking block here. Closing the
+                # previous TOOL block orphaned its later argument fragments
+                # (content_block_delta on a closed index -> Claude Code drops
+                # the tool call and the agent turn stalls).
+                if self.current_block and self.current_block != "tool_use":
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                    self.current_block = None
                 self.index += 1
                 self.tool_map[idx] = self.index
+                self.open_tool_blocks.add(self.index)
                 tid = tc.get("id") or f"toolu_{self.index}"
                 events.append({"type": "content_block_start", "data": {
                     "type": "content_block_start", "index": self.index,
@@ -1507,12 +1605,22 @@ class AnthropicStreamState:
 
         if ch.get("finish_reason") and not self.finished:
             self.finished = True
-            if self.current_block is not None:
+            # R-02: close all open tool blocks, then any text/thinking block.
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            self.open_tool_blocks.clear()
+            if self.current_block is not None and self.current_block != "tool_use":
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             fr = ch.get("finish_reason")
-            stop = "tool_use" if (fr == "tool_calls" or self.tool_map) else (
-                {"stop": "end_turn", "length": "max_tokens", "content_filter": "refusal"}.get(fr, "end_turn")
-            )
+            # B-06 fix: map STRICTLY from finish_reason. Forcing tool_use
+            # whenever any tool had been seen made Claude Code wait for a
+            # tool_result that would never be requested, and masked genuine
+            # max_tokens truncation as tool_use.
+            stop = {
+                "stop": "end_turn", "length": "max_tokens",
+                "tool_calls": "tool_use", "function_call": "tool_use",
+                "content_filter": "refusal",
+            }.get(fr, "end_turn")
             events.append({"type": "message_delta", "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -1534,10 +1642,18 @@ class AnthropicStreamState:
                 "content": [], "stop_reason": None, "stop_sequence": None,
                 "usage": self._usage(),
             }}})
-        if self.current_block is not None:
+        # B-06: capture before clearing.
+        was_in_tool_block = (self.current_block == "tool_use") or bool(self.open_tool_blocks)
+        # R-02: close every open tool block first.
+        for _ti in sorted(self.open_tool_blocks):
+            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+        self.open_tool_blocks.clear()
+        if self.current_block is not None and self.current_block != "tool_use":
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            self.current_block = None
-        stop = "tool_use" if self.tool_map else "end_turn"
+        self.current_block = None
+        # B-06: this is the no-finish_reason path, so inferring from tool state
+        # is legitimate — but narrow it to a tool block that was still open.
+        stop = "tool_use" if (self.tool_map and was_in_tool_block) else "end_turn"
         events.append({"type": "message_delta", "data": {
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -1566,6 +1682,7 @@ class ResponsesStreamState:
         self._completed = False
         self._finished = False
         self.accum_usage = {}
+        self.upstream_error = None  # R-03
 
     def next_seq(self):
         self.seq += 1
@@ -1643,6 +1760,17 @@ class ResponsesStreamState:
         self._completed = True
         norm = self._normalize_usage(usage)
         rid = self.rid
+        # R-03: the upstream reported a mid-stream failure. Emit
+        # response.failed instead of a fabricated response.completed, so the
+        # client can detect the error and retry rather than persisting a
+        # truncated answer as a successful turn.
+        if getattr(self, "upstream_error", None):
+            return [self.emit("response.failed", {"response": {
+                "id": rid, "object": "response", "model": self.model,
+                "status": "failed",
+                "error": {"code": "upstream_error",
+                          "message": str(self.upstream_error)[:2000]},
+            }})]
         text = getattr(self, "final_text", "")
         events = [
             self.emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": text}),
@@ -1702,11 +1830,24 @@ class ResponsesStreamState:
         if isinstance(chunk, dict) and chunk.get("usage"):
             self.accum_usage.update(chunk["usage"])
 
-        if "choices" not in chunk:
+        # R-03: an upstream {"error": ...} frame has no "choices" and was
+        # silently dropped, so the turn ended with a fabricated
+        # response.completed. Record it so done() emits response.failed.
+        if isinstance(chunk, dict) and chunk.get("error") is not None and "choices" not in chunk:
+            _e = chunk["error"]
+            self.upstream_error = (_e.get("message") if isinstance(_e, dict) else str(_e)) or "upstream error"
+            logger.error(f"[nous responses] upstream error frame: {self.upstream_error}")
             return events
 
-        ch = chunk["choices"][0]
-        delta = ch.get("delta", {})
+        # R-08: a frame may legally carry an EMPTY choices array (usage-only
+        # frames, some provider keep-alives). `chunk["choices"][0]` raised
+        # IndexError -> HTTP 500 mid-stream, killing the turn.
+        _choices = chunk.get("choices") or []
+        if not _choices:
+            return events
+
+        ch = _choices[0] or {}
+        delta = ch.get("delta", {}) or {}
 
         # Text
         if delta.get("content"):
@@ -1759,18 +1900,63 @@ class ResponsesStreamState:
 # METRICS
 # --------------------------------------------------------------------------
 class Metrics:
+    """B-39 fix: nous was the only wrapper whose metrics had NO persistence —
+    every counter reset to zero on each restart, so the dashboard's
+    total_requests/error_rate were meaningless after a deploy. Now persists to
+    a JSON snapshot periodically and reloads it at startup (blackbox /
+    opencode / openrouter parity)."""
+
     def __init__(self):
         self.requests = 0
         self.tokens_in = 0
         self.tokens_out = 0
         self.errors = 0
         self.start = time.time()
+        self._lock = threading.Lock()
+        self._persist_interval = float(os.environ.get('METRICS_PERSIST_SEC', '60'))
+        self._last_persist = time.time()
+        self._load_persisted()
+
+    def _persist_path(self) -> str:
+        return str(Path(__file__).resolve().parents[1] / 'metrics-snapshot.json')
+
+    def _load_persisted(self):
+        try:
+            path = self._persist_path()
+            if os.path.exists(path):
+                with open(path) as f:
+                    data = json.load(f)
+                self.requests = int(data.get('requests', 0))
+                self.tokens_in = int(data.get('tokens_in', 0))
+                self.tokens_out = int(data.get('tokens_out', 0))
+                self.errors = int(data.get('errors', 0))
+        except Exception:
+            pass
+
+    def _persist(self):
+        try:
+            with open(self._persist_path(), 'w') as f:
+                json.dump({
+                    'requests': self.requests,
+                    'tokens_in': self.tokens_in,
+                    'tokens_out': self.tokens_out,
+                    'errors': self.errors,
+                    'saved_at': time.time(),
+                }, f)
+        except Exception:
+            pass
 
     def record(self, prompt=0, completion=0, error=False):
-        self.requests += 1
-        self.tokens_in += prompt
-        self.tokens_out += completion
-        if error: self.errors += 1
+        with self._lock:
+            self.requests += 1
+            self.tokens_in += prompt
+            self.tokens_out += completion
+            if error:
+                self.errors += 1
+            now = time.time()
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
 
     def snapshot(self):
         uptime = time.time() - self.start
@@ -1974,7 +2160,7 @@ async def lifespan(app: FastAPI):
     _HEAL_TASK = None
     await MODEL_REGISTRY_CLIENT.stop()
     # Cleanup: close aiohttp session
-    global _SESSION
+    # B-22: `global _SESSION` removed — never assigned in this scope.
     if _SESSION is not None and not _SESSION.closed:
         try:
             await _SESSION.close()
@@ -2021,17 +2207,48 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
 async def _auth_check(request: Request):
+    """B-28/B-29/B-30 fix: fail-closed, rotation-aware, byte-safe auth.
+
+    Three defects fixed here:
+      B-28 — `if not BEARER_TOKEN: return` allowed ALL requests when the token
+             was unset (open relay on a truncated/failed .env reload).
+      B-29 — comparing against the module-level BEARER_TOKEN captured at import
+             meant rotation (and revocation) required a full restart.
+      B-30 — hmac.compare_digest on two `str` raises TypeError on non-ASCII
+             input, surfacing as an unhandled 500 instead of a clean 401.
+    """
     if request.method == 'OPTIONS':
         return  # CORS preflight passes without auth
-    if not BEARER_TOKEN: return
-    if os.environ.get('DISABLE_AUTH'): return
+    if _HAS_SHARED_AUTH:
+        res = _shared_check_auth(request.headers, surface=request.url.path)
+        if not res.ok:
+            raise HTTPException(res.status, detail={"error": {
+                "type": "authentication_error", "message": res.message}})
+        return
+    if os.environ.get('DISABLE_AUTH'):
+        return
+    # B-29: re-read from the environment so .env rotation takes effect.
+    token_cfg = (os.environ.get('BEARER_TOKEN') or '').strip()
+    if not token_cfg:
+        raise HTTPException(503, detail={"error": {
+            "type": "authentication_error", "message": "Server auth not configured"}})
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     token = auth.replace("Bearer ", "", 1).strip()
-    if not hmac.compare_digest(token, BEARER_TOKEN):
+    if not token or not hmac.compare_digest(
+            token.encode('utf-8'), token_cfg.encode('utf-8')):
         raise HTTPException(401, detail={"error": {"type": "authentication_error", "message": "Unauthorized"}})
 
 @app.get("/health")
@@ -2341,10 +2558,11 @@ async def count_tokens(req: Request):
 # --- OPENAI CHAT ---
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     await _auth_check(request)
     try:
         body = await request.json()
@@ -2470,7 +2688,11 @@ async def responses(request: Request):
             for ev in state.start():
                 yield ev
             try:
-                async for line in stream_with_heartbeat(result, lambda x: x if isinstance(x, str) else str(x), state=state, key_entry=key_entry):
+                # B-11 fix: the old serializer was `str(x)` for non-str events,
+                # which writes a Python repr ({'type': ...} with single quotes)
+                # into the SSE body — invalid JSON that Codex either ignores or
+                # renders as text. Emit a proper event:/data: frame instead.
+                async for line in stream_with_heartbeat(result, _responses_sse_serialize, state=state, key_entry=key_entry):
                     yield line
             finally:
                 # BUG-FIX: store conversation without blocking stream
@@ -2634,8 +2856,16 @@ async def embeddings(request: Request):
     a 404 catch-all. Operators who need embeddings should use nvidia-python
     or openrouter wrappers which DO support embeddings.
     """
+    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
+    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
+    # anyone who can hit the port. Gate it like every other POST surface.
+    await _auth_check(request)
+    if not check_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

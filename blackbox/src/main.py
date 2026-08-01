@@ -44,6 +44,13 @@ try:
 except ImportError:
     _HAS_SIZE_LIMITER = False
 
+# B-28/B-29/B-30 fix: shared, fail-closed auth (see common/auth.py).
+try:
+    from common.auth import check_auth as _shared_check_auth
+    _HAS_SHARED_AUTH = True
+except ImportError:  # pragma: no cover - common/ always present in-repo
+    _HAS_SHARED_AUTH = False
+
     def sanitize_header_value(value):
         # Fallback sanitizer: upstream common.middleware is missing from the
         # repo, so provide the BUG-SEC2 header-injection guard inline.
@@ -510,12 +517,12 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` that used to live here SHADOWED
+# the `should_cooldown_key` imported from common.translations, so cooldown
+# policy silently diverged per wrapper — exactly the drift
+# CROSS_WRAPPER_BUG_POLICY.md exists to prevent. The model-capacity carve-out
+# has been promoted into the shared implementation; this module now uses it
+# directly (imported above as _should_cooldown_key).
 
 
 _BACKGROUND_TASKS: set = set()
@@ -763,7 +770,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     return {'id': data.get('id') or f"msg_{int(time.time()*1000)}", 'type': 'message', 'role': 'assistant', 'model': model, 'content': content, 'stop_reason': stop, 'stop_sequence': None, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0}}
 
 
-_RESPONSE_STORE: dict[str, list] = {}
+_RESPONSE_STORE: dict[str, tuple] = {}  # key -> (ts, size, messages)
 
 def _extract_principal(request) -> str:
     """Extract a stable tenant identifier from the request for store namespacing.
@@ -803,9 +810,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
     # tenant's. Without this, any previous_response_id value would match
     # across tenants — a cross-tenant data leak.
     if prev and principal:
-        key = _response_store_key(principal, prev)
-        if key in _RESPONSE_STORE:
-            msgs.extend(_RESPONSE_STORE[key])
+        # B-33: TTL-aware read from the bounded store.
+        msgs.extend(_get_stored_conversation(principal, prev))
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({'role': 'user', 'content': raw})
@@ -1024,7 +1030,8 @@ async def model_catalog_refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _session, _MODEL_REFRESH_TASK
+    # B-22: `global _session` removed — never assigned in this scope.
+    global _MODEL_REFRESH_TASK
     pool.load_from_env()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed and not is_alias_name(seed):
@@ -1099,25 +1106,45 @@ async def _http_exception_handler(request: Request, exc: HTTPException):
 
 app.add_middleware(CORSMiddleware, allow_origin_regex=r'https?://(127\.0\.0\.1|localhost|\[::1\])(:[0-9]+)?$', allow_methods=['*'], allow_headers=['*'], expose_headers=['*'], allow_credentials=True)
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
 
 def _auth_check(request: Request):
+    """B-28/B-29/B-30 fix: delegate to the shared, fail-closed implementation.
+
+    Previously this returned early (allowing ALL requests) when BEARER_TOKEN
+    was unset, and compared `str` operands with hmac.compare_digest — which
+    raises TypeError → 500 on non-ASCII tokens instead of a clean 401.
+    """
     if request.method == 'OPTIONS':
+        return  # CORS preflight passes without auth
+    if _HAS_SHARED_AUTH:
+        res = _shared_check_auth(request.headers, surface=request.url.path)
+        if not res.ok:
+            raise HTTPException(res.status, {'error': {
+                'type': 'authentication_error', 'message': res.message}})
         return
+    # Fallback (common/ unavailable): still fail closed.
     if os.environ.get('DISABLE_AUTH'):
-        return  # pre-auth mode: allow all (LAN/open)
-    token = _bearer_token()  # re-read so .env rotation takes effect
-    if not token:
-        # BB-3/DR-10: never fail silently open — log loudly (opencode parity).
-        if request.headers.get('authorization') or request.headers.get('x-api-key'):
-            logger.warning('[auth] BEARER_TOKEN unset but client sent credentials — accepting open (insecure)')
         return
+    token = _bearer_token()
+    if not token:
+        raise HTTPException(503, {'error': {
+            'type': 'authentication_error', 'message': 'Server auth not configured'}})
     auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
     client_token = auth.replace('Bearer ', '', 1).strip()
-    # SEC-5: constant-time comparison to avoid timing side-channels.
-    if not client_token or not hmac.compare_digest(client_token, token):
+    if not client_token or not hmac.compare_digest(
+            client_token.encode('utf-8'), token.encode('utf-8')):
         raise HTTPException(401, {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}})
 
 
@@ -1305,10 +1332,11 @@ def _clean_tools(body: dict):
 
 @app.post('/v1/chat/completions')
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     _auth_check(request)
     if not check_rate_limit(_client_ip(request)):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
@@ -1419,6 +1447,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     rsn_index = None
     rsn_id = f"rsn_{int(time.time()*1000)}"
     acc_reason = ""
+    upstream_err: list[str] = []  # R-03: mid-stream upstream error frames
 
     def emit(etype, payload):
         return _emit_response_event(seq, etype, payload)
@@ -1442,11 +1471,25 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
 
     async def process_payload(payload: bytes):
         nonlocal acc_text, acc_usage, acc_reason, rsn_started, rsn_index, next_output_index
-        if payload in (b'[DONE]', b'', b'"[DONE]"'):
+        # B-01 fix: an empty `data:` payload is a valid SSE keep-alive /
+        # empty event, NOT end-of-stream (nous N-09 parity). Treating it as a
+        # terminator ended turns mid-generation.
+        if payload == b'':
+            return
+        if payload in (b'[DONE]', b'"[DONE]"'):
             return
         try:
             c = json.loads(payload)
         except (json.JSONDecodeError, ValueError):
+            return
+        # R-03: an upstream {"error": ...} frame must NOT be dropped; record it
+        # so the stream terminates with response.failed instead of a fabricated
+        # response.completed carrying partial text.
+        if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+            _e = c['error']
+            nonlocal_err = _e.get('message') if isinstance(_e, dict) else str(_e)
+            logger.error(f'[responses] upstream error frame: {nonlocal_err}')
+            upstream_err.append(str(nonlocal_err or 'upstream error'))
             return
         if c.get('usage'):
             u = c['usage']
@@ -1497,6 +1540,8 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
                     last_hb = now
                 continue
             buffer += chunk
+            if b'\r' in buffer:  # CRLF parity (nous N-08)
+                buffer = buffer.replace(b'\r\n', b'\n')
             while b'\n' in buffer:
                 line, buffer = buffer.split(b'\n', 1)
                 line = line.strip()
@@ -1525,6 +1570,15 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
 
     if failed:
         return
+    # R-03: the upstream reported a mid-stream failure. Terminate with
+    # response.failed instead of fabricating a successful completion that the
+    # client would persist as the assistant's answer.
+    if upstream_err:
+        yield emit('response.failed', {'response': {
+            'id': rid, 'object': 'response', 'model': model, 'status': 'failed',
+            'error': {'code': 'upstream_error', 'message': upstream_err[0][:2000]}}})
+        yield 'data: [DONE]\n\n'
+        return
     msg_item = {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
     if rsn_started:
         yield emit('response.reasoning_text.done', {'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason})
@@ -1544,14 +1598,58 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
 
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+
+
 def _store_response(principal: str, rid: str, messages: list):
-    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix).
+
+    B-33 fix: the previous implementation capped ENTRY COUNT only (200) with no
+    TTL and no byte bound — 200 multi-MB histories is still unbounded in memory.
+    Now bounded on all three axes (opencode/nous parity).
+    """
     if not rid:
         return
     key = _response_store_key(principal, rid)
-    _RESPONSE_STORE[key] = messages
-    while len(_RESPONSE_STORE) > 200:
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = 0
+    if size > _RESPONSE_STORE_MAX_BYTES:
+        logger.warning(f'[responses] history for {rid} too large ({size}B); not stored')
+        return
+    _RESPONSE_STORE[key] = (time.time(), size, messages)
+    _prune_response_store()
+
+
+def _prune_response_store():
+    """Evict expired, then oldest, entries until within all bounds (B-33)."""
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for k in [k for k, v in list(_RESPONSE_STORE.items())
+                  if isinstance(v, tuple) and now - v[0] > _RESPONSE_STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(k, None)
+    while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
         _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
+    total = sum(v[1] for v in _RESPONSE_STORE.values() if isinstance(v, tuple))
+    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+        _k, v = _RESPONSE_STORE.popitem()
+        if isinstance(v, tuple):
+            total -= v[1]
+
+
+def _get_stored_conversation(principal: str, rid: str) -> list:
+    """TTL-aware read from the bounded store (B-33)."""
+    entry = _RESPONSE_STORE.get(_response_store_key(principal, rid))
+    if not entry or not isinstance(entry, tuple):
+        return []
+    ts, _size, msgs = entry
+    if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
+        _RESPONSE_STORE.pop(_response_store_key(principal, rid), None)
+        return []
+    return list(msgs)
 
 
 @app.post('/v1/messages')
@@ -1612,13 +1710,19 @@ async def anthropic_messages(request: Request):
                                 last_hb = now
                             continue
                         buf += chunk
+                        # CRLF parity (nous N-08).
+                        if b'\r' in buf:
+                            buf = buf.replace(b'\r\n', b'\n')
                         while b'\n' in buf:
                             line, buf = buf.split(b'\n', 1)
                             line = line.strip()
                             if not line.startswith(b'data:'):
                                 continue
                             payload = line[5:].strip()
-                            if payload in (b'[DONE]', b'', b'"[DONE]"'):
+                            # B-01 fix: empty `data:` is a keep-alive, not EOF.
+                            if payload == b'':
+                                continue
+                            if payload in (b'[DONE]', b'"[DONE]"'):
                                 for ev in state.force_done():
                                     yield ev
                                 return
@@ -1630,8 +1734,23 @@ async def anthropic_messages(request: Request):
                                 yield ev
                     for ev in state.force_done():
                         yield ev
+                except (GeneratorExit, asyncio.CancelledError):
+                    # B-09 parity: no yields during generator finalization.
+                    raise
                 except Exception as e:
                     logger.error(f'[anthropic stream] {e}')
+                    # B-07 fix: never fabricate a clean end_turn from a
+                    # transport failure — the client would persist a truncated
+                    # answer as successful and could not retry. Emit a real
+                    # Anthropic error event first (nous N-05 parity).
+                    try:
+                        yield ('event: error\ndata: ' + json.dumps({
+                            'type': 'error',
+                            'error': {'type': 'api_error',
+                                      'message': f'upstream stream error: {str(e)[:2000]}'},
+                        }, ensure_ascii=False) + '\n\n')
+                    except Exception:
+                        pass
                     for ev in state.force_done():
                         yield ev
                 finally:
@@ -1719,8 +1838,16 @@ async def embeddings(request: Request):
     a 404 catch-all. Operators who need embeddings should use nvidia-python
     or openrouter wrappers which DO support embeddings.
     """
+    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
+    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
+    # anyone who can hit the port. Gate it like every other POST surface.
+    _auth_check(request)
+    if not check_rate_limit(_client_ip(request)):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

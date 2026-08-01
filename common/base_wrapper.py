@@ -74,6 +74,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 
 # Shared translation utilities (parse_retry_after, build_forward_headers, etc.)
+from common.sse import (
+    IDLE as _IDLE,
+    iter_chunks_with_idle as _iter_chunks_with_idle,
+)
 from common.translations import (
     parse_retry_after,
     is_retriable_status,
@@ -386,7 +390,16 @@ class BaseWrapper:
         path = request.url.path
         method = request.method
         # Public paths: no auth required (dashboard, metrics, model discovery).
-        is_public = path in self.PUBLIC_PATHS or path.startswith('/metrics/') or path.startswith('/catalog/') or path.startswith('/mcp/')
+        # B-17/B-27 fix: `method` was computed and then IGNORED here, so a POST
+        # to a discovery-only path was treated as public exactly like a GET.
+        # Read-only surfaces are now gated to safe methods.
+        _safe = method in ('GET', 'HEAD')
+        is_public = (
+            (path in self.PUBLIC_PATHS and _safe)
+            or (_safe and (path.startswith('/metrics/')
+                           or path.startswith('/catalog/')
+                           or path.startswith('/mcp/')))
+        )
         # Per-IP rate limiting (applies to all requests; 0 disables).
         client_ip = getattr(request.client, 'host', '') or 'unknown'
         if not self.rate_limiter.check(client_ip):
@@ -544,34 +557,50 @@ class BaseWrapper:
                     key_released = True  # guard: outer finally skips release for stream path
                     async def stream_gen():
                         nonlocal released
-                        # Fase 3.1: idle-aware heartbeat via asyncio.wait_for.
-                        # Fires even when upstream is completely silent (reasoning
-                        # models thinking 30+ sec). Without this, client/LB idle
-                        # timeouts kill the stream mid-turn.
+                        # B-08 fix: sentinel-task idle detection (common/sse.py)
+                        # replaces asyncio.wait_for, which cancelled the pending
+                        # read and could not distinguish an idle upstream from a
+                        # dead one — a failed stream was heartbeated forever.
+                        # Also fixes the dead `last_hb` (it was assigned but
+                        # never read, so the interval was unthrottled).
                         last_hb = time.time()
                         at_line_boundary = True
+                        # R-06: never append a second [DONE]. Doing so
+                        # unconditionally produced the corrupt frame
+                        # '[DONE]data: [DONE]' when the upstream already sent
+                        # one without a trailing blank line — not valid JSON, so
+                        # strict SDK parsers error at the end of a good turn.
+                        saw_done = False
                         hb_interval = float(self.config.heartbeat_interval_ms) / 1000.0
                         try:
-                            aiter = resp_ref.content.__aiter__()
-                            while True:
-                                try:
-                                    line = await asyncio.wait_for(aiter.__anext__(), timeout=hb_interval)
-                                except asyncio.TimeoutError:
-                                    if at_line_boundary:
+                            async for line in _iter_chunks_with_idle(resp_ref, hb_interval):
+                                now = time.time()
+                                if line is _IDLE:
+                                    if at_line_boundary and (now - last_hb) > hb_interval:
                                         yield b': heartbeat\n\n'
-                                        last_hb = time.time()
+                                        last_hb = now
                                     continue
-                                except StopAsyncIteration:
-                                    break
+                                if line and b'[DONE]' in (line if isinstance(line, (bytes, bytearray)) else str(line).encode()):
+                                    saw_done = True
                                 yield line
                                 if isinstance(line, (bytes, bytearray)) and len(line):
                                     at_line_boundary = line.endswith(b'\n')
                                 elif line:
                                     at_line_boundary = str(line).endswith('\n')
                                 last_hb = time.time()
-                            yield b'data: [DONE]\n\n'
-                        except asyncio.CancelledError:
+                            if not at_line_boundary:
+                                yield b'\n\n'
+                            if not saw_done:
+                                yield b'data: [DONE]\n\n'
+                        except (GeneratorExit, asyncio.CancelledError):
                             raise
+                        except Exception as e:
+                            logger.warning(
+                                '[stream] upstream error (%s: %s); finalizing',
+                                type(e).__name__, e)
+                            yield f': upstream-error {type(e).__name__}\n\n'.encode()
+                            if not saw_done:
+                                yield b'data: [DONE]\n\n'
                         finally:
                             if not released:
                                 released = True

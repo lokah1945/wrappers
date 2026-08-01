@@ -30,9 +30,9 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 ## 📚 Documentation
 
 **Quick Start:**
-- **[DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)** - Complete documentation index
+- **[DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)** - Complete documentation index
 - **[WRAPPER_CONTRACT.md](WRAPPER_CONTRACT.md)** - Technical standards and contract
-- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Final audit report
+- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](docs/audits/AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Final audit report
 
 **Wrapper-Specific Documentation:**
 - [nvidia-python/README.md](nvidia-python/README.md)
@@ -193,7 +193,7 @@ See [productions/PRODUCTION_RUNBOOK.md](productions/PRODUCTION_RUNBOOK.md) for:
 ```
 wrappers/
 ├── README.md                        # This file
-├── DOCUMENTATION_INDEX.md           # Complete documentation index
+├── docs/                            # All non-production documentation
 ├── WRAPPER_CONTRACT.md              # Technical standards
 ├── wrappers.json                    # Wrapper metadata
 ├── .env.example                     # Root environment template
@@ -261,10 +261,14 @@ wrappers/
 │   ├── PRODUCTION_RUNBOOK.md
 │   └── reports/
 │
-└── audit_report/                    # Audit reports
-    ├── INDEX.md
-    ├── parts/
-    └── fix_instructions/
+└── docs/                            # Non-production documentation
+    ├── DOCUMENTATION_INDEX.md
+    ├── CROSS_WRAPPER_BUG_POLICY.md
+    ├── TEMPLATE_WRAPPER.md
+    ├── ADR.md
+    ├── audits/                      # Historical + current audit reports
+    ├── reports/                     # Readiness, benchmark, planning reports
+    └── artifacts/                   # One-off scripts and raw test output
 ```
 
 ---
@@ -275,14 +279,14 @@ wrappers/
 
 **Final Audit:** 2026-07-28  
 **Score:** 100/100 - Enterprise Grade  
-**Report:** [AUDIT_FINAL_100_PERFECT_2026-07-28.md](AUDIT_FINAL_100_PERFECT_2026-07-28.md)
+**Report:** [AUDIT_FINAL_100_PERFECT_2026-07-28.md](docs/audits/AUDIT_FINAL_100_PERFECT_2026-07-28.md)
 
 ### Audit Reports
 
-- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Final comprehensive audit (100/100)
-- **[AUDIT_ZERO_TOLERANCE_2026-07-28.md](AUDIT_ZERO_TOLERANCE_2026-07-28.md)** - Zero tolerance audit
-- **[DEEP_AUDIT_SECURITY_2026-07-28.md](DEEP_AUDIT_SECURITY_2026-07-28.md)** - Security audit
-- **[audit_report/INDEX.md](audit_report/INDEX.md)** - Complete audit index
+- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](docs/audits/AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Final comprehensive audit (100/100)
+- **[AUDIT_ZERO_TOLERANCE_2026-07-28.md](docs/audits/AUDIT_ZERO_TOLERANCE_2026-07-28.md)** - Zero tolerance audit
+- **[DEEP_AUDIT_SECURITY_2026-07-28.md](docs/audits/DEEP_AUDIT_SECURITY_2026-07-28.md)** - Security audit
+- **[docs/audits/](docs/audits/)** - All historical audit reports
 
 ### Security Features
 
@@ -370,17 +374,17 @@ open http://localhost:XXXX/dashboard
 ## 📞 Support & Resources
 
 ### Documentation
-- **[DOCUMENTATION_INDEX.md](DOCUMENTATION_INDEX.md)** - Complete documentation index
+- **[DOCUMENTATION_INDEX.md](docs/DOCUMENTATION_INDEX.md)** - Complete documentation index
 - **[WRAPPER_CONTRACT.md](WRAPPER_CONTRACT.md)** - Technical standards
 - **Wrapper-specific READMEs** - Per-wrapper documentation
 
 ### Audit Reports
-- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Latest audit
-- **[audit_report/INDEX.md](audit_report/INDEX.md)** - Audit index
+- **[AUDIT_FINAL_100_PERFECT_2026-07-28.md](docs/audits/AUDIT_FINAL_100_PERFECT_2026-07-28.md)** - Latest audit
+- **[docs/audits/](docs/audits/)** - Historical audits
 
 ### Production
 - **[productions/PRODUCTION_RUNBOOK.md](productions/PRODUCTION_RUNBOOK.md)** - Production guide
-- **[WRAPPER_STANDARDIZATION_REPORT.md](WRAPPER_STANDARDIZATION_REPORT.md)** - Structure standards
+- **[WRAPPER_STANDARDIZATION_REPORT.md](docs/reports/WRAPPER_STANDARDIZATION_REPORT.md)** - Structure standards
 
 ---
 

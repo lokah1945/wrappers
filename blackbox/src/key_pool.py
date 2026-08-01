@@ -44,23 +44,46 @@ class KeyEntry:
         return self.current_rpm() + self.in_flight
 
     def is_blocked(self) -> bool:
-        if time.time() < self.hard_blocked_until:
-            return True
-        if self.hard_blocked_until:
+        """B-37 fix: side-effect-free predicate.
+
+        This used to CLEAR hard_blocked_until/block_reason as a side effect of
+        being asked "are you blocked?". It is called from stats()/health_json()
+        outside the pool lock, so a concurrent metrics scrape could clear a
+        live block. Expiry is now an explicit operation (expire_block()).
+        """
+        return time.time() < self.hard_blocked_until
+
+    def expire_block(self) -> None:
+        """Clear an elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
             self.hard_blocked_until = 0.0
             self.block_reason = ''
-        return False
 
     def record(self):
+        """B-36 fix: record request telemetry ONLY.
+
+        in_flight accounting used to be folded in here, so any path that
+        recorded without a matching release() permanently inflated in_flight —
+        which feeds effective_load and therefore key selection, skewing the
+        pool away from healthy keys over time. Callers now pair
+        record() + increment_in_flight() explicitly (opencode/openrouter
+        parity), making the exactly-once release invariant auditable.
+        """
         now = time.time()
         self.timestamps.append(now)
         self.total_requests += 1
         self.last_used = now
+
+    def increment_in_flight(self):
         self.in_flight += 1
 
-    def release(self):
+    def decrement_in_flight(self):
         if self.in_flight > 0:
             self.in_flight -= 1
+
+    def release(self):
+        # Backwards-compatible alias.
+        self.decrement_in_flight()
 
     def block(self, seconds: int, reason: str):
         seconds = max(1, min(int(seconds or 1), int(os.environ.get('KEY_COOLDOWN_MAX_SEC', '300'))))
@@ -181,6 +204,10 @@ class KeyPool:
             # NO MODEL FALLBACK: filter candidates by model-scoped blocks.
             # Error on model A at key1 blocks key1 ONLY for model A —
             # model B can still use key1 because it's a different model.
+            # B-37: expire elapsed blocks explicitly, under the lock, instead
+            # of relying on is_blocked() mutating state as a side effect.
+            for k in self.keys:
+                k.expire_block()
             candidates = [k for k in self.keys
                           if not k.is_blocked()
                           and not (model and k.is_model_blocked(model))
@@ -191,14 +218,16 @@ class KeyPool:
             best = [k for k in candidates if k.effective_load == min_load]
             key = best[self._rr % len(best)]
             self._rr += 1
+            # B-36: telemetry and in-flight accounting are now explicit.
             key.record()
+            key.increment_in_flight()
             self._in_flight_total += 1
             return {'key': key}
 
     def release(self, key: KeyEntry = None):
         if key is None:
             return
-        key.release()
+        key.decrement_in_flight()
         self._in_flight_total = max(0, self._in_flight_total - 1)
 
     def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = '', model: str = ''):

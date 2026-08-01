@@ -89,13 +89,14 @@ class KeyEntry:
         logger.warning(f'[openrouter] key {self.label} model {model_id!r} cooled down for {seconds}s ({reason})')
 
     def is_hard_blocked(self) -> bool:
-        now = time.time()
-        if now < self.hard_blocked_until:
-            return True
-        if self.hard_blocked_until:
+        """B-37 fix: side-effect-free predicate (see opencode key_pool)."""
+        return time.time() < self.hard_blocked_until
+
+    def expire_block(self) -> None:
+        """Clear an elapsed hard block. Caller must hold the pool lock."""
+        if self.hard_blocked_until and time.time() >= self.hard_blocked_until:
             self.hard_blocked_until = 0.0
             self.block_reason = ''
-        return False
 
     def is_model_blocked(self, model_id: str) -> bool:
         if not model_id:
@@ -193,6 +194,9 @@ class KeyPool:
                 logger.warning(f'[openrouter] Load shedding: in-flight >= {inflight_cap}')
                 return None
 
+            # B-37: expire elapsed blocks explicitly, under the lock.
+            for _k in self.keys:
+                _k.expire_block()
             candidates = [
                 k for k in self.keys
                 if not k.is_hard_blocked()

@@ -560,6 +560,16 @@ class ResponsesHandler:
             stream = result.get('stream')
             try:
                 if stream is not None:
+                    # R-07: this generator MUST be closed on every exit path.
+                    # `stream` is nvidia's stream_wrapper(), whose `finally`
+                    # releases the aiohttp response AND the pool key. Breaking
+                    # out of the `async for` (as the R-03 upstream-error path
+                    # does) or raising leaves the generator merely suspended —
+                    # its finally never runs, so the TCP connection is never
+                    # returned to the connector. After MAX_CONNECTIONS such
+                    # requests every subsequent call blocks forever waiting for
+                    # a free slot: the wrapper stops responding entirely while
+                    # the key pool still reports "available".
                     async for raw in stream:
                         chunk = raw.decode('utf-8', errors='replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
                         buffer += chunk
@@ -578,9 +588,17 @@ class ResponsesHandler:
                                 continue
                             if c.get('usage'):
                                 usage = convert_usage(c['usage'])
-                            if not c.get('choices'):
+                            # R-03: surface upstream error frames instead of
+                            # dropping them and emitting response.completed.
+                            if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+                                _e = c['error']
+                                stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                                break
+                            # R-08: empty choices array is legal.
+                            _cl = c.get('choices') or []
+                            if not _cl:
                                 continue
-                            ch = c['choices'][0]
+                            ch = _cl[0] or {}
                             d = ch.get('delta') or {}
                             if isinstance(d.get('content'), str) and d['content']:
                                 acc_text += d['content']
@@ -672,9 +690,40 @@ class ResponsesHandler:
                 stream_error = e
                 import logging
                 logging.getLogger('responses').error(f"[responses:nim stream] {e}")
+            finally:
+                # R-07: deterministically close the upstream generator so its
+                # finally-block releases the connection and the pool key.
+                if stream is not None:
+                    _ac = getattr(stream, 'aclose', None)
+                    if _ac is not None:
+                        try:
+                            await _ac()
+                        except Exception:
+                            pass
 
+            # B-13 fix: NEVER inject a transport error as model output. The old
+            # code emitted "[upstream stream error: ...]" as an
+            # output_text.delta, so an infrastructure failure was persisted by
+            # the client as a successful assistant answer and could not be
+            # retried. Emit response.failed instead (blackbox B20 parity).
+            # R-03: report failure whenever the upstream errored, even if some
+            # text already streamed. The old `and not acc_text` guard meant a
+            # failure AFTER partial output was reported as response.completed,
+            # so the client persisted a truncated answer as a successful turn.
+            if stream_error:
+                yield emit({
+                    'type': 'response.failed', 'sequence_number': next_seq(),
+                    'response': {
+                        'id': resp_id, 'object': 'response', 'model': model,
+                        'status': 'failed',
+                        'error': {'code': 'upstream_error',
+                                  'message': f'upstream stream error: {str(stream_error)[:2000]}'},
+                    },
+                })
+                yield 'data: [DONE]\n\n'
+                return
             if not acc_text and not has_tool:
-                acc_text = f"[upstream stream error: {stream_error}]" if stream_error else '[No text response; the model returned no visible text.]'
+                acc_text = '[No text response; the model returned no visible text.]'
                 yield emit({
                     'type': 'response.output_text.delta', 'sequence_number': next_seq(),
                     'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,

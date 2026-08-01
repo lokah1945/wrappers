@@ -47,6 +47,13 @@ try:
 except ImportError:
     _HAS_SIZE_LIMITER = False
 
+# B-28/B-29/B-30 fix: shared, fail-closed auth (see common/auth.py).
+try:
+    from common.auth import check_auth as _shared_check_auth
+    _HAS_SHARED_AUTH = True
+except ImportError:  # pragma: no cover
+    _HAS_SHARED_AUTH = False
+
     def sanitize_header_value(value):
         # Fallback sanitizer: upstream common.middleware is missing from the
         # repo, so provide the BUG-SEC2 header-injection guard inline.
@@ -541,12 +548,10 @@ def _looks_model_capacity_error(data) -> bool:
     return any(x in blob for x in ('no deployments available', 'selected model', 'cooldown_list', 'invalid model name', 'model unavailable'))
 
 
-def _should_cooldown_key(status: int, data) -> bool:
-    if status == 429 and _looks_model_capacity_error(data):
-        return False
-    if status == 404 and _looks_model_capacity_error(data):
-        return False
-    return status in (401, 402, 403, 408, 409, 429) or status >= 500
+# B-21 fix: the local `_should_cooldown_key` here SHADOWED the
+# `should_cooldown_key` imported from common.translations, so cooldown policy
+# diverged silently per wrapper. The model-capacity carve-out is now part of
+# the shared implementation; this module uses it directly.
 
 
 # NB-8: strong references for fire-and-forget tasks — asyncio only keeps a weak
@@ -865,7 +870,7 @@ def _store_response(principal: str, key: str, data) -> None:
     single-turn entries are truncated before storage; trimming drops oldest
     turns using the precomputed per-entry sizes.
     """
-    global _RESPONSE_STORE
+    # B-22: `global _RESPONSE_STORE` removed — mutated in place, never rebound.
     if isinstance(data, list):
         entries, sizes = [], []
         for item in data:
@@ -1163,7 +1168,8 @@ async def model_catalog_refresh_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _session, _MODEL_REFRESH_TASK, _METRICS_PERSIST_TASK, _env_observer
+    # B-22: `_session` dropped from this global stmt — never rebound here.
+    global _MODEL_REFRESH_TASK, _METRICS_PERSIST_TASK, _env_observer
     pool.load_from_env()
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
@@ -1270,6 +1276,15 @@ app.add_middleware(
     allow_credentials=True,
 )
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
     app.add_middleware(RequestSizeLimiter)
 
@@ -1281,11 +1296,18 @@ def _auth_check(request: Request):
     # G10 fix: if BEARER_TOKEN is set, auth is mandatory and must match.
     # If client sends a token (even wrong) we MUST reject on mismatch.
     # If BEARER_TOKEN empty, remain open (backwards-compatible, logged).
+    # B-28 fix: delegate to shared, fail-closed auth. Previously an unset
+    # BEARER_TOKEN allowed ALL requests (open relay on a truncated .env).
+    if _HAS_SHARED_AUTH:
+        res = _shared_check_auth(request.headers, surface=request.url.path)
+        if not res.ok:
+            raise HTTPException(res.status, {"error": {
+                "type": "authentication_error", "message": res.message}})
+        return
     token = _bearer_token()  # OC-18: re-read so .env rotation takes effect
     if not token:
-        if request.headers.get("authorization") or request.headers.get("x-api-key"):
-            logger.warning("[auth] BEARER_TOKEN unset but client sent credentials — accepting open (insecure)")
-        return
+        raise HTTPException(503, {"error": {
+            "type": "authentication_error", "message": "Server auth not configured"}})
     auth = request.headers.get("authorization", "") or request.headers.get("x-api-key", "")
     client_token = auth.replace("Bearer ", "", 1).strip()
     # SEC-5: constant-time comparison to avoid timing side-channels on the token.
@@ -1326,7 +1348,7 @@ async def models(request: Request):
         {"id": "deepseek-v4-flash-free", "object": "model", "owned_by": "opencode-zen"},
         {"id": "north-mini-code-free", "object": "model", "owned_by": "opencode-zen"},
     ]
-    global _known_models
+    # B-22: `global _known_models` removed — never assigned in this scope.
     for m in fallback_all:
         _known_models.add(m["id"])
     for alias in ("sonnet", "opus", "haiku"):
@@ -1428,7 +1450,7 @@ async def capabilities(request: Request):
     try:
         model_response = await models(request)
         models_list = model_response.get("data", []) if isinstance(model_response, dict) else []
-        global _known_models
+        # B-22: `global _known_models` removed — never assigned in this scope.
         for m in models_list:
             if isinstance(m, dict) and m.get("id"):
                 _known_models.add(m.get("id", ""))
@@ -1460,10 +1482,11 @@ async def count_tokens(request: Request):
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
-    import uuid
-    import time
-    request_id = request.headers.get("x-request-id") or str(uuid.uuid4())
-    start_time = time.time()
+    # B-23 fix: the previous `request_id = ...` / `start_time = ...` locals here
+    # were computed and then never used — dead code implying per-request
+    # observability that did not exist. Correlation ID and latency are set
+    # centrally by the HTTP middleware (X-Request-ID / X-Process-Time), so the
+    # duplicated locals are removed rather than reimplemented here.
     """OpenAI Chat — routes to Zen /chat/completions (or native family if model demands it)."""
     _auth_check(request)
     _ip = _client_ip(request)
@@ -1495,8 +1518,9 @@ async def chat_completions(request: Request):
             return _jr(400, {"error": {"type": "invalid_request_error", "message": "tool role requires tool_call_id"}})
     is_stream = bool(body.get("stream", False))
 
-    # Prefer chat/completions; if model is responses/messages-native, still accept chat shape via conversion path upstream may reject — try chat first for openai-compatible clients
-    family = _zen_family(body.get("model") or "")
+    # B-23: `family = _zen_family(...)` was computed and never used — OC-12
+    # routes every model through the OpenAI-compatible chat endpoint below, so
+    # the family lookup is dead. Removed.
     # OC-12: gemini/google family was incorrectly routed to the catalog URL
     # `{base}/models/{model}` (a GET listing), which 404/405s and cooled down a
     # key. Route it through the OpenAI-compatible chat endpoint like the rest.
@@ -1603,6 +1627,7 @@ async def responses(request: Request):
                 rsn_index = None
                 rsn_id = f"rsn_{int(time.time()*1000)}"
                 acc_reason = ""
+                upstream_err: list = []  # R-03: mid-stream upstream error frames
 
                 def emit(etype, payload):
                     nonlocal seq
@@ -1630,11 +1655,23 @@ async def responses(request: Request):
 
                 async def process_payload(payload: bytes):
                     nonlocal acc_text, acc_usage, acc_reason, rsn_started, rsn_index, next_output_index
-                    if payload in (b"[DONE]", b"", b'"[DONE]"'):
+                    # B-01 fix: empty `data:` is a valid SSE keep-alive /
+                    # empty event, NOT end-of-stream (nous N-09 parity).
+                    if payload == b"":
+                        return
+                    if payload in (b"[DONE]", b'"[DONE]"'):
                         return
                     try:
                         c = json.loads(payload)
                     except (json.JSONDecodeError, ValueError):
+                        return
+                    # R-03: record upstream error frames so the stream ends as
+                    # response.failed rather than a fabricated completion.
+                    if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+                        _e = c['error']
+                        _m = _e.get('message') if isinstance(_e, dict) else str(_e)
+                        logger.error(f'[responses] upstream error frame: {_m}')
+                        upstream_err.append(str(_m or 'upstream error'))
                         return
                     if c.get("usage"):
                         u = c["usage"]
@@ -1685,6 +1722,8 @@ async def responses(request: Request):
                                 last_hb = time.time()
                             continue
                         buffer += chunk
+                        if b"\r" in buffer:  # CRLF parity (nous N-08)
+                            buffer = buffer.replace(b"\r\n", b"\n")
                         while b"\n" in buffer:
                             line, buffer = buffer.split(b"\n", 1)
                             line = line.strip()
@@ -1711,6 +1750,14 @@ async def responses(request: Request):
                         pass
                     pool.release(key)
 
+                # R-03: surface a mid-stream upstream failure as response.failed
+                # instead of a fabricated response.completed with partial text.
+                if upstream_err:
+                    yield emit("response.failed", {"response": {
+                        "id": rid, "object": "response", "model": model, "status": "failed",
+                        "error": {"code": "upstream_error", "message": str(upstream_err[0])[:2000]}}})
+                    yield "data: [DONE]\n\n"
+                    return
                 msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
                 if rsn_started:
                     yield emit("response.reasoning_text.done", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "text": acc_reason})
@@ -1820,13 +1867,21 @@ async def anthropic_messages(request: Request):
                                 last_hb = time.time()
                             continue
                         buf += chunk
+                        # CRLF parity (nous N-08): normalise \r\n framing so a
+                        # CRLF upstream streams incrementally instead of
+                        # buffering the whole response until EOF.
+                        if b"\r" in buf:
+                            buf = buf.replace(b"\r\n", b"\n")
                         while b"\n" in buf:
                             line, buf = buf.split(b"\n", 1)
                             line = line.strip()
                             if not line.startswith(b"data:"):
                                 continue
                             payload = line[5:].strip()
-                            if payload in (b"[DONE]", b""):
+                            # B-01 fix: empty `data:` is a keep-alive, not EOF.
+                            if payload == b"":
+                                continue
+                            if payload in (b"[DONE]", b'"[DONE]"'):
                                 for ev in state.force_done():
                                     yield ev
                                 return
@@ -1839,8 +1894,21 @@ async def anthropic_messages(request: Request):
                     # upstream closed without [DONE]
                     for ev in state.force_done():
                         yield ev
+                except (GeneratorExit, asyncio.CancelledError):
+                    # B-09 parity: no yields during generator finalization.
+                    raise
                 except Exception as e:
                     logger.error(f'[anthropic stream] {e}')
+                    # B-07 fix: surface the failure instead of fabricating a
+                    # successful end_turn (nous N-05 parity).
+                    try:
+                        yield ('event: error\ndata: ' + json.dumps({
+                            'type': 'error',
+                            'error': {'type': 'api_error',
+                                      'message': f'upstream stream error: {str(e)[:2000]}'},
+                        }, ensure_ascii=False) + '\n\n')
+                    except Exception:
+                        pass
                     for ev in state.force_done():
                         yield ev
                 finally:
@@ -1926,8 +1994,16 @@ async def embeddings(request: Request):
     a 404 catch-all. Operators who need embeddings should use nvidia-python
     or openrouter wrappers which DO support embeddings.
     """
+    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
+    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
+    # anyone who can hit the port. Gate it like every other POST surface.
+    _auth_check(request)
+    if not check_rate_limit(_client_ip(request)):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        body = await request.json()
+        # B-19: validate the body is well-formed JSON (so clients get 400 not
+        # 501 for malformed input) without binding an unused variable.
+        await request.json()
     except Exception:
         return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)

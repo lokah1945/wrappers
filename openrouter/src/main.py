@@ -27,6 +27,7 @@ import sys
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -113,10 +114,18 @@ try:
 except ImportError:
     _HAS_SIZE_LIMITER = False
     import re as _re
+
     def sanitize_header_value(value):
         if not isinstance(value, str):
             value = str(value)
         return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
+
+# B-08 fix: shared sentinel-task idle iterator + CRLF normalisation.
+from common.sse import (  # noqa: E402
+    IDLE as _IDLE,
+    iter_chunks_with_idle as _iter_chunks_with_idle,
+    normalize_sse_newlines as _normalize_sse_newlines,
+)
 
 from dotenv import load_dotenv
 
@@ -414,7 +423,8 @@ async def get_agent() -> aiohttp.ClientSession:
 # ── Model Refresh ─────────────────────────────────────────────────────────
 async def _refresh_models_loop():
     """Periodically refresh model catalog from upstream."""
-    global _MODEL_REFRESH_TASK
+    # B-22: `global _MODEL_REFRESH_TASK` removed — never assigned in this scope
+    # (the task handle is set by lifespan, which declares it correctly).
     try:
         # Initial load
         ids = await _refresh_models()
@@ -445,6 +455,68 @@ async def _refresh_models(force: bool = False) -> list:
         return []
 
 
+# ── Background tasks ───────────────────────────────────────────────────────
+# B-35 fix: openrouter was the only wrapper with no background-task registry.
+# asyncio only holds a WEAK reference to a running task, so a fire-and-forget
+# coroutine can be garbage-collected mid-flight. All four siblings retain
+# strong refs (_BG_TASKS / _spawn_bg_task / _spawn_background); this is the
+# openrouter equivalent.
+_BG_TASKS: set = set()
+
+
+def _spawn_background(coro, label: str = 'bg'):
+    """Fire-and-forget with a retained strong reference + error logging."""
+    task = asyncio.ensure_future(coro)
+    _BG_TASKS.add(task)
+
+    def _done(t: asyncio.Task):
+        _BG_TASKS.discard(t)
+        if t.cancelled():
+            return
+        exc = t.exception()
+        if exc is not None:
+            logger.warning('[bg:%s] background task failed: %r', label, exc)
+
+    task.add_done_callback(_done)
+    return task
+
+
+async def _record_model_result(model_id: str, api_key: str, status: int, data, url: str):
+    """Persist the account-scoped upstream outcome (parity fix).
+
+    openrouter was the only wrapper that never recorded model-state
+    observations, so its models were invisible to the shared model registry
+    (MODEL_STORE / MODEL_REGISTRY_CLIENT were constructed but never written to).
+    Runs as a background task so the SQLite commit never sits on the TTFB path.
+    """
+    try:
+        if status == 200:
+            stored = await MODEL_STORE.record_status_async(
+                model_id, credential_fingerprint(api_key), 'available', status, 'OK', endpoint=url)
+        else:
+            stored = await MODEL_STORE.record_error_async(model_id, api_key, status, data, endpoint=url)
+        MODEL_REGISTRY_CLIENT.schedule_observation(
+            'openrouter', model_id,
+            stored.get('account_scope', credential_fingerprint(api_key)),
+            stored.get('state', 'unknown'), status, stored.get('reason_code', ''),
+            stored.get('reason_detail', ''), url,
+        )
+    except Exception as e:
+        logger.warning(f'[model-state] openrouter result record failed: {e}')
+
+
+async def _drain_background_tasks(timeout: float = 5.0):
+    """Await outstanding background tasks during shutdown (B-35)."""
+    if not _BG_TASKS:
+        return
+    pending = list(_BG_TASKS)
+    logger.info('[openrouter] draining %d background task(s)', len(pending))
+    try:
+        await asyncio.wait(pending, timeout=timeout)
+    except Exception as e:  # pragma: no cover - defensive
+        logger.warning('[openrouter] background drain error: %r', e)
+
+
 # ── Lifecycle ──────────────────────────────────────────────────────────────
 
 @asynccontextmanager
@@ -468,16 +540,38 @@ async def lifespan(app: FastAPI):
     yield
 
     # Shutdown
-    logger.info("[openrouter] Shutting down")
+    # B-34 fix: drain in-flight requests before tearing down the session.
+    # Previously openrouter closed the aiohttp session immediately, severing
+    # every active stream mid-response on each deploy/restart (all three
+    # siblings already implement this drain).
+    logger.info("[openrouter] Starting graceful shutdown...")
+    shutdown_start = time.time()
+    max_wait = int(os.environ.get('SHUTDOWN_DRAIN_SEC', '30'))
+    while shutdown_start + max_wait > time.time():
+        total = sum(k.in_flight for k in pool.keys)
+        if total == 0:
+            logger.info("[openrouter] All requests drained")
+            break
+        await asyncio.sleep(0.1)
+    else:
+        logger.warning("[openrouter] Drain timeout — %d request(s) still in flight",
+                       sum(k.in_flight for k in pool.keys))
+
     if _MODEL_REFRESH_TASK:
         _MODEL_REFRESH_TASK.cancel()
         try:
             await _MODEL_REFRESH_TASK
         except asyncio.CancelledError:
             pass
+
+    # B-35 fix: await outstanding fire-and-forget tasks so metrics/model-state
+    # writes are not lost (and cannot be GC'd mid-flight).
+    await _drain_background_tasks()
+
     await metrics.close()
     if _agent and not _agent.closed:
         await _agent.close()
+    logger.info("[openrouter] Shutdown complete")
 
 
 # ── FastAPI App ────────────────────────────────────────────────────────────
@@ -504,19 +598,71 @@ app.add_middleware(
     expose_headers=["x-request-id", "x-process-time"],
 )
 
+
+# R-01 fix: reject non-object JSON bodies with a shaped 400 instead of letting
+# `body.get(...)` raise AttributeError -> HTTP 500 (see common/body_guard.py).
+try:
+    from common.body_guard import JSONBodyGuard as _JSONBodyGuard
+    app.add_middleware(_JSONBodyGuard)
+except ImportError:  # pragma: no cover
+    pass
+
 if _HAS_SIZE_LIMITER:
-    app.add_middleware(RequestSizeLimiter, max_bytes=50 * 1024 * 1024)
+    # B-32 fix: align the request-size cap with every sibling wrapper
+    # (common.middleware default = 10MB). openrouter previously allowed 50MB,
+    # 5x the fleet-wide memory-exhaustion headroom.
+    app.add_middleware(RequestSizeLimiter)
 
 
 # ── Auth Middleware ────────────────────────────────────────────────────────
 
 DISABLE_AUTH = os.environ.get('DISABLE_AUTH', '').strip().lower() in ('1', 'true', 'yes')
-PUBLIC_PATHS = {'/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
-                '/catalog/health', '/catalog/ready', '/catalog/metrics',
-                '/mcp/sse', '/mcp/messages', '/mcp',
-                # Public model discovery (Ollama + OpenAI compatible) — agents
-                # need to list models before authenticating.
-                '/api/tags', '/v1/models', '/version'}
+
+# B-28 fix: fail CLOSED when no bearer token is configured. A truncated/empty
+# .env previously turned the proxy into an open relay burning upstream credit.
+# Set REQUIRE_AUTH=false only for deliberately open LAN deployments.
+REQUIRE_AUTH = os.environ.get('REQUIRE_AUTH', 'true').strip().lower() not in ('0', 'false', 'no', 'off')
+
+# B-27 fix: exact-match public paths + explicit method gating. The previous
+# `startswith` test made '/v1/models' match '/v1/models-anything' and ignored
+# the HTTP method, so any future route sharing a public prefix (or a POST to a
+# GET-only discovery path) was silently unauthenticated.
+PUBLIC_PATHS_ANY = frozenset({
+    '/health', '/ready', '/metrics', '/metrics/prom', '/dashboard', '/stats',
+    '/catalog/health', '/catalog/ready', '/catalog/metrics',
+    '/mcp/sse', '/mcp/messages', '/mcp',
+})
+# Public model discovery (Ollama + OpenAI compatible) — agents need to list
+# models before authenticating. GET only.
+PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version'})
+
+# B-26 fix: the OpenRouter *Provisioning* API (create/delete/rotate keys) is
+# privileged and must never share the bypass with read-only catalog routes.
+MANAGEMENT_PREFIX = '/openrouter/'
+
+
+def _management_token() -> str:
+    """Dedicated token for the key-management surface (B-26).
+
+    Falls back to the inference bearer token so existing single-token
+    deployments keep working, but the management routes are NEVER public.
+    """
+    return (os.environ.get('OPENROUTER_MANAGEMENT_TOKEN')
+            or os.environ.get('MANAGEMENT_TOKEN')
+            or _bearer_token()
+            or '').strip()
+
+
+def _is_public_path(path: str, method: str) -> bool:
+    """Exact-match public-path test (B-27)."""
+    if path in PUBLIC_PATHS_ANY:
+        return True
+    if method == 'GET' and path in PUBLIC_PATHS_GET:
+        return True
+    # Read-only catalog browsing stays public (GET only).
+    if method == 'GET' and path.startswith('/catalog/'):
+        return True
+    return False
 
 # Headers forwarded upstream (transparent passthrough to preserve client identity
 # and beta-feature flags for OpenAI/Anthropic SDKs).
@@ -535,11 +681,14 @@ async def auth_middleware(request: Request, call_next):
     # (Anthropic SDK uses x-api-key, OpenAI SDK uses Authorization).
     if not DISABLE_AUTH:
         path = request.url.path
-        is_public = any(path.startswith(p) for p in PUBLIC_PATHS)
-        if not is_public and not path.startswith('/catalog/') and not path.startswith('/openrouter/'):
+        method = request.method
+        is_management = path.startswith(MANAGEMENT_PREFIX)
+        # B-26 fix: management routes are NEVER public, regardless of prefix.
+        if is_management or not _is_public_path(path, method):
             auth = request.headers.get('Authorization', '')
             x_api_key = request.headers.get('x-api-key', '')
-            token = _bearer_token()
+            # B-26: privileged provisioning surface uses its own token.
+            token = _management_token() if is_management else _bearer_token()
             client_token = ''
             if auth.lower().startswith('bearer '):
                 client_token = auth[7:].strip()
@@ -547,12 +696,31 @@ async def auth_middleware(request: Request, call_next):
                 client_token = x_api_key.strip()
             elif auth:
                 client_token = auth.strip()
-            if token and (not client_token or not hmac.compare_digest(client_token, token)):
-                return JSONResponse(
-                    {"error": {"message": "Unauthorized", "type": "authentication_error"}},
-                    status_code=401,
-                    headers={"WWW-Authenticate": 'Bearer'},
-                )
+
+            # B-28 fix: fail CLOSED when no token is configured instead of
+            # silently allowing every request through.
+            if not token:
+                if REQUIRE_AUTH:
+                    logger.error(
+                        '[auth] no %s token configured and REQUIRE_AUTH=true — refusing request to %s',
+                        'management' if is_management else 'bearer', path,
+                    )
+                    return JSONResponse(
+                        {"error": {"message": "Server auth not configured", "type": "authentication_error"}},
+                        status_code=503,
+                    )
+                logger.warning('[auth] token unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
+            else:
+                # B-30 parity: compare as bytes so a non-ASCII token yields a
+                # clean 401 instead of a TypeError → 500.
+                ok = bool(client_token) and hmac.compare_digest(
+                    client_token.encode('utf-8'), token.encode('utf-8'))
+                if not ok:
+                    return JSONResponse(
+                        {"error": {"message": "Unauthorized", "type": "authentication_error"}},
+                        status_code=401,
+                        headers={"WWW-Authenticate": 'Bearer'},
+                    )
 
     # Rate limit
     ip = _client_ip(request)
@@ -589,6 +757,29 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
     """
     model_id = (body or {}).get("model", "") if body else ""
+
+    # Parity fix: openrouter was the ONLY wrapper with no call-plan validation
+    # and no model-identity guard (MODEL_REGISTRY / same_provider_model_id were
+    # imported but never used). Validate BEFORE spending an upstream request so
+    # a mutated/invalid model id cannot burn a key's quota, and so the
+    # "NO MODEL FALLBACK" contract is enforced here too.
+    if model_id:
+        surface = ('anthropic_messages' if '/messages' in path
+                   else ('openai_responses' if '/responses' in path else 'openai_chat'))
+        try:
+            call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
+            if not same_provider_model_id('openrouter', call_plan.model.provider_model_id, model_id):
+                return JSONResponse({"error": {
+                    "type": "server_error",
+                    "message": "Model identity changed during call-plan resolution",
+                    "code": "MODEL_ID_MUTATION"}}, status_code=500)
+        except ValueError as exc:
+            return JSONResponse({"error": {
+                "type": "invalid_request_error", "message": str(exc),
+                "code": "MODEL_CALL_PLAN_INVALID"}}, status_code=400)
+        except Exception as exc:  # registry unavailable — do not block traffic
+            logger.debug(f'[openrouter] call-plan check skipped: {exc}')
+
     attempts = max(1, pool.total_keys)
     last_status = 429
     last_data = {"error": {"message": "All keys exhausted or rate-limited", "type": "rate_limit_error"}}
@@ -638,6 +829,13 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     resp.release()
                     pool.release(key_obj)
                     key_released = True  # I4: mark released, skip outer finally
+                    # B-39 fix: record upstream stream failures.
+                    _spawn_background(metrics.record_request(model=model_id, status_code=resp.status),
+                                      'metrics-stream-err')
+                    if model_id:
+                        _spawn_background(_record_model_result(model_id, key_obj.api_key,
+                                                               resp.status, last_data, url),
+                                          'model-state')
                     last_status = resp.status
                     try:
                         last_data = json.loads(error_text)
@@ -648,21 +846,49 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                         continue  # retry with next key
                     return JSONResponse(last_data, status_code=resp.status)
                 pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
+                # B-39 fix: streaming requests were never counted, so
+                # error_rate was permanently ~0 and the dashboard reported
+                # false health. Count the stream as a request now.
+                _spawn_background(metrics.record_request(model=model_id, status_code=200),
+                                  'metrics-stream')
+                if model_id:
+                    _spawn_background(_record_model_result(model_id, key_obj.api_key, 200, None, url),
+                                      'model-state')
 
                 # Heartbeat-aware streaming passthrough — keeps idle LBs/agents alive.
-                heartbeat_ms = HEARTBEAT_MS
-                heartbeat_bytes = b': heartbeat\n\n'
+                # B-23: `heartbeat_ms` / `heartbeat_bytes` were dead locals —
+                # the heartbeat interval and payload are handled inside
+                # stream_with_heartbeat() below. Removed.
                 resp_ref = resp
                 released = False
                 key_released = True  # I4: stream path owns release; outer finally skips
 
                 async def stream_gen():
                     nonlocal released
+                    # R-06: track whether upstream already terminated, and
+                    # whether its last byte ended a line. Unconditionally
+                    # appending b'data: [DONE]\n\n' produced the corrupt frame
+                    # '[DONE]data: [DONE]' when the upstream sent [DONE]
+                    # WITHOUT a trailing blank line — a real pattern, and the
+                    # resulting line is not valid JSON, so strict SDK parsers
+                    # error out at the very end of an otherwise good turn.
+                    saw_done = False
+                    ends_newline = True
                     try:
                         async for line in resp_ref.content:
+                            if line:
+                                if b'[DONE]' in line:
+                                    saw_done = True
+                                ends_newline = line.endswith(b'\n')
                             yield line
-                        # If upstream didn't send [DONE], synthesize it for OpenAI SSE.
-                        yield b'data: [DONE]\n\n'
+                        # Only synthesize [DONE] if upstream never sent one.
+                        if not saw_done:
+                            if not ends_newline:
+                                yield b'\n\n'
+                            yield b'data: [DONE]\n\n'
+                        elif not ends_newline:
+                            # Upstream's [DONE] lacked its frame terminator.
+                            yield b'\n\n'
                     except asyncio.CancelledError:
                         raise
                     finally:
@@ -675,29 +901,45 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                             pool.release(key_obj)
 
                 async def stream_with_heartbeat():
-                    # Idle-aware heartbeat: fires even when upstream is silent
-                    # (reasoning models thinking 30+ sec). Uses sentinel-task
-                    # pattern via asyncio.wait_for on the upstream iterator.
+                    # B-08 fix: use the shared sentinel-task iterator instead of
+                    # asyncio.wait_for. wait_for CANCELS the pending read on
+                    # timeout and its TimeoutError is indistinguishable from a
+                    # genuine socket read timeout — so a DEAD upstream was
+                    # heartbeated forever and the client hung until its own
+                    # timeout. (nous N-05 / blackbox BB-5 parity.)
                     last_hb = time.time()
                     at_line_boundary = True
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
                     inner = stream_gen()
-                    while True:
+                    try:
+                        async for chunk in _iter_chunks_with_idle(inner, hb_interval):
+                            now = time.time()
+                            if chunk is _IDLE:
+                                # Only inject a comment at a clean line boundary
+                                # so a heartbeat can never split a data: frame.
+                                if at_line_boundary and (now - last_hb) > hb_interval:
+                                    yield b': heartbeat\n\n'
+                                    last_hb = now
+                                continue
+                            yield chunk
+                            if isinstance(chunk, (bytes, bytearray)) and len(chunk):
+                                at_line_boundary = chunk.endswith(b'\n')
+                            elif chunk:
+                                at_line_boundary = str(chunk).endswith('\n')
+                            last_hb = time.time()
+                    except (GeneratorExit, asyncio.CancelledError):
+                        raise
+                    except Exception as e:
+                        # B-08: a real upstream failure must terminate the
+                        # stream visibly rather than being masked as idle.
+                        logger.warning(
+                            f'[openrouter] upstream stream error ({type(e).__name__}: {e}); finalizing')
+                        yield f': upstream-error {type(e).__name__}\n\n'.encode()
+                    finally:
                         try:
-                            chunk = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-                        except asyncio.TimeoutError:
-                            if at_line_boundary:
-                                yield b': heartbeat\n\n'
-                                last_hb = time.time()
-                            continue
-                        except StopAsyncIteration:
-                            break
-                        yield chunk
-                        if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                            at_line_boundary = chunk.endswith(b'\n')
-                        elif chunk:
-                            at_line_boundary = str(chunk).endswith('\n')
-                        last_hb = time.time()
+                            await inner.aclose()
+                        except Exception:
+                            pass
 
                 return StreamingResponse(
                     stream_with_heartbeat(),
@@ -716,6 +958,11 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
             async with agent.request(method, url, json=body, headers=fwd, timeout=timeout) as resp:
                 await metrics.record_request(model=model_id, status_code=resp.status)
                 text = await resp.text()
+                if model_id:
+                    _spawn_background(
+                        _record_model_result(model_id, key_obj.api_key, resp.status,
+                                             None if resp.status == 200 else text, url),
+                        'model-state')
                 if resp.status >= 400:
                     # Parse Retry-After header for 429 cooldown (anti rate-limit).
                     try:
@@ -843,16 +1090,24 @@ async def responses(request: Request):
     response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
 
     if isinstance(response, JSONResponse):
-        # Reshape error to Responses API format.
+        # R-05 (CRITICAL, same class): the raw OpenAI ChatCompletion body was
+        # returned to Codex instead of a Responses object, because this branch
+        # returned before the translation below could run.
         try:
             payload = json.loads(response.body)
-            if isinstance(payload, dict) and 'error' in payload:
-                return JSONResponse(
-                    {"error": payload['error'], "type": "error"},
-                    status_code=response.status_code,
-                )
         except Exception:
-            pass
+            return response
+        if isinstance(payload, dict) and 'error' in payload:
+            return JSONResponse(
+                {"error": payload['error'], "type": "error"},
+                status_code=response.status_code,
+            )
+        if isinstance(payload, dict) and 'choices' in payload:
+            resp_obj = chat_to_responses(model, payload, body)
+            rid = resp_obj.get('id')
+            if rid and principal:
+                _store_response(principal, rid, chat_body.get('messages', []))
+            return JSONResponse(resp_obj, status_code=response.status_code)
         return response
 
     # Streaming: translate OpenAI SSE → Responses SSE event lifecycle.
@@ -876,7 +1131,8 @@ async def responses(request: Request):
             # Store for previous_response_id continuity.
             resp_id = resp.get('id')
             if resp_id and principal:
-                _RESPONSE_STORE[_response_store_key(principal, resp_id)] = chat_body.get('messages', [])
+                # B-33: bounded + TTL-pruned write.
+                _store_response(principal, resp_id, chat_body.get('messages', []))
             return JSONResponse(resp, status_code=response.status_code)
     except Exception as e:
         logger.warning(f"[openrouter] /v1/responses translation failed: {e}")
@@ -902,6 +1158,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
     msg_id = f"msg_{int(time.time()*1000)}"
     text_started = False
     full_text = ''
+    upstream_error = None  # R-03: mid-stream upstream failure
 
     def _sse(event_type: str, payload: dict) -> str:
         """Build a complete SSE frame: event:\ndata:\n\n"""
@@ -932,17 +1189,27 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
 
         def _parse_line(line_str: str):
             """Parse one complete SSE line. Returns (events_list, is_done)."""
-            nonlocal text_started, full_text
+            nonlocal text_started, full_text, upstream_error
             events = []
-            if not line_str.startswith('data: '):
+            # B-02 fix: the space after `data:` is OPTIONAL in SSE. Requiring
+            # it silently discarded 100% of chunks from upstreams that emit
+            # `data:{...}`, producing an empty answer with no log or error.
+            if not line_str.startswith('data:'):
                 return events, False
-            data_str = line_str[6:].strip()
+            data_str = line_str[5:].strip()
             if data_str == '[DONE]':
                 return events, True
             try:
                 data = json.loads(data_str)
             except json.JSONDecodeError:
                 return events, False
+            # R-03: surface a mid-stream upstream error instead of dropping it
+            # and closing with a fabricated response.completed.
+            if isinstance(data, dict) and data.get('error') is not None and 'choices' not in data:
+                _e = data['error']
+                upstream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                logger.error(f'[openrouter responses] upstream error frame: {upstream_error}')
+                return events, True
             if data.get('object') != 'chat.completion.chunk':
                 return events, False
             choices = data.get('choices', [])
@@ -974,20 +1241,20 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 return events, True
             return events, False
 
-        # Idle-aware iteration with heartbeat
-        inner = openai_gen.__aiter__()
-        while not done:
-            try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
-                # Upstream idle — inject heartbeat
+        # B-08 fix: sentinel-task idle detection (see common/sse.py). The old
+        # asyncio.wait_for could not distinguish an idle upstream from a dead
+        # one, so a failed stream was heartbeated indefinitely.
+        async for raw in _iter_chunks_with_idle(openai_gen, hb_interval):
+            if done:
+                break
+            if raw is _IDLE:
                 yield ': heartbeat\n\n'
                 continue
-            except StopAsyncIteration:
-                break
             if isinstance(raw, str):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
+            # Parity fix: tolerate CRLF SSE framing (nous N-08).
+            buffer = _normalize_sse_newlines(buffer)
             # Split on \n, process complete lines, retain tail in buffer
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
@@ -1023,6 +1290,20 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 },
             })
 
+        # R-03: report failure rather than fabricating a successful completion.
+        if upstream_error:
+            yield _sse('response.failed', {
+                'type': 'response.failed',
+                'response': {
+                    'id': resp_id, 'object': 'response', 'created_at': created_at,
+                    'model': model, 'status': 'failed',
+                    'error': {'code': 'upstream_error',
+                              'message': str(upstream_error)[:2000]},
+                },
+            })
+            yield 'data: [DONE]\n\n'
+            return
+
         # response.completed
         yield _sse('response.completed', {
             'type': 'response.completed',
@@ -1039,9 +1320,15 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
 
         yield 'data: [DONE]\n\n'
 
+    except (GeneratorExit, asyncio.CancelledError):
+        # B-09 parity: never yield during async-generator finalization.
+        raise
     except Exception as e:
         logger.error(f'[openrouter] responses stream translation error: {e}')
-        # Ensure terminal events are always emitted.
+        # B-07 fix: a transport failure must surface as response.failed, NOT as
+        # a fabricated response.completed carrying partial text — the client
+        # otherwise persists a truncated answer as a successful turn and
+        # cannot retry. (blackbox B20 parity.)
         try:
             if text_started:
                 yield _sse('response.output_text.done', {
@@ -1061,19 +1348,25 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                         'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
                     },
                 })
-            yield _sse('response.completed', {
-                'type': 'response.completed',
+            # B-07 fix: report FAILURE, not a fabricated success.
+            yield _sse('response.failed', {
+                'type': 'response.failed',
                 'response': {
                     'id': resp_id, 'object': 'response', 'created_at': created_at,
-                    'model': model, 'status': 'completed',
-                    'output': [{
-                        'id': msg_id, 'type': 'message', 'status': 'completed',
-                        'role': 'assistant',
-                        'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                    }],
+                    'model': model, 'status': 'failed',
+                    'error': {'code': 'upstream_error',
+                              'message': f'upstream stream error: {str(e)[:2000]}'},
                 },
             })
             yield 'data: [DONE]\n\n'
+        except Exception:
+            pass
+    finally:
+        # B-09 fix: deterministically release the upstream response + pool key.
+        try:
+            aclose = getattr(openai_gen, 'aclose', None)
+            if aclose is not None:
+                await aclose()
         except Exception:
             pass
 
@@ -1175,6 +1468,40 @@ async def api_tags():
     return {'models': out_models}
 
 
+@app.get("/v1/capabilities")
+async def capabilities(request: Request):
+    """Model capability discovery.
+
+    WRAPPER_CONTRACT v3.0 §2.1 requires this surface on every wrapper; it was
+    the only one of the mandated endpoints missing from openrouter (gap found
+    while verifying the contract against the code on 2026-08-01). Shape matches
+    the nous/opencode/blackbox implementations so a client can treat all five
+    wrappers identically.
+    """
+    models_list = []
+    try:
+        resp = await list_models(request)
+        payload = json.loads(resp.body) if hasattr(resp, 'body') else {}
+        models_list = payload.get('data', []) if isinstance(payload, dict) else []
+    except Exception as e:
+        logger.warning(f'[capabilities] model list unavailable: {e}')
+        models_list = []
+    return {
+        "object": "list",
+        "models": [
+            {
+                "id": m.get("id") if isinstance(m, dict) else m,
+                "capabilities": ["chat", "completion"],
+                "streaming": True,
+            }
+            for m in models_list
+        ],
+        "summary": {"total": len(models_list),
+                    "by_type": {"chat": len(models_list)}},
+        "dynamic_alias_target": None,
+    }
+
+
 # ── Anthropic-compatible ─────────────────────────────────────────────────
 
 @app.post("/v1/messages")
@@ -1199,16 +1526,25 @@ async def messages(request: Request):
                                      stream=openai_body["stream"], request=request)
 
     if isinstance(response, JSONResponse):
-        # Reshape error envelope to Anthropic format for SDK compatibility.
+        # RUNTIME FINDING R-05 (CRITICAL): this branch returned the RAW OpenAI
+        # ChatCompletion body on success — `return response` fired before the
+        # Anthropic translation further down could ever run, because
+        # _proxy_request always returns a JSONResponse for non-streaming calls.
+        # Claude Code received {"object":"chat.completion","choices":[...]}
+        # instead of {"type":"message","content":[...]} and could not parse the
+        # reply at all. Translate here, where the response actually arrives.
         try:
             payload = json.loads(response.body)
-            if isinstance(payload, dict) and 'error' in payload:
-                return JSONResponse(
-                    {"type": "error", "error": payload['error']},
-                    status_code=response.status_code,
-                )
         except Exception:
-            pass
+            return response
+        if isinstance(payload, dict) and 'error' in payload:
+            return JSONResponse(
+                {"type": "error", "error": payload['error']},
+                status_code=response.status_code,
+            )
+        if isinstance(payload, dict) and 'choices' in payload:
+            return JSONResponse(_openai_to_anthropic_response(payload, body),
+                                status_code=response.status_code)
         return response
 
     # For streaming, translate OpenAI SSE → Anthropic SSE
@@ -1266,7 +1602,60 @@ async def count_tokens(request: Request):
 # /v1/chat/completions to OpenRouter — then translate the response back.
 
 # Tenant-isolated response store for previous_response_id continuity.
-_RESPONSE_STORE: dict[str, list] = {}
+# B-33 fix: this store was COMPLETELY UNBOUNDED — one full conversation
+# history per /v1/responses call, retained for the process lifetime, with no
+# eviction anywhere. A long-running Codex session leaked until OOM. Now bounded
+# by entry count, total bytes, and TTL (opencode/nous parity).
+_RESPONSE_STORE: "OrderedDict[str, tuple]" = OrderedDict()
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+
+
+def _store_response(principal: str, response_id: str, messages: list) -> None:
+    """Bounded, TTL-pruned write to the response store (B-33)."""
+    if not response_id or not principal:
+        return
+    key = _response_store_key(principal, response_id)
+    try:
+        size = len(json.dumps(messages, ensure_ascii=False))
+    except (TypeError, ValueError):
+        size = 0
+    # Reject a single oversized entry outright rather than evicting everything.
+    if size > _RESPONSE_STORE_MAX_BYTES:
+        logger.warning('[responses] history for %s too large (%dB); not stored', response_id, size)
+        return
+    _RESPONSE_STORE[key] = (time.time(), size, messages)
+    _RESPONSE_STORE.move_to_end(key)
+    _prune_response_store()
+
+
+def _prune_response_store() -> None:
+    """Evict expired, then oldest, entries until within all bounds (B-33)."""
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for k in [k for k, (ts, _s, _m) in _RESPONSE_STORE.items()
+                  if now - ts > _RESPONSE_STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(k, None)
+    while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
+        _RESPONSE_STORE.popitem(last=False)
+    total = sum(s for _ts, s, _m in _RESPONSE_STORE.values())
+    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+        _k, (_ts, s, _m) = _RESPONSE_STORE.popitem(last=False)
+        total -= s
+
+
+def _get_stored_conversation(principal: str, response_id: str) -> list:
+    """Read a stored history, honouring TTL (B-33)."""
+    key = _response_store_key(principal, response_id)
+    entry = _RESPONSE_STORE.get(key)
+    if not entry:
+        return []
+    ts, _size, msgs = entry
+    if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
+        _RESPONSE_STORE.pop(key, None)
+        return []
+    return list(msgs)
 
 
 def _response_store_key(principal: str, response_id: str) -> str:
@@ -1300,9 +1689,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
     msgs: list = []
     prev = body.get('previous_response_id')
     if prev and principal:
-        key = _response_store_key(principal, prev)
-        if key in _RESPONSE_STORE:
-            msgs.extend(_RESPONSE_STORE[key])
+        # B-33: TTL-aware read from the bounded store.
+        msgs.extend(_get_stored_conversation(principal, prev))
     raw = body.get('input')
     if isinstance(raw, str):
         msgs.append({'role': 'user', 'content': raw})
@@ -1625,9 +2013,11 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     block_index = 0
     text_started = False
     tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
+    open_tool_blocks: set = set()  # R-02: concurrently-open tool_use blocks
     finish_reason = None
     output_tokens = 0
     input_tokens = 0
+    upstream_error = None  # B-07: set when upstream reports a mid-stream error
 
     try:
         # message_start (always first)
@@ -1648,27 +2038,32 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
         buffer = b''
         hb_interval = float(HEARTBEAT_MS) / 1000.0
         done = False
-        inner = openai_gen.__aiter__()
-        while not done:
-            try:
-                raw = await asyncio.wait_for(inner.__anext__(), timeout=hb_interval)
-            except asyncio.TimeoutError:
+        # B-08 fix: sentinel-task idle detection (see common/sse.py).
+        async for raw in _iter_chunks_with_idle(openai_gen, hb_interval):
+            if done:
+                break
+            if raw is _IDLE:
                 yield ': heartbeat\n\n'
                 continue
-            except StopAsyncIteration:
-                break
             if isinstance(raw, str):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
+            # Parity fix: tolerate CRLF SSE framing (nous N-08).
+            buffer = _normalize_sse_newlines(buffer)
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
                 line = line_bytes.decode('utf-8', errors='replace').strip()
                 if not line:
                     continue
 
-                if not line.startswith('data: '):
+                # B-02 fix: accept `data:{...}` as well as `data: {...}` — the
+                # space is optional per the SSE spec.
+                if not line.startswith('data:'):
                     continue
-                data_str = line[6:].strip()
+                data_str = line[5:].strip()
+                # B-01 parity: an empty `data:` is a keep-alive, not EOF.
+                if not data_str:
+                    continue
                 if data_str == '[DONE]':
                     done = True
                     break
@@ -1678,6 +2073,18 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 except json.JSONDecodeError:
                     continue
 
+                # B-02 (compounding) fix: surface mid-stream upstream errors
+                # instead of silently dropping them. Previously any payload
+                # without object=="chat.completion.chunk" was discarded, so an
+                # upstream {"error": {...}} vanished and the stream closed with
+                # a fabricated end_turn.
+                if isinstance(data.get('error'), (dict, str)):
+                    err = data['error']
+                    emsg = err.get('message') if isinstance(err, dict) else str(err)
+                    logger.error(f'[openrouter] upstream error mid-stream: {emsg}')
+                    upstream_error = emsg or 'upstream error'
+                    done = True
+                    break
                 if data.get('object') != 'chat.completion.chunk':
                     continue
                 choices = data.get('choices', [])
@@ -1705,71 +2112,137 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     })
 
                 # Tool calls
-                if delta.get('tool_calls'):
-                    for tc in delta['tool_calls']:
-                        tc_idx = tc.get('index', 0)
-                        fn = tc.get('function', {})
-                        if tc_idx not in tool_call_blocks:
-                            # Close any open text block first.
-                            if block_open and text_started:
-                                yield _sse('content_block_stop', {
-                                    'type': 'content_block_stop', 'index': block_index,
-                                })
-                                block_index += 1
-                                text_started = False
-                                block_open = False
-                            tool_call_blocks[tc_idx] = block_index
+                # B-03 fix (CRITICAL): three compounded defects previously
+                # corrupted every tool call on this surface —
+                #   1. content_block_start was emitted OUTSIDE the
+                #      "first time we see this tool" guard, so it repeated on
+                #      every delta chunk (and injected phantom unnamed blocks).
+                #   2. the `if fn.get('arguments')` emit sat OUTSIDE the `for`
+                #      loop, so with N parallel tools only the LAST tool's
+                #      arguments were forwarded — the rest were lost entirely.
+                #   3. block_index was never incremented for a tool block, so
+                #      all parallel tools collided on the same index.
+                # Verified by harness: 2 parallel tools produced 4 starts, all
+                # at index 0, and dropped one tool's arguments completely.
+                for tc in (delta.get('tool_calls') or []):
+                    if not isinstance(tc, dict):
+                        continue
+                    tc_idx = tc.get('index', 0)
+                    fn = tc.get('function') or {}
+                    if tc_idx not in tool_call_blocks:
+                        # R-02: close only a TEXT block here. Closing the
+                        # previous TOOL block orphaned its later argument
+                        # fragments (OpenAI interleaves fragments across all
+                        # active tool indices), so `content_block_delta`
+                        # arrived on a closed index and Claude Code dropped
+                        # the tool call. Tool blocks stay open concurrently
+                        # and are all closed at the terminal path.
+                        if block_open and text_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': block_index,
+                            })
+                            block_index += 1
+                            text_started = False
+                            block_open = False
+                        tool_call_blocks[tc_idx] = block_index
+                        open_tool_blocks.add(block_index)
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {
                                 'type': 'tool_use',
-                                'id': tc.get('id', f'toolu_{block_index}'),
-                                'name': fn.get('name', ''),
+                                'id': tc.get('id') or f'toolu_{block_index}',
+                                'name': fn.get('name', '') or '',
                                 'input': {},
                             },
                         })
                         block_open = True
+                        block_index += 1   # R-02: next block gets a fresh index
+                    # Emit arguments for THIS tool (inside the loop).
                     if fn.get('arguments'):
                         yield _sse('content_block_delta', {
-                            'type': 'content_block_delta', 'index': tool_call_blocks[tc_idx],
-                            'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
+                            'type': 'content_block_delta',
+                            'index': tool_call_blocks[tc_idx],
+                            'delta': {'type': 'input_json_delta',
+                                      'partial_json': fn['arguments']},
                         })
 
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
-        # Close any open block.
-        if block_open:
+        # B-04 / R-02: close the open TEXT block (if any), then every
+        # concurrently-open tool_use block, lowest index first.
+        if block_open and text_started:
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
+            text_started = False
+        for _ti in sorted(open_tool_blocks):
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': _ti,
+            })
+        open_tool_blocks.clear()
+        block_open = False
 
+        # B-07 fix: an upstream error must NOT be reported as a successful
+        # end_turn — the client would persist a truncated answer and could not
+        # retry. Emit a real Anthropic `error` event first.
+        if upstream_error:
+            yield _sse('error', {
+                'type': 'error',
+                'error': {'type': 'api_error', 'message': str(upstream_error)[:2000]},
+            })
+
+        # B-06 parity: map strictly from finish_reason; never infer tool_use
+        # merely because a tool was seen earlier in the turn.
         stop_reason = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use',
-                       'content_filter': 'end_turn'}.get(finish_reason, 'end_turn')
+                       'content_filter': 'refusal'}.get(finish_reason, 'end_turn')
 
         yield _sse('message_delta', {
             'type': 'message_delta',
             'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
-            'usage': {'output_tokens': output_tokens},
+            'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
         })
 
         yield _sse('message_stop', {'type': 'message_stop'})
 
+    except (GeneratorExit, asyncio.CancelledError):
+        # B-09 parity: client disconnected. An async generator must not yield
+        # during finalization — re-raise so cleanup happens in `finally` only.
+        raise
     except Exception as e:
         logger.error(f'[openrouter] anthropic stream translation error: {e}')
-        # Ensure terminal events are always emitted so the client doesn't hang.
-        if block_open:
-            try:
-                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
-            except Exception:
-                pass
+        # B-07 fix: surface the failure instead of fabricating a clean turn.
         try:
+            if block_open and text_started:
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
+            for _ti in sorted(open_tool_blocks):
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ti})
+            open_tool_blocks.clear()
+        except Exception:
+            pass
+        try:
+            yield _sse('error', {
+                'type': 'error',
+                'error': {'type': 'api_error',
+                          'message': f'upstream stream error: {str(e)[:2000]}'},
+            })
             yield _sse('message_delta', {
                 'type': 'message_delta',
                 'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-                'usage': {'output_tokens': output_tokens},
+                'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
             })
             yield _sse('message_stop', {'type': 'message_stop'})
+        except Exception:
+            pass
+    finally:
+        # B-09 fix: deterministically close the inner generator so the upstream
+        # response is released and the pool key returned exactly once, even on
+        # client disconnect. Previously this was left to GC, leaking in-flight
+        # slots until the pool starved.
+        try:
+            aclose = getattr(openai_gen, 'aclose', None)
+            if aclose is not None:
+                await aclose()
         except Exception:
             pass
 

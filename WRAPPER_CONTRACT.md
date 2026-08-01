@@ -1,323 +1,396 @@
 # Wrapper Monorepo Contract
 
-**Version:** 2.0 (2026-07-28)  
-**Status:** Production Ready - Enterprise Grade (100/100)
+**Version:** 3.0 (2026-08-01)
+**Supersedes:** 2.0 (2026-07-28)
+**Status:** Normative. This document is the specification every wrapper is held to.
 
-This monorepo contains provider-specific wrappers that must behave as one coherent product. Upstreams differ (NVIDIA NIM, Nous, OpenCode Zen, Blackbox AI), but the wrapper contract is intentionally identical across all wrappers.
+This monorepo contains provider-specific wrappers that must behave as **one coherent product**. Upstreams differ (NVIDIA NIM, Nous Research, OpenCode Zen, BLACKBOX AI, OpenRouter), but the client-facing contract is intentionally identical across all wrappers.
+
+> **How to read this document.** Requirements use RFC-2119 keywords: **MUST**, **MUST NOT**, **SHOULD**, **MAY**. Every clause here was verified against the code at the version stamped above; where a wrapper legitimately deviates, the deviation is stated explicitly rather than hidden.
+
+**Changes from v2.0 are summarised in [§12](#12-changelog-v20--v30).**
 
 ---
 
-## Standardized Structure (2026-07-28)
+## 1. Standardized structure
 
-All wrappers follow the **identical directory structure** for consistency and maintainability:
+All wrappers follow an identical layout:
 
 ```
-wrapper/
+<wrapper>/
 ├── __init__.py              # Package marker
 ├── README.md                # Wrapper-specific documentation
 ├── .env.example             # Configuration template
 ├── dashboard.html           # Monitoring dashboard
+├── requirements.txt         # Pinned runtime dependencies
 ├── src/
-│   ├── __init__.py          # Source package marker
-│   └── main.py              # Main FastAPI application
-└── systemd/ (optional)      # Systemd service files
+│   ├── __init__.py
+│   ├── main.py              # FastAPI application (entry point)
+│   ├── key_pool.py          # Credential pool  (nvidia/opencode/blackbox/openrouter)
+│   └── metrics.py           # Metrics collector (nvidia/opencode/blackbox/openrouter)
+└── systemd/
+    └── wrapper-<name>.service
 ```
 
-### Standardized Run Command
+Two documented deviations:
 
-All wrappers use the same uvicorn package pattern:
+- **`nous`** keeps its key pool and metrics inline in `src/main.py` rather than in separate modules.
+- **`nvidia-python`** carries additional provider modules (`anthropic_compat.py`, `responses_compat.py`, `capabilities.py`, `registry.py`, `alert_history.py`, `loki_push.py`) because NIM has the richest surface area.
+
+Both are accepted; behaviour MUST still satisfy every clause below.
+
+### 1.1 Run command (authoritative)
+
+The wrapper directory is both the working directory and the `PYTHONPATH` root:
 
 ```bash
-# Development (hot reload)
-uvicorn wrapper.src.main:app --reload --port XXXX
+# systemd (production) — see <wrapper>/systemd/*.service
+WorkingDirectory=/root/wrapper/<wrapper>
+Environment=PYTHONPATH=/root/wrapper/<wrapper>
+ExecStart=/usr/bin/python3 -m uvicorn src.main:app --host 127.0.0.1 --port <PORT>
 
-# Production (multiple workers)
-uvicorn wrapper.src.main:app --host 0.0.0.0 --port XXXX --workers 4
+# local development
+cd <wrapper> && uvicorn src.main:app --reload --port <PORT>
 ```
 
-### Path Reference Pattern
+`model-registry` is a plain service, not a wrapper: `python3 model-registry/service.py`.
 
-For files in `wrapper/src/main.py`:
+> **Correction to v2.0.** v2.0 documented `uvicorn wrapper.src.main:app` (dotted package prefix). That is **not** how any wrapper is actually launched — every systemd unit and `wrappers.json` uses `src.main:app` with the wrapper directory on `PYTHONPATH`. `wrappers.json` is the machine-readable source of truth.
+
+### 1.2 Path reference pattern
+
+From inside `<wrapper>/src/main.py`:
 
 ```python
-# Access wrapper root directory (for dashboard.html, .env, etc.)
-Path(__file__).parent.parent
-# Result: wrapper/
-
-# Access repo root (for common/ package)
-Path(__file__).parents[2]
-# Result: /path/to/repo/
+Path(__file__).resolve().parents[1]   # -> <wrapper>/      (dashboard.html, .env, *.db)
+Path(__file__).resolve().parents[2]   # -> repo root       (the `common/` package)
 ```
+
+Both wrapper dir and repo root are inserted on `sys.path` at import so `common/` resolves under either launch mode.
 
 ---
 
-## Non-Negotiable Runtime Contract
+## 2. Non-negotiable runtime contract
 
-Every wrapper must expose these client-facing surfaces where technically possible:
+### 2.1 Required surfaces
 
-- **OpenAI-compatible Chat Completions:** `POST /v1/chat/completions`
-- **OpenAI-compatible Responses API:** `POST /v1/responses`
-- **Anthropic-compatible Messages API:** `POST /v1/messages`
-- **Anthropic token counting:** `POST /v1/messages/count_tokens`
-- **Model discovery:** `GET /v1/models`
-- **Capability/health/metrics endpoints**
+Every wrapper **MUST** expose:
 
-Every wrapper must preserve these invariants:
+| Surface | Endpoint |
+|---|---|
+| OpenAI Chat Completions | `POST /v1/chat/completions` |
+| OpenAI Responses | `POST /v1/responses` |
+| Anthropic Messages | `POST /v1/messages` |
+| Anthropic token counting | `POST /v1/messages/count_tokens` |
+| Model discovery | `GET /v1/models`, `GET /api/tags` |
+| Capabilities | `GET /v1/capabilities` |
+| Health / readiness | `GET /health`, `GET /ready` |
+| Metrics | `GET /metrics`, `GET /metrics/prom`, `GET /metrics/model-status` |
+| Dashboard | `GET /dashboard` |
+| Version | `GET /version` |
 
-1. **Provider errors are not surfaced prematurely.** A single failed key/token is never a whole-wrapper failure.
-2. **All-key retry before client error.** For retriable/key-level statuses (`401`, `402`, `403`, `408`, `409`, `429`, `5xx`), try every available credential path before returning an error to the agent/client.
-3. **Per-key cooldown.** The key that failed is cooled down and skipped temporarily; other keys continue serving traffic.
-4. **Exact in-flight accounting.** A key is reserved exactly once when selected and released exactly once after non-stream completion, stream completion, stream exception, or upstream EOF.
-5. **Stream lifecycle is terminally complete.** OpenAI streams end with `data: [DONE]`; Anthropic streams end with `message_delta` + `message_stop`; Responses streams end with `response.completed` before `data: [DONE]`.
-6. **No unstructured tool leakage.** Claude Code/Codex/Hermes/OpenClaw must receive structured tool calls/results, not raw DSML or provider-specific tool markup.
-7. **Conversation continuity.** Responses `previous_response_id` stores enough assistant `tool_calls` context so the next `function_call_output`/tool result is never orphaned.
+`POST /v1/embeddings` **MUST** exist on every wrapper. Where the upstream has no embeddings API (`nous`, `opencode`, `blackbox`) it **MUST** return a shaped `501 not_implemented_error` naming a wrapper that does support it — never a bare 404. `nvidia-python` and `openrouter` proxy embeddings for real.
+
+Provider-specific extras (nvidia's `/v1/ranking`, `/v1/images/*`, `/v1/engines`, `/events`; openrouter's `/catalog/*`, `/openrouter/keys/*`, `/mcp/*`) are permitted **provided** they never alter the semantics of the shared surfaces.
+
+### 2.2 Behavioural invariants
+
+1. **A single failed credential is never a whole-wrapper failure.**
+2. **All-key retry before client error.** For retriable statuses (`401`, `402`, `403`, `408`, `409`, `429`, `5xx`) every available credential **MUST** be tried before returning an error.
+3. **Per-key cooldown.** A failing key is cooled down and skipped; other keys keep serving. A cooldown decision **MUST** come from the shared `common.translations.should_cooldown_key` — a model-capacity error **MUST NOT** cool the credential.
+4. **Exactly-once in-flight accounting.** A key is reserved exactly once on selection and released exactly once on non-stream completion, stream completion, stream exception, upstream EOF, **or client disconnect**.
+5. **Terminally complete streams.** OpenAI ends with exactly one `data: [DONE]`; Anthropic ends with `message_delta` + `message_stop`; Responses ends with `response.completed` **or** `response.failed`, then `data: [DONE]`.
+6. **No unstructured tool leakage.** Clients receive structured tool calls, never raw DSML or provider-specific markup.
+7. **Conversation continuity.** `previous_response_id` retains enough assistant `tool_calls` context that the next tool result is never orphaned. The store **MUST** be tenant-namespaced and bounded (§6.3).
 8. **Transparent model choice.** Wrappers do not silently substitute client-selected models. Aliases (`sonnet`, `haiku`, `opus`, `claude-*`) are dynamic/operator-bound, not hardcoded provider choices.
 9. **SDK-shaped errors.** OpenAI surfaces return OpenAI-shaped errors; Anthropic surfaces return Anthropic-shaped errors.
-10. **Provider-specific behavior stays behind the adapter boundary.** Client/agent semantics remain uniform even when upstream protocols differ.
+10. **Provider specifics stay behind the adapter boundary.**
 
 ---
 
-## Enterprise Features (All Wrappers)
+## 3. Streaming contract (normative)
 
-All 5 wrappers implement these **enterprise-grade features**:
+This section is new in v3.0. Every clause below corresponds to a defect found in live testing; the tag in brackets is the finding ID, and each is enforced by a regression test.
 
-### 1. Configuration Validation
-- `validate_config()` function at startup
-- Validates required environment variables
-- Validates port range (1024-65535)
-- Fails fast with clear error messages
+### 3.1 Parsing upstream SSE
 
-### 2. Request Correlation
-- UUID-based request correlation ID
-- Extracted from `x-request-id` header or auto-generated
-- Logged with every request for distributed tracing
+- **`data:` with or without a space MUST both parse.** The space is optional per the SSE spec. `[B-02]`
+- **A bare `data:` (empty value) is a keep-alive, NOT end-of-stream.** Only a literal `[DONE]` terminates. `[B-01]`
+- **CRLF (`\r\n`) framing MUST be normalised** before splitting, or a CRLF upstream buffers until EOF instead of streaming. `[N-08]`
+- **`id:`, `retry:` and comment (`:`) lines MUST be tolerated** and ignored.
+- **A frame that fails to parse as JSON MUST be logged and dropped.** It **MUST NOT** be synthesised into assistant content — doing so renders protocol text to the user as model output. `[B-10]`
+- **`"choices": []` is legal.** Indexing `choices[0]` without a non-empty check raises `IndexError`, which escapes as HTTP 500 mid-stream. `[R-08]`
+- **A trailing partial frame with no blank line MUST still be flushed.**
 
-### 3. Latency Tracking
-- Middleware-based latency measurement
-- `X-Process-Time` header in responses
-- Structured logging with request_id and latency_ms
+### 3.2 Emitting Anthropic SSE
 
-### 4. Graceful Shutdown
-- In-flight request tracking
-- Wait up to 30s for requests to drain
-- Force shutdown with warning if timeout
-- Proper resource cleanup
+- **Exactly one `message_start` and exactly one `message_stop`.** Nothing may follow `message_stop`.
+- **Every `content_block_start` MUST be matched by a `content_block_stop` on the same index.** An index **MUST NOT** be reused after close, and no `content_block_delta` may reference a closed or unopened index.
+- **Parallel tool blocks MUST stay open concurrently.** OpenAI interleaves argument fragments across all active tool indices; closing tool #1 when tool #2 opens orphans tool #1's later fragments and the agent's tool call silently never executes. `[R-02]`
+- **A `tool_use` block MUST carry a non-empty `name`.** Phantom unnamed blocks indicate the tool map was cleared prematurely. `[R-02]`
+- **Reassembled `input_json_delta` fragments MUST form valid JSON per tool.**
+- **`stop_reason` MUST map strictly from `finish_reason`** (`stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`, `content_filter`→`refusal`). It **MUST NOT** be forced to `tool_use` merely because a tool appeared earlier — that makes Claude Code wait forever for a tool result and masks `max_tokens` truncation. `[B-06]`
+  Inferring `tool_use` is permitted **only** in the no-`finish_reason` path (`force_done`) when a tool block was still open.
 
-### 5. Proper Concurrency
-- `asyncio.Lock()` for async contexts
-- `threading.Lock()` for sync contexts
-- No race conditions or deadlocks
-- Cancellation-safe lock acquisition
+### 3.3 Error transparency
 
----
+- **An upstream failure MUST NOT be presented as a successful turn.** A mid-stream `{"error": ...}` frame has no `"choices"` key and was historically dropped, closing the stream with a fabricated `end_turn` — the client persisted a truncated answer and could not retry. It **MUST** surface as an Anthropic `error` event / Responses `response.failed`. `[B-07, R-03]`
+- **Transport errors MUST NOT be injected as model text.** No `[upstream stream error: …]` inside a `text_delta` or `output_text.delta`. `[B-13]`
+- **Content arriving after `finish_reason` MUST be dropped** (protocol requirement) **and counted**, so truncation is observable rather than silent. `[B-05]`
 
-## Shared Conceptual Pipeline
+### 3.4 Heartbeats and liveness
 
-All wrappers follow the same conceptual request pipeline:
+- Wrappers **MUST** emit `: heartbeat` comments during upstream idle gaps so reasoning models do not trip client/LB idle timeouts.
+- Idle detection **MUST** use the sentinel-task pattern in `common.sse.iter_chunks_with_idle`. `asyncio.wait_for` on the upstream iterator is **forbidden**: it cancels the pending read and cannot distinguish an idle upstream from a dead one, so a failed stream is heartbeated forever while the client hangs. `[B-08]`
+- A heartbeat **MUST** only be injected at a clean line boundary, never mid-frame.
+- A real upstream error **MUST** terminate the stream visibly, not be masked as idle.
 
-```text
-Client/Agent
-  ↓
-Ingress endpoint (/v1/chat/completions, /v1/responses, /v1/messages)
-  ↓
-Auth + CORS + input validation
-  ↓
-Request correlation ID extraction/generation
-  ↓
-Latency tracking start
-  ↓
-Model alias resolution + FREE_ONLY/policy checks
-  ↓
-Protocol translation (Anthropic↔OpenAI, Responses↔Chat)
-  ↓
-Tool schema normalization + invalid placeholder drop
-  ↓
-Credential selection (effective-load key pool)
-  ↓
-Upstream provider call
-  ↓
-Retry/cooldown across credential pool on key-level/retriable errors
-  ↓
-Provider response normalization
-  ↓
-Strict SSE or JSON response lifecycle
-  ↓
-Latency measurement end
-  ↓
-Metrics + exact key release + structured logging
-```
+### 3.5 Terminators and cleanup
+
+- **`data: [DONE]` MUST be emitted at most once.** Appending it unconditionally produces the corrupt frame `[DONE]data: [DONE]` when the upstream already sent one without its trailing blank line. `[R-06]`
+- **Async generators MUST NOT yield after `GeneratorExit`/`CancelledError`.** Re-raise and clean up in `finally`.
+- **Wrapped upstream generators MUST be closed deterministically** with `await gen.aclose()`. Merely breaking out of `async for` leaves the generator suspended, so its `finally` — which releases the response and the pool key — never runs, and the connection is never returned to the connector. `[B-09, R-07]`
+
+### 3.6 Response translation
+
+- **Non-streaming replies MUST be translated to the surface's shape.** Returning a raw OpenAI `chat.completion` body on `/v1/messages` or `/v1/responses` makes the reply unparseable to Claude Code and Codex. `[R-05]`
+- A wrapper **MUST NOT** forward frames belonging to a foreign protocol onto a surface. `[B-12]`
 
 ---
 
-## Wrapper Implementations
+## 4. Input handling
 
-### 1. `nvidia-python` (Port 9101)
-
-**Upstream:** NVIDIA NIM API  
-**Module:** `nvidia_python.src.main`  
-**Status:** Production Ready
-
-NVIDIA is the most feature-rich adapter because NIM has model catalog, multiple endpoint families, capability classes, model verification, and reasoning parameter injection.
-
-**Provider-specific features:**
-- NIM model discovery and retired/unavailable model tracking
-- NIM capability classification (`chat`, `vision`, `image`, `ranking`, etc.)
-- NIM reasoning/thinking parameter mapping
-- Multiple NVIDIA base URLs (`integrate.api`, `ai.api`, `nvcf`)
-- Model verification on startup
-
-**Enterprise features:** ✅ All 5 implemented
+- **A malformed or non-object JSON body MUST yield a shaped `4xx`, never a `5xx`.** A valid-but-non-object body (`[1,2,3]`, `"str"`, `42`) reaches `body.get(...)`, and `list.get` raises `AttributeError` → HTTP 500. A 500 tells the SDK the *server* is broken and many SDKs then retry, amplifying load. Enforced centrally by `common.body_guard.JSONBodyGuard`, registered on all five wrappers. `[R-01]`
+- `max_tokens` **MUST** be a positive integer and is capped at `1_000_000`.
+- Request size is capped by `common.middleware.RequestSizeLimiter` (default 10 MB, `MAX_REQUEST_BYTES`). All five wrappers **MUST** use the same default.
+- Unknown `role` values and orphan `tool` messages are repaired or rejected with a shaped 400.
 
 ---
 
-### 2. `nous` (Port 9102)
+## 5. Authentication
 
-**Upstream:** Nous Research Inference API  
-**Module:** `nous.src.main`  
-**Status:** Production Ready
+Two implementation shapes exist and both are acceptable, provided behaviour is identical:
 
-Nous upstream exposes OpenAI-style chat completions. The wrapper translates Anthropic and Responses requests into Chat Completions.
+| Wrapper | Mechanism |
+|---|---|
+| `nvidia-python`, `openrouter` | HTTP middleware (protected by default; new routes are covered automatically) |
+| `nous`, `opencode`, `blackbox` | Per-route `_auth_check(request)` delegating to `common.auth` |
 
-**Provider-specific features:**
-- OAuth token loading from Hermes `AUTH_PATH`
-- Static `NOUS_API_KEY*` fallback pool
-- Curated free model catalog and Nous model metadata
-- Dynamic alias binding
+Middleware is **preferred** for new wrappers because a forgotten decorator cannot silently expose a route.
 
-**Enterprise features:** ✅ All 5 implemented
+Requirements:
 
----
-
-### 3. `opencode` (Port 9103)
-
-**Upstream:** OpenCode Zen API  
-**Module:** `opencode.src.main`  
-**Status:** Production Ready
-
-OpenCode Zen exposes multiple native families (`chat`, `responses`, `messages`, `google` style model paths). The wrapper chooses the upstream family but keeps client-facing semantics uniform.
-
-**Provider-specific features:**
-- Native family routing (`/chat/completions`, `/responses`, `/messages`)
-- Google-style model path handling
-- FREE_ONLY mode with allowlist
-- Dynamic alias binding
-
-**Enterprise features:** ✅ All 5 implemented
+1. **Fail closed.** With no `BEARER_TOKEN` configured, inference endpoints **MUST** return `503`, not serve openly. Opt out only via `REQUIRE_AUTH=false`. `[B-28]`
+2. **Re-read the token per request** so rotation and revocation take effect without a restart. `[B-29]`
+3. **Byte-safe comparison.** `hmac.compare_digest` on two `str` raises `TypeError` on non-ASCII input; both operands **MUST** be encoded, yielding a clean 401. `[B-30]`
+4. **Accept both `Authorization: Bearer` and `x-api-key`**, evaluated independently.
+5. **Public paths MUST be exact-matched and method-gated.** Prefix matching lets `/v1/models` match `/v1/models-internal`. `[B-27]`
+6. **Every POST surface is authenticated and rate-limited**, including `/v1/embeddings` and the catch-all. `[B-31]`
+7. **Privileged management APIs MUST NOT share the inference bypass.** openrouter's `/openrouter/keys/*` (create/rotate/delete provisioning keys) requires `OPENROUTER_MANAGEMENT_TOKEN`. `[B-26]`
+8. `OPTIONS` preflight passes without auth.
 
 ---
 
-### 4. `blackbox` (Port 9104)
+## 6. Resource management
 
-**Upstream:** BLACKBOX AI API  
-**Module:** `blackbox.src.main`  
-**Status:** Production Ready
+### 6.1 Credential pool
 
-Blackbox AI wrapper with full OpenAI + Anthropic compatibility.
+- Selection is least-effective-load with round-robin tie-break.
+- `record()` (telemetry) and `increment_in_flight()` (accounting) are **separate** calls. Folding them together lets any unpaired path permanently inflate `in_flight`, skewing selection away from healthy keys. `[B-36]`
+- `is_blocked()` / `is_hard_blocked()` **MUST** be side-effect-free. Block expiry is an explicit `expire_block()` swept under the lock in `acquire()` — a predicate that clears state can be called by a metrics scrape outside the lock. `[B-37]`
+- Pool locks **MUST** be `asyncio.Lock` in async contexts.
+- Exhaustion returns **`429`** (never `503`) so SDKs auto-retry.
+- Load shedding is **off** by default.
 
-**Provider-specific features:**
-- BLACKBOX AI authentication
-- Free model filtering
-- Dynamic alias binding
-- Streaming with heartbeat
+### 6.2 Connections
 
-**Enterprise features:** ✅ All 5 implemented
+- One shared `aiohttp.ClientSession` per wrapper; never one per request.
+- Streaming responses use `total=None` with a `sock_read` idle timeout, so long generations survive while a dead upstream is still detected.
 
----
+### 6.3 Response store
 
+The `previous_response_id` store **MUST** be bounded on **all three** axes — entry count, total bytes, and TTL. Count alone is insufficient: 200 multi-MB histories is still unbounded memory. `[B-33]`
 
-## Configuration Standards
+| Variable | Default |
+|---|---|
+| `RESPONSES_STORE_MAX_ENTRIES` | `200` |
+| `RESPONSES_STORE_MAX_BYTES` | `33554432` (32 MB) |
+| `RESPONSES_STORE_TTL_SEC` | `3600` |
 
-### Environment Variables
+Keys **MUST** be namespaced by auth principal.
 
-All wrappers use **standardized `.env.example`** with these sections:
+### 6.4 Lifecycle
 
-1. **REQUIRED: API Keys** - Multi-key rotation support
-2. **REQUIRED: Client Authentication** - BEARER_TOKEN
-3. **OPTIONAL: OAuth Authentication** - AUTH_PATH
-4. **NETWORK CONFIGURATION** - LISTEN_HOST, LISTEN_PORT
-5. **API ENDPOINT** - Provider base URL
-6. **RATE LIMITING & KEY MANAGEMENT** - RPM limits, cooldowns
-7. **CONNECTION SETTINGS** - Timeouts, max connections
-8. **STREAMING & HEARTBEAT** - Anti-silence settings
-9. **FREE MODEL RESTRICTION** - FREE_ONLY, FREE_MODEL_ALLOWLIST
-10. **DYNAMIC ALIAS CONFIGURATION** - DYNAMIC_ALIAS_TARGET
-11. **MODEL REGISTRY** - Central intelligence service
-12. **MODEL VERIFICATION** - VERIFY_ON_BOOT
-13. **LOGGING** - LOG_FILE path
-
-### Port Mapping
-
-| Wrapper | Port | Module |
-|---------|------|--------|
-| nvidia-python | 9101 | nvidia_python.src.main |
-| nous | 9102 | nous.src.main |
-| opencode | 9103 | opencode.src.main |
-| blackbox | 9104 | blackbox.src.main |
-| model-registry | 9200 | model-registry.service |
+- **Graceful shutdown MUST drain in-flight requests** (`SHUTDOWN_DRAIN_SEC`, default 30) before closing the session, or every deploy severs active streams. `[B-34]`
+- **Fire-and-forget tasks MUST be retained in a registry.** asyncio holds only a weak reference, so an unreferenced task can be garbage-collected mid-flight. `[B-35]`
+- Background tasks are awaited (bounded) during shutdown.
 
 ---
 
-## Dashboard
+## 7. Shared modules — the parity mechanism
 
-All wrappers include a **monitoring dashboard** at `/dashboard`:
+Cross-wrapper drift is the single largest historical source of bugs in this repo: the same defect fixed in one wrapper and not in its four siblings. Shared behaviour therefore lives in `common/` and **MUST NOT** be reimplemented locally.
 
-- **Real-time metrics** - RPS, latency, error rate
-- **Key status** - Available, blocked, in-flight
-- **Model availability** - Per-model status
-- **Rate-limit / 429 events** - Per-key cooldowns (circuit breaker removed 2026-07-30)
-- **Auto-refresh** - Every 10 seconds
-- **Auth prompt** - Token entered client-side (not embedded)
+| Module | Responsibility |
+|---|---|
+| `common/auth.py` | Fail-closed auth decision, token extraction, byte-safe compare, public-path test |
+| `common/sse.py` | Sentinel-task idle iterator (`IDLE`, `iter_chunks_with_idle`), CRLF normalisation |
+| `common/body_guard.py` | ASGI guard rejecting non-object JSON bodies with a shaped 400 |
+| `common/translations/anthropic_stream.py` | `AnthropicStreamState` — OpenAI SSE → Anthropic SSE |
+| `common/translations/shared.py` | Protocol conversion, error normalisation, retry/cooldown policy, DSML parsing, header forwarding |
+| `common/middleware.py` | `RequestSizeLimiter`, header sanitisation |
+| `common/model/` | Model registry client, call plans, identity guard, validation |
+| `common/model_state.py` | Account-scoped model state persistence |
+| `common/base_wrapper.py` | Reference base class for new wrappers |
+
+**Shadowing a shared helper with a local definition of the same name is forbidden.** A local `_should_cooldown_key` silently overrode the shared import in three wrappers and let cooldown policy diverge. If the shared version is inadequate, improve it — do not fork it. `[B-21]`
+
+`nous` keeps a dict-based `AnthropicStreamState` variant for its `stream_with_heartbeat` serializer. This is an accepted deviation; it **MUST** satisfy §3 identically, and it is covered by the same tests.
 
 ---
 
-## Testing & Verification
+## 8. Cross-wrapper parity policy
 
-### Syntax Validation
+Per [`docs/CROSS_WRAPPER_BUG_POLICY.md`](docs/CROSS_WRAPPER_BUG_POLICY.md), **a bug found in one wrapper MUST be checked against all five and fixed wherever it exists.** This is not advisory: in the 2026-08-01 audit, **six of eight runtime findings existed in more than one wrapper**, and two of them were found only by an automated guard after manual review had missed them.
+
+Four parity guards run in CI and fail the build on regression:
+
+| Guard | Prevents |
+|---|---|
+| `test_r04_no_loop_variable_shadows_a_function_parameter` | A loop variable overwriting a parameter (leaked SSE frames as model text) |
+| `test_r08_no_unguarded_choices_indexing` | `choices[0]` without a non-empty check |
+| `test_parity_all_wrappers_use_sentinel_heartbeat_not_wait_for` | Reintroducing `asyncio.wait_for` heartbeats |
+| `test_parity_no_wrapper_shadows_shared_cooldown_helper` | Shadowing a shared helper |
+
+---
+
+## 9. Configuration
+
+### 9.1 Ports and entry points
+
+`wrappers.json` is the machine-readable source of truth.
+
+| Wrapper | Port | Entry point | Env prefix | Upstream |
+|---|---|---|---|---|
+| `nvidia-python` | 9101 | `src.main:app` | `NVIDIA_` | NVIDIA NIM |
+| `nous` | 9102 | `src.main:app` | `NOUS_` | Nous Research |
+| `opencode` | 9103 | `src.main:app` | `OPENCODE_` | OpenCode Zen |
+| `blackbox` | 9104 | `src.main:app` | `BLACKBOX_` | BLACKBOX AI |
+| `openrouter` | 9106 | `src.main:app` | `OPENROUTER_` | OpenRouter |
+| `model-registry` | 9200 | `service:app` | `MODEL_REGISTRY_` | internal |
+
+Port 9105 is intentionally unused.
+
+### 9.2 Shared environment variables
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `BEARER_TOKEN` | *(none)* | Client auth token. Unset ⇒ 503 unless `REQUIRE_AUTH=false`. |
+| `REQUIRE_AUTH` | `true` | Fail closed when no token is configured. |
+| `DISABLE_AUTH` | *(unset)* | Explicit open mode (LAN only). |
+| `LISTEN_HOST` / `LISTEN_PORT` | `127.0.0.1` / per-wrapper | Bind address. |
+| `<PREFIX>_API_KEY_1..N` | *(none)* | Upstream credential pool. |
+| `<PREFIX>_BASE_URL` | provider default | Upstream base URL. |
+| `<PREFIX>_SOFT_LIMIT_RPM` / `SOFT_LIMIT_RPM` | `30` | Per-key soft RPM (pacing). |
+| `<PREFIX>_HARD_LIMIT_RPM` / `HARD_LIMIT_RPM` | `40`–`60` | Per-key hard RPM. |
+| `RATE_LIMIT_RPM` | `600` | Per-IP limit; `0` disables. |
+| `RATE_LIMIT_COOLDOWN_SEC` | `65` | Cooldown after a 429. |
+| `KEY_COOLDOWN_MAX_SEC` | `300` | Cooldown ceiling. |
+| `HEARTBEAT_INTERVAL_MS` | `5000` | Idle heartbeat interval. |
+| `STREAM_SOCK_READ_TIMEOUT_SEC` | `300` | Upstream read-idle timeout. |
+| `CONNECT_TIMEOUT_SEC` | `30` | Upstream connect timeout. |
+| `REQUEST_TIMEOUT_SEC` | `600` | Non-streaming total timeout. |
+| `MAX_CONNECTIONS` | `200` | Connector limit. |
+| `MAX_REQUEST_BYTES` | `10485760` | Request size cap (10 MB, all wrappers). |
+| `SHUTDOWN_DRAIN_SEC` | `30` | In-flight drain window. |
+| `RESPONSES_STORE_MAX_ENTRIES` | `200` | Response-store entry cap. |
+| `RESPONSES_STORE_MAX_BYTES` | `33554432` | Response-store byte cap. |
+| `RESPONSES_STORE_TTL_SEC` | `3600` | Response-store TTL. |
+| `METRICS_PERSIST_SEC` | `60` | Metrics snapshot interval. |
+| `FREE_ONLY` / `FREE_MODEL_ALLOWLIST` | `no` | Restrict to free models. |
+| `DYNAMIC_ALIAS_TARGET` | *(none)* | Operator-bound alias target. |
+| `LOAD_SHEDDING_ENABLED` | `false` | Shed load above `INFLIGHT_SOFT_CAP`. |
+| `OPENROUTER_MANAGEMENT_TOKEN` | falls back to `BEARER_TOKEN` | Provisioning-API credential (openrouter). |
+
+---
+
+## 10. Observability
+
+- **Metrics MUST persist across restarts** (JSON snapshot, or SQLite for nvidia) and **MUST** be written periodically, not only on graceful shutdown, so counters survive SIGKILL/OOM.
+- **The error counter MUST actually increment.** Streaming requests and error paths were historically uncounted, leaving `error_rate` permanently ~0 and the dashboard reporting false health. `[B-39]`
+- Every response carries `X-Request-ID` and `X-Process-Time`.
+- `/health` reports key availability, in-flight counts and version; `/metrics/prom` exposes Prometheus format.
+- Model outcomes are recorded per credential into the shared model registry by all five wrappers (`nvidia-python` calls `MODEL_REGISTRY_CLIENT.schedule_observation` directly; the others go through a `_record_model_result` helper). Persistence **MUST** be off the request hot path — never awaited before responding.
+
+---
+
+## 11. Testing and verification
+
+A wrapper is **not** contract-compliant until it passes all three gates.
+
 ```bash
-python3 -m py_compile wrapper/src/main.py
+python -m pip install -r tests/requirements.txt
+
+# 1. Unit + parity + regression suite
+python -m pytest tests -q                        # 123 tests
+
+# 2. Live agent-traffic E2E — boots each wrapper as a real server against a
+#    mock upstream and drives it as Claude Code / Codex / OpenAI SDK would.
+python tests/e2e_runtime/run_runtime_e2e.py      # 420 checks, exits non-zero on failure
+
+# 3. Sustained load — leak, pool-starvation and degradation detection
+python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
 ```
 
-### Import Validation
-```bash
-python3 -c "from wrapper.src import main"
-```
+The E2E harness exercises **21 pathological-but-legal upstream behaviours** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `nofinish`, `noterminator`, `midstream_error`, `abrupt`, `slow`, `usage_after`, `empty`, `unicode`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`, `http500`, `http429`.
 
-### Health Check
-```bash
-curl http://localhost:XXXX/health
-```
-
-### Dashboard Access
-```bash
-open http://localhost:XXXX/dashboard
-```
+**Unit tests alone are insufficient.** Every one of the eight runtime findings (R-01…R-08) passed a green 110-test unit suite; they were only reachable by running the servers and speaking to them over a socket.
 
 ---
 
-## Audit Score
+## 12. Changelog (v2.0 → v3.0)
 
-**Final Score: 100/100 - Enterprise Grade**
+### Corrected — v2.0 statements that did not match the code
 
-| Aspect | Score | Status |
-|--------|-------|--------|
-| Structure Consistency | 100/100 | ✅ Perfect |
-| Code Quality | 100/100 | ✅ Perfect |
-| Configuration | 100/100 | ✅ Perfect |
-| Documentation | 100/100 | ✅ Perfect |
-| Production Features | 100/100 | ✅ Perfect |
-| Enterprise Features | 100/100 | ✅ Perfect |
+| v2.0 claim | Reality |
+|---|---|
+| Run command `uvicorn wrapper.src.main:app` | Every unit uses `src.main:app` with the wrapper dir on `PYTHONPATH`. |
+| "4 wrapper implementations" | There are **5**; `openrouter` (9106) was missing entirely. |
+| "Audit Score: 100/100 — Enterprise Grade" across six categories | Not substantiated. Later audits found 37 issues including an unauthenticated key-deletion API and provably broken parallel tool calls. Replaced with verifiable test gates (§11). |
+| "Enterprise features: ✅ All 5 implemented" per wrapper | Graceful drain was absent from nvidia and openrouter until 2026-08-01; a background-task registry was absent from openrouter. |
+| Port table omitted 9106 | Added. |
+| References to root-level audit files | Moved to `docs/`; links updated. |
+
+### Added — new normative sections
+
+- **§3 Streaming contract** — the largest addition. Parsing, block lifecycle, parallel tool calls, error transparency, heartbeats, terminators, generator cleanup. Each clause traces to a defect found in live testing.
+- **§4 Input handling** — non-object JSON bodies must not 500.
+- **§5 Authentication** — fail-closed, per-request token read, byte-safe compare, exact public-path matching, management-API separation.
+- **§6 Resource management** — pool accounting, side-effect-free predicates, three-axis store bounds, drain, task registry.
+- **§7 Shared modules** — the parity mechanism, and the prohibition on shadowing shared helpers.
+- **§8 Cross-wrapper parity policy** — elevated from advisory to enforced, with four CI guards.
+- **§10 Observability** — metrics must persist and error counters must actually increment.
+- **§11 Testing** — three concrete gates replacing the previous four ad-hoc shell snippets.
+
+### Documented deviations
+
+`nous` inlines its key pool, metrics and a dict-based `AnthropicStreamState` in `src/main.py`. Accepted; behaviour must still satisfy every clause and is covered by the same tests.
 
 ---
 
-## References
+## 13. References
 
-- **Wrapper Standardization Report:** `WRAPPER_STANDARDIZATION_REPORT.md`
-- **Production Readiness Report:** `PRODUCTION_READINESS_REPORT_2026-07-28.md`
-- **Final Audit Report:** `AUDIT_FINAL_100_PERFECT_2026-07-28.md`
-- **Cross-Wrapper Bug Policy:** `CROSS_WRAPPER_BUG_POLICY.md`
+- [`README.md`](README.md) — repository entry point
+- [`wrappers.json`](wrappers.json) — machine-readable deployment config
+- [`docs/CROSS_WRAPPER_BUG_POLICY.md`](docs/CROSS_WRAPPER_BUG_POLICY.md) — parity policy
+- [`docs/TEMPLATE_WRAPPER.md`](docs/TEMPLATE_WRAPPER.md) — new-wrapper skeleton
+- [`docs/DOCUMENTATION_INDEX.md`](docs/DOCUMENTATION_INDEX.md) — full documentation map
+- [`docs/audits/RUNTIME_AUDIT_2026-08-01.md`](docs/audits/RUNTIME_AUDIT_2026-08-01.md) — current runtime verification
+- [`docs/audits/BUG_ANALYSIS_2026-07-31.md`](docs/audits/BUG_ANALYSIS_2026-07-31.md) — current deep audit
+- [`docs/reports/PRODUCTION_READINESS_2026-08-01.md`](docs/reports/PRODUCTION_READINESS_2026-08-01.md) — readiness scorecard
+- [`productions/PRODUCTION_RUNBOOK.md`](productions/PRODUCTION_RUNBOOK.md) — operational runbook
 
 ---
 
-**Last Updated:** 2026-07-28  
-**Version:** 2.0  
-**Status:** Production Ready - Enterprise Grade (100/100)
+**Version:** 3.0 · **Last updated:** 2026-08-01
+**Verification at this version:** 123 unit tests · 420 live E2E checks · ~18,100 soak requests · 0 failures
