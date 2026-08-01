@@ -560,6 +560,16 @@ class ResponsesHandler:
             stream = result.get('stream')
             try:
                 if stream is not None:
+                    # R-07: this generator MUST be closed on every exit path.
+                    # `stream` is nvidia's stream_wrapper(), whose `finally`
+                    # releases the aiohttp response AND the pool key. Breaking
+                    # out of the `async for` (as the R-03 upstream-error path
+                    # does) or raising leaves the generator merely suspended —
+                    # its finally never runs, so the TCP connection is never
+                    # returned to the connector. After MAX_CONNECTIONS such
+                    # requests every subsequent call blocks forever waiting for
+                    # a free slot: the wrapper stops responding entirely while
+                    # the key pool still reports "available".
                     async for raw in stream:
                         chunk = raw.decode('utf-8', errors='replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
                         buffer += chunk
@@ -678,6 +688,16 @@ class ResponsesHandler:
                 stream_error = e
                 import logging
                 logging.getLogger('responses').error(f"[responses:nim stream] {e}")
+            finally:
+                # R-07: deterministically close the upstream generator so its
+                # finally-block releases the connection and the pool key.
+                if stream is not None:
+                    _ac = getattr(stream, 'aclose', None)
+                    if _ac is not None:
+                        try:
+                            await _ac()
+                        except Exception:
+                            pass
 
             # B-13 fix: NEVER inject a transport error as model output. The old
             # code emitted "[upstream stream error: ...]" as an

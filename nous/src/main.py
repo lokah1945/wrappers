@@ -1608,7 +1608,6 @@ class AnthropicStreamState:
             # R-02: close all open tool blocks, then any text/thinking block.
             for _ti in sorted(self.open_tool_blocks):
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-            _had_tools = bool(self.open_tool_blocks)
             self.open_tool_blocks.clear()
             if self.current_block is not None and self.current_block != "tool_use":
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
@@ -1683,6 +1682,7 @@ class ResponsesStreamState:
         self._completed = False
         self._finished = False
         self.accum_usage = {}
+        self.upstream_error = None  # R-03
 
     def next_seq(self):
         self.seq += 1
@@ -1760,6 +1760,17 @@ class ResponsesStreamState:
         self._completed = True
         norm = self._normalize_usage(usage)
         rid = self.rid
+        # R-03: the upstream reported a mid-stream failure. Emit
+        # response.failed instead of a fabricated response.completed, so the
+        # client can detect the error and retry rather than persisting a
+        # truncated answer as a successful turn.
+        if getattr(self, "upstream_error", None):
+            return [self.emit("response.failed", {"response": {
+                "id": rid, "object": "response", "model": self.model,
+                "status": "failed",
+                "error": {"code": "upstream_error",
+                          "message": str(self.upstream_error)[:2000]},
+            }})]
         text = getattr(self, "final_text", "")
         events = [
             self.emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": text}),
@@ -1818,6 +1829,15 @@ class ResponsesStreamState:
         # Accumulate usage from any chunk (Nous sends it separately from finish_reason)
         if isinstance(chunk, dict) and chunk.get("usage"):
             self.accum_usage.update(chunk["usage"])
+
+        # R-03: an upstream {"error": ...} frame has no "choices" and was
+        # silently dropped, so the turn ended with a fabricated
+        # response.completed. Record it so done() emits response.failed.
+        if isinstance(chunk, dict) and chunk.get("error") is not None and "choices" not in chunk:
+            _e = chunk["error"]
+            self.upstream_error = (_e.get("message") if isinstance(_e, dict) else str(_e)) or "upstream error"
+            logger.error(f"[nous responses] upstream error frame: {self.upstream_error}")
+            return events
 
         if "choices" not in chunk:
             return events

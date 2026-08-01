@@ -565,6 +565,12 @@ class BaseWrapper:
                         # never read, so the interval was unthrottled).
                         last_hb = time.time()
                         at_line_boundary = True
+                        # R-06: never append a second [DONE]. Doing so
+                        # unconditionally produced the corrupt frame
+                        # '[DONE]data: [DONE]' when the upstream already sent
+                        # one without a trailing blank line — not valid JSON, so
+                        # strict SDK parsers error at the end of a good turn.
+                        saw_done = False
                         hb_interval = float(self.config.heartbeat_interval_ms) / 1000.0
                         try:
                             async for line in _iter_chunks_with_idle(resp_ref, hb_interval):
@@ -574,13 +580,18 @@ class BaseWrapper:
                                         yield b': heartbeat\n\n'
                                         last_hb = now
                                     continue
+                                if line and b'[DONE]' in (line if isinstance(line, (bytes, bytearray)) else str(line).encode()):
+                                    saw_done = True
                                 yield line
                                 if isinstance(line, (bytes, bytearray)) and len(line):
                                     at_line_boundary = line.endswith(b'\n')
                                 elif line:
                                     at_line_boundary = str(line).endswith('\n')
                                 last_hb = time.time()
-                            yield b'data: [DONE]\n\n'
+                            if not at_line_boundary:
+                                yield b'\n\n'
+                            if not saw_done:
+                                yield b'data: [DONE]\n\n'
                         except (GeneratorExit, asyncio.CancelledError):
                             raise
                         except Exception as e:
@@ -588,7 +599,8 @@ class BaseWrapper:
                                 '[stream] upstream error (%s: %s); finalizing',
                                 type(e).__name__, e)
                             yield f': upstream-error {type(e).__name__}\n\n'.encode()
-                            yield b'data: [DONE]\n\n'
+                            if not saw_done:
+                                yield b'data: [DONE]\n\n'
                         finally:
                             if not released:
                                 released = True

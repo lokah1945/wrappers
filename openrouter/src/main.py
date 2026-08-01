@@ -865,11 +865,30 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
                 async def stream_gen():
                     nonlocal released
+                    # R-06: track whether upstream already terminated, and
+                    # whether its last byte ended a line. Unconditionally
+                    # appending b'data: [DONE]\n\n' produced the corrupt frame
+                    # '[DONE]data: [DONE]' when the upstream sent [DONE]
+                    # WITHOUT a trailing blank line — a real pattern, and the
+                    # resulting line is not valid JSON, so strict SDK parsers
+                    # error out at the very end of an otherwise good turn.
+                    saw_done = False
+                    ends_newline = True
                     try:
                         async for line in resp_ref.content:
+                            if line:
+                                if b'[DONE]' in line:
+                                    saw_done = True
+                                ends_newline = line.endswith(b'\n')
                             yield line
-                        # If upstream didn't send [DONE], synthesize it for OpenAI SSE.
-                        yield b'data: [DONE]\n\n'
+                        # Only synthesize [DONE] if upstream never sent one.
+                        if not saw_done:
+                            if not ends_newline:
+                                yield b'\n\n'
+                            yield b'data: [DONE]\n\n'
+                        elif not ends_newline:
+                            # Upstream's [DONE] lacked its frame terminator.
+                            yield b'\n\n'
                     except asyncio.CancelledError:
                         raise
                     finally:
@@ -1071,16 +1090,24 @@ async def responses(request: Request):
     response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
 
     if isinstance(response, JSONResponse):
-        # Reshape error to Responses API format.
+        # R-05 (CRITICAL, same class): the raw OpenAI ChatCompletion body was
+        # returned to Codex instead of a Responses object, because this branch
+        # returned before the translation below could run.
         try:
             payload = json.loads(response.body)
-            if isinstance(payload, dict) and 'error' in payload:
-                return JSONResponse(
-                    {"error": payload['error'], "type": "error"},
-                    status_code=response.status_code,
-                )
         except Exception:
-            pass
+            return response
+        if isinstance(payload, dict) and 'error' in payload:
+            return JSONResponse(
+                {"error": payload['error'], "type": "error"},
+                status_code=response.status_code,
+            )
+        if isinstance(payload, dict) and 'choices' in payload:
+            resp_obj = chat_to_responses(model, payload, body)
+            rid = resp_obj.get('id')
+            if rid and principal:
+                _store_response(principal, rid, chat_body.get('messages', []))
+            return JSONResponse(resp_obj, status_code=response.status_code)
         return response
 
     # Streaming: translate OpenAI SSE → Responses SSE event lifecycle.
@@ -1131,6 +1158,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
     msg_id = f"msg_{int(time.time()*1000)}"
     text_started = False
     full_text = ''
+    upstream_error = None  # R-03: mid-stream upstream failure
 
     def _sse(event_type: str, payload: dict) -> str:
         """Build a complete SSE frame: event:\ndata:\n\n"""
@@ -1161,7 +1189,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
 
         def _parse_line(line_str: str):
             """Parse one complete SSE line. Returns (events_list, is_done)."""
-            nonlocal text_started, full_text
+            nonlocal text_started, full_text, upstream_error
             events = []
             # B-02 fix: the space after `data:` is OPTIONAL in SSE. Requiring
             # it silently discarded 100% of chunks from upstreams that emit
@@ -1175,6 +1203,13 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 data = json.loads(data_str)
             except json.JSONDecodeError:
                 return events, False
+            # R-03: surface a mid-stream upstream error instead of dropping it
+            # and closing with a fabricated response.completed.
+            if isinstance(data, dict) and data.get('error') is not None and 'choices' not in data:
+                _e = data['error']
+                upstream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                logger.error(f'[openrouter responses] upstream error frame: {upstream_error}')
+                return events, True
             if data.get('object') != 'chat.completion.chunk':
                 return events, False
             choices = data.get('choices', [])
@@ -1254,6 +1289,20 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
                 },
             })
+
+        # R-03: report failure rather than fabricating a successful completion.
+        if upstream_error:
+            yield _sse('response.failed', {
+                'type': 'response.failed',
+                'response': {
+                    'id': resp_id, 'object': 'response', 'created_at': created_at,
+                    'model': model, 'status': 'failed',
+                    'error': {'code': 'upstream_error',
+                              'message': str(upstream_error)[:2000]},
+                },
+            })
+            yield 'data: [DONE]\n\n'
+            return
 
         # response.completed
         yield _sse('response.completed', {
@@ -1443,16 +1492,25 @@ async def messages(request: Request):
                                      stream=openai_body["stream"], request=request)
 
     if isinstance(response, JSONResponse):
-        # Reshape error envelope to Anthropic format for SDK compatibility.
+        # RUNTIME FINDING R-05 (CRITICAL): this branch returned the RAW OpenAI
+        # ChatCompletion body on success — `return response` fired before the
+        # Anthropic translation further down could ever run, because
+        # _proxy_request always returns a JSONResponse for non-streaming calls.
+        # Claude Code received {"object":"chat.completion","choices":[...]}
+        # instead of {"type":"message","content":[...]} and could not parse the
+        # reply at all. Translate here, where the response actually arrives.
         try:
             payload = json.loads(response.body)
-            if isinstance(payload, dict) and 'error' in payload:
-                return JSONResponse(
-                    {"type": "error", "error": payload['error']},
-                    status_code=response.status_code,
-                )
         except Exception:
-            pass
+            return response
+        if isinstance(payload, dict) and 'error' in payload:
+            return JSONResponse(
+                {"type": "error", "error": payload['error']},
+                status_code=response.status_code,
+            )
+        if isinstance(payload, dict) and 'choices' in payload:
+            return JSONResponse(_openai_to_anthropic_response(payload, body),
+                                status_code=response.status_code)
         return response
 
     # For streaming, translate OpenAI SSE → Anthropic SSE
@@ -1921,6 +1979,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     block_index = 0
     text_started = False
     tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
+    open_tool_blocks: set = set()  # R-02: concurrently-open tool_use blocks
     finish_reason = None
     output_tokens = 0
     input_tokens = 0
@@ -2037,9 +2096,14 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     tc_idx = tc.get('index', 0)
                     fn = tc.get('function') or {}
                     if tc_idx not in tool_call_blocks:
-                        # Close whatever block is currently open (text or a
-                        # previous tool) before opening a new one.
-                        if block_open:
+                        # R-02: close only a TEXT block here. Closing the
+                        # previous TOOL block orphaned its later argument
+                        # fragments (OpenAI interleaves fragments across all
+                        # active tool indices), so `content_block_delta`
+                        # arrived on a closed index and Claude Code dropped
+                        # the tool call. Tool blocks stay open concurrently
+                        # and are all closed at the terminal path.
+                        if block_open and text_started:
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': block_index,
                             })
@@ -2047,6 +2111,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             text_started = False
                             block_open = False
                         tool_call_blocks[tc_idx] = block_index
+                        open_tool_blocks.add(block_index)
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {
@@ -2057,6 +2122,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             },
                         })
                         block_open = True
+                        block_index += 1   # R-02: next block gets a fresh index
                     # Emit arguments for THIS tool (inside the loop).
                     if fn.get('arguments'):
                         yield _sse('content_block_delta', {
@@ -2069,14 +2135,19 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
-        # B-04 fix: close the block that is ACTUALLY open. block_index is now
-        # maintained correctly by the tool-call path above, so this no longer
-        # tells the client to close a block it never opened.
-        if block_open:
+        # B-04 / R-02: close the open TEXT block (if any), then every
+        # concurrently-open tool_use block, lowest index first.
+        if block_open and text_started:
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
-            block_open = False
+            text_started = False
+        for _ti in sorted(open_tool_blocks):
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': _ti,
+            })
+        open_tool_blocks.clear()
+        block_open = False
 
         # B-07 fix: an upstream error must NOT be reported as a successful
         # end_turn — the client would persist a truncated answer and could not
@@ -2107,11 +2178,14 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     except Exception as e:
         logger.error(f'[openrouter] anthropic stream translation error: {e}')
         # B-07 fix: surface the failure instead of fabricating a clean turn.
-        if block_open:
-            try:
+        try:
+            if block_open and text_started:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
-            except Exception:
-                pass
+            for _ti in sorted(open_tool_blocks):
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ti})
+            open_tool_blocks.clear()
+        except Exception:
+            pass
         try:
             yield _sse('error', {
                 'type': 'error',

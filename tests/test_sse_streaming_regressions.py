@@ -459,3 +459,183 @@ def test_parity_shared_cooldown_skips_model_capacity_errors():
     assert should_cooldown_key(401, {}) is True
     assert should_cooldown_key(503, {}) is True
     assert should_cooldown_key(400, {}) is False
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# RUNTIME FINDINGS (R-01..R-07) — 2026-08-01
+# Found by tests/runtime/run_runtime_e2e.py, which boots each wrapper as a REAL
+# server and drives it with agent-shaped traffic. Every one of these passed the
+# unit suite before being fixed, so they are locked down here too.
+# ══════════════════════════════════════════════════════════════════════════
+
+def test_r01_non_object_json_body_guard_registered_everywhere():
+    """A valid-but-non-object JSON body ([1,2,3]) caused HTTP 500 in all five
+    wrappers: handlers call body.get() and list.get raises AttributeError."""
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert 'JSONBodyGuard' in src, f'{wrapper}: JSON body-shape guard not registered'
+
+
+def test_r01_body_guard_rejects_non_objects_and_passes_objects():
+    from common.body_guard import _is_anthropic_surface
+    assert _is_anthropic_surface('/v1/messages')
+    assert not _is_anthropic_surface('/v1/chat/completions')
+
+
+def test_r01_body_guard_replay_delegates_after_body():
+    """Regression: synthesising http.disconnect after the body broke EVERY
+    streaming response (StreamingResponse's disconnect-watcher cancelled the
+    stream after one event). The replay must delegate to the real receive()."""
+    import inspect
+    from common import body_guard
+    src = inspect.getsource(body_guard._replay)
+    assert 'original_receive' in src
+    assert 'await original_receive()' in src
+
+
+def test_r02_parallel_tool_blocks_stay_open_concurrently():
+    """Opening tool #2 must NOT close tool #1 — OpenAI interleaves argument
+    fragments across all active tool indices."""
+    st = AnthropicStreamState(model='m')
+    frames = []
+    frames += st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'id': 'a', 'function': {'name': 'alpha', 'arguments': '{"x'}},
+        {'index': 1, 'id': 'b', 'function': {'name': 'beta', 'arguments': '{"y'}},
+    ]}}]})
+    frames += st.translate_chunk({'choices': [{'delta': {'tool_calls': [
+        {'index': 0, 'function': {'arguments': '":1}'}},
+        {'index': 1, 'function': {'arguments': '":2}'}},
+    ]}}]})
+    frames += st.translate_chunk({'choices': [{'delta': {}, 'finish_reason': 'tool_calls'}]})
+
+    open_blocks, errs, args = set(), [], {}
+    for f in frames:
+        d = json.loads(f.split('data: ')[1])
+        t = d.get('type')
+        if t == 'content_block_start':
+            open_blocks.add(d['index'])
+        elif t == 'content_block_delta':
+            if d['index'] not in open_blocks:
+                errs.append(f"delta on closed/unopened index {d['index']}")
+            if d['delta'].get('type') == 'input_json_delta':
+                args[d['index']] = args.get(d['index'], '') + d['delta']['partial_json']
+        elif t == 'content_block_stop':
+            open_blocks.discard(d['index'])
+    assert not errs, errs
+    assert not open_blocks, f'unclosed blocks: {open_blocks}'
+    assert len(args) == 2
+    for blob in args.values():
+        json.loads(blob)  # must be valid JSON
+
+
+def test_r02_no_wrapper_closes_previous_tool_block_on_new_tool():
+    """nvidia's stop_open() also DELETED the tool from tool_map, so the next
+    fragment re-created a phantom unnamed block."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'anthropic_compat.py').read_text()
+    assert 'stop_all_tools' in src, 'nvidia has no concurrent tool-block close'
+    i = src.index('async def stop_open')
+    body = src[i:i + 1400]
+    assert 'del tool_map[k]' not in body, 'stop_open still deletes tools from tool_map'
+
+
+def test_r03_upstream_error_frame_surfaces_not_swallowed():
+    """A mid-stream {"error": ...} frame has no "choices" and used to be
+    dropped, closing the turn with a fabricated end_turn."""
+    st = AnthropicStreamState(model='m')
+    st.translate_chunk({'choices': [{'delta': {'content': 'partial'}}]})
+    evs = st.translate_chunk({'error': {'message': 'boom', 'type': 'server_error'}})
+    types = [json.loads(e.split('data: ')[1])['type'] for e in evs]
+    assert 'error' in types, 'upstream error frame was swallowed'
+    assert types[-1] == 'message_stop'
+    assert st.upstream_error == 'boom'
+    # nothing may be emitted afterwards
+    assert st.translate_chunk({'choices': [{'delta': {'content': 'more'}}]}) == []
+
+
+def test_r03_all_wrappers_handle_upstream_error_frames():
+    for wrapper, path in (
+        ('nous', 'src/main.py'),
+        ('opencode', 'src/main.py'),
+        ('blackbox', 'src/main.py'),
+        ('openrouter', 'src/main.py'),
+        ('nvidia-python', 'src/anthropic_compat.py'),
+        ('nvidia-python', 'src/responses_compat.py'),
+    ):
+        src = (ROOT / wrapper / path).read_text()
+        assert "get('error') is not None" in src or 'get("error") is not None' in src, \
+            f'{wrapper}/{path}: does not detect mid-stream upstream error frames'
+
+
+def test_r04_no_loop_variable_shadows_a_function_parameter():
+    """`async for chunk in stop_open()` overwrote the `chunk` PARAMETER holding
+    the model's text, so an SSE frame string was rendered as assistant prose."""
+    import ast
+    offenders = []
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        for py in (ROOT / wrapper / 'src').glob('*.py'):
+            tree = ast.parse(py.read_text())
+            for fn in ast.walk(tree):
+                if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                params = {a.arg for a in fn.args.args} | {a.arg for a in fn.args.kwonlyargs}
+                for node in ast.walk(fn):
+                    if isinstance(node, (ast.For, ast.AsyncFor)) and isinstance(node.target, ast.Name):
+                        if node.target.id in params:
+                            offenders.append(f'{py.name}:{node.lineno} {fn.name}() '
+                                             f"loop var '{node.target.id}' shadows a parameter")
+    assert not offenders, 'loop variables shadowing parameters:\n  ' + '\n  '.join(offenders)
+
+
+def test_r05_openrouter_translates_non_streaming_responses():
+    """openrouter returned the RAW OpenAI ChatCompletion body on the Anthropic
+    and Responses surfaces — `return response` fired before the translation."""
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    i = src.index('async def messages(')
+    block = src[i:i + 3000]
+    assert '_openai_to_anthropic_response(payload, body)' in block, \
+        'openrouter /v1/messages does not translate non-streaming replies'
+    j = src.index('async def responses(')
+    rblock = src[j:j + 3000]
+    assert 'chat_to_responses(' in rblock, \
+        'openrouter /v1/responses does not translate non-streaming replies'
+
+
+def test_r06_no_duplicate_done_terminator():
+    """Appending [DONE] unconditionally produced the corrupt frame
+    '[DONE]data: [DONE]' when upstream already sent one without a blank line.
+
+    Every site that SYNTHESISES a terminator must be guarded. nous is exempt
+    from the `saw_done` idiom because it only echoes [DONE] on the branch that
+    just consumed one, and its `terminated` flag makes that path single-shot —
+    verified explicitly below rather than by keyword.
+    """
+    for wrapper in ('nvidia-python', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        if 'data: [DONE]' in src:
+            assert 'saw_done' in src, f'{wrapper}: [DONE] emitted without a saw_done guard'
+    base = (ROOT / 'common' / 'base_wrapper.py').read_text()
+    assert 'saw_done' in base, 'common/base_wrapper.py appends [DONE] unconditionally'
+
+    # nous: every emission site must sit inside the pass-through branch
+    # (`state is None`), and the path must be single-shot via `terminated`.
+    nsrc = (ROOT / 'nous' / 'src' / 'main.py').read_text()
+    marker = 'yield "data: [DONE]'
+    positions = []
+    at = nsrc.find(marker)
+    while at != -1:
+        positions.append(at)
+        at = nsrc.find(marker, at + 1)
+    assert positions, 'nous no longer emits a [DONE] terminator at all'
+    for idx in positions:
+        window = nsrc[max(0, idx - 240):idx]
+        assert 'if state is None:' in window, (
+            'nous emits [DONE] outside the pass-through branch (duplicate risk)')
+    assert 'terminated = True' in nsrc
+
+
+def test_r07_nvidia_responses_closes_upstream_generator():
+    """Breaking out of `async for raw in stream` left the generator suspended,
+    so its finally (which releases the response AND the pool key) never ran."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    assert "_ac = getattr(stream, 'aclose', None)" in src, \
+        'responses_compat does not deterministically close the upstream generator'
