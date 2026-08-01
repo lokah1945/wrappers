@@ -1028,9 +1028,13 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     errored = True
                     error_message = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                     break
+                # R-08: guard against an empty choices array.
                 if not chunk.get('choices'):
                     continue
-                ch = chunk['choices'][0]
+                _cl = chunk.get('choices') or []
+                if not _cl:
+                    continue
+                ch = _cl[0] or {}
                 delta = ch.get('delta', {})
 
                 content_text = delta.get('content', '') or ''
@@ -1084,7 +1088,8 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     try:
                         chunk = json.loads(data)
                         if chunk.get('choices'):
-                            ch = chunk['choices'][0]
+                            # R-08: empty choices array is legal.
+                            ch = (chunk.get('choices') or [{}])[0] or {}
                             delta = ch.get('delta', {})
                             content_text = delta.get('content', '') or ''
                             reasoning = delta.get('reasoning_content') or delta.get('reasoning')

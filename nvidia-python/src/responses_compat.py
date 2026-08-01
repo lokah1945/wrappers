@@ -594,9 +594,11 @@ class ResponsesHandler:
                                 _e = c['error']
                                 stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                                 break
-                            if not c.get('choices'):
+                            # R-08: empty choices array is legal.
+                            _cl = c.get('choices') or []
+                            if not _cl:
                                 continue
-                            ch = c['choices'][0]
+                            ch = _cl[0] or {}
                             d = ch.get('delta') or {}
                             if isinstance(d.get('content'), str) and d['content']:
                                 acc_text += d['content']

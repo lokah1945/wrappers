@@ -639,3 +639,43 @@ def test_r07_nvidia_responses_closes_upstream_generator():
     src = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
     assert "_ac = getattr(stream, 'aclose', None)" in src, \
         'responses_compat does not deterministically close the upstream generator'
+
+
+def test_r08_empty_choices_array_does_not_crash():
+    """A frame with `"choices": []` is legal (usage-only frames, provider
+    keep-alives). `chunk["choices"][0]` raised IndexError, which escaped as
+    HTTP 500 mid-stream and killed the turn."""
+    st = AnthropicStreamState(model='m')
+    st.translate_chunk({'choices': [{'delta': {'content': 'a'}}]})
+    # must not raise
+    st.translate_chunk({'id': 'x', 'object': 'chat.completion.chunk', 'choices': []})
+    evs = st.translate_chunk({'choices': [{'delta': {'content': 'b'}}]})
+    assert any('text_delta' in e and '"b"' in e for e in evs)
+
+
+def test_r08_no_unguarded_choices_indexing():
+    """No wrapper may index choices[0] without first proving it is non-empty.
+
+    A frame carrying `"choices": []` is legal, and the resulting IndexError
+    escaped as an HTTP 500 in the middle of a stream.
+    """
+    import re
+    offenders = []
+    pattern = re.compile(r"""\[["']choices["']\]\[0\]""")
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        for py in sorted((ROOT / wrapper / 'src').glob('*.py')):
+            lines = py.read_text().splitlines()
+            for n, line in enumerate(lines, 1):
+                stripped = line.strip()
+                if stripped.startswith('#'):
+                    continue                       # comment describing the bug
+                if not pattern.search(line):
+                    continue
+                if 'or [{}]' in line or 'or []' in line:
+                    continue                       # inline default guard
+                ctx = ' '.join(lines[max(0, n - 3):n - 1])
+                if 'len(' in ctx and '> 0' in ctx:
+                    continue                       # explicit length check above
+                offenders.append(f'{wrapper}/{py.name}:{n}: {stripped[:90]}')
+    assert not offenders, ('unguarded choices[0] indexing:\n  '
+                           + '\n  '.join(offenders))

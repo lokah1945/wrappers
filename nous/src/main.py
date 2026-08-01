@@ -1839,11 +1839,15 @@ class ResponsesStreamState:
             logger.error(f"[nous responses] upstream error frame: {self.upstream_error}")
             return events
 
-        if "choices" not in chunk:
+        # R-08: a frame may legally carry an EMPTY choices array (usage-only
+        # frames, some provider keep-alives). `chunk["choices"][0]` raised
+        # IndexError -> HTTP 500 mid-stream, killing the turn.
+        _choices = chunk.get("choices") or []
+        if not _choices:
             return events
 
-        ch = chunk["choices"][0]
-        delta = ch.get("delta", {})
+        ch = _choices[0] or {}
+        delta = ch.get("delta", {}) or {}
 
         # Text
         if delta.get("content"):
