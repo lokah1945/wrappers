@@ -1468,6 +1468,40 @@ async def api_tags():
     return {'models': out_models}
 
 
+@app.get("/v1/capabilities")
+async def capabilities(request: Request):
+    """Model capability discovery.
+
+    WRAPPER_CONTRACT v3.0 §2.1 requires this surface on every wrapper; it was
+    the only one of the mandated endpoints missing from openrouter (gap found
+    while verifying the contract against the code on 2026-08-01). Shape matches
+    the nous/opencode/blackbox implementations so a client can treat all five
+    wrappers identically.
+    """
+    models_list = []
+    try:
+        resp = await list_models(request)
+        payload = json.loads(resp.body) if hasattr(resp, 'body') else {}
+        models_list = payload.get('data', []) if isinstance(payload, dict) else []
+    except Exception as e:
+        logger.warning(f'[capabilities] model list unavailable: {e}')
+        models_list = []
+    return {
+        "object": "list",
+        "models": [
+            {
+                "id": m.get("id") if isinstance(m, dict) else m,
+                "capabilities": ["chat", "completion"],
+                "streaming": True,
+            }
+            for m in models_list
+        ],
+        "summary": {"total": len(models_list),
+                    "by_type": {"chat": len(models_list)}},
+        "dynamic_alias_target": None,
+    }
+
+
 # ── Anthropic-compatible ─────────────────────────────────────────────────
 
 @app.post("/v1/messages")

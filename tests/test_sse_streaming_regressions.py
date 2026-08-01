@@ -679,3 +679,78 @@ def test_r08_no_unguarded_choices_indexing():
                 offenders.append(f'{wrapper}/{py.name}:{n}: {stripped[:90]}')
     assert not offenders, ('unguarded choices[0] indexing:\n  '
                            + '\n  '.join(offenders))
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# WRAPPER_CONTRACT v3.0 conformance
+# ══════════════════════════════════════════════════════════════════════════
+
+# WRAPPER_CONTRACT.md §2.1 — surfaces every wrapper MUST expose.
+CONTRACT_REQUIRED_SURFACES = (
+    '/v1/chat/completions',
+    '/v1/responses',
+    '/v1/messages',
+    '/v1/messages/count_tokens',
+    '/v1/embeddings',
+    '/v1/models',
+    '/api/tags',
+    '/v1/capabilities',
+    '/health',
+    '/ready',
+    '/metrics',
+    '/metrics/prom',
+    '/dashboard',
+    '/version',
+)
+
+
+def test_contract_all_wrappers_expose_required_surfaces():
+    """§2.1: the mandated surface set must exist on all five wrappers.
+
+    Found by this check on 2026-08-01: openrouter was missing
+    /v1/capabilities — a real parity gap surfaced by verifying the contract
+    against the code rather than trusting the contract's own claims.
+    """
+    missing = []
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        for ep in CONTRACT_REQUIRED_SURFACES:
+            if f'"{ep}"' not in src and f"'{ep}'" not in src:
+                missing.append(f'{wrapper}: {ep}')
+    assert not missing, ('wrappers missing contract-required surfaces:\n  '
+                         + '\n  '.join(missing))
+
+
+def test_contract_ports_match_wrappers_json():
+    """§9.1: wrappers.json is the machine-readable source of truth for ports."""
+    cfg = json.loads((ROOT / 'wrappers.json').read_text())['wrappers']
+    expected = {'nvidia-python': 9101, 'nous': 9102, 'opencode': 9103,
+                'blackbox': 9104, 'openrouter': 9106, 'model-registry': 9200}
+    for name, port in expected.items():
+        assert cfg[name]['port'] == port, f'{name}: wrappers.json port drifted'
+    # The contract states 9105 is intentionally unused.
+    assert 9105 not in {w['port'] for w in cfg.values()}
+
+
+def test_contract_entry_points_match_systemd():
+    """§1.1: the documented run command must match the shipped systemd units."""
+    cfg = json.loads((ROOT / 'wrappers.json').read_text())['wrappers']
+    for name in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        assert cfg[name]['entry_point'] == 'src.main:app', \
+            f'{name}: entry_point drifted from src.main:app'
+        unit = ROOT / name / 'systemd' / f'wrapper-{name}.service'
+        if unit.exists():
+            text = unit.read_text()
+            assert 'src.main:app' in text, f'{name}: systemd unit does not use src.main:app'
+            assert f"--port {cfg[name]['port']}" in text, \
+                f'{name}: systemd port disagrees with wrappers.json'
+
+
+def test_contract_shared_modules_exist():
+    """§7: the parity mechanism depends on these shared modules existing."""
+    for rel in ('common/auth.py', 'common/sse.py', 'common/body_guard.py',
+                'common/middleware.py', 'common/model_state.py',
+                'common/base_wrapper.py',
+                'common/translations/anthropic_stream.py',
+                'common/translations/shared.py'):
+        assert (ROOT / rel).exists(), f'shared module missing: {rel}'
