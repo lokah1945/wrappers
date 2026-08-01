@@ -1850,8 +1850,23 @@ class ResponsesStreamState:
         delta = ch.get("delta", {}) or {}
 
         # Text
-        if delta.get("content"):
-            events.append(self.delta(delta["content"]))
+        # F2: `content` is only str for the OpenAI-compatible shape; some
+        # upstreams stream multi-part content arrays. Guard the type so a
+        # list doesn't raise TypeError mid-stream (HTTP 500 kills the turn),
+        # mirroring nvidia-python responses_compat:603/674.
+        content = delta.get("content")
+        if isinstance(content, str):
+            if content:
+                events.append(self.delta(content))
+        elif isinstance(content, list):
+            parts = []
+            for part in content:
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str) and text:
+                        parts.append(text)
+            if parts:
+                events.append(self.delta("".join(parts)))
 
         # Reasoning (Nous reasoning_content / reasoning) — MUST be streamed so the
         # client keeps receiving progress during the model's thinking phase.

@@ -13,6 +13,12 @@ import re
 import time
 from typing import Any, List, AsyncGenerator
 
+try:
+    from common.model.errors import looks_anti_bot_challenge
+except Exception:  # pragma: no cover - fallback for standalone use
+    def looks_anti_bot_challenge(payload: Any) -> bool:  # type: ignore[misc]
+        return False
+
 
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use blocks).
@@ -180,7 +186,15 @@ def normalize_upstream_error(status: int, text_or_data: Any) -> dict:
     if not msg:
         msg = f"HTTP {status}" if status else "Unknown upstream error"
 
-    if status == 429:
+    # F1: never leak raw anti-bot HTML pages into SDK error messages — replace
+    # with a concise, transient description (not an auth failure). Must be
+    # detected BEFORE the status->type mapping below, which would otherwise
+    # reclassify it as authentication_error and mislead SDKs into prompting
+    # for new credentials.
+    if looks_anti_bot_challenge(msg):
+        msg = "Upstream anti-bot protection blocked the request (transient transport block, not an authentication failure)"
+        etype = "api_error"
+    elif status == 429:
         etype = "rate_limit_error"
     elif status in (401, 402, 403):
         etype = "authentication_error"
@@ -296,6 +310,10 @@ def should_cooldown_key(status: int, body: Any) -> bool:
     """
     # A 429/404 caused by model capacity must NOT cool the credential.
     if status in (429, 404) and looks_model_capacity_error(body):
+        return False
+    # F1: anti-bot/Cloudflare transport blocks (403 with HTML body) are NOT
+    # credential failures — cooldown would take the whole key pool offline.
+    if status in (401, 402, 403) and looks_anti_bot_challenge(body):
         return False
     if status in (429, 401, 402, 403):
         return True

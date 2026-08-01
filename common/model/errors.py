@@ -28,6 +28,41 @@ def provider_account_hint(payload: Any) -> str:
     return match.group(1) if match else ""
 
 
+_ANTI_BOT_HTML_PREFIXES = ("<!doctype", "<html", "<?xml")
+_ANTI_BOT_MARKERS = (
+    "cloudflare", "cf-ray", "cf-chl", "cf-connecting-ip",
+    "used cloudflare to restrict access", "access denied",
+    "captcha", "just a moment", "security check", "verify you are human",
+)
+# Strongly identifying markers that suffice on their own. Includes the exact
+# phrase emitted by common.translations.normalize_upstream_error for sanitized
+# anti-bot errors, so should_cooldown_key() still recognizes an anti-bot block
+# after the raw HTML body has been normalized away.
+_ANTI_BOT_STRONG_MARKERS = (
+    "cf-ray", "cf-chl", "used cloudflare to restrict access",
+    "anti-bot protection blocked the request",
+)
+
+
+def looks_anti_bot_challenge(payload: Any) -> bool:
+    """Detect HTML anti-bot pages (Cloudflare et al) masquerading as API errors.
+
+    These are transient transport blocks, NOT credential failures. Cooldown and
+    account-state logic must not treat them as auth_or_quota (see F1 audit
+    finding: a UA-based Cloudflare block previously cooled down every key for
+    AUTH_KEY_COOLDOWN_SEC and leaked raw HTML into SDK error messages).
+    """
+    text = error_text(payload).lower().lstrip()
+    if any(text.startswith(p) for p in _ANTI_BOT_HTML_PREFIXES):
+        return True
+    if any(m in text for m in _ANTI_BOT_STRONG_MARKERS):
+        return True
+    hits = [m for m in _ANTI_BOT_MARKERS if m in text]
+    # A single generic marker (e.g. "access denied") is not enough — require
+    # two corroborating markers.
+    return len(hits) >= 2
+
+
 def classify_provider_error(provider: str, status: int, payload: Any = "", manifest: dict[str, Any] | None = None) -> ErrorClassification:
     """Apply provider-specific manifest rules before shared classification."""
     text = error_text(payload).lower()
@@ -85,6 +120,15 @@ def classify_upstream_error(status: int, payload: Any = "") -> ErrorClassificati
             account_scoped=True,
         )
     if status == 403:
+        if looks_anti_bot_challenge(payload):
+            # Anti-bot/Cloudflare transport block — NOT an authentication
+            # failure. Transient: keep the retry loop alive across keys but
+            # never rotate/punish credentials or poison account state (F1).
+            return ErrorClassification(
+                ErrorState.TRANSIENT_FAILURE,
+                "ANTI_BOT_CHALLENGE",
+                retry_same_model=True,
+            )
         return ErrorClassification(
             ErrorState.ACCOUNT_FORBIDDEN,
             "AUTH_OR_PERMISSION",
