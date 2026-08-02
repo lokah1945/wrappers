@@ -328,7 +328,7 @@ Port 9105 is intentionally unused.
 
 ## 11. Testing and verification
 
-A wrapper is **not** contract-compliant until it passes all five gates.
+A wrapper is **not** contract-compliant until it passes all six gates.
 
 ```bash
 python -m pip install -r tests/requirements.txt
@@ -356,7 +356,7 @@ python tests/e2e_runtime/full_matrix_audit.py    # 240 checks
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
 ```
 
-The E2E harness exercises **22 pathological-but-legal upstream behaviours** against 3 surfaces on all 5 wrappers: `normal`, `echo`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `abrupt`, `slow`, `usage_after`, `empty`, `unicode`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`, `http500`, `http429`.
+The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `usage_after`, `empty`, `unicode`, `slow`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`. The mock upstream additionally provides non-stream modes (`echo`, `error`, `http429once`, `abrupt`, `http500`, `http429`) for parameter/error/retry probes.
 
 **Unit tests alone are insufficient.** Every one of the eight runtime findings (R-01…R-08) passed a green 110-test unit suite; they were only reachable by running the servers and speaking to them over a socket.
 
@@ -418,4 +418,4 @@ The E2E harness exercises **22 pathological-but-legal upstream behaviours** agai
 ---
 
 **Version:** 3.1 · **Last updated:** 2026-08-01
-**Verification at this version:** 241 unit tests · 63 streaming regressions · 63 translation-matrix tests · 445 live E2E checks · 5 wrappers × 4 modes SDK-compat · 240 full-matrix checks · ~20k soak requests · 0 failures
+**Verification at this version:** 241 unit tests · 63 streaming regressions · 67 translation-matrix tests · 445 live E2E checks · 5 wrappers × 4 modes SDK-compat · 240 full-matrix checks · ~20k soak requests · 0 failures

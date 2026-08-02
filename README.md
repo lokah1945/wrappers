@@ -21,7 +21,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 
 **Verification (all reproducible, see [Testing](#-testing)):**
 - ✅ 241 unit + regression tests (incl. AI Gateway translation matrix)
-- ✅ 63 streaming regression tests · 63 translation-matrix tests
+- ✅ 63 streaming regression tests · 67 translation-matrix tests
 - ✅ 445/445 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes)
 - ✅ SDK-compat gate — every wrapper's Responses output parses with the official openai SDK (Codex parser), 5 wrappers × 4 modes
 - ✅ COMPATIBILITY_LAYER E2E — layer 2 (Anthropic upstream) + layer 3 (auto-discovery)
