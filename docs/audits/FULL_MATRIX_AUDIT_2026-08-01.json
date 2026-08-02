@@ -1,0 +1,2168 @@
+{
+ "total": 240,
+ "passed": 240,
+ "failed": 0,
+ "blocked": 0,
+ "results": [
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/models",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/api/tags",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/health",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/ready",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/capabilities",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/version",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "content='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "tools-roundtrip",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "param-passthrough",
+   "status": "PASS",
+   "evidence": "temp=0.3 top_p=0.9 max=123",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "multimodal",
+   "status": "PASS",
+   "evidence": "image_url reached upstream",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "auth-401",
+   "status": "PASS",
+   "evidence": "HTTP 401",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "nonobject-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "neg-maxtokens-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "retry-after-429",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "slow-heartbeat",
+   "status": "PASS",
+   "evidence": "HTTP 200 hb=True done=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "metadata-x-request-id",
+   "status": "PASS",
+   "evidence": "rid=audit-123",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "tools-tool_use",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "thinking-block",
+   "status": "PASS",
+   "evidence": "1 thinking blocks",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "reasoning-only",
+   "status": "PASS",
+   "evidence": "stop=end_turn blocks=2",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "system-prompt",
+   "status": "PASS",
+   "evidence": "system->messages[0]=yes",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "multimodal-image",
+   "status": "PASS",
+   "evidence": "image translated to image_url",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "invalid-role-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text=\"['Hello from mock upstream.']\"",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "2 text deltas",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "tools-function_call",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "reasoning-only-completed",
+   "status": "PASS",
+   "evidence": "status=completed",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "instructions",
+   "status": "PASS",
+   "evidence": "instructions->system",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "max_output_tokens-cap",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "prev-response-id",
+   "status": "PASS",
+   "evidence": "resp_zhzhipd1smeb9.. -> turn two ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "upstream-error-surfaced",
+   "status": "PASS",
+   "evidence": "HTTP 200 failed=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/models",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/api/tags",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/health",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/ready",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/capabilities",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/version",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "content='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "tools-roundtrip",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "param-passthrough",
+   "status": "PASS",
+   "evidence": "temp=0.3 top_p=0.9 max=123",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "multimodal",
+   "status": "PASS",
+   "evidence": "image_url reached upstream",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "auth-401",
+   "status": "PASS",
+   "evidence": "HTTP 401",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "nonobject-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "neg-maxtokens-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "retry-after-429",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "slow-heartbeat",
+   "status": "PASS",
+   "evidence": "HTTP 200 hb=True done=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "metadata-x-request-id",
+   "status": "PASS",
+   "evidence": "rid=audit-123",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "tools-tool_use",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "thinking-block",
+   "status": "PASS",
+   "evidence": "1 thinking blocks",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "reasoning-only",
+   "status": "PASS",
+   "evidence": "stop=end_turn blocks=2",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "system-prompt",
+   "status": "PASS",
+   "evidence": "system->messages[0]=yes",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "multimodal-image",
+   "status": "PASS",
+   "evidence": "image translated to image_url",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "invalid-role-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text=\"['Hello from mock upstream.']\"",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "2 text deltas",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "tools-function_call",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "reasoning-only-completed",
+   "status": "PASS",
+   "evidence": "status=completed",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "instructions",
+   "status": "PASS",
+   "evidence": "instructions->system",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "max_output_tokens-cap",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "prev-response-id",
+   "status": "PASS",
+   "evidence": "chatcmpl-mock.. -> turn two ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "upstream-error-surfaced",
+   "status": "PASS",
+   "evidence": "HTTP 200 failed=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/models",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/api/tags",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/health",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/ready",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/capabilities",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/version",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "content='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "tools-roundtrip",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "param-passthrough",
+   "status": "PASS",
+   "evidence": "temp=0.3 top_p=0.9 max=123",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "multimodal",
+   "status": "PASS",
+   "evidence": "image_url reached upstream",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "auth-401",
+   "status": "PASS",
+   "evidence": "HTTP 401",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "nonobject-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "neg-maxtokens-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "retry-after-429",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "slow-heartbeat",
+   "status": "PASS",
+   "evidence": "HTTP 200 hb=True done=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "metadata-x-request-id",
+   "status": "PASS",
+   "evidence": "rid=audit-123",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "tools-tool_use",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "thinking-block",
+   "status": "PASS",
+   "evidence": "1 thinking blocks",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "reasoning-only",
+   "status": "PASS",
+   "evidence": "stop=end_turn blocks=2",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "system-prompt",
+   "status": "PASS",
+   "evidence": "system->messages[0]=yes",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "multimodal-image",
+   "status": "PASS",
+   "evidence": "image translated to image_url",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "invalid-role-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text=\"['Hello from mock upstream.']\"",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "2 text deltas",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "tools-function_call",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "reasoning-only-completed",
+   "status": "PASS",
+   "evidence": "status=completed",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "instructions",
+   "status": "PASS",
+   "evidence": "instructions->system",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "max_output_tokens-cap",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "prev-response-id",
+   "status": "PASS",
+   "evidence": "chatcmpl-mock.. -> turn two ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "upstream-error-surfaced",
+   "status": "PASS",
+   "evidence": "HTTP 200 failed=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/models",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/api/tags",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/health",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/ready",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/capabilities",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/version",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "content='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "tools-roundtrip",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "param-passthrough",
+   "status": "PASS",
+   "evidence": "temp=0.3 top_p=0.9 max=123",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "multimodal",
+   "status": "PASS",
+   "evidence": "image_url reached upstream",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "auth-401",
+   "status": "PASS",
+   "evidence": "HTTP 401",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "nonobject-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "neg-maxtokens-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "retry-after-429",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "slow-heartbeat",
+   "status": "PASS",
+   "evidence": "HTTP 200 hb=True done=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "metadata-x-request-id",
+   "status": "PASS",
+   "evidence": "rid=audit-123",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "tools-tool_use",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "thinking-block",
+   "status": "PASS",
+   "evidence": "1 thinking blocks",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "reasoning-only",
+   "status": "PASS",
+   "evidence": "stop=end_turn blocks=2",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "system-prompt",
+   "status": "PASS",
+   "evidence": "system->messages[0]=yes",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "multimodal-image",
+   "status": "PASS",
+   "evidence": "image translated to image_url",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "invalid-role-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text=\"['Hello from mock upstream.']\"",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "2 text deltas",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "tools-function_call",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "reasoning-only-completed",
+   "status": "PASS",
+   "evidence": "status=completed",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "instructions",
+   "status": "PASS",
+   "evidence": "instructions->system",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "max_output_tokens-cap",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "prev-response-id",
+   "status": "PASS",
+   "evidence": "chatcmpl-mock.. -> turn two ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "upstream-error-surfaced",
+   "status": "PASS",
+   "evidence": "HTTP 200 failed=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/models",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/api/tags",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/health",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/ready",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/v1/capabilities",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "discovery",
+   "test": "/version",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "content='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "tools-roundtrip",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "param-passthrough",
+   "status": "PASS",
+   "evidence": "temp=0.3 top_p=0.9 max=123",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "multimodal",
+   "status": "PASS",
+   "evidence": "image_url reached upstream",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "auth-401",
+   "status": "PASS",
+   "evidence": "HTTP 401",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "nonobject-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "neg-maxtokens-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "retry-after-429",
+   "status": "PASS",
+   "evidence": "HTTP 200",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "slow-heartbeat",
+   "status": "PASS",
+   "evidence": "HTTP 200 hb=True done=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-chat",
+   "test": "metadata-x-request-id",
+   "status": "PASS",
+   "evidence": "rid=audit-123",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "text='Hello from mock upstream.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "tools-tool_use",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "thinking-block",
+   "status": "PASS",
+   "evidence": "1 thinking blocks",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "reasoning-only",
+   "status": "PASS",
+   "evidence": "stop=end_turn blocks=1",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "system-prompt",
+   "status": "PASS",
+   "evidence": "system->messages[0]=yes",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "multimodal-image",
+   "status": "PASS",
+   "evidence": "image translated to image_url",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "upstream-500-shaped",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "badjson-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "anthropic-messages",
+   "test": "invalid-role-4xx",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-nonstream-text",
+   "status": "PASS",
+   "evidence": "text=\"['Hello from mock upstream.']\"",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "sdk-stream-text",
+   "status": "PASS",
+   "evidence": "2 text deltas",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "tools-function_call",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "reasoning-only-completed",
+   "status": "PASS",
+   "evidence": "status=completed",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "instructions",
+   "status": "PASS",
+   "evidence": "instructions->system",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "max_output_tokens-cap",
+   "status": "PASS",
+   "evidence": "HTTP 400",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "prev-response-id",
+   "status": "PASS",
+   "evidence": "chatcmpl-mock.. -> turn two ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 1,
+   "component": "openai-responses",
+   "test": "upstream-error-surfaced",
+   "status": "PASS",
+   "evidence": "HTTP 200 failed=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "content='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-stream",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-tools",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough-stream",
+   "status": "PASS",
+   "evidence": "anthropic stream ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-tools-passthrough",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-thinking-passthrough",
+   "status": "PASS",
+   "evidence": "1 thinking",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "sdk parsed ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-stream",
+   "status": "PASS",
+   "evidence": "9 events",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-tools",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "nvidia-python",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-upstream-error",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "content='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-stream",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-tools",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough-stream",
+   "status": "PASS",
+   "evidence": "anthropic stream ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-tools-passthrough",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-thinking-passthrough",
+   "status": "PASS",
+   "evidence": "1 thinking",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "sdk parsed ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-stream",
+   "status": "PASS",
+   "evidence": "9 events",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-tools",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "nous",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-upstream-error",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "content='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-stream",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-tools",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough-stream",
+   "status": "PASS",
+   "evidence": "anthropic stream ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-tools-passthrough",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-thinking-passthrough",
+   "status": "PASS",
+   "evidence": "1 thinking",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "sdk parsed ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-stream",
+   "status": "PASS",
+   "evidence": "9 events",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-tools",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "opencode",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-upstream-error",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "content='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-stream",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-tools",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough-stream",
+   "status": "PASS",
+   "evidence": "anthropic stream ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-tools-passthrough",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-thinking-passthrough",
+   "status": "PASS",
+   "evidence": "1 thinking",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "sdk parsed ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-stream",
+   "status": "PASS",
+   "evidence": "9 events",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-tools",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "blackbox",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-upstream-error",
+   "status": "PASS",
+   "evidence": "HTTP 500 shaped=True",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "content='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-sdk-stream",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-tools",
+   "status": "PASS",
+   "evidence": "2 tool_calls",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough",
+   "status": "PASS",
+   "evidence": "text='Hello from anthropic mock.'",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-passthrough-stream",
+   "status": "PASS",
+   "evidence": "anthropic stream ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-tools-passthrough",
+   "status": "PASS",
+   "evidence": "2 tool_use stop=tool_use",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "messages-thinking-passthrough",
+   "status": "PASS",
+   "evidence": "1 thinking",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-nonstream",
+   "status": "PASS",
+   "evidence": "sdk parsed ok",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-sdk-stream",
+   "status": "PASS",
+   "evidence": "9 events",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "responses-tools",
+   "status": "PASS",
+   "evidence": "2 function_call",
+   "detail": ""
+  },
+  {
+   "wrapper": "openrouter",
+   "layer": 2,
+   "component": "anthropic-upstream",
+   "test": "chat-upstream-error",
+   "status": "PASS",
+   "evidence": "HTTP 429 shaped=True",
+   "detail": ""
+  }
+ ]
+}

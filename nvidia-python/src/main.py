@@ -283,6 +283,17 @@ async def verify_loop(pool):
 # ----------------------------------------------------------------------
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup."""
     import os
     import sys
@@ -389,6 +400,13 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        openai_chat_to_anthropic_request,
+    )
+    from common.compat import (
+        is_anthropic_upstream as _is_anthropic_upstream,
+        passthrough_anthropic_sse as _passthrough_anthropic_sse,
+        translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+        translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
@@ -753,7 +771,7 @@ def _resolve_git_root():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', '--show-toplevel'],
-            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         # fallback: walk up to find .git
@@ -769,7 +787,7 @@ def _resolve_git_commit():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', 'HEAD'],
-            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL
+            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         return 'unknown'
@@ -2101,6 +2119,27 @@ class Server:
         @app.post('/v1/responses')
         async def responses_api(request: Request):
             raw = await request.body()
+            # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens positive + capped.
+            try:
+                _rb = json.loads(raw)
+            except (json.JSONDecodeError, ValueError):
+                _rb = {}
+            for _mt_key in ('max_output_tokens', 'max_tokens'):
+                _mtv = _rb.get(_mt_key) if isinstance(_rb, dict) else None
+                if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
+                    return JSONResponse(status_code=400, content={'error': {'message': f'{_mt_key} must be a positive integer', 'type': 'invalid_request_error'}})
+                if isinstance(_mtv, int) and _mtv > 1_000_000:
+                    return JSONResponse(status_code=400, content={'error': {'message': f'{_mt_key} exceeds maximum allowed value of 1000000', 'type': 'invalid_request_error'}})
+            # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the
+            # Responses request to Anthropic Messages and translate back.
+            if _is_anthropic_upstream():
+                try:
+                    body = json.loads(raw)
+                except (json.JSONDecodeError, ValueError):
+                    return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
+                if body.get('model'):
+                    body['model'] = resolve_target_model(body.get('model', ''))
+                return await self._compat2_responses(body, request)
             # V-14 fix: the recursive debug walk only runs when DEBUG logging is
             # actually enabled — no O(body) CPU on the Codex hot path otherwise.
             if logger.isEnabledFor(logging.DEBUG):
@@ -2243,8 +2282,143 @@ class Server:
                     return '/v1' + path
         return path
 
+
+    # ── COMPATIBILITY_LAYER=2 (Anthropic upstream) ─────────────────────────
+    async def _compat2_proxy(self, body: dict, request: Request):
+        """POST to the Anthropic Messages upstream with the key pool.
+
+        Returns (status, resp_or_data, key_entry). For a 200 streaming response
+        the caller owns resp + key (release in finally); otherwise resp is the
+        parsed JSON error/success and key is None (already released).
+        """
+        model_id = body.get('model', '')
+        attempts = max(1, self.pool.total_keys)
+        last_status = 429
+        last_data = {'error': {'message': 'All keys exhausted or rate-limited', 'type': 'rate_limit_error'}}
+        for _attempt in range(attempts):
+            key_result = await self.pool.acquire(model_id)
+            if not key_result:
+                break
+            key = key_result['key']
+            self._in_flight += 1
+            try:
+                target = f"{BASE_LLM}/v1/messages"
+                fwd = {'Authorization': f'Bearer {key.api_key}',
+                       **forward_headers(request), 'Content-Type': 'application/json'}
+                if body.get('stream'):
+                    fwd['Accept'] = 'text/event-stream'
+                resp = await self._session.post(target, json=body, headers=fwd,
+                                                timeout=self._client_timeout(bool(body.get('stream')), '/v1/messages'))
+                if resp.status == 429:
+                    ra = _parse_retry_after(resp.headers.get('retry-after'))
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+                    await self._record_model_response(model_id, key, resp.status, await resp.text(), '/v1/messages')
+                    await self.pool.register_rate_limit(key, model_id, ra, None, None)
+                    last_status = resp.status
+                    last_data = {'error': {'message': 'rate limited', 'type': 'rate_limit_error'}}
+                    continue
+                if body.get('stream') and resp.status < 400:
+                    return 200, resp, key
+                data = await resp.read()
+                self._in_flight = max(0, self._in_flight - 1)
+                key.decrement_in_flight()
+                try:
+                    parsed = json.loads(data)
+                except (json.JSONDecodeError, ValueError):
+                    parsed = {'error': {'message': data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
+                if resp.status >= 400:
+                    await self._record_model_response(model_id, key, resp.status, parsed, '/v1/messages')
+                    last_status = resp.status
+                    last_data = parsed
+                    if resp.status in (408, 409, 429) or resp.status >= 500:
+                        continue
+                    return resp.status, parsed, None
+                return resp.status, parsed, None
+            except Exception as e:
+                logger.error(f'[compat2] upstream error: {e}')
+                self._in_flight = max(0, self._in_flight - 1)
+                key.decrement_in_flight()
+                last_status = 502
+                last_data = {'error': {'message': f'upstream error: {e}', 'type': 'api_error'}}
+                continue
+        return last_status, last_data, None
+
+    async def _compat2_chat(self, body: dict, request: Request):
+        from common.translations import anthropic_to_openai_response as _a2o
+        anthro = openai_chat_to_anthropic_request(body)
+        anthro['stream'] = bool(body.get('stream', False))
+        status, result, key = await self._compat2_proxy(anthro, request)
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if anthro['stream']:
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
+                        yield frame
+                finally:
+                    try:
+                        result.release()
+                    except Exception:
+                        pass
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+            return StreamingResponse(gen(), media_type='text/event-stream',
+                                     headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        return JSONResponse(status_code=200, content=_a2o(result, body.get('model', '')))
+
+    async def _compat2_messages(self, body: dict, request: Request):
+        status, result, key = await self._compat2_proxy(body, request)
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if bool(body.get('stream', False)):
+            async def gen():
+                try:
+                    async for frame in _passthrough_anthropic_sse(result, float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
+                        yield frame
+                finally:
+                    try:
+                        result.release()
+                    except Exception:
+                        pass
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+            return StreamingResponse(gen(), media_type='text/event-stream',
+                                     headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        return JSONResponse(status_code=200, content=result)
+
+    async def _compat2_responses(self, body: dict, request: Request):
+        from .responses_compat import respond_non_streaming
+        anthro = openai_chat_to_anthropic_request(body)
+        anthro['stream'] = bool(body.get('stream', False))
+        status, result, key = await self._compat2_proxy(anthro, request)
+        if status != 200:
+            return JSONResponse(status_code=status, content=result)
+        if anthro['stream']:
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
+                        yield frame
+                finally:
+                    try:
+                        result.release()
+                    except Exception:
+                        pass
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+            return StreamingResponse(
+                _translate_openai_chat_sse_to_responses(gen(), body.get('model', '')),
+                media_type='text/event-stream',
+                headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        oai_chat = anthropic_to_openai_response(result, body.get('model', ''))
+        return JSONResponse(status_code=200, content=respond_non_streaming(oai_chat, body.get('model', '')))
+
     async def _handle_chat_completions(self, body: dict, request: Request, raw: bytes):
         model_id = body.get('model', '')
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI
+        # chat request to Anthropic Messages and translate the response back.
+        if _is_anthropic_upstream():
+            return await self._compat2_chat(body, request)
         if is_model_unavailable(model_id):
             return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
 
@@ -2341,6 +2515,16 @@ class Server:
             yield 'data: [DONE]\n\n'
 
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
+        try:
+            body = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — /v1/messages passes
+        # through verbatim (model alias is resolved by the caller).
+        if _is_anthropic_upstream() and isinstance(body, dict):
+            if body.get('model'):
+                body['model'] = resolve_target_model(body.get('model', ''))
+            return await self._compat2_messages(body, request)
         anthro_version = (request.headers.get('anthropic-version') or '').strip()
         # Claude Code always sends this; default for other Anthropic-compatible clients
         if not anthro_version:
@@ -2364,6 +2548,13 @@ class Server:
         for t in body.get('tools', []) or []:
             if not isinstance(t.get('input_schema'), dict):
                 return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool.input_schema must be an object'))
+
+        # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages rejected.
+        for _m in body.get('messages', []) or []:
+            if isinstance(_m, dict) and _m.get('role') not in (None, 'user', 'assistant', 'tool', 'system', 'developer'):
+                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f"Invalid role: {_m.get('role')!r}"))
+            if isinstance(_m, dict) and _m.get('role') == 'tool' and not _m.get('tool_use_id') and not _m.get('tool_call_id'):
+                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool message requires tool_use_id'))
 
         model_id = resolve_target_model(body.get('model', ''))
         body['model'] = model_id

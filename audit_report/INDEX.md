@@ -1,7 +1,7 @@
 # Audit Report Index
 
-**Date:** 2026-08-01  
-**Commit:** `40f2d69` (merged PR #5 — "Harden agent runtime contract across wrappers")
+**Date:** 2026-08-01  \
+**Re-audit date:** 2026-08-01 (fix + re-verification cycle for **CODEX-RESP-01** and remaining technical debt)
 
 ---
 
@@ -9,20 +9,29 @@
 
 | File | Description |
 |---|---|
-| `DEEP_AUDIT_REPORT_2026-08-01.md` | **Main comprehensive audit report** — post-fix verification across all 5 wrappers, common/, tests/ |
+| `DEEP_AUDIT_REPORT_2026-08-01.md` | **Main comprehensive audit report** — post-fix verification across all 5 wrappers, common/, tests/ (updated with the CODEX-RESP-01 fix + re-audit §7c) |
+| `docs/audits/CODEX_RESP_REAUDIT_2026-08-01.md` | **Tracked re-audit report** — the fix cycle for the critical Codex/Responses bug and the debt items, with reproducible gates |
+| `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` | **AI Gateway Translation Layer audit** — OpenAI↔Anthropic / Responses↔Chat round-trip matrix (F1–F7) |
+| `docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md` | **SDK-compat audit** — last Codex bug: every wrapper's Responses output must parse with the official openai SDK (CODEX-RESP-02) |
+| `docs/COMPATIBILITY_LAYER.md` | **COMPATIBILITY_LAYER design** — operator-declared upstream dialect (1=OpenAI, 2=Anthropic, 3=Auto) |
+| `docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md` | **Full matrix audit** — 240/240 checks, 5 wrappers × 2 upstreams × 3 surfaces × params × agents, with JSON evidence |
 
 ---
 
-## Verification Gates Passed
+## Verification Gates Passed (after fix + re-audit)
 
 | Gate | Command | Result |
 |---|---|---|
-| Unit + Regression Suite | `python -m pytest tests -q` | **136 passed** |
-| Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **57 passed** |
-| Runtime E2E (5 wrappers × 3 surfaces × 21 modes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **420/420 checks passed** |
-| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~20,806 requests, 0 failures** |
+| Unit + Regression Suite | `python -m pytest tests -q` | **229 passed** (209 + 20 COMPATIBILITY_LAYER tests) |
+| Streaming Regression Suite | `python -m pytest tests/test_sse_streaming_regressions.py -q` | **63 passed** |
+| **AI Gateway Translation Layer** | `python -m pytest tests/test_translation_matrix.py -q` | **63 passed** (all 5 wrappers incl. nvidia) |
+| **SDK Compatibility (Codex parser)** | `python tests/e2e_runtime/sdk_codex_compat.py` | **5 wrappers × 4 modes — all parse with the official openai SDK** |
+| **COMPATIBILITY_LAYER E2E** | `python tests/e2e_runtime/compat_layer_e2e.py` | **5 wrappers × layer=2 × all surfaces + layer=3 auto-discovery — all green** |
+| Runtime E2E (5 wrappers × 3 surfaces × 22 modes + cross-translation probes) | `python tests/e2e_runtime/run_runtime_e2e.py` | **445/445 checks passed** (incl. `reasoning_only`, `anthropic_tools`, `responses_tools`, thinking-block assertion) |
+| Sustained Soak | `python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6` | **~20,800 requests, 0 failures**, flat RSS/latency |
 | Contract Conformance | `pytest tests/test_sse_streaming_regressions.py::test_contract_all_wrappers_expose_required_surfaces` | **All 10 surfaces on all 5 wrappers** |
 | Cross-Wrapper Parity Guards | `pytest tests/test_sse_streaming_regressions.py -k parity` | **4/4 pass** |
+| Codex reasoning-only regression | `pytest tests/test_sse_streaming_regressions.py -k codex_resp01` | **3/3 pass** (openrouter emits full item lifecycle + `response.completed` for reasoning-only streams) |
 
 ---
 
@@ -30,12 +39,12 @@
 
 | Agent / SDK | Status |
 |---|---|
-| Claude Code (Anthropic SDK) | ✅ |
-| Codex (OpenAI Responses API) | ⚠️ **openrouter: CRITICAL BUG** — hangs on reasoning-only outputs; **nous/opencode: ✅** |
-| OpenClaw / Hermes / OpenHands | ✅ |
+| Claude Code (Anthropic SDK) | ✅ — thinking blocks, parallel tools, strict stop_reason, tool_use round trips (F1–F7) |
+| Codex (OpenAI Responses API) | ✅ **all wrappers** — openrouter reasoning-only hang **fixed** (CODEX-RESP-01); reasoning-input items skipped (F2); `usage.total_tokens` present (F7) |
+| OpenClaw / Hermes / OpenHands | ✅ — tool_choice mapped (F3/F4), stop_sequences forwarded (F4) |
 | OpenCode | ✅ |
-| Generic OpenAI SDK | ✅ |
-| Generic Anthropic SDK | ✅ |
+| Generic OpenAI SDK | ✅ — passthrough verbatim |
+| Generic Anthropic SDK | ✅ — full request/response translation incl. images (F1/F6), reasoning (F5) |
 | Ollama clients | ✅ |
 | MCP/catalog clients | ✅ |
 
@@ -56,45 +65,135 @@
 | **B-37** | Model-block predicate side effects | Side-effect-free `is_model_blocked()` + explicit `expire_model_blocks()` |
 | **B-38** | Nous `threading.Lock` | `asyncio.Lock` in KeyPool |
 | **FREE_ONLY** false positive | Substring "free" | Suffix matching (`:free`/`-free`) + allowlist |
+| **CODEX-RESP-01** | **Codex hangs indefinitely on reasoning-only outputs (openrouter)** | `if text_started:` guard removed; completion events always emitted; reasoning + tool-call deltas streamed as proper output items (eager `output_item.added`, unconditional `output_item.done` × reasoning/text/tools, `response.completed` with full output array) |
 
 ---
 
-## NEW: Critical Issue Found in This Audit
+## NEW: Critical Issue Found in This Audit — RESOLVED
 
-| ID | Wrapper | Risk | Fix |
+| ID | Wrapper | Risk | Fix (this cycle) |
 |---|---|---|---|
-| **CODEX-RESP-01** | **openrouter** | **Codex hangs indefinitely for reasoning-only model outputs** — `if text_started:` guard at `openrouter/src/main.py:1287` skips completion events when model emits only reasoning/thinking | Remove `if text_started:` guard; always emit completion events (reference: `nous` `ResponsesStreamState.done()`, `opencode` inline `gen()`) |
+| **CODEX-RESP-01** | **openrouter** | **Codex hangs indefinitely for reasoning-only model outputs** — `if text_started:` guard at `openrouter/src/main.py` skipped completion events when model emits only reasoning/thinking | Rewrote `_translate_openai_stream_to_responses`: message item opened eagerly, `reasoning_content`/`reasoning` streamed as a reasoning output item, tool-call deltas streamed as `function_call` items, completion events emitted **unconditionally**, `response.completed` carries the full sorted output array. Mirrors `nous` `ResponsesStreamState.done()` / `opencode` inline `gen()`. **Verified by 3 new unit tests + new `reasoning_only` mock/E2E mode + strengthened E2E lifecycle check.** |
 
-**Impact:** Codex hangs indefinitely waiting for `response.completed` when model outputs only reasoning/thinking. Not caught by current tests (mock upstream always emits text). **Must fix before production use with Codex on openrouter.**
+**Impact (before fix):** Codex hangs indefinitely waiting for `response.completed` when a model outputs only reasoning/thinking — the exact "Codex stops mid-process, no final response" symptom. Not caught by the old test suite because the mock upstream always emitted text.
 
 ---
 
-## Remaining Technical Debt (Non-Blocking)
+## Technical Debt — Re-verified After This Cycle
 
-| Issue | Wrapper(s) | Severity |
+All items previously listed as remaining debt were **re-verified against the code**:
+
+| Issue | Status after this cycle |
+|---|---|
+| B-36: `record()` conflates telemetry with in-flight | **Already fixed** (blackbox/nous `record()` is telemetry-only; `acquire()` calls `record()` + `increment_in_flight()` separately). **New regression guard added:** `test_b36_pool_record_is_telemetry_only_not_in_flight`. |
+| B-33: Response store missing TTL/byte cap | **Already fixed** (blackbox store bounded on count + bytes + TTL; covered by `test_b33_*`). |
+| B-34: No graceful shutdown drain | **Already fixed** — openrouter + nvidia-python have drain loops in lifespan (`SHUTDOWN_DRAIN_SEC`). |
+| B-35: BG task registry incomplete | **Already fixed** — openrouter `_spawn_background` registry + `_drain_background_tasks()`. |
+| B-39: Metrics divergence — openrouter `record_error()` dead | **Fixed this cycle**: every local error response now routes through `_error_response()` (auth rejections, invalid JSON, FREE_ONLY blocks, pool exhaustion, MCP 503s) which calls `metrics.record_error()` before returning — error counter now increments for local errors too. **New guard:** `test_b39_openrouter_local_error_responses_count_in_metrics`. |
+| B-20: Blocking `subprocess` git calls | **Hardened this cycle**: every git subprocess call in all 5 wrappers + model-registry now carries `timeout=3` (the calls run once at import, but were unbounded). **New guard:** `test_b20_git_subprocess_calls_are_timeout_bounded`. |
+
+---
+
+## Fifth Pass — Full Matrix End-to-End Audit (2026-08-01)
+
+Systematic audit harness (`tests/e2e_runtime/full_matrix_audit.py`) booting all
+5 wrappers against the OpenAI mock (layer 1) and the Anthropic mock (layer 2),
+driven with REAL SDK clients (anthropic SDK = Claude Code, openai SDK = Codex /
+generic OpenAI, plus raw protocol checks). **240/240 checks PASS** (evidence:
+`docs/audits/FULL_MATRIX_AUDIT_2026-08-01.json`).
+
+Five real defects found and fixed (each locked by `tests/test_full_matrix_regressions.py`):
+| ID | Wrapper(s) | Finding | Contract |
+|---|---|---|---|
+| F-1 | openrouter | chat `max_tokens` negative/non-int accepted | §4 |
+| F-2 | openrouter | responses `max_output_tokens` cap missing | §4 |
+| F-3 | nous, opencode, openrouter, nvidia-python | messages surface accepted unknown roles / orphan tools | §4 |
+| F-4 | nvidia-python | responses `max_output_tokens` cap missing | §4 |
+| F-5 | nous, opencode, blackbox | `X-Request-ID` logged but never returned on responses | §10 |
+
+Verification: 241 unit tests (was 229), 445/445 runtime E2E, SDK-compat gate,
+COMPATIBILITY_LAYER E2E, soak ~20.1k requests 0 failures — all green.
+
+## Fourth Pass — COMPATIBILITY_LAYER: Operator-Declared Upstream Dialect (2026-08-01)
+
+New feature per user request: a `COMPATIBILITY_LAYER` env var in every
+wrapper's `.env` — the operator declares what protocol the UPSTREAM speaks so
+the wrapper never guesses:
+
+| Value | Meaning | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat | Anthropic↔OpenAI |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once/base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`=300) | same | same |
+
+Implemented:
+- `common/compat.py` — resolver, fail-fast validation, auto-discovery probe + cache, three shared layer-2 stream adapters (Anthropic SSE→OpenAI chat SSE, passthrough w/o `[DONE]`, OpenAI chat SSE→Responses SSE)
+- `common/translations/shared.py::openai_chat_to_anthropic_request` — system, base64 images, tool_calls→tool_use, tool results, tools→input_schema, tool_choice, stop→stop_sequences
+- Layer-2 wiring in all 3 surfaces × all 5 wrappers (default layer=1 untouched)
+- `.env.example` × 5, `validate_config()` fail-fast × 5, README + WRAPPER_CONTRACT §9.2
+- New gates: `tests/test_compat_layer.py` (21 tests) + `tests/e2e_runtime/compat_layer_e2e.py` (5 wrappers × layer=2 × all surfaces + layer=3 auto-discovery vs both mocks)
+
+**Verification:** 229 unit tests (was 209), 445/445 E2E (layer-1 unchanged),
+SDK-compat gate green, COMPATIBILITY_LAYER E2E green for all 5 wrappers,
+soak ~20.3k requests 0 failures.
+
+## Third Deep Pass — CODEX-RESP-02: Responses Must Parse With the Official SDK (2026-08-01)
+
+The reported "last bug" (Codex + wrapper-nous) traced to the /v1/responses
+output being unparseable by the openai SDK (Codex's parser) on **all five
+wrappers**. Proven with real servers + `client.responses.stream()`; fixed:
+
+| # | Finding | Fix |
 |---|---|---|
-| B-36: `record()` conflates telemetry with in-flight | blackbox, nous | MEDIUM |
-| B-33: Response store missing TTL/byte cap | blackbox | MEDIUM |
-| B-34: No graceful shutdown drain | openrouter, nvidia-python | MEDIUM |
-| B-35: BG task registry incomplete | openrouter | LOW |
-| B-39: Metrics divergence | openrouter (`record_error` dead) | MEDIUM |
-| B-20: Blocking `subprocess` git in `/health` | all 5 + model-registry | LOW |
+| R2-1 | `response.created` minimal → SDK snapshot `output` None → crash on first `output_item.added` | full response object (`object`, `created_at`, `output: []`, `usage`) in nous/opencode/blackbox |
+| R2-2 | `response.function_call.delta` (nonstandard) → SDK never accumulated tool args | `response.function_call_arguments.delta` + added `.done` before each `output_item.done` (all 5) |
+| R2-3 | reasoning `summary: ""` (string) → SDK serializer failures | `summary: []` + `content: [{type: reasoning_text}]` (all 5) |
+| R2-4 | non-streaming Responses missing `parallel_tool_calls`/`tool_choice`/`tools` → SDK validation error | added to all 5 (nvidia via `base_response`) |
 
----
+**New gate:** `tests/e2e_runtime/sdk_codex_compat.py` (real servers, official
+SDK parse) + 5 unit guards in `test_translation_matrix.py`. `openai` added to
+`tests/requirements.txt`. See
+`docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md`.
+
+## Second Deep Pass — AI Gateway Translation Layer (2026-08-01)
+
+See `docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md` for the full
+bit-level findings. This pass verified OpenAI↔Anthropic cross-translation
+(both directions, streaming + non-streaming) and Responses↔Chat round trips
+across all 5 wrappers and fixed 7 findings:
+
+| # | Finding | Wrapper(s) | Impact |
+|---|---|---|---|
+| F1 | single-image message → `KeyError: 'text'` crash | nous, blackbox | vision requests HTTP 500 |
+| F2 | `reasoning` input items → empty user message | nous, opencode, blackbox, openrouter | Codex multi-turn 400 |
+| F3 | `tool_choice` dropped | nous | forced tool choice silently auto |
+| F4 | `stop_sequences` dropped; `tool_choice` verbatim Anthropic shape | opencode | stops lost / upstream 400 |
+| F5 | thinking dropped in request + non-stream + streaming response | openrouter | reasoning vanished on Anthropic surface |
+| F6 | URL-source images broken/dropped | nous, openrouter | vision with URL images broken |
+| F7 | reasoning item + `total_tokens` missing in `chat_to_responses`; `output_text` parts dropped; `str()` repr tool output | nous | Codex SDK usage error / continuity loss |
+
+**New gate:** `tests/test_translation_matrix.py` — 58 tests locking every
+round trip (incl. nvidia via its own modules).
 
 ## Reproduction Commands
 
 ```bash
-# Unit + regression suite (136 tests)
+# Unit + regression suite (204 tests)
 python -m pytest tests -q
 
-# Streaming regressions (57 tests)
+# AI Gateway Translation Layer gate (58 tests)
+python -m pytest tests/test_translation_matrix.py -q
+
+# Streaming regressions (63 tests)
 python -m pytest tests/test_sse_streaming_regressions.py -q
 
-# Live agent-traffic E2E (420 checks)
+# Codex reasoning-only regression (3 tests)
+python -m pytest tests/test_sse_streaming_regressions.py -k codex_resp01 -v
+
+# Live agent-traffic E2E (445 checks)
 python tests/e2e_runtime/run_runtime_e2e.py
 
-# Sustained load (20k requests)
+# Sustained load (~20k requests)
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
 
 # Contract conformance

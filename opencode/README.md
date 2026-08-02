@@ -19,10 +19,10 @@ opencode/
 
 ```bash
 # Development
-uvicorn opencode.src.main:app --reload --port 9103
+uvicorn src.main:app --reload --port 9103
 
 # Production
-uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9103 --workers 4
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.
@@ -31,9 +31,9 @@ See WRAPPER_STANDARDIZATION_REPORT.md for details.
 
 Production proxy for **[OpenCode Zen](https://opencode.ai/docs/zen/)** — multi-protocol AI gateway.
 
-**Status:** ✅ **PRODUCTION READY — 100/100**  
+**Status:** ✅ **Verified compatible** (2026-08-01 matrix audit: 240/240 checks)  
 **Version:** 1.0.4-dynamic-alias  
-**Port:** 9107
+**Port:** 9103
 
 ## Zen endpoint map (from official docs)
 
@@ -47,6 +47,25 @@ Production proxy for **[OpenCode Zen](https://opencode.ai/docs/zen/)** — multi
 | Catalog | — | `GET /models` |
 
 Base URL: `https://opencode.ai/zen/v1` (override with `OPENCODE_BASE_URL`).
+
+## Upstream Compatibility Layer (COMPATIBILITY_LAYER)
+
+The operator declares what protocol the **upstream** speaks; the wrapper never
+guesses. The same variable exists in every wrapper's `.env`:
+
+```
+COMPATIBILITY_LAYER=1   # 1 = OpenAI Compatible (default), 2 = Anthropic Compatible,
+                        # 3 = Auto Discovery (probe upstream once, cached)
+```
+
+| Layer | Upstream speaks | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat translate | Anthropic↔OpenAI translate |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI translate | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once per base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`) | same | same |
+
+Invalid values fail fast at startup (`validate_config`). Full design:
+[`docs/COMPATIBILITY_LAYER.md`](../docs/COMPATIBILITY_LAYER.md).
 
 ## Client-facing surface (always available)
 
@@ -86,7 +105,7 @@ cp .env.example .env
 # Edit .env (OPENCODE_API_KEY_1 from https://opencode.ai/auth + BEARER_TOKEN)
 
 # 3. Run
-python -m uvicorn src.main:app --host 0.0.0.0 --port 9107
+python -m uvicorn src.main:app --host 0.0.0.0 --port 9103
 ```
 
 ### Claude Code

@@ -29,10 +29,13 @@ import time
 
 from aiohttp import web
 
+_HTTP429_ONCE = 0
+
+
 MODES = (
-    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'nofinish',
-    'noterminator', 'midstream_error', 'abrupt', 'slow', 'usage_after', 'empty',
-    'unicode',
+    'normal', 'echo', 'error', 'http429once', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
+    'nofinish', 'noterminator', 'midstream_error', 'abrupt', 'slow', 'usage_after',
+    'empty', 'unicode',
     # Round-2 adversarial modes
     'bigchunk',      # one huge multi-line write (many events in a single TCP read)
     'bytesplit',     # every frame split byte-by-byte across writes
@@ -78,8 +81,38 @@ async def chat_completions(request: web.Request):
     stream = bool(body.get('stream'))
 
     if not stream:
+        if mode == 'error':
+            return web.json_response({'error': {'message': 'mock exploded', 'type': 'server_error'}}, status=500)
+        if mode == 'http500':
+            return web.json_response({'error': {'message': 'mock 500', 'type': 'server_error'}}, status=500)
+        if mode == 'http429':
+            return web.json_response({'error': {'message': 'mock 429', 'type': 'rate_limit_error'}}, status=429)
+        if mode == 'http429once':
+            # First request 429, subsequent requests succeed — simulates a
+            # transient upstream rate limit so the audit can prove the wrapper
+            # retries with the next key and succeeds.
+            global _HTTP429_ONCE
+            _HTTP429_ONCE = _HTTP429_ONCE + 1
+            if _HTTP429_ONCE <= 1:
+                return web.json_response({'error': {'message': 'mock 429 once', 'type': 'rate_limit_error'}}, status=429)
+        if mode == 'echo':
+            # Parameter-passthrough probe: echo back what the wrapper sent so
+            # the audit can prove temperature/top_p/max_tokens/system/tools/
+            # response_format/images reached the upstream untouched.
+            return web.json_response({
+                'id': 'chatcmpl-mock', 'object': 'chat.completion',
+                'created': int(time.time()), 'model': model,
+                'choices': [{'index': 0,
+                             'message': {'role': 'assistant',
+                                         'content': json.dumps(body, ensure_ascii=False)},
+                             'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 11, 'completion_tokens': 7, 'total_tokens': 18},
+            })
         if mode == 'empty':
             msg = {'role': 'assistant', 'content': None}
+        elif mode in ('reasoning', 'reasoning_only'):
+            msg = {'role': 'assistant', 'content': None if mode == 'reasoning_only' else 'Hello from mock upstream.',
+                   'reasoning_content': 'Let me think...'}
         elif mode == 'tools':
             msg = {'role': 'assistant', 'content': None, 'tool_calls': [
                 {'id': 'call_a', 'type': 'function',
@@ -146,6 +179,19 @@ async def chat_completions(request: web.Request):
             await _write(resp, _chunk({'reasoning_content': 'Let me think... '}), space=space, crlf=crlf)
             await _write(resp, _chunk({'reasoning_content': 'still thinking.'}), space=space, crlf=crlf)
             await _write(resp, _chunk({'content': 'The answer is 42.'}), space=space, crlf=crlf)
+            await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
+            return resp
+
+        if mode == 'reasoning_only':
+            # CODEX-RESP-01 regression: a model that emits ONLY reasoning
+            # (reasoning_content deltas, NO text content) must still produce a
+            # terminal response.completed. The old openrouter translator
+            # skipped the completion events for such streams (guarded on
+            # `if text_started:`), so Codex hung waiting for them.
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'reasoning_content': 'Let me think... '}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'reasoning_content': 'still thinking.'}), space=space, crlf=crlf)
             await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
             await _write(resp, '[DONE]', space=space, crlf=crlf)
             return resp
@@ -354,7 +400,107 @@ def build_app() -> web.Application:
     return app
 
 
+
+# ── Anthropic-native upstream (COMPATIBILITY_LAYER=2 / =3 auto) ───────────
+# Serves ONLY the Anthropic Messages API (+ /messages alias for base styles
+# that already include /v1). No /chat/completions — auto-discovery must detect
+# Anthropic.
+
+async def _anthropic_chunk(text, delta_kind='text_delta', key='text'):
+    return json.dumps({'type': 'content_block_delta', 'index': 0,
+                       'delta': {'type': delta_kind, key: text}})
+
+
+async def anthropic_messages(request: web.Request):
+    body = await request.json()
+    model = body.get('model', '')
+    mode = _mode(model)
+    stream = bool(body.get('stream'))
+    msg_id = f"msg_anthropic_{int(time.time()*1000)}"
+
+    if mode == 'error':
+        return web.json_response({'type': 'error', 'error': {
+            'type': 'api_error', 'message': 'anthropic mock exploded'}},
+            status=500)
+
+    if not stream:
+        content = []
+        if mode in ('reasoning', 'reasoning_only'):
+            content.append({'type': 'thinking', 'thinking': 'Let me think...'})
+        if mode == 'tools':
+            content.append({'type': 'text', 'text': ''})
+            content.append({'type': 'tool_use', 'id': 'toolu_a', 'name': 'alpha',
+                            'input': {'x': 1}})
+            content.append({'type': 'tool_use', 'id': 'toolu_b', 'name': 'beta',
+                            'input': {'y': 2}})
+            stop_reason = 'tool_use'
+        else:
+            if mode != 'reasoning_only':
+                content.append({'type': 'text', 'text': 'Hello from anthropic mock.'})
+            stop_reason = 'end_turn'
+        return web.json_response({
+            'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model,
+            'content': content, 'stop_reason': stop_reason, 'stop_sequence': None,
+            'usage': {'input_tokens': 12, 'output_tokens': 8},
+        })
+
+    resp = web.StreamResponse(status=200, headers={
+        'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache',
+        'Connection': 'close'})
+    resp.force_close()
+    await resp.prepare(request)
+
+    async def _write(obj):
+        await resp.write(f"event: {obj['type']}\ndata: {json.dumps(obj)}\n\n".encode())
+
+    await _write({'type': 'message_start', 'message': {
+        'id': msg_id, 'type': 'message', 'role': 'assistant', 'model': model,
+        'content': [], 'stop_reason': None, 'stop_sequence': None,
+        'usage': {'input_tokens': 12, 'output_tokens': 0}}})
+    idx = 0
+    if mode in ('reasoning', 'reasoning_only'):
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'thinking', 'thinking': ''}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'thinking_delta', 'thinking': 'Let me think...'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+    if mode == 'tools':
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'tool_use', 'id': 'toolu_a', 'name': 'alpha', 'input': {}}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'input_json_delta', 'partial_json': '{"x":1}'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'tool_use', 'id': 'toolu_b', 'name': 'beta', 'input': {}}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'input_json_delta', 'partial_json': '{"y":2}'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+        idx += 1
+    if mode != 'reasoning_only':
+        await _write({'type': 'content_block_start', 'index': idx,
+                      'content_block': {'type': 'text', 'text': ''}})
+        await _write({'type': 'content_block_delta', 'index': idx,
+                      'delta': {'type': 'text_delta', 'text': 'Hello from anthropic mock.'}})
+        await _write({'type': 'content_block_stop', 'index': idx})
+    stop_reason = 'tool_use' if mode == 'tools' else 'end_turn'
+    await _write({'type': 'message_delta', 'delta': {'stop_reason': stop_reason, 'stop_sequence': None},
+                  'usage': {'input_tokens': 12, 'output_tokens': 8}})
+    await _write({'type': 'message_stop'})
+    await resp.write_eof()
+    return resp
+
+
+def build_anthropic_app():
+    app = web.Application()
+    app.router.add_post('/v1/messages', anthropic_messages)
+    app.router.add_post('/messages', anthropic_messages)
+    return app
+
 if __name__ == '__main__':
     import sys
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 9999
-    web.run_app(build_app(), host='127.0.0.1', port=port, print=None)
+    mode = sys.argv[2] if len(sys.argv) > 2 else 'openai'
+    app = build_anthropic_app() if mode == 'anthropic' else build_app()
+    web.run_app(app, host='127.0.0.1', port=port, print=None)

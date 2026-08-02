@@ -19,10 +19,10 @@ blackbox/
 
 ```bash
 # Development
-uvicorn blackbox.src.main:app --reload --port 9104
+uvicorn src.main:app --reload --port 9104
 
 # Production
-uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9104 --workers 4
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.
@@ -45,6 +45,25 @@ Production-grade wrapper untuk BLACKBOX AI dengan fitur enterprise:
 - ✅ Dashboard monitoring (real-time metrics, key status)
 - ✅ .env hot reload (ubah config tanpa restart)
 
+## Upstream Compatibility Layer (COMPATIBILITY_LAYER)
+
+The operator declares what protocol the **upstream** speaks; the wrapper never
+guesses. The same variable exists in every wrapper's `.env`:
+
+```
+COMPATIBILITY_LAYER=1   # 1 = OpenAI Compatible (default), 2 = Anthropic Compatible,
+                        # 3 = Auto Discovery (probe upstream once, cached)
+```
+
+| Layer | Upstream speaks | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat translate | Anthropic↔OpenAI translate |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI translate | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once per base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`) | same | same |
+
+Invalid values fail fast at startup (`validate_config`). Full design:
+[`docs/COMPATIBILITY_LAYER.md`](../docs/COMPATIBILITY_LAYER.md).
+
 ## Quick Start
 
 ### 1. Setup .env
@@ -61,7 +80,7 @@ cp .env.example .env
 
 ```bash
 # Development
-python -m blackbox.src.main
+python -m uvicorn src.main:app --host 127.0.0.1 --port 9104
 
 # Production (systemd)
 sudo systemctl start wrapper-blackbox
@@ -300,7 +319,7 @@ Type=simple
 User=root
 WorkingDirectory=/root/wrapper/blackbox
 Environment="PATH=/root/wrapper/blackbox/venv/bin"
-ExecStart=/root/wrapper/blackbox/venv/bin/python -m blackbox.src.main
+ExecStart=/root/wrapper/blackbox/venv/bin/python -m uvicorn src.main:app --host 127.0.0.1 --port 9104
 Restart=always
 RestartSec=10
 
@@ -319,7 +338,7 @@ COPY common/ ./common/
 RUN pip install -r blackbox/requirements.txt
 
 EXPOSE 9104
-CMD ["python", "-m", "blackbox.src.main"]
+CMD ["python", "-m", "uvicorn", "src.main:app", "--host", "127.0.0.1", "--port", "9104"]
 ```
 
 ## License

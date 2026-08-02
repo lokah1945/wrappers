@@ -163,6 +163,15 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        openai_chat_to_anthropic_request,
+    )
+    from common.compat import (
+        is_anthropic_upstream as _is_anthropic_upstream,
+        is_auto_discovery as _is_auto_discovery,
+        passthrough_anthropic_sse as _passthrough_anthropic_sse,
+        translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+        translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
+        probe_upstream_compatibility as _probe_upstream_compatibility,
     )
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
@@ -214,6 +223,17 @@ VERSION = '1.0.0'
 # ── Validate Config ──────────────────────────────────────────────────────
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup. Fail-fast on missing required env vars."""
     missing = []
     for var in ['OPENROUTER_API_KEY_1', 'BEARER_TOKEN']:
@@ -239,7 +259,7 @@ def _resolve_git_root():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', '--show-toplevel'],
-            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         p = os.path.dirname(os.path.abspath(__file__))
@@ -254,7 +274,7 @@ def _resolve_git_commit():
     try:
         import subprocess
         return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=_resolve_git_root(),
-                                       stderr=subprocess.DEVNULL).decode().strip()
+                                       stderr=subprocess.DEVNULL, timeout=3).decode().strip()
     except Exception:
         return 'unknown'
 
@@ -399,6 +419,25 @@ SSE_TRANSPORT = SseServerTransport("/mcp/messages") if MCP_SERVER else None
 # ── Key Pool ──────────────────────────────────────────────────────────────
 pool = KeyPool()
 metrics = Metrics()
+
+
+def _error_response(content, status_code: int = 500, headers: dict | None = None) -> JSONResponse:
+    """Shaped error response that also counts the error in metrics (B-39).
+
+    openrouter's `record_error()` was dead code — no caller ever invoked it,
+    so local error responses (auth rejections, invalid JSON, FREE_ONLY
+    blocks, pool exhaustion) never incremented the dashboard's error counter
+    and `error_rate` reported false health. Every local error response now
+    goes through this helper (opencode `_jr` parity); upstream errors are
+    still counted by `metrics.record_request(status_code=...)`.
+    """
+    try:
+        metrics.record_error(status_code=status_code)
+    except Exception:
+        pass
+    if headers is not None:
+        return JSONResponse(content, status_code=status_code, headers=headers)
+    return JSONResponse(content, status_code=status_code)
 
 # ── Async HTTP session ────────────────────────────────────────────────────
 _agent: aiohttp.ClientSession | None = None
@@ -691,7 +730,7 @@ async def auth_middleware(request: Request, call_next):
     if is_management and not _is_loopback_client(request):
         logger.warning('[auth] rejecting non-loopback management request from %s to %s',
                        getattr(request.client, 'host', None) if request.client else None, path)
-        return JSONResponse(
+        return _error_response(
             {"error": {"message": "OpenRouter management API is loopback-only", "type": "authentication_error"}},
             status_code=403,
         )
@@ -721,7 +760,7 @@ async def auth_middleware(request: Request, call_next):
                     ' (management never fails open)' if is_management else ' and REQUIRE_AUTH=true',
                     path,
                 )
-                return JSONResponse(
+                return _error_response(
                     {"error": {"message": "Server auth not configured", "type": "authentication_error"}},
                     status_code=503,
                 )
@@ -732,7 +771,7 @@ async def auth_middleware(request: Request, call_next):
             ok = bool(client_token) and hmac.compare_digest(
                 client_token.encode('utf-8'), token.encode('utf-8'))
             if not ok:
-                return JSONResponse(
+                return _error_response(
                     {"error": {"message": "Unauthorized", "type": "authentication_error"}},
                     status_code=401,
                     headers={"WWW-Authenticate": 'Bearer'},
@@ -741,7 +780,7 @@ async def auth_middleware(request: Request, call_next):
     # Rate limit
     ip = _client_ip(request)
     if not check_rate_limit(ip):
-        return JSONResponse(
+        return _error_response(
             {"error": {"message": "Rate limit exceeded", "type": "rate_limit_error"}},
             status_code=429,
             headers={"Retry-After": "60"},
@@ -766,11 +805,16 @@ async def auth_middleware(request: Request, call_next):
 
 async def _proxy_request(method: str, path: str, body: dict | None = None,
                          headers: dict | None = None, stream: bool = False,
-                         request: Request | None = None) -> Response:
+                         request: Request | None = None,
+                         terminal_done: bool = True) -> Response:
     """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
     Iterates over all available keys on retriable failures (429, 5xx, network errors).
     Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
+
+    terminal_done: COMPATIBILITY_LAYER=2 (Anthropic upstream) streams end with
+    message_stop, not [DONE]; pass terminal_done=False to skip the synthesized
+    [DONE] terminator.
     """
     model_id = (body or {}).get("model", "") if body else ""
 
@@ -785,12 +829,12 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
         try:
             call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
             if not same_provider_model_id('openrouter', call_plan.model.provider_model_id, model_id):
-                return JSONResponse({"error": {
+                return _error_response({"error": {
                     "type": "server_error",
                     "message": "Model identity changed during call-plan resolution",
                     "code": "MODEL_ID_MUTATION"}}, status_code=500)
         except ValueError as exc:
-            return JSONResponse({"error": {
+            return _error_response({"error": {
                 "type": "invalid_request_error", "message": str(exc),
                 "code": "MODEL_CALL_PLAN_INVALID"}}, status_code=400)
         except Exception as exc:  # registry unavailable — do not block traffic
@@ -897,14 +941,19 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                     saw_done = True
                                 ends_newline = line.endswith(b'\n')
                             yield line
-                        # Only synthesize [DONE] if upstream never sent one.
-                        if not saw_done:
-                            if not ends_newline:
+                        # COMPATIBILITY_LAYER=2: an Anthropic upstream ends its
+                        # stream with message_stop, never [DONE] — appending
+                        # [DONE] would corrupt the Anthropic SSE. Only
+                        # synthesize [DONE] when terminal_done is requested.
+                        if terminal_done:
+                            # Only synthesize [DONE] if upstream never sent one.
+                            if not saw_done:
+                                if not ends_newline:
+                                    yield b'\n\n'
+                                yield b'data: [DONE]\n\n'
+                            elif not ends_newline:
+                                # Upstream's [DONE] lacked its frame terminator.
                                 yield b'\n\n'
-                            yield b'data: [DONE]\n\n'
-                        elif not ends_newline:
-                            # Upstream's [DONE] lacked its frame terminator.
-                            yield b'\n\n'
                     except asyncio.CancelledError:
                         raise
                     finally:
@@ -1043,7 +1092,7 @@ def _check_free_only(model: str) -> JSONResponse | None:
     """Check FREE_ONLY constraint. Returns error response if blocked.
     Returns 400 (not 403) for consistency with nous/opencode/blackbox wrappers."""
     if free_only_enabled() and model and not is_free_model(model):
-        return JSONResponse(
+        return _error_response(
             {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
                                    "Use models with :free suffix.", "type": "invalid_request_error"}},
             status_code=400,
@@ -1056,9 +1105,26 @@ async def chat_completions(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     model = body.get("model", "")
+
+    # WRAPPER_CONTRACT §4: max_tokens MUST be a positive integer capped at 1M.
+    mt = body.get("max_tokens")
+    if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
+        return _error_response({"error": {"message": "max_tokens must be a positive integer",
+                                          "type": "invalid_request_error"}}, status_code=400)
+    if isinstance(mt, int) and mt > 1_000_000:
+        return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
+                                          "type": "invalid_request_error"}}, status_code=400)
+    # WRAPPER_CONTRACT §4: unknown roles and orphan tool messages are rejected.
+    for _m in body.get("messages") or []:
+        if isinstance(_m, dict) and _m.get("role") not in (None, "system", "user", "assistant", "tool", "developer", "function"):
+            return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_call_id"):
+            return _error_response({"error": {"message": "tool role requires tool_call_id",
+                                              "type": "invalid_request_error"}}, status_code=400)
 
     # FREE_ONLY check
     blocked = _check_free_only(model)
@@ -1066,6 +1132,37 @@ async def chat_completions(request: Request):
         return blocked
 
     stream = body.get("stream", False)
+
+    # COMPATIBILITY_LAYER=2: upstream speaks Anthropic Messages — translate the
+    # OpenAI chat request once and translate the Anthropic response back.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(body)
+        anthro_body["stream"] = stream
+        res = await _proxy_request("POST", "messages", anthro_body, stream=stream,
+                                   request=request, terminal_done=False)
+        if isinstance(res, StreamingResponse):
+            return StreamingResponse(
+                _translate_anthropic_stream_to_openai_chat(
+                    res.body_iterator, model, float(HEARTBEAT_MS) / 1000.0),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": res.headers.get("x-request-id", ""),
+                },
+            )
+        if isinstance(res, JSONResponse):
+            try:
+                payload = json.loads(res.body)
+            except Exception:
+                return res
+            if isinstance(payload, dict) and payload.get('error'):
+                return res
+            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
+                oai_resp = anthropic_to_openai_response(payload, model)
+                return JSONResponse(oai_resp, status_code=res.status_code)
+        return res
+
     res = await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
     if isinstance(res, JSONResponse) and res.status_code == 200:
         try:
@@ -1090,9 +1187,20 @@ async def responses(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     model = body.get("model", "")
+
+    # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens capped at 1M and
+    # positive on the Responses surface too.
+    for _mt_key in ("max_output_tokens", "max_tokens"):
+        _mtv = body.get(_mt_key)
+        if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
+            return _error_response({"error": {"message": f"{_mt_key} must be a positive integer",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_mtv, int) and _mtv > 1_000_000:
+            return _error_response({"error": {"message": f"{_mt_key} exceeds maximum allowed value of 1000000",
+                                              "type": "invalid_request_error"}}, status_code=400)
 
     blocked = _check_free_only(model)
     if blocked:
@@ -1102,6 +1210,41 @@ async def responses(request: Request):
     principal = _request_principal(request)
     chat_body = responses_to_chat(body, principal=principal)
     is_stream = bool(chat_body.get("stream", False))
+
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat → Anthropic
+    # request; translate the Anthropic response back through OpenAI Chat to
+    # Responses.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(chat_body)
+        response = await _proxy_request("POST", "messages", anthro_body, stream=is_stream,
+                                        request=request, terminal_done=False)
+        if isinstance(response, StreamingResponse):
+            chat_sse = _translate_anthropic_stream_to_openai_chat(
+                response.body_iterator, model, float(HEARTBEAT_MS) / 1000.0)
+            return StreamingResponse(
+                _translate_openai_chat_sse_to_responses(chat_sse, model),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": response.headers.get("x-request-id", ""),
+                },
+            )
+        if isinstance(response, JSONResponse):
+            try:
+                payload = json.loads(response.body)
+            except Exception:
+                return response
+            if isinstance(payload, dict) and 'error' in payload:
+                return response
+            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
+                oai_chat = anthropic_to_openai_response(payload, model)
+                resp_obj = chat_to_responses(model, oai_chat, body)
+                rid = resp_obj.get('id')
+                if rid and principal:
+                    _store_response(principal, rid, chat_body.get('messages', []))
+                return JSONResponse(resp_obj, status_code=response.status_code)
+        return response
 
     response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
 
@@ -1164,6 +1307,18 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
       response.output_text.done → response.content_part.done →
       response.output_item.done → response.completed → [DONE]
 
+    Reasoning and tool-call deltas are streamed as their own output items
+    (`response.reasoning_text.delta` / `response.function_call_arguments.delta`) so
+    Codex keeps receiving progress during the model's thinking phase and can
+    act on structured tool calls.
+
+    CODEX-RESP-01 (CRITICAL): the completion events MUST be emitted even when
+    the model produced ONLY reasoning/thinking and no text content. The old
+    text-gated guard skipped them, so Codex never saw its output items close
+    and waited indefinitely for the terminal events — appearing to
+    "stop mid-process". Reference: nous `ResponsesStreamState.done()`,
+    opencode inline `gen()`.
+
     CRITICAL: each SSE event MUST be yielded as a SINGLE string with the
     `\n\n` terminator inline. Splitting `event:` and `data:` into separate
     yields causes Starlette to flush them as separate HTTP chunks; the client
@@ -1172,9 +1327,18 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
     resp_id = f"resp_{int(time.time()*1000)}"
     created_at = int(time.time())
     msg_id = f"msg_{int(time.time()*1000)}"
-    text_started = False
     full_text = ''
     upstream_error = None  # R-03: mid-stream upstream failure
+    # Reasoning output item (CODEX-RESP-01): reasoning-only streams must still
+    # open and close their output items or Codex hangs waiting for completion.
+    reasoning_started = False
+    acc_reason = ''
+    rsn_index = 1
+    rsn_id = f"rsn_{int(time.time()*1000)}"
+    # Tool-call accumulation (parallel support), mirroring opencode/nous.
+    tool_accs: list = []
+    next_output_index = 1  # 0 = assistant message; 1+ = reasoning / tool items
+    msg_open = False
 
     def _sse(event_type: str, payload: dict) -> str:
         """Build a complete SSE frame: event:\ndata:\n\n"""
@@ -1196,6 +1360,24 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             'response': {'id': resp_id, 'status': 'in_progress'},
         })
 
+        # CODEX-RESP-01: open the assistant message item EAGERLY so even a
+        # reasoning-only stream has an active item. OpenAI Responses requires
+        # the output item to be "added" before any delta is sent, and Codex
+        # emits "OutputTextDelta without active item" and hangs otherwise.
+        yield _sse('response.output_item.added', {
+            'type': 'response.output_item.added', 'output_index': 0,
+            'item': {
+                'id': msg_id, 'type': 'message', 'status': 'in_progress',
+                'role': 'assistant', 'content': [],
+            },
+        })
+        yield _sse('response.content_part.added', {
+            'type': 'response.content_part.added', 'item_id': msg_id,
+            'output_index': 0, 'content_index': 0,
+            'part': {'type': 'output_text', 'text': '', 'annotations': []},
+        })
+        msg_open = True
+
         # Buffer accumulator: upstream chunks may contain multiple SSE lines
         # or partial lines split across chunk boundaries. Accumulate and split
         # on \n to parse complete lines only.
@@ -1203,9 +1385,24 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         hb_interval = float(HEARTBEAT_MS) / 1000.0
         done = False
 
+        def _get_tool_acc(tc: dict) -> dict:
+            nonlocal next_output_index
+            idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
+            acc = tool_accs[idx] if idx < len(tool_accs) else None
+            if acc is None:
+                acc = {'call_id': tc.get('id') or f'call_{idx}_{int(time.time()*1000)}',
+                       'name': '', 'args': '', 'output_index': next_output_index, 'added': False}
+                next_output_index += 1
+                while len(tool_accs) <= idx:
+                    tool_accs.append(None)
+                tool_accs[idx] = acc
+            if tc.get('id'):
+                acc['call_id'] = tc['id']
+            return acc
+
         def _parse_line(line_str: str):
             """Parse one complete SSE line. Returns (events_list, is_done)."""
-            nonlocal text_started, full_text, upstream_error
+            nonlocal full_text, upstream_error, reasoning_started, acc_reason, rsn_index, next_output_index
             events = []
             # B-02 fix: the space after `data:` is OPTIONAL in SSE. Requiring
             # it silently discarded 100% of chunks from upstreams that emit
@@ -1232,27 +1429,85 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             if not choices:
                 return events, False
             choice = choices[0]
-            delta = choice.get('delta', {})
-            if delta.get('content'):
-                if not text_started:
+            delta = choice.get('delta', {}) or {}
+
+            # Text content. F2/parity: `content` is str for the OpenAI shape,
+            # but some upstreams stream multi-part content arrays — guard the
+            # type so a list doesn't raise TypeError mid-stream (HTTP 500
+            # kills the turn), mirroring nvidia-python/nous.
+            content = delta.get('content')
+            if isinstance(content, str):
+                if content:
+                    full_text += content
+                    events.append(_sse('response.output_text.delta', {
+                        'type': 'response.output_text.delta', 'item_id': msg_id,
+                        'output_index': 0, 'content_index': 0, 'delta': content,
+                    }))
+            elif isinstance(content, list):
+                parts = [p.get('text') for p in content
+                         if isinstance(p, dict) and isinstance(p.get('text'), str) and p.get('text')]
+                if parts:
+                    joined = ''.join(parts)
+                    full_text += joined
+                    events.append(_sse('response.output_text.delta', {
+                        'type': 'response.output_text.delta', 'item_id': msg_id,
+                        'output_index': 0, 'content_index': 0, 'delta': joined,
+                    }))
+
+            # Reasoning (OpenRouter reasoning_content / reasoning) — MUST be
+            # streamed so the client sees progress during thinking (Codex /
+            # OpenAI SDK abort a silent stream → "stops mid-way"). Mirror
+            # nous/opencode: open a 'reasoning' output item, then deltas.
+            reason_delta = (
+                delta.get('reasoning_content') if isinstance(delta.get('reasoning_content'), str)
+                else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else '')
+            )
+            if reason_delta:
+                if not reasoning_started:
+                    reasoning_started = True
+                    rsn_index = next_output_index
+                    next_output_index += 1
                     events.append(_sse('response.output_item.added', {
-                        'type': 'response.output_item.added', 'output_index': 0,
+                        'type': 'response.output_item.added', 'output_index': rsn_index,
+                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress',
+                                 'summary': [], 'content': []},
+                    }))
+                acc_reason += reason_delta
+                events.append(_sse('response.reasoning_text.delta', {
+                    'type': 'response.reasoning_text.delta', 'item_id': rsn_id,
+                    'output_index': rsn_index, 'content_index': 0, 'delta': reason_delta,
+                }))
+
+            # Tool calls (parallel support, mirroring opencode/nous): every
+            # added function_call item MUST be closed with output_item.done or
+            # Codex hangs waiting for a tool result.
+            for tc in delta.get('tool_calls') or []:
+                if not isinstance(tc, dict):
+                    continue
+                fn = tc.get('function') or {}
+                acc = _get_tool_acc(tc)
+                if not acc['added']:
+                    acc['added'] = True
+                    events.append(_sse('response.output_item.added', {
+                        'type': 'response.output_item.added', 'output_index': acc['output_index'],
                         'item': {
-                            'id': msg_id, 'type': 'message', 'status': 'in_progress',
-                            'role': 'assistant', 'content': [],
+                            'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
+                            'call_id': acc['call_id'], 'name': acc['name'], 'arguments': '',
                         },
                     }))
-                    events.append(_sse('response.content_part.added', {
-                        'type': 'response.content_part.added', 'item_id': msg_id,
-                        'output_index': 0, 'content_index': 0,
-                        'part': {'type': 'output_text', 'text': '', 'annotations': []},
+                if isinstance(fn.get('name'), str) and fn['name']:
+                    acc['name'] += fn['name']
+                    events.append(_sse('response.function_call_arguments.delta', {
+                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
+                        'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name'],
                     }))
-                    text_started = True
-                full_text += delta['content']
-                events.append(_sse('response.output_text.delta', {
-                    'type': 'response.output_text.delta', 'item_id': msg_id,
-                    'output_index': 0, 'content_index': 0, 'delta': delta['content'],
-                }))
+                if isinstance(fn.get('arguments'), str) and fn['arguments']:
+                    acc['args'] += fn['arguments']
+                    events.append(_sse('response.function_call_arguments.delta', {
+                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
+                        'output_index': acc['output_index'], 'delta': fn['arguments'],
+                    }))
+
             if choice.get('finish_reason'):
                 return events, True
             return events, False
@@ -1284,25 +1539,57 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     done = True
                     break
 
-        if text_started:
-            # output_text.done
-            yield _sse('response.output_text.done', {
-                'type': 'response.output_text.done', 'item_id': msg_id,
-                'output_index': 0, 'content_index': 0, 'text': full_text,
+        # CODEX-RESP-01 fix: completion events are emitted UNCONDITIONALLY.
+        # The old text-gated guard skipped them when the model emitted only
+        # reasoning/thinking, so Codex never saw output items close and hung
+        # waiting for the terminal events.
+        if reasoning_started:
+            yield _sse('response.reasoning_text.done', {
+                'type': 'response.reasoning_text.done', 'item_id': rsn_id,
+                'output_index': rsn_index, 'content_index': 0, 'text': acc_reason,
             })
-            # content_part.done
-            yield _sse('response.content_part.done', {
-                'type': 'response.content_part.done', 'item_id': msg_id,
-                'output_index': 0, 'content_index': 0,
-                'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
-            })
-            # output_item.done
             yield _sse('response.output_item.done', {
-                'type': 'response.output_item.done', 'output_index': 0,
+                'type': 'response.output_item.done', 'output_index': rsn_index,
+                'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed',
+                         'summary': [],
+                         'content': [{'type': 'reasoning_text', 'text': acc_reason}]},
+            })
+        # output_text.done
+        yield _sse('response.output_text.done', {
+            'type': 'response.output_text.done', 'item_id': msg_id,
+            'output_index': 0, 'content_index': 0, 'text': full_text,
+        })
+        # content_part.done
+        yield _sse('response.content_part.done', {
+            'type': 'response.content_part.done', 'item_id': msg_id,
+            'output_index': 0, 'content_index': 0,
+            'part': {'type': 'output_text', 'text': full_text, 'annotations': []},
+        })
+        # output_item.done
+        yield _sse('response.output_item.done', {
+            'type': 'response.output_item.done', 'output_index': 0,
+            'item': {
+                'id': msg_id, 'type': 'message', 'status': 'completed',
+                'role': 'assistant',
+                'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+            },
+        })
+        # Close every function_call item that was opened (Codex hangs if a
+        # function_call item is added but never marked done).
+        # CODEX-RESP-02: emit the standard `response.function_call_arguments.done`
+        # before closing the item so the SDK finalizes the parsed arguments.
+        for acc in tool_accs:
+            if not acc:
+                continue
+            yield _sse('response.function_call_arguments.done', {
+                'type': 'response.function_call_arguments.done', 'item_id': acc['call_id'],
+                'output_index': acc['output_index'], 'name': acc['name'], 'arguments': acc['args'],
+            })
+            yield _sse('response.output_item.done', {
+                'type': 'response.output_item.done', 'output_index': acc['output_index'],
                 'item': {
-                    'id': msg_id, 'type': 'message', 'status': 'completed',
-                    'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
+                    'id': acc['call_id'], 'type': 'function_call', 'status': 'completed',
+                    'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args'],
                 },
             })
 
@@ -1320,17 +1607,30 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             yield 'data: [DONE]\n\n'
             return
 
-        # response.completed
+        # response.completed — final output array sorted by output_index
+        # (0 = message, then reasoning / tool items in open order).
+        outputs_by_index = {
+            0: {'id': msg_id, 'type': 'message', 'status': 'completed',
+                'role': 'assistant',
+                'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}]},
+        }
+        if reasoning_started:
+            outputs_by_index[rsn_index] = {'id': rsn_id, 'type': 'reasoning',
+                                           'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]}
+        for acc in tool_accs:
+            if not acc:
+                continue
+            outputs_by_index[acc['output_index']] = {
+                'id': acc['call_id'], 'type': 'function_call', 'status': 'completed',
+                'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args'],
+            }
+        output = [outputs_by_index[i] for i in sorted(outputs_by_index)]
         yield _sse('response.completed', {
             'type': 'response.completed',
             'response': {
                 'id': resp_id, 'object': 'response', 'created_at': created_at,
-                'model': model, 'status': 'completed',
-                'output': [{
-                    'id': msg_id, 'type': 'message', 'status': 'completed',
-                    'role': 'assistant',
-                    'content': [{'type': 'output_text', 'text': full_text, 'annotations': []}],
-                }],
+                'model': model, 'status': 'completed', 'output': output,
+                'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
             },
         })
 
@@ -1346,7 +1646,18 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         # otherwise persists a truncated answer as a successful turn and
         # cannot retry. (blackbox B20 parity.)
         try:
-            if text_started:
+            if msg_open:
+                if reasoning_started:
+                    yield _sse('response.reasoning_text.done', {
+                        'type': 'response.reasoning_text.done', 'item_id': rsn_id,
+                        'output_index': rsn_index, 'content_index': 0, 'text': acc_reason,
+                    })
+                    yield _sse('response.output_item.done', {
+                        'type': 'response.output_item.done', 'output_index': rsn_index,
+                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed',
+                                 'summary': [],
+                                 'content': [{'type': 'reasoning_text', 'text': acc_reason}]},
+                    })
                 yield _sse('response.output_text.done', {
                     'type': 'response.output_text.done', 'item_id': msg_id,
                     'output_index': 0, 'content_index': 0, 'text': full_text,
@@ -1385,14 +1696,15 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 await aclose()
         except Exception:
             pass
-
-
+# ══════════════════════════════════════════════════════════════════════════
+# EMBEDDINGS / IMAGES / MODELS ROUTES
+# ══════════════════════════════════════════════════════════════════════════
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     return await _proxy_request("POST", "embeddings", body, request=request)
 
@@ -1402,7 +1714,7 @@ async def images_generations(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     return await _proxy_request("POST", "images/generations", body, request=request)
 
@@ -1526,13 +1838,41 @@ async def messages(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     model = body.get("model", "")
+
+    # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
+    for _m in body.get("messages") or []:
+        if isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
+            return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_use_id") and not _m.get("tool_call_id"):
+            return _error_response({"error": {"message": "tool message requires tool_use_id",
+                                              "type": "invalid_request_error"}}, status_code=400)
 
     blocked = _check_free_only(model)
     if blocked:
         return blocked
+
+    # COMPATIBILITY_LAYER=2: upstream speaks Anthropic — the /v1/messages
+    # surface passes through verbatim (model alias only); no translation.
+    if _is_anthropic_upstream():
+        response = await _proxy_request("POST", "messages", body,
+                                        stream=bool(body.get("stream", False)),
+                                        request=request, terminal_done=False)
+        if isinstance(response, StreamingResponse):
+            return StreamingResponse(
+                _passthrough_anthropic_sse(response.body_iterator,
+                                           float(HEARTBEAT_MS) / 1000.0),
+                media_type="text/event-stream",
+                headers={
+                    "Cache-Control": "no-cache", "Connection": "keep-alive",
+                    "X-Accel-Buffering": "no",
+                    "x-request-id": response.headers.get("x-request-id", ""),
+                },
+            )
+        return response
 
     # Translate Anthropic → OpenAI
     openai_body = _anthropic_to_openai(body)
@@ -1594,7 +1934,7 @@ async def count_tokens(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
     # Best-effort: count characters / 4 as a rough token estimate without burning quota.
     msgs = body.get("messages", [])
@@ -1718,6 +2058,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             if not isinstance(it, dict):
                 continue
             t = it.get('type')
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == 'function_call_output':
                 outv = it.get('output', '')
                 msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id') or '',
@@ -1782,10 +2124,13 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
     text = msg.get('content') or ''
     output = []
     # Surface upstream reasoning_content as a reasoning output item.
+    # CODEX-RESP-02: the SDK's ResponseReasoningItem expects summary/content
+    # as lists — `text` alone parses with serializer warnings.
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
     if reasoning:
         output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning',
-                       'status': 'completed', 'text': reasoning})
+                       'status': 'completed', 'summary': [],
+                       'content': [{'type': 'reasoning_text', 'text': reasoning}]})
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call',
@@ -1796,9 +2141,13 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
                    'status': 'completed', 'role': 'assistant',
                    'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
     u = data.get('usage') or {}
+    # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+    # parallel_tool_calls / tool_choice / tools — missing them fails
+    # non-streaming client.responses.create() parsing.
     resp = {'id': data.get('id') or f"resp_{int(time.time()*1000)}",
             'object': 'response', 'created_at': int(time.time()),
             'model': model, 'status': 'completed', 'output': output,
+            'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
             'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0,
                       'output_tokens': u.get('completion_tokens', 0) or 0,
                       'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
@@ -1832,12 +2181,18 @@ def _anthropic_to_openai(body: dict) -> dict:
             if isinstance(content, list):
                 text_parts = []
                 tool_calls = []
+                reasoning_parts = []
                 for block in content:
                     if not isinstance(block, dict):
                         continue
                     btype = block.get("type")
                     if btype == "text":
                         text_parts.append(block.get("text", ""))
+                    elif btype in ("thinking", "reasoning"):
+                        # Transparent passthrough: keep multi-turn reasoning
+                        # context (parity with nous/opencode/blackbox, which
+                        # map thinking blocks to reasoning_content).
+                        reasoning_parts.append(block.get("thinking") or block.get("reasoning") or "")
                     elif btype == "tool_use":
                         tool_calls.append({
                             "id": block.get("id", ""),
@@ -1854,6 +2209,8 @@ def _anthropic_to_openai(body: dict) -> dict:
                     msg_obj["content"] = None
                 if tool_calls:
                     msg_obj["tool_calls"] = tool_calls
+                if reasoning_parts:
+                    msg_obj["reasoning_content"] = "\n".join(reasoning_parts)
                 messages.append(msg_obj)
             else:
                 messages.append({"role": "assistant", "content": content})
@@ -1892,6 +2249,13 @@ def _anthropic_to_openai(body: dict) -> dict:
                                 "type": "image_url",
                                 "image_url": {"url": f"data:{media_type};base64,{data}"},
                             })
+                        else:
+                            url = src.get("url", "")
+                            if url:
+                                image_parts.append({
+                                    "type": "image_url",
+                                    "image_url": {"url": url},
+                                })
                 # Emit tool_result messages BEFORE the user text message (OpenAI requires tool results
                 # to immediately follow the assistant's tool_calls).
                 for tr in tool_results:
@@ -1968,6 +2332,12 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     choice = choices[0] if choices else {}
     message = choice.get("message", {})
     content_blocks = []
+    # Transparent passthrough: surface reasoning_content as a thinking block
+    # (parity with nous/opencode/blackbox/shared translators). Dropping it
+    # silently removes part of the model's output.
+    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    if reasoning:
+        content_blocks.append({"type": "thinking", "thinking": reasoning})
     if message.get("content"):
         content_blocks.append({"type": "text", "text": message["content"]})
     if message.get("tool_calls"):
@@ -2028,6 +2398,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     block_open = False
     block_index = 0
     text_started = False
+    thinking_started = False
+    thinking_index = None
     tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
     open_tool_blocks: set = set()  # R-02: concurrently-open tool_use blocks
     finish_reason = None
@@ -2113,9 +2485,51 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     input_tokens = usage_chunk.get('prompt_tokens', input_tokens)
                     output_tokens = usage_chunk.get('completion_tokens', output_tokens)
 
+                # Reasoning / thinking content — streamed as a thinking block
+                # (parity with the shared AnthropicStreamState used by
+                # nous/opencode/blackbox). Previously dropped entirely, so a
+                # reasoning model's thinking never reached Claude Code on this
+                # surface — part of the model's output silently vanished.
+                reason_delta = (
+                    delta.get('reasoning_content') if isinstance(delta.get('reasoning_content'), str)
+                    else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else '')
+                )
+                if reason_delta:
+                    if not thinking_started:
+                        # Close only an open TEXT block (tool blocks stay open
+                        # concurrently — R-02). The next block gets a fresh
+                        # index.
+                        if block_open and text_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': block_index,
+                            })
+                            block_index += 1
+                            text_started = False
+                            block_open = False
+                        thinking_index = block_index
+                        yield _sse('content_block_start', {
+                            'type': 'content_block_start', 'index': thinking_index,
+                            'content_block': {'type': 'thinking', 'thinking': ''},
+                        })
+                        thinking_started = True
+                        block_open = True
+                        block_index += 1
+                    yield _sse('content_block_delta', {
+                        'type': 'content_block_delta', 'index': thinking_index,
+                        'delta': {'type': 'thinking_delta', 'thinking': reason_delta},
+                    })
+
                 # Text content
                 if delta.get('content'):
                     if not text_started:
+                        # Close an open thinking block if any (tool blocks stay
+                        # open concurrently — R-02).
+                        if block_open and thinking_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': thinking_index,
+                            })
+                            thinking_started = False
+                            block_open = False
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {'type': 'text', 'text': ''},
@@ -2146,19 +2560,26 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     tc_idx = tc.get('index', 0)
                     fn = tc.get('function') or {}
                     if tc_idx not in tool_call_blocks:
-                        # R-02: close only a TEXT block here. Closing the
-                        # previous TOOL block orphaned its later argument
-                        # fragments (OpenAI interleaves fragments across all
-                        # active tool indices), so `content_block_delta`
-                        # arrived on a closed index and Claude Code dropped
-                        # the tool call. Tool blocks stay open concurrently
-                        # and are all closed at the terminal path.
+                        # R-02: close only a TEXT or THINKING block here.
+                        # Closing the previous TOOL block orphaned its later
+                        # argument fragments (OpenAI interleaves fragments
+                        # across all active tool indices), so
+                        # `content_block_delta` arrived on a closed index and
+                        # Claude Code dropped the tool call. Tool blocks stay
+                        # open concurrently and are all closed at the
+                        # terminal path.
                         if block_open and text_started:
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': block_index,
                             })
                             block_index += 1
                             text_started = False
+                            block_open = False
+                        elif block_open and thinking_started:
+                            yield _sse('content_block_stop', {
+                                'type': 'content_block_stop', 'index': thinking_index,
+                            })
+                            thinking_started = False
                             block_open = False
                         tool_call_blocks[tc_idx] = block_index
                         open_tool_blocks.add(block_index)
@@ -2185,13 +2606,18 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
-        # B-04 / R-02: close the open TEXT block (if any), then every
+        # B-04 / R-02: close the open TEXT/THINKING block (if any), then every
         # concurrently-open tool_use block, lowest index first.
         if block_open and text_started:
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
             text_started = False
+        if block_open and thinking_started:
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': thinking_index,
+            })
+            thinking_started = False
         for _ti in sorted(open_tool_blocks):
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': _ti,
@@ -2231,6 +2657,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
         try:
             if block_open and text_started:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
+            if block_open and thinking_started:
+                yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': thinking_index})
             for _ti in sorted(open_tool_blocks):
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ti})
             open_tool_blocks.clear()
@@ -2363,14 +2791,14 @@ async def _mgmt_request(method: str, path: str = "", json_body: dict | None = No
                           params: dict | None = None) -> Response:
     """Make authenticated management API request to OpenRouter."""
     if not MANAGEMENT_ENABLED:
-        return JSONResponse(
+        return _error_response(
             {"error": "OpenRouter management not enabled. Set OPENROUTER_MANAGEMENT_ENABLED=yes "
                        "and configure OPENROUTER_MANAGEMENT_KEY"},
             status_code=501,
         )
     mgmt_key = os.environ.get('OPENROUTER_MANAGEMENT_KEY', '').strip()
     if not mgmt_key:
-        return JSONResponse(
+        return _error_response(
             {"error": "OPENROUTER_MANAGEMENT_KEY not configured"},
             status_code=501,
         )
@@ -2395,7 +2823,7 @@ async def _mgmt_request(method: str, path: str = "", json_body: dict | None = No
             return JSONResponse(data, status_code=resp.status)
     except Exception as e:
         logger.error(f"[openrouter] Management API error: {e}")
-        return JSONResponse({"error": str(e)}, status_code=502)
+        return _error_response({"error": str(e)}, status_code=502)
 
 
 @app.post("/openrouter/keys/list")
@@ -2444,7 +2872,7 @@ async def openrouter_rotate_key(request: Request):
     body = await request.json() if request.headers.get("content-length") else {}
     old_hash = body.get("old_key_hash", "")
     if not old_hash:
-        return JSONResponse({"error": "old_key_hash is required"}, status_code=400)
+        return _error_response({"error": "old_key_hash is required"}, status_code=400)
     new_name = body.get("new_name")
     new_limit = body.get("new_limit")
 
@@ -2481,7 +2909,7 @@ async def openrouter_key_usage():
 async def mcp_sse(request: Request):
     """SSE transport endpoint for MCP."""
     if not MCP_SERVER or not SSE_TRANSPORT:
-        return JSONResponse({"error": "MCP not available"}, status_code=503)
+        return _error_response({"error": "MCP not available"}, status_code=503)
 
     async def event_generator():
         async with anyio.create_task_group() as tg, SSE_TRANSPORT.connect_sse(
@@ -2499,7 +2927,7 @@ async def mcp_sse(request: Request):
 async def mcp_messages(request: Request):
     """Streamable HTTP transport for MCP (JSON-RPC messages)."""
     if not MCP_SERVER or not SSE_TRANSPORT:
-        return JSONResponse({"error": "MCP not available"}, status_code=503)
+        return _error_response({"error": "MCP not available"}, status_code=503)
     return await SSE_TRANSPORT.handle_post_message(request.scope, request._receive, request._send)
 
 

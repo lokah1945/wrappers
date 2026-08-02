@@ -90,6 +90,13 @@ from common.translations import (
     anthropic_to_openai_response,
     openai_to_anthropic_response,
     stream_anthropic_to_openai,
+    openai_chat_to_anthropic_request,
+)
+from common.compat import (
+    is_anthropic_upstream as _is_anthropic_upstream,
+    passthrough_anthropic_sse as _passthrough_anthropic_sse,
+    translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
+    translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
 )
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -131,6 +138,17 @@ BEARER_TOKEN = os.environ.get('BEARER_TOKEN', '').strip()
 
 
 def validate_config():
+    # COMPATIBILITY_LAYER: operator-declared upstream dialect (1=OpenAI,
+    # 2=Anthropic, 3=Auto). Fail fast on invalid values so the wrapper never
+    # guesses the upstream protocol.
+    try:
+        from common.compat import validate_compat_layer
+        validate_compat_layer()
+    except ValueError as _e:
+        print(f"❌ ERROR: {_e}")
+        sys.exit(1)
+    except ImportError:
+        pass
     """Validate required configuration at startup."""
     import os
     import sys
@@ -241,7 +259,7 @@ def _resolve_git_root():
         import subprocess
         return subprocess.check_output(
             ['git', 'rev-parse', '--show-toplevel'],
-            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL
+            cwd=os.path.dirname(os.path.abspath(__file__)), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
     except Exception:
         p = os.path.dirname(os.path.abspath(__file__))
@@ -254,7 +272,7 @@ def _resolve_git_root():
 def _resolve_git_commit():
     try:
         import subprocess
-        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=_resolve_git_root(), stderr=subprocess.DEVNULL).decode().strip()
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3).decode().strip()
     except Exception:
         return 'unknown'
 
@@ -675,7 +693,13 @@ def anthropic_to_openai(body: dict) -> dict:
                 rc = b.get('content')
                 txt = rc if isinstance(rc, str) else '\n'.join(x.get('text', '') for x in (rc or []) if isinstance(x, dict))
                 msgs.append({'role': 'tool', 'tool_call_id': b.get('tool_use_id') or b.get('id') or '', 'content': txt})
-        final = parts if len(parts) > 1 else (parts[0]['text'] if parts else ('' if tools else None))
+        # NB-7/DR-5 parity (opencode): a single non-text part (e.g. one image
+        # block) must be wrapped in a list — indexing parts[0]['text'] on an
+        # image_url part raised KeyError, crashing every vision request that
+        # sent exactly one image with no accompanying text; and OpenAI chat
+        # content must be a string or an ARRAY, never a bare part dict.
+        final = parts if len(parts) > 1 else (
+            parts[0]['text'] if parts and parts[0].get('type') == 'text' else ([parts[0]] if parts else ('' if tools else None)))
         if role == 'user' and not parts and not tools and not reasoning:
             continue
         if role == 'assistant' and not parts and not tools and not reasoning:
@@ -831,6 +855,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             if not isinstance(it, dict):
                 continue
             t = it.get('type')
+            if t == 'reasoning':
+                continue  # multi-turn Codex input includes reasoning items; chat has no placeholder
             if t == 'function_call_output':
                 outv = it.get('output', '')
                 msgs.append({'role': 'tool', 'tool_call_id': it.get('call_id') or '', 'content': outv if isinstance(outv, str) else json.dumps(outv, ensure_ascii=False)})
@@ -893,13 +919,21 @@ def chat_to_responses(model: str, data: dict) -> dict:
     # output item (opencode parity) instead of silently discarding it.
     reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
     if reasoning:
-        output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning', 'status': 'completed', 'text': reasoning})
+        # CODEX-RESP-02: SDK ResponseReasoningItem expects summary/content as
+        # lists (text alone triggers serializer warnings in the openai SDK).
+        output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning', 'status': 'completed',
+                       'summary': [], 'content': [{'type': 'reasoning_text', 'text': reasoning}]})
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call', 'status': 'completed', 'call_id': tc.get('id'), 'name': fn.get('name', '') or '', 'arguments': fn.get('arguments', '') or ''})
     output.append({'id': f"msg_{int(time.time()*1000)}", 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
     u = data.get('usage') or {}
-    return {'id': data.get('id') or f"resp_{int(time.time()*1000)}", 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': output, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0, 'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
+    # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
+    # parallel_tool_calls / tool_choice / tools — missing them fails
+    # non-streaming client.responses.create() parsing.
+    return {'id': data.get('id') or f"resp_{int(time.time()*1000)}", 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': output,
+            'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
+            'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0, 'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
 
 
 def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs=None) -> dict:
@@ -1099,7 +1133,12 @@ async def add_latency_tracking(request: Request, call_next):
         f"latency={latency_ms:.2f}ms status={response.status_code}"
     )
     
+
     response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
+    # WRAPPER_CONTRACT §10: every response carries X-Request-ID and
+    # X-Process-Time. The request id was logged but never returned, breaking
+    # distributed tracing for clients that correlate by header.
+    response.headers["X-Request-ID"] = request_id
     return response
 
 
@@ -1364,6 +1403,33 @@ async def chat_completions(request: Request):
         return JSONResponse(status_code=400, content=free_only_error(requested or body['model']))
     _clean_tools(body)
     is_stream = bool(body.get('stream', False))
+
+    # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI chat
+    # request to Anthropic Messages and translate the response back.
+    if _is_anthropic_upstream():
+        anthro_body = openai_chat_to_anthropic_request(body)
+        anthro_body['stream'] = is_stream
+        url = f'{BLACKBOX_BASE}/messages'
+        if is_stream:
+            status, resp, key = await proxy_request_with_pool('POST', url, anthro_body, request, is_stream=True)
+            if status != 200:
+                return JSONResponse(status_code=status, content=resp if isinstance(resp, dict) else {'error': {'message': str(resp), 'type': 'api_error'}})
+            async def gen():
+                try:
+                    async for frame in _translate_anthropic_stream_to_openai_chat(resp, body.get('model', ''), HEARTBEAT_MS / 1000.0):
+                        yield frame
+                finally:
+                    try:
+                        resp.release()
+                    except Exception:
+                        pass
+                    pool.release(key)
+            return StreamingResponse(gen(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+        status, data, _ = await proxy_request_with_pool('POST', url, anthro_body, request)
+        if status != 200:
+            return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
+        return JSONResponse(anthropic_to_openai_response(data, body.get('model', '')))
+
     url = f'{BLACKBOX_BASE}/chat/completions'
     if is_stream:
         status, resp, key = await proxy_request_with_pool('POST', url, body, request, is_stream=True)
@@ -1414,6 +1480,41 @@ async def responses(request: Request):
         if err:
             return JSONResponse(status_code=400, content=err)
         url = f'{BLACKBOX_BASE}/chat/completions'
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat →
+        # Anthropic request; translate the Anthropic response back through
+        # OpenAI Chat to Responses.
+        if _is_anthropic_upstream():
+            anthro_body = openai_chat_to_anthropic_request(chat_body)
+            anthro_body['stream'] = chat_body['stream']
+            url = f'{BLACKBOX_BASE}/messages'
+            if anthro_body['stream']:
+                status, resp, key = await proxy_request_with_pool('POST', url, anthro_body, request, is_stream=True)
+                if status != 200:
+                    await metrics.record_request(model=model, path='/v1/responses', status_code=status)
+                    return JSONResponse(status_code=status, content=resp if isinstance(resp, dict) else {'error': {'message': str(resp), 'type': 'api_error'}})
+                rid = f"resp_{int(time.time()*1000)}"
+                async def gen():
+                    try:
+                        async for frame in _translate_anthropic_stream_to_openai_chat(resp, body.get('model', ''), HEARTBEAT_MS / 1000.0):
+                            yield frame
+                    finally:
+                        try:
+                            resp.release()
+                        except Exception:
+                            pass
+                        pool.release(key)
+                return StreamingResponse(
+                    _translate_openai_chat_sse_to_responses(gen(), model),
+                    media_type='text/event-stream',
+                    headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+            status, data, _ = await proxy_request_with_pool('POST', url, anthro_body, request)
+            if status != 200:
+                await metrics.record_request(model=model, path='/v1/responses', status_code=status)
+                return JSONResponse(status_code=status, content=data if isinstance(data, dict) else {'error': {'message': str(data), 'type': 'api_error'}})
+            oai_chat = anthropic_to_openai_response(data, model)
+            resp_obj = chat_to_responses(model, oai_chat)
+            _store_response(principal, resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(oai_chat)])
+            return JSONResponse(resp_obj)
         if chat_body['stream']:
             status, resp, key = await proxy_request_with_pool('POST', url, chat_body, request, is_stream=True)
             if status != 200:
@@ -1515,7 +1616,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
                 rsn_started = True
                 rsn_index = next_output_index
                 next_output_index += 1
-                yield emit('response.output_item.added', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': '', 'content': []}})
+                yield emit('response.output_item.added', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': [], 'content': []}})
             acc_reason += reason_delta
             yield emit('response.reasoning_text.delta', {'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'delta': reason_delta})
         for tc in d.get('tool_calls') or []:
@@ -1526,15 +1627,18 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
                 yield emit('response.output_item.added', {'output_index': acc['output_index'], 'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress', 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''}})
             if fn.get('name'):
                 acc['name'] += fn['name']
-                yield emit('response.function_call.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name']})
+                yield emit('response.function_call_arguments.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name']})
             if fn.get('arguments'):
                 acc['args'] += fn['arguments']
-                yield emit('response.function_call.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['arguments']})
+                yield emit('response.function_call_arguments.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['arguments']})
 
     failed = False
     last_hb = time.time()
     try:
-        yield emit('response.created', {'response': {'id': rid, 'model': model, 'status': 'in_progress'}})
+        yield emit('response.created', {'response': {
+            'id': rid, 'object': 'response', 'created_at': int(time.time()),
+            'model': model, 'status': 'in_progress', 'output': [],
+            'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}}})
         yield emit('response.in_progress', {'response': {'id': rid, 'status': 'in_progress'}})
         yield emit('response.output_item.added', {'output_index': 0, 'item': {'id': msg_id, 'type': 'message', 'status': 'in_progress', 'role': 'assistant', 'content': []}})
         yield emit('response.content_part.added', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': ''}})
@@ -1590,19 +1694,22 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     msg_item = {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': acc_text, 'annotations': []}]}
     if rsn_started:
         yield emit('response.reasoning_text.done', {'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason})
-        yield emit('response.output_item.done', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason}})
+        yield emit('response.output_item.done', {'output_index': rsn_index, 'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]}})
     yield emit('response.output_text.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': acc_text})
     yield emit('response.content_part.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': acc_text, 'annotations': []}})
     yield emit('response.output_item.done', {'output_index': 0, 'item': msg_item})
     outputs = [msg_item]
     if rsn_started:
-        outputs.append({'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': '', 'text': acc_reason})
+        outputs.append({'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]})
     completed_tools = [a for a in tool_accs if a]
     for acc in completed_tools:
         fc_item = {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed', 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']}
+        # CODEX-RESP-02: standard OpenAI Responses event finalising tool
+        # arguments before the item is closed.
+        yield emit('response.function_call_arguments.done', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'name': acc['name'], 'arguments': acc['args']})
         yield emit('response.output_item.done', {'output_index': acc['output_index'], 'item': fc_item})
         outputs.append(fc_item)
-    yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj()}})
+    yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj(), 'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': []}})
     _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
 
 
@@ -1688,6 +1795,31 @@ async def anthropic_messages(request: Request):
     # DR-8: contain handler exceptions — return a shaped Anthropic error
     # envelope instead of a raw ASGI 500.
     try:
+        # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
+        # passes through verbatim (model alias already applied above).
+        if _is_anthropic_upstream():
+            url = f'{BLACKBOX_BASE}/messages'
+            if bool(body.get('stream', False)):
+                status, resp, key = await proxy_request_with_pool('POST', url, body, request, is_stream=True)
+                if status != 200:
+                    await metrics.record_request(model=model, path='/v1/messages', status_code=status)
+                    return JSONResponse(status_code=status, content={'type': 'error', 'error': resp if isinstance(resp, dict) else {'type': 'api_error', 'message': str(resp)}})
+                async def gen():
+                    try:
+                        async for frame in _passthrough_anthropic_sse(resp, HEARTBEAT_MS / 1000.0):
+                            yield frame
+                    finally:
+                        try:
+                            resp.release()
+                        except Exception:
+                            pass
+                        pool.release(key)
+                return StreamingResponse(gen(), media_type='text/event-stream', headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+            status, data, _ = await proxy_request_with_pool('POST', url, body, request)
+            if status != 200:
+                await metrics.record_request(model=model, path='/v1/messages', status_code=status)
+                return JSONResponse(status_code=status, content={'type': 'error', 'error': data if isinstance(data, dict) else {'type': 'api_error', 'message': str(data)}})
+            return JSONResponse(data)
         openai_body = anthropic_to_openai(body)
         openai_body['stream'] = bool(body.get('stream', False))
         # DR-9 parity (BUG-SEC3): apply the shared validation (incl. the

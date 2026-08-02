@@ -1,14 +1,14 @@
 # Wrapper Monorepo Contract
 
-**Version:** 3.0 (2026-08-01)
-**Supersedes:** 2.0 (2026-07-28)
+**Version:** 3.1 (2026-08-01)
+**Supersedes:** 3.0 (2026-08-01)
 **Status:** Normative. This document is the specification every wrapper is held to.
 
 This monorepo contains provider-specific wrappers that must behave as **one coherent product**. Upstreams differ (NVIDIA NIM, Nous Research, OpenCode Zen, BLACKBOX AI, OpenRouter), but the client-facing contract is intentionally identical across all wrappers.
 
 > **How to read this document.** Requirements use RFC-2119 keywords: **MUST**, **MUST NOT**, **SHOULD**, **MAY**. Every clause here was verified against the code at the version stamped above; where a wrapper legitimately deviates, the deviation is stated explicitly rather than hidden.
 
-**Changes from v2.0 are summarised in [§12](#12-changelog-v20--v30).**
+**Changes from v2.0 are summarised in [§12](#12-changelog).**
 
 ---
 
@@ -309,6 +309,8 @@ Port 9105 is intentionally unused.
 | `METRICS_PERSIST_SEC` | `60` | Metrics snapshot interval. |
 | `FREE_ONLY` / `FREE_MODEL_ALLOWLIST` | `no` | Restrict to free models. |
 | `DYNAMIC_ALIAS_TARGET` | *(none)* | Operator-bound alias target. |
+| `COMPATIBILITY_LAYER` | `1` | **Upstream dialect, declared by the operator** — `1` OpenAI Compatible (default, current behaviour), `2` Anthropic Compatible (upstream speaks the Messages API; surfaces are translated to/from Anthropic, `/v1/messages` passes through verbatim), `3` Auto Discovery (probe upstream once per base URL, cache with `COMPATIBILITY_PROBE_TTL_SEC`, fall back to `1`). Invalid values fail fast in `validate_config()`. See `docs/COMPATIBILITY_LAYER.md`. |
+| `COMPATIBILITY_PROBE_TTL_SEC` | `300` | Cache TTL for auto-discovery probes (layer 3). |
 | `LOAD_SHEDDING_ENABLED` | `false` | Shed load above `INFLIGHT_SOFT_CAP`. |
 | `OPENROUTER_MANAGEMENT_TOKEN` | falls back to `BEARER_TOKEN` | Provisioning-API credential (openrouter). |
 
@@ -326,29 +328,49 @@ Port 9105 is intentionally unused.
 
 ## 11. Testing and verification
 
-A wrapper is **not** contract-compliant until it passes all three gates.
+A wrapper is **not** contract-compliant until it passes all six gates.
 
 ```bash
 python -m pip install -r tests/requirements.txt
 
-# 1. Unit + parity + regression suite
-python -m pytest tests -q                        # 123 tests
+# 1. Unit + parity + regression suite (incl. AI Gateway translation matrix)
+python -m pytest tests -q                        # 241 tests
 
 # 2. Live agent-traffic E2E — boots each wrapper as a real server against a
 #    mock upstream and drives it as Claude Code / Codex / OpenAI SDK would.
-python tests/e2e_runtime/run_runtime_e2e.py      # 420 checks, exits non-zero on failure
+python tests/e2e_runtime/run_runtime_e2e.py      # 445 checks, exits non-zero on failure
 
-# 3. Sustained load — leak, pool-starvation and degradation detection
+# 3. SDK compatibility — every wrapper's /v1/responses output (streaming +
+#    non-streaming) must parse with the official openai SDK (Codex's parser).
+python tests/e2e_runtime/sdk_codex_compat.py     # 5 wrappers × 4 modes
+
+# 4. COMPATIBILITY_LAYER E2E — layer=2 (Anthropic upstream) across all 5
+#    wrappers × 3 surfaces + layer=3 auto-discovery against both mocks.
+python tests/e2e_runtime/compat_layer_e2e.py
+
+# 5. Full matrix audit — every wrapper × upstream dialect × surface ×
+#    parameter, driven with the real anthropic + openai SDKs.
+python tests/e2e_runtime/full_matrix_audit.py    # 240 checks
+
+# 6. Sustained load — leak, pool-starvation and degradation detection
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
 ```
 
-The E2E harness exercises **21 pathological-but-legal upstream behaviours** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `nofinish`, `noterminator`, `midstream_error`, `abrupt`, `slow`, `usage_after`, `empty`, `unicode`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`, `http500`, `http429`.
+The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `usage_after`, `empty`, `unicode`, `slow`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`. The mock upstream additionally provides non-stream modes (`echo`, `error`, `http429once`, `abrupt`, `http500`, `http429`) for parameter/error/retry probes.
 
 **Unit tests alone are insufficient.** Every one of the eight runtime findings (R-01…R-08) passed a green 110-test unit suite; they were only reachable by running the servers and speaking to them over a socket.
 
 ---
 
-## 12. Changelog (v2.0 → v3.0)
+## 12. Changelog
+
+### v3.0 → v3.1 (2026-08-01)
+
+- **§9.2:** added `COMPATIBILITY_LAYER` (operator-declared upstream dialect: `1` OpenAI, `2` Anthropic, `3` auto-discovery) and `COMPATIBILITY_PROBE_TTL_SEC`. See [`docs/COMPATIBILITY_LAYER.md`](docs/COMPATIBILITY_LAYER.md).
+- **§11:** expanded to six gates — the previous three plus the SDK-compatibility gate (official openai SDK parses every wrapper's Responses output), the COMPATIBILITY_LAYER E2E, and the full matrix audit (240 checks).
+- **§4 / §10 enforcement:** contract §4 (positive-int/capped `max_tokens`, role/tool-message validation on every surface) and §10 (`X-Request-ID` on every response) are now enforced on all five wrappers and locked by regression guards.
+
+### v2.0 → v3.0
 
 ### Corrected — v2.0 statements that did not match the code
 
@@ -385,12 +407,15 @@ The E2E harness exercises **21 pathological-but-legal upstream behaviours** agai
 - [`docs/CROSS_WRAPPER_BUG_POLICY.md`](docs/CROSS_WRAPPER_BUG_POLICY.md) — parity policy
 - [`docs/TEMPLATE_WRAPPER.md`](docs/TEMPLATE_WRAPPER.md) — new-wrapper skeleton
 - [`docs/DOCUMENTATION_INDEX.md`](docs/DOCUMENTATION_INDEX.md) — full documentation map
-- [`docs/audits/RUNTIME_AUDIT_2026-08-01.md`](docs/audits/RUNTIME_AUDIT_2026-08-01.md) — current runtime verification
-- [`docs/audits/BUG_ANALYSIS_2026-07-31.md`](docs/audits/BUG_ANALYSIS_2026-07-31.md) — current deep audit
+- [`docs/audits/RUNTIME_AUDIT_2026-08-01.md`](docs/audits/RUNTIME_AUDIT_2026-08-01.md) — runtime verification
+- [`docs/COMPATIBILITY_LAYER.md`](docs/COMPATIBILITY_LAYER.md) — operator-declared upstream dialect
+- [`docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md`](docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md) — full matrix audit (240 checks)
+- [`docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md`](docs/audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md) — AI Gateway translation-layer audit
+- [`docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md`](docs/audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md) — SDK-compat (Codex) audit
 - [`docs/reports/PRODUCTION_READINESS_2026-08-01.md`](docs/reports/PRODUCTION_READINESS_2026-08-01.md) — readiness scorecard
 - [`productions/PRODUCTION_RUNBOOK.md`](productions/PRODUCTION_RUNBOOK.md) — operational runbook
 
 ---
 
-**Version:** 3.0 · **Last updated:** 2026-08-01
-**Verification at this version:** 123 unit tests · 420 live E2E checks · ~18,100 soak requests · 0 failures
+**Version:** 3.1 · **Last updated:** 2026-08-01
+**Verification at this version:** 241 unit tests · 63 streaming regressions · 67 translation-matrix tests · 445 live E2E checks · 5 wrappers × 4 modes SDK-compat · 240 full-matrix checks · ~20k soak requests · 0 failures

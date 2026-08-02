@@ -19,10 +19,10 @@ nvidia-python/
 
 ```bash
 # Development
-uvicorn nvidia_python.src.main:app --reload --port 9101
+uvicorn src.main:app --reload --port 9101
 
 # Production
-uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9101 --workers 4
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.
@@ -31,7 +31,7 @@ See WRAPPER_STANDARDIZATION_REPORT.md for details.
 
 > OpenAI- and Anthropic-compatible transparent proxy for the NVIDIA NIM API.
 
-**Status:** ✅ **PRODUCTION READY — 100/100**  
+**Status:** ✅ **Verified compatible** (2026-08-01 matrix audit: 240/240 checks)  
 **Version:** 8.6.5-py  
 **Implementation:** Python (FastAPI + aiohttp)  
 **Port:** 9101
@@ -70,6 +70,25 @@ This is the **single source of truth** for wrapper-nvidia going forward.
 - Header Smuggling (CVE-2025-64484): Normalize X-Forwarded-* headers properly
 - Request Smuggling: Validate Content-Length vs Transfer-Encoding conflicts
 
+## Upstream Compatibility Layer (COMPATIBILITY_LAYER)
+
+The operator declares what protocol the **upstream** speaks; the wrapper never
+guesses. The same variable exists in every wrapper's `.env`:
+
+```
+COMPATIBILITY_LAYER=1   # 1 = OpenAI Compatible (default), 2 = Anthropic Compatible,
+                        # 3 = Auto Discovery (probe upstream once, cached)
+```
+
+| Layer | Upstream speaks | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat translate | Anthropic↔OpenAI translate |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI translate | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once per base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`) | same | same |
+
+Invalid values fail fast at startup (`validate_config`). Full design:
+[`docs/COMPATIBILITY_LAYER.md`](../docs/COMPATIBILITY_LAYER.md).
+
 ## Quick Start
 
 ### 1. Install
@@ -93,7 +112,7 @@ cp .env.example .env
 ```bash
 python -m uvicorn src.main:app --host 0.0.0.0 --port 9101
 # or
-python -m src.main
+python -m uvicorn src.main:app --host 127.0.0.1 --port 9101
 ```
 
 ### 4. Verify

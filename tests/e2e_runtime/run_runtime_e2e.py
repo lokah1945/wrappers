@@ -48,8 +48,9 @@ BASE_FOR = {
 }
 
 STREAM_MODES = [
-    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'nofinish',
-    'noterminator', 'midstream_error', 'usage_after', 'empty', 'unicode', 'slow',
+    'normal', 'nospace', 'keepalive', 'crlf', 'tools', 'reasoning', 'reasoning_only',
+    'nofinish', 'noterminator', 'midstream_error', 'usage_after', 'empty', 'unicode',
+    'slow',
     # Round-2 adversarial framing / protocol modes
     'bigchunk', 'bytesplit', 'comments', 'dupfinish', 'nullcontent',
     'emptychoices', 'toolnoid', 'longtool',
@@ -244,6 +245,23 @@ def check_anthropic_stream(evs, mode) -> list[str]:
             sr = stops[0].get('delta', {}).get('stop_reason') if stops else None
             errs.append(f'upstream error reported as success (stop_reason={sr!r}); '
                         'client cannot detect the failure or retry')
+
+    # AI Gateway cross-translation: upstream reasoning_content must surface as
+    # a thinking block on the Anthropic surface (transparency — part of the
+    # model's output must not vanish). The upstream `reasoning` / `reasoning_only`
+    # modes emit reasoning_content deltas.
+    if mode in ('reasoning', 'reasoning_only'):
+        thinking_starts = [d for _e, d in evs if isinstance(d, dict)
+                           and d.get('type') == 'content_block_start'
+                           and (d.get('content_block') or {}).get('type') == 'thinking']
+        thinking_deltas = [d for _e, d in evs if isinstance(d, dict)
+                           and d.get('type') == 'content_block_delta'
+                           and (d.get('delta') or {}).get('type') == 'thinking_delta']
+        if not thinking_starts:
+            errs.append('upstream reasoning_content dropped — no thinking block '
+                        'on the Anthropic surface (transparency violation)')
+        elif mode == 'reasoning' and not thinking_deltas:
+            errs.append('thinking block opened but no thinking_delta emitted')
     return errs
 
 
@@ -305,6 +323,27 @@ def check_responses_stream(evs, mode) -> list[str]:
         errs.append('no terminal response.completed/failed event (Codex hangs)')
     if mode == 'midstream_error' and 'response.completed' in types:
         errs.append('upstream error reported as response.completed')
+    # CODEX-RESP-01 guard: a *completed* turn must have a complete item
+    # lifecycle — every output_item.added must be matched by an
+    # output_item.done. The openrouter translator used to skip the done
+    # events when the model emitted only reasoning (no text), so Codex never
+    # saw its output items close and hung waiting for the terminal events.
+    # Failure paths (response.failed) are exempt: siblings close items only
+    # on success, matching the OpenAI Responses error shape.
+    if 'response.completed' in types:
+        added = {(d.get('output_index'), (d.get('item') or {}).get('id'))
+                 for _e, d in evs
+                 if isinstance(d, dict) and d.get('type') == 'response.output_item.added'}
+        done = {(d.get('output_index'), (d.get('item') or {}).get('id'))
+                for _e, d in evs
+                if isinstance(d, dict) and d.get('type') == 'response.output_item.done'}
+        if not added:
+            errs.append('no response.output_item.added before response.completed '
+                        '(Codex has no active item — hangs)')
+        for idx, iid in sorted(added):
+            if (idx, iid) not in done:
+                errs.append(f'output item {iid} (index {idx}) added but never done '
+                            '(Codex hangs waiting for item close)')
     # Sequence numbers, when present, must be strictly increasing.
     seqs = [d['sequence_number'] for _e, d in evs
             if isinstance(d, dict) and isinstance(d.get('sequence_number'), int)]
@@ -500,6 +539,13 @@ async def exercise(wrapper: str, port: int) -> None:
              {'model': 'mock/normal', 'max_tokens': 64,
               'messages': [{'role': 'user', 'content': 'hi'}]}, 'anthropic'),
             ('/v1/responses', {'model': 'mock/normal', 'input': 'hi'}, 'responses'),
+            # Cross-translation: tools mode on the Anthropic surface must yield
+            # tool_use blocks + stop_reason tool_use; on the Responses surface
+            # it must yield function_call output items.
+            ('/v1/messages',
+             {'model': 'mock/tools', 'max_tokens': 64,
+              'messages': [{'role': 'user', 'content': 'hi'}]}, 'anthropic_tools'),
+            ('/v1/responses', {'model': 'mock/tools', 'input': 'hi'}, 'responses_tools'),
         ):
             try:
                 async with s.post(base + path, json=payload, headers=headers,
@@ -527,6 +573,30 @@ async def exercise(wrapper: str, port: int) -> None:
                             fail(wrapper, path, 'nonstream', 'missing stop_reason')
                         else:
                             ok(wrapper, path, 'nonstream')
+                    elif shape == 'anthropic_tools':
+                        types = [b.get('type') for b in d.get('content', []) if isinstance(b, dict)]
+                        if d.get('type') != 'message':
+                            fail(wrapper, path, 'nonstream', f'type={d.get("type")!r}')
+                        elif 'tool_use' not in types:
+                            fail(wrapper, path, 'nonstream',
+                                 f'no tool_use block translated from upstream tool_calls: {types}')
+                        elif d.get('stop_reason') != 'tool_use':
+                            fail(wrapper, path, 'nonstream',
+                                 f'stop_reason={d.get("stop_reason")!r}, expected tool_use (Claude Code '
+                                 'waits forever for tool_result otherwise)')
+                        else:
+                            ok(wrapper, path, 'nonstream', f'{len(types)} blocks')
+                    elif shape == 'responses_tools':
+                        otypes = [o.get('type') for o in d.get('output', [])]
+                        if d.get('object') != 'response':
+                            fail(wrapper, path, 'nonstream', f'object={d.get("object")!r}')
+                        elif 'function_call' not in otypes:
+                            fail(wrapper, path, 'nonstream',
+                                 f'no function_call output translated: {otypes}')
+                        elif d.get('status') != 'completed':
+                            fail(wrapper, path, 'nonstream', f'status={d.get("status")!r}')
+                        else:
+                            ok(wrapper, path, 'nonstream', f'{len(otypes)} items')
                     else:
                         if d.get('object') != 'response':
                             fail(wrapper, path, 'nonstream', f'object={d.get("object")!r}')
