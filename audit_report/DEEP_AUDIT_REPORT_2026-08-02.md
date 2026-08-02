@@ -1,6 +1,6 @@
 # Deep Audit Report — Wrapper Monorepo
 **Date:** 2026-08-02  
-**Auditor:** Automated Deep Audit  
+**Auditor:** Automated Deep Audit (read-only)  
 **Scope:** All 5 wrappers (nvidia-python, nous, opencode, blackbox, openrouter) + model-registry + common shared modules  
 **Reference Contract:** WRAPPER_CONTRACT v3.1 (2026-08-01)
 
@@ -12,15 +12,16 @@
 |--------|--------|
 | Unit Tests (241) | ✅ ALL PASS |
 | Runtime E2E (445 checks) | ✅ ALL PASS |
-| SDK Compatibility (Codex) | ⚠️ 16/20 FAIL (4 wrappers) |
-| Full Matrix Audit (240 checks) | ⚠️ 44 FAIL (all anthropic-messages surface) |
-| Compat Layer E2E | Not run (blocked by above) |
+| SDK Compatibility (Codex) | ⚠️ 16/20 FAIL (4 wrappers blocked by auth bug) |
+| Full Matrix Audit (240 checks) | ⚠️ 44 FAIL (all anthropic-messages surface auth bug) |
+| Compat Layer E2E | Not run (blocked by auth bug) |
+| Soak Test | Not run |
 
 **Critical Finding:** The shared `common.auth` module has a **fatal flaw** in `extract_client_token()` that causes **all 4 wrappers using shared auth (nous, opencode, blackbox, openrouter) to reject valid Anthropic SDK requests** with 401 Unauthorized. Only nvidia-python (custom auth) passes.
 
 ---
 
-## Critical Bugs Found
+## Critical Bugs Found (P0 — Block Release)
 
 ### 🔴 CRITICAL-01: Shared Auth Breaks Anthropic SDK Compatibility
 **Location:** `/root/wrapper/common/auth.py` — `extract_client_token()` function (lines 58-78)
@@ -71,14 +72,56 @@ authorized = any(hmac.compare_digest(t.encode(), _tok.encode()) for t in candida
 
 ---
 
-## High Severity Bugs
+### 🔴 CRITICAL-04: Codex Stops Mid-Process on Reasoning-Only Streams (CODEX-RESP-01)
+**Location:** Multiple wrappers' Responses API streaming translation
+
+**Root Cause:** When a model emits ONLY reasoning/thinking (no text content), the completion events (`response.output_text.done`, `response.content_part.done`, `response.output_item.done`, `response.completed`) are not emitted. Codex waits indefinitely for these terminal events.
+
+**Status by Wrapper:**
+| Wrapper | Fix Applied | Status |
+|---------|-------------|--------|
+| nvidia-python | ✅ `responses_compat.py` lines 740-741, 1542-1556 | FIXED |
+| openrouter | ✅ `main.py` lines 1542-1556 | FIXED |
+| nous | ❌ `stream_with_heartbeat` + `ResponsesStreamState.done()` | MISSING |
+| opencode | ❌ `_translate_openai_stream_to_responses` | MISSING |
+| blackbox | ❌ `_responses_stream` | MISSING |
+
+**Evidence:** SDK Compat test `reasoning_only` mode would fail for 3 wrappers once auth bug is fixed.
+
+---
+
+### 🔴 CRITICAL-05: Special Token Leakage — ">ࠀ<unk" in Responses
+**Location:** Streaming translation paths where model output contains tokenizer special tokens
+
+**Root Cause:** Some upstream models (DeepSeek, Nemotron, Kimi) output tokenizer special tokens in the reasoning stream. The streaming translation does not filter these tokens, so they appear in the final response as visible text like `>ࠀ<unk` (where ࠀ = U+0800 Samaritan letter Alaf, a tokenizer artifact).
+
+**Evidence:** User reports Claude Code receives responses containing `>ࠀ<unk` and Codex stops mid-process.
+
+**Affected Paths:**
+- OpenAI → Responses translation (all wrappers)
+- Anthropic → OpenAI translation (nvidia-python `stream_openai_to_anthropic`)
+- OpenAI → Anthropic translation (shared `anthropic_stream.py`)
+
+**Fix Required:** Add special token filtering in streaming translation:
+```python
+# Filter common tokenizer special tokens
+SPECIAL_TOKENS = {'<unk>', '<s>', '</s>', '<pad>', '<mask>', 'ࠀ', '｜', '<|', '|>'}
+def filter_special_tokens(text: str) -> str:
+    for tok in SPECIAL_TOKENS:
+        text = text.replace(tok, '')
+    return text
+```
+
+---
+
+## High Severity Bugs (P1 — Next Sprint)
 
 ### 🟠 HIGH-01: Response Store Not Bounded on All Three Axes (Multiple Wrappers)
 **Contract §6.3:** "MUST be bounded on **all three** axes — entry count, total bytes, and TTL"
 
 | Wrapper | Entry Cap | Byte Cap | TTL | Status |
 |---------|-----------|----------|-----|--------|
-| nvidia-python | ✅ 200 | ✅ 32MB | ✅ 3600s | PASS |
+| nvidia-python | ✅ 200 | ✅ 64MB/32MB | ✅ 3600s | PASS |
 | nous | ✅ 200 | ❌ MISSING | ✅ 86400s | FAIL |
 | opencode | ✅ 200 | ❌ MISSING | ✅ 3600s | FAIL |
 | blackbox | ✅ 200 | ✅ 32MB | ✅ 3600s | PASS |
@@ -104,7 +147,7 @@ authorized = any(hmac.compare_digest(t.encode(), _tok.encode()) for t in candida
 
 ---
 
-### 🟠 HIGH-03: Graceful Shutdown Drain Missing in Some Wrappers
+### 🟠 HIGH-03: Graceful Shutdown Drain Missing in Model-Registry
 **Contract §6.4:** "Graceful shutdown MUST drain in-flight requests (SHUTDOWN_DRAIN_SEC, default 30) before closing the session"
 
 | Wrapper | Drain Implemented | Status |
@@ -142,33 +185,16 @@ authorized = any(hmac.compare_digest(t.encode(), _tok.encode()) for t in candida
 
 ---
 
-## Medium Severity Bugs
+### 🟠 HIGH-06: Nous Missing Metrics Persistence for Streaming Endpoints
+**Location:** `/root/wrapper/nous/src/main.py` — `messages()` and `responses()` endpoints
 
-### 🟡 MED-01: Shadowed Shared Cooldown Helper (Historical, Now Fixed)
-**Contract §7:** "Shadowing a shared helper with a local definition of the same name is forbidden"
-
-**Status:** FIXED in current code — all wrappers now import `should_cooldown_key` from `common.translations`. Previous local `_should_cooldown_key` definitions removed.
-
-**Verified by test:** `test_parity_no_wrapper_shadows_shared_cooldown_helper` PASSES
+**Issue:** `metrics.record(error=...)` only called in `chat_completions`. The `messages()` and `responses()` endpoints don't record metrics for streaming or error paths.
 
 ---
 
-### 🟡 MED-02: Retry-After Parsing Inconsistency
-**Issue:** Some wrappers use local `_retry_after_seconds()` delegating to shared `parse_retry_after`, but the delegation signatures differ.
+## Medium Severity Bugs (P2 — Tech Debt)
 
-| Wrapper | Uses Shared | Local Wrapper | Status |
-|---------|-------------|---------------|--------|
-| nvidia-python | ✅ `_parse_retry_after` (local, handles RFC1123 date) | Local | OK |
-| nous | ✅ `_retry_after_seconds` → shared | Delegates | OK |
-| opencode | ✅ `_retry_after_seconds` → shared | Delegates | OK |
-| blackbox | ✅ `_retry_after_seconds` → shared | Delegates | OK |
-| openrouter | ✅ `_parse_retry_after` (shared) | Direct | OK |
-
-**Note:** All now use shared implementation, but nvidia-python has local copy for historical reasons. Should consolidate.
-
----
-
-### 🟡 MED-03: Free-Only Model Detection Uses Substring Match (Security)
+### 🟡 MED-01: Free-Only Model Detection Uses Substring Match (Security)
 **Contract:** "FREE_ONLY=yes|true|1 → only models with ':free' or '-free' suffix"
 
 **Current Implementation:** Most wrappers check `':free' in model_id or '-free' in model_id` — **substring match**, not suffix.
@@ -179,25 +205,25 @@ authorized = any(hmac.compare_digest(t.encode(), _tok.encode()) for t in candida
 
 ---
 
-### 🟡 MED-04: OpenRouter Catalog/MCP Routes Not Auth-Gated
+### 🟡 MED-02: OpenRouter Catalog/MCP Routes Not Auth-Gated
 **Contract §5.6:** "Every POST surface is authenticated and rate-limited, including embeddings and the catch-all"
 
 **OpenRouter:** `/catalog/*` and `/mcp/*` routes are mounted via `common.catalog_integration` but the catch-all (line 2003) only checks `path.startswith("catalog/") or path.startswith("mcp/")` for 404 — **POST to these routes bypasses auth/rate-limit**.
 
 ---
 
-### 🟡 MED-05: Model Registry Service No Input Validation on Internal Endpoints
+### 🟡 MED-03: Model Registry Service No Input Validation on Internal Endpoints
 **Issue:** `/internal/catalog`, `/internal/aliases`, `/internal/observations` use `_read_json_body()` which validates JSON object shape, but no size limit (RequestSizeLimiter middleware not added to model-registry app).
 
 ---
 
-## Low Severity / Technical Debt
-
-### 🔵 LOW-01: Duplicate Retry-After Parsing (nvidia-python)
+### 🟡 MED-04: Duplicate Retry-After Parsing (nvidia-python)
 **Location:** `/root/wrapper/nvidia-python/src/main.py` lines 1340-1364
 **Issue:** Local `_parse_retry_after()` duplicates shared `parse_retry_after()`. Should import shared version.
 
-### 🔵 LOW-02: Inconsistent Health/Ready Auth
+---
+
+### 🟡 MED-05: Inconsistent Health/Ready Auth
 **Contract:** `/health` and `/ready` should be public (no auth)
 - nvidia-python: `/ready` requires auth ❌
 - nous: `/ready` public ✅
@@ -205,21 +231,11 @@ authorized = any(hmac.compare_digest(t.encode(), _tok.encode()) for t in candida
 - blackbox: `/ready` requires auth ❌
 - openrouter: `/ready` public ✅
 
-### 🔵 LOW-03: Missing `/v1/capabilities` in Some Wrappers
-**Contract §2.1:** "Capabilities MUST exist: GET /v1/capabilities"
-- nvidia-python: ✅
-- nous: ✅
-- opencode: ✅
-- blackbox: ✅
-- openrouter: ✅ (added in current version)
-- model-registry: N/A
+---
 
-### 🔵 LOW-04: OpenRouter Missing `/metrics/model-status`
+### 🟡 MED-06: OpenRouter Missing `/metrics/model-status`
 **Contract §2.1:** "Metrics MUST include: GET /metrics/model-status"
 - openrouter: Has `/metrics` and `/metrics/prom` but no `/metrics/model-status`
-
-### 🔵 LOW-05: Hardcoded Version Strings
-Multiple wrappers have hardcoded `VERSION = 'x.y.z'` instead of reading from package metadata or git tag.
 
 ---
 
@@ -244,10 +260,12 @@ Per `docs/CROSS_WRAPPER_BUG_POLICY.md`: "A bug found in one wrapper MUST be chec
 | Graceful drain | nvidia-python | all wrappers | ⚠️ PARTIAL (model-registry missing) |
 | Background task registry | nvidia-python | all wrappers | ⚠️ PARTIAL (model-registry missing) |
 | Model identity guard | nvidia-python | blackbox, opencode, openrouter | ✅ DONE |
-| Call-plan validation | nvidia-python | blackbox, opencode, openrouter | ✅ DONE |
+| Call-plan validation | nvidia-python | blackbox, opencode, openrouter | ⚠️ PARTIAL (openrouter missing) |
 | SDK-shaped errors | nvidia-python | all | ✅ DONE |
 | Max-tokens validation | nvidia-python | all | ✅ DONE |
 | Non-object JSON guard | nvidia-python | all (shared body_guard) | ✅ DONE |
+| CODEX-RESP-01 (reasoning-only) | nvidia-python | openrouter | ⚠️ PARTIAL (nous, opencode, blackbox missing) |
+| Special token filtering | — | — | ❌ MISSING ALL |
 
 ---
 
@@ -285,29 +303,38 @@ Would need auth fix first.
 
 Per user report: "Codex process stopped mid-way due to bug in wrapper-nous as backend."
 
-**Likely Cause:** The Anthropic SDK auth bug (CRITICAL-01) would cause Codex (which uses Anthropic SDK for `/v1/messages`) to receive 401 on every request, appearing as a backend failure. Codex would retry and eventually give up.
+**Likely Causes:**
+1. **Primary:** CRITICAL-01 (Anthropic SDK auth bug) — Codex uses Anthropic SDK for `/v1/messages`, receives 401 on every request, appears as backend failure
+2. **Secondary:** CRITICAL-04 (CODEX-RESP-01) — Reasoning-only streams don't emit completion events, Codex hangs waiting for terminal events
+3. **Tertiary:** CRITICAL-05 (Special token leakage) — `>ࠀ<unk` appears in responses, confusing the client
+
+The Codex session log (`/root/.codex/sessions/2026/08/02/rollout-2026-08-02T22-24-40-019fc313-c330-7a11-9e61-19cb20fd595b.jsonl`) shows the session started but was cut off mid-analysis.
 
 ---
 
 ## Recommendations (Priority Order)
 
-### P0 — Block Release
+### P0 — Block Release (Must Fix Before Any Deploy)
 1. **Fix `common.auth.extract_client_token()`** — Check both `authorization` and `x-api-key` independently (like nvidia-python)
 2. **Fix openrouter `/v1/messages` non-streaming translation** — Ensure Anthropic response format returned
-3. **Add byte cap to nous/opencode response stores** — Enforce 3-axis bound per contract
+3. **Fix openrouter model identity guard** — Run validation for all inference requests
+4. **Add CODEX-RESP-01 fix to nous, opencode, blackbox** — Emit completion events unconditionally in Responses streaming
+5. **Add special token filtering** — Filter tokenizer artifacts (`<unk>`, `ࠀ`, `<|`, `|>`, etc.) in all streaming translations
+6. **Add response store byte caps to nous/opencode** — Enforce 3-axis bound per contract
 
 ### P1 — Next Sprint
-4. **Add graceful drain + task registry to model-registry**
-5. **Fix per-IP rate limiting to use peer-only (remove XFF fallback)** in opencode, blackbox, openrouter
-6. **Fix free-model detection to use suffix match** (not substring)
-7. **Add RequestSizeLimiter to model-registry**
+7. **Add graceful drain + task registry to model-registry**
+8. **Fix per-IP rate limiting to use peer-only (remove XFF fallback)** in opencode, blackbox, openrouter
+9. **Fix free-model detection to use suffix match** (not substring)
+10. **Add RequestSizeLimiter to model-registry**
+11. **Add metrics recording to nous messages/responses endpoints**
+12. **Add `/metrics/model-status` to openrouter**
+13. **Standardize `/ready` auth** — All public (contract says public)
+14. **Gate catalog/mcp POST routes in openrouter**
 
 ### P2 — Tech Debt
-8. **Consolidate retry-after parsing** — Remove nvidia-python local copy
-9. **Standardize `/ready` auth** — All public or all auth'd (contract says public)
-10. **Add `/metrics/model-status` to openrouter**
-11. **Gate catalog/mcp POST routes in openrouter**
-12. **Use dynamic version from git/package** instead of hardcoded strings
+15. **Consolidate retry-after parsing** — Remove nvidia-python local copy
+16. **Use dynamic version from git/package** instead of hardcoded strings
 
 ---
 
@@ -341,6 +368,9 @@ This audit was **read-only**. No source files were modified. All findings docume
 | Shared Middleware | `common/middleware.py` | 31-110 |
 | Model State | `common/model_state.py` | 43-465 |
 | Model Registry | `model-registry/service.py` | 73-353 |
+| Nvidia Responses Streaming | `nvidia-python/src/responses_compat.py` | 523-790 |
+| OpenRouter Responses Streaming | `openrouter/src/main.py` | 1301-1694 |
+| Nous Streaming | `nous/src/main.py` | 1385-1550 |
 | Contract Spec | `WRAPPER_CONTRACT.md` | All |
 
 ---
