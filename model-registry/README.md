@@ -25,3 +25,12 @@ manifests/errors/      provider error rules
 manifests/aliases/     scoped alias bindings
 schemas/               versioned JSON schemas
 ```
+
+## Status
+
+- **Port:** 9200 (`service:app`) — plain service, not a wrapper.
+- **Entry point:** `python3 model-registry/service.py`
+- **Verified:** 2026-08-01 — included in the 241-test suite
+  (`tests/test_model_registry.py`, `tests/test_model_registry_service.py`) and
+  the full-matrix audit boot process.
+- **COMPATIBILITY_LAYER:** not applicable (internal service).

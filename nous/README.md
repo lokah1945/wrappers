@@ -1,4 +1,4 @@
-# wrapper-nous v2.0.5 — 100/100 Production Grade
+# wrapper-nous — Verified Compatible (2026-08-01)
 
 ## Standardized Structure (2026-07-28)
 
@@ -19,10 +19,10 @@ nous/
 
 ```bash
 # Development
-uvicorn nous.src.main:app --reload --port 9102
+uvicorn src.main:app --reload --port 9102
 
 # Production
-uvicorn nous.src.main:app --host 0.0.0.0 --port 9102 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 4
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.
@@ -36,8 +36,8 @@ See WRAPPER_STANDARDIZATION_REPORT.md for details.
 > - Anthropic SDK
 > - Claude Code, Codex, Cursor, LangChain, LlamaIndex, CrewAI, AutoGen, OpenClaw, Hermes Agent
 
-**Version:** 2.0.5 (Production)  
-**Score:** **100/100**
+**Version:** 2.0.7-audit-hardening (Production)  
+**Status:** ✅ Verified compatible (2026-08-01 matrix audit)
 
 ## Part of the Wrappers Monorepo
 
@@ -93,8 +93,27 @@ cp .env.example .env
 # Edit .env (AUTH_PATH or NOUS_API_KEY + BEARER_TOKEN)
 
 # 3. Run
-python3 -m uvicorn wrapper_nous:app --host 127.0.0.1 --port 9106
+python3 -m uvicorn src.main:app --host 127.0.0.1 --port 9102
 ```
+
+## Upstream Compatibility Layer (COMPATIBILITY_LAYER)
+
+The operator declares what protocol the **upstream** speaks; the wrapper never
+guesses. The same variable exists in every wrapper's `.env`:
+
+```
+COMPATIBILITY_LAYER=1   # 1 = OpenAI Compatible (default), 2 = Anthropic Compatible,
+                        # 3 = Auto Discovery (probe upstream once, cached)
+```
+
+| Layer | Upstream speaks | `/v1/chat/completions` | `/v1/responses` | `/v1/messages` |
+|---|---|---|---|---|
+| `1` (default) | OpenAI | passthrough | Responses↔Chat translate | Anthropic↔OpenAI translate |
+| `2` | Anthropic | OpenAI→Anthropic→OpenAI translate | Responses→Chat→Anthropic→back | **passthrough** |
+| `3` | auto | probed once per base URL, cached (`COMPATIBILITY_PROBE_TTL_SEC`) | same | same |
+
+Invalid values fail fast at startup (`validate_config`). Full design:
+[`docs/COMPATIBILITY_LAYER.md`](../docs/COMPATIBILITY_LAYER.md).
 
 ## Configuration (.env)
 
@@ -170,7 +189,7 @@ Use the provided `wrapper-nous.service` (updated for uvicorn).
 
 For high load, you can run with multiple workers:
 ```bash
-uvicorn wrapper_nous:app --host 0.0.0.0 --port 9106 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 4
 ```
 
 ## Verification

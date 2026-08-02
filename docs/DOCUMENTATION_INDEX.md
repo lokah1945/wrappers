@@ -19,6 +19,7 @@ on or that a newcomer must read first:
 | File | Purpose |
 |---|---|
 | [`CROSS_WRAPPER_BUG_POLICY.md`](CROSS_WRAPPER_BUG_POLICY.md) | **Normative.** A bug found in one wrapper must be checked and fixed in all five. |
+| [`COMPATIBILITY_LAYER.md`](COMPATIBILITY_LAYER.md) | **Normative.** Operator-declared upstream dialect (1=OpenAI, 2=Anthropic, 3=Auto). |
 | [`TEMPLATE_WRAPPER.md`](TEMPLATE_WRAPPER.md) | Skeleton and checklist for adding a new provider wrapper. |
 | [`ADR.md`](ADR.md) | Architecture decision records. |
 | [`DOCUMENTATION_INDEX.md`](DOCUMENTATION_INDEX.md) | This file. |
@@ -33,6 +34,10 @@ be read as historical artifacts only.
 | Report | Date | Status |
 |---|---|---|
 | [`RUNTIME_AUDIT_2026-08-01.md`](audits/RUNTIME_AUDIT_2026-08-01.md) | 2026-08-01 | **Current.** Live agent-traffic verification; 8 runtime bugs (R-01…R-08) found and fixed. |
+| [`FULL_MATRIX_AUDIT_2026-08-01.md`](audits/FULL_MATRIX_AUDIT_2026-08-01.md) | 2026-08-01 | **Current.** Full matrix audit — 240/240 checks, real SDK clients, 5 contract defects (F-1…F-5) fixed. |
+| [`TRANSLATION_LAYER_AUDIT_2026-08-01.md`](audits/TRANSLATION_LAYER_AUDIT_2026-08-01.md) | 2026-08-01 | **Current.** AI Gateway translation-layer audit (F1-F7). |
+| [`CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md`](audits/CODEX_RESP02_SDK_COMPAT_AUDIT_2026-08-01.md) | 2026-08-01 | **Current.** SDK-compat / Codex (CODEX-RESP-02). |
+| [`CODEX_RESP_REAUDIT_2026-08-01.md`](audits/CODEX_RESP_REAUDIT_2026-08-01.md) | 2026-08-01 | **Current.** Codex reasoning-only fix (CODEX-RESP-01). |
 | [`BUG_ANALYSIS_2026-07-31.md`](audits/BUG_ANALYSIS_2026-07-31.md) | 2026-07-31 | **Current.** 37-finding deep audit across all wrappers. |
 | [`FINAL_PRODUCTION_AUDIT_2026-07-29.md`](audits/FINAL_PRODUCTION_AUDIT_2026-07-29.md) | 2026-07-29 | Superseded |
 | [`AUDIT_REVIEW_2026-07-29.md`](audits/AUDIT_REVIEW_2026-07-29.md) | 2026-07-29 | Superseded |
