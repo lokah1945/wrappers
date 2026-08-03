@@ -334,7 +334,7 @@ A wrapper is **not** contract-compliant until it passes all eight gates.
 python -m pip install -r tests/requirements.txt
 
 # 1. Unit + parity + regression suite (incl. AI Gateway translation matrix)
-python -m pytest tests -q                        # 308 tests
+python -m pytest tests -q                        # 310 tests
 
 # 2. Live agent-traffic E2E — boots each wrapper as a real server against a
 #    mock upstream and drives it as Claude Code / Codex / OpenAI SDK would.
@@ -443,4 +443,4 @@ Three deep-audit rounds (2026-08-03…04) hardened the five wrappers without add
 ---
 
 **Version:** 3.2 · **Last updated:** 2026-08-04
-**Verification at this version:** 308 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · soak; **8/8 gates green, 0 failures**
+**Verification at this version:** 310 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · soak; **8/8 gates green, 0 failures**

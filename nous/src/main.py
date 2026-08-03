@@ -1437,7 +1437,7 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
             inp = {"raw": fn.get("arguments", "")}
         content.append({
             "type": "tool_use",
-            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}",
+            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}",
             "name": fn.get("name") or "",
             "input": inp if isinstance(inp, dict) else {"value": inp},
         })
@@ -1963,7 +1963,7 @@ class AnthropicStreamState:
                 self.index += 1
                 self.tool_map[idx] = self.index
                 self.open_tool_blocks.add(self.index)
-                tid = tc.get("id") or f"toolu_{self.index}"
+                tid = tc.get("id") or f"toolu_{self.index}-{secrets.token_hex(3)}"
                 events.append({"type": "content_block_start", "data": {
                     "type": "content_block_start", "index": self.index,
                     "content_block": {"type": "tool_use", "id": tid, "name": fn.get("name", "") or "", "input": {}},
@@ -2054,7 +2054,7 @@ class AnthropicStreamState:
             events.append({"type": "content_block_start", "data": {
                 "type": "content_block_start", "index": self.index,
                 "content_block": {"type": "tool_use",
-                                  "id": tu.get("id") or f"toolu_dsml_{self.index}",
+                                  "id": tu.get("id") or f"toolu_dsml_{self.index}-{secrets.token_hex(3)}",
                                   "name": tu.get("name") or "", "input": {}}}})
             events.append({"type": "content_block_delta", "data": {
                 "type": "content_block_delta", "index": self.index,

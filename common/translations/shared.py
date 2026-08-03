@@ -161,7 +161,7 @@ def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
             ))
             tools.append({
                 "type": "tool_use",
-                "id": f"toolu_dsml_{int(time.time() * 1000)}_{hash(name) % 10000:04x}",
+                "id": f"toolu_dsml_{int(time.time() * 1000)}_{hash(name) % 10000:04x}_{secrets.token_hex(3)}",
                 "name": name,
                 "input": params,
             })
@@ -685,7 +685,7 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
                 args = {"raw": str(raw_args)}
         content.append({
             "type": "tool_use",
-            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}",
+            "id": tc.get("id") or f"toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}",
             "name": fn.get("name") or "",
             "input": args,
         })
@@ -950,7 +950,7 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
                     parsed_args = {'raw': str(raw_args)}
                 blocks.append({
                     'type': 'tool_use',
-                    'id': tc.get('id') or f'toolu_{int(time.time()*1000)}',
+                    'id': tc.get('id') or f'toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}',
                     'name': fn.get('name') or '',
                     'input': parsed_args if isinstance(parsed_args, dict) else {'value': parsed_args},
                 })

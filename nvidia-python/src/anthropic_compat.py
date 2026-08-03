@@ -367,7 +367,7 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
                     if not isinstance(args, str):
                         args = json.dumps(args or {})
                     am['tool_calls'].append({
-                        'id': blk.get('id') or f'toolu_{int(time.time()*1000)}',
+                        'id': blk.get('id') or f'toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}',
                         'type': 'function',
                         'function': {
                             'name': blk.get('name') or '',
@@ -818,7 +818,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     ai = next_index
                     current_tool_index = ai
                     current_tool_name = tool_name
-                    current_tool_id = f'toolu_dsml_{int(time.time() * 1000)}_{hash(tool_name) % 10000:04x}_{ai}'
+                    current_tool_id = f'toolu_dsml_{int(time.time() * 1000)}_{hash(tool_name) % 10000:04x}_{ai}_{secrets.token_hex(3)}'
                     current_tool_input = {}
 
                     if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
@@ -1145,7 +1145,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                         tool_map[oi] = ai
                         open_idx = ai
                         sent_content_block_start = True
-                        tool_call_id = tc.get('id') or f'toolu_{int(time.time() * 1000)}_{hash(str(ai)) % 10000:04x}_{ai}'
+                        tool_call_id = tc.get('id') or f'toolu_{int(time.time() * 1000)}_{hash(str(ai)) % 10000:04x}_{ai}_{secrets.token_hex(3)}'
                         sent_text_or_tool_block = True
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': ai,
@@ -1297,7 +1297,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': ai,
                             'content_block': {'type': 'tool_use',
-                                              'id': _tu.get('id') or f'toolu_dsml_{ai}',
+                                              'id': _tu.get('id') or f'toolu_dsml_{ai}-{secrets.token_hex(3)}',
                                               'name': _tu.get('name') or '', 'input': {}},
                         })
                         yield _sse('content_block_delta', {

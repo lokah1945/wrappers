@@ -810,7 +810,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     content.extend(dsml_tools)
     for tc in tool_calls:
         fn = tc.get('function') or {}
-        content.append({'type': 'tool_use', 'id': tc.get('id') or f"toolu_{int(time.time()*1000)}", 'name': fn.get('name', '') or '', 'input': _parse_tool_args(fn.get('arguments', ''))})
+        content.append({'type': 'tool_use', 'id': tc.get('id') or f"toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}", 'name': fn.get('name', '') or '', 'input': _parse_tool_args(fn.get('arguments', ''))})
     if not content:
         content.append({'type': 'text', 'text': ''})
     fr = (data.get('choices') or [{}])[0].get('finish_reason')

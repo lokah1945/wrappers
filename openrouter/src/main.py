@@ -2651,7 +2651,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
             continue
         content_blocks.append({
             "type": "tool_use",
-            "id": _tu.get("id") or f"toolu_dsml_{len(content_blocks)}",
+            "id": _tu.get("id") or f"toolu_dsml_{len(content_blocks)}-{secrets.token_hex(3)}",
             "name": _tu.get("name") or "",
             "input": _tu.get("input") if isinstance(_tu.get("input"), dict) else {},
         })
@@ -2959,7 +2959,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             'type': 'content_block_start', 'index': block_index,
                             'content_block': {
                                 'type': 'tool_use',
-                                'id': tc.get('id') or f'toolu_{block_index}',
+                                'id': tc.get('id') or f'toolu_{block_index}-{secrets.token_hex(3)}',
                                 'name': fn.get('name', '') or '',
                                 'input': {},
                             },
@@ -3041,7 +3041,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'type': 'content_block_start', 'index': block_index,
                 'content_block': {
                     'type': 'tool_use',
-                    'id': _tu.get('id') or f'toolu_dsml_{block_index}',
+                    'id': _tu.get('id') or f'toolu_dsml_{block_index}-{secrets.token_hex(3)}',
                     'name': _tu.get('name') or '', 'input': {},
                 }})
             yield _sse('content_block_delta', {

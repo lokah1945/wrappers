@@ -416,6 +416,36 @@ class TestR9UniqueMessageIds(unittest.TestCase):
         ids = {AnthropicStreamState('m').msg_id for _ in range(50)}
         self.assertEqual(len(ids), 50, 'msg_id collides within a millisecond')
 
+    def test_dsml_recovered_tool_use_ids_unique(self):
+        """R10: DSML-recovered/missing-id tool_use mints must be unique beyond
+        one millisecond — colliding ids corrupt tool_result pairing in stored
+        and replayed histories."""
+        from common.translations.shared import parse_dsml_from_text
+        markup = ('noise |DSML|tool_calls>|DSML|invoke name="get_weather">'
+                  '|DSML|parameter name="city" string="true">Paris</|DSML|parameter>'
+                  '</|DSML|invoke></|DSML|tool_calls> tail')
+        ids = set()
+        for _ in range(50):
+            _clean, tools = parse_dsml_from_text(markup)
+            self.assertEqual(len(tools), 1)
+            ids.add(tools[0]['id'])
+        self.assertEqual(len(ids), 50, 'DSML tool_use ids collide across turns')
+        self.assertTrue(all(i.startswith('toolu_dsml_') for i in ids))
+
+    def test_stream_tool_call_fallback_ids_unique(self):
+        from common.translations.anthropic_stream import AnthropicStreamState
+        ids = set()
+        for _ in range(50):
+            st = AnthropicStreamState('m')
+            evs = st.translate_chunk({'choices': [{'index': 0, 'delta': {
+                'tool_calls': [{'index': 0, 'function': {'name': 'f', 'arguments': '{'}}]},
+                'finish_reason': None}]})
+            starts = [e for e in evs if e.startswith('event: content_block_start')]
+            self.assertTrue(starts)
+            payload = json.loads(starts[0].split('data: ', 1)[1])
+            ids.add(payload['content_block']['id'])
+        self.assertEqual(len(ids), 50, 'fallback tool_use ids collide across turns')
+
     def test_nvidia_compat_single_prefix_and_unique(self):
         import importlib
         sys.path.insert(0, str(ROOT / 'nvidia-python'))

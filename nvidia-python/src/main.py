@@ -554,7 +554,7 @@ def _parse_dsml_from_text(text: str) -> tuple:
             params = dict(re_module.findall(r'\|DSML\|parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)</\|DSML\|parameter>', inner))
             tools.append({
                 'type': 'tool_use',
-                'id': f'toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}',
+                'id': f'toolu_dsml_{int(time.time()*1000)}_{hash(name)%10000:04x}_{secrets.token_hex(3)}',
                 'name': name,
                 'input': params,
             })
@@ -659,7 +659,7 @@ class AnthropicStreamState:
                 events.extend(self._close_block())
                 self.index += 1
                 self.tool_map[oi] = self.index
-                tid = tc.get('id') or f'toolu_{self.index}'
+                tid = tc.get('id') or f'toolu_{self.index}-{secrets.token_hex(3)}'
                 events.append(self._sse('content_block_start', {
                     'type': 'content_block_start', 'index': self.index,
                     'content_block': {'type': 'tool_use', 'id': tid, 'name': fn.get('name') or '', 'input': {}},
@@ -714,7 +714,7 @@ class AnthropicStreamState:
                 events.append(self._sse('content_block_start', {
                     'type': 'content_block_start', 'index': self.index,
                     'content_block': {'type': 'tool_use',
-                                      'id': tu.get('id') or f'toolu_dsml_{self.index}',
+                                      'id': tu.get('id') or f'toolu_dsml_{self.index}-{secrets.token_hex(3)}',
                                       'name': tu.get('name') or '', 'input': {}}}))
                 events.append(self._sse('content_block_delta', {
                     'type': 'content_block_delta', 'index': self.index,

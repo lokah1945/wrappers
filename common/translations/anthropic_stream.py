@@ -253,7 +253,7 @@ class AnthropicStreamState:
                 'type': 'content_block_start', 'index': self.index,
                 'content_block': {
                     'type': 'tool_use',
-                    'id': tu.get('id') or f'toolu_dsml_{self.index}',
+                    'id': tu.get('id') or f'toolu_dsml_{self.index}-{secrets.token_hex(3)}',
                     'name': tu.get('name') or '', 'input': {},
                 }}))
             ev.append(self._sse('content_block_delta', {
@@ -387,7 +387,7 @@ class AnthropicStreamState:
                 self.index += 1
                 self.tool_map[oi] = self.index
                 self.open_tool_blocks.add(self.index)
-                tid = tc.get("id") or f"toolu_{self.index}"
+                tid = tc.get("id") or f"toolu_{self.index}-{secrets.token_hex(3)}"
                 events.append(self._sse("content_block_start", {
                     "type": "content_block_start",
                     "index": self.index,

@@ -909,7 +909,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
             inp = {"raw": fn.get('arguments', '')}
         content.append({
             "type": "tool_use",
-            "id": tc.get('id') or f"toolu_{int(time.time()*1000)}",
+            "id": tc.get('id') or f"toolu_{int(time.time()*1000)}-{secrets.token_hex(3)}",
             "name": fn.get('name', ''),
             "input": inp if isinstance(inp, dict) else {"value": inp},
         })
