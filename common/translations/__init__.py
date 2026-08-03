@@ -21,6 +21,10 @@ from .shared import (
     openai_to_anthropic_response,
     stream_anthropic_to_openai,
     openai_chat_to_anthropic_request,
+    responses_usage,
+    tokens_from_chat_usage,
+    scrub_visible_text,
+    responses_content_to_chat,
 )
 
 __all__ = [
@@ -40,4 +44,8 @@ __all__ = [
     "openai_to_anthropic_response",
     "stream_anthropic_to_openai",
     "openai_chat_to_anthropic_request",
+    "responses_usage",
+    "tokens_from_chat_usage",
+    "scrub_visible_text",
+    "responses_content_to_chat",
 ]

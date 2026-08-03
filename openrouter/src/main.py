@@ -177,9 +177,61 @@ try:
 except ImportError as _imp_err:
     raise RuntimeError("common.translations import failed; wrapper requires shared translations") from _imp_err
 
+# P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
+# shape-aware passthrough re-serialisation.
+try:
+    from common.sanitize_tokens import (
+        PassthroughBlockRewriter as _PassthroughBlockRewriter,
+        PassthroughSSE as _PassthroughSSE,
+        SpecialTokenFilter as _SpecialTokenFilter,
+        DsmlMarkupFilter as _DsmlMarkupFilter,
+        filter_special_tokens as _filter_special_tokens,
+        strip_dsml_markup as _strip_dsml_markup,
+        scrub_openai_response_inplace as _scrub_openai_response_inplace,
+        sse_block as _shared_sse_block,
+    )
+except ImportError as _imp_err:
+    raise RuntimeError("common.sanitize_tokens import failed; wrapper requires shared sanitizer") from _imp_err
+
+# P1-1/P1-3 shared helpers (input_image passthrough, full Responses usage).
+try:
+    from common.translations.shared import (
+        responses_content_to_chat as _responses_content_to_chat,
+        tokens_from_chat_usage as _tokens_from_chat_usage,
+        responses_usage as _responses_usage,
+    )
+except ImportError as _imp_err:
+    raise RuntimeError("common.translations.shared import failed; wrapper requires shared helpers") from _imp_err
+
 # ── MCP integration (FastMCP) ───────────────────────────────────────────
-from mcp.server.fastmcp import FastMCP
-from mcp.server.sse import SseServerTransport
+# P2 fix (audit 2026-08-03): `mcp>=2` renamed/removed the fastmcp shim, and a
+# hard import crash killed the WHOLE wrapper at boot even though only the
+# (optional) /mcp surface needs it. Degrade gracefully: the wrapper serves
+# every inference surface and reports 501 on /mcp instead.
+try:
+    from mcp.server.fastmcp import FastMCP
+    from mcp.server.sse import SseServerTransport
+    _HAS_MCP = True
+except ImportError:  # pragma: no cover - depends on installed mcp version
+    _HAS_MCP = False
+
+    class FastMCP:  # type: ignore[no-redef]
+        """Stub so the wrapper boots without the optional mcp dependency."""
+
+        def __init__(self, *a, **kw):
+            pass
+
+        def tool(self, *a, **kw):
+            def _deco(fn):
+                return fn
+            return _deco
+
+        def sse_app(self, *a, **kw):
+            return None
+
+    class SseServerTransport:  # type: ignore[no-redef]
+        def __init__(self, *a, **kw):
+            pass
 
 # ── Bootstrap ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[1]
@@ -308,13 +360,12 @@ def _bearer_token() -> str:
 
 
 def _client_ip(request: Request) -> str:
+    """Rate limiting keys by the real peer. P2 fix (audit 2026-08-03): the
+    client-supplied X-Forwarded-For fallback is removed — it was trivially
+    spoofable, letting an attacker rotate values to bypass the limiter. When
+    no peer is known everything shares one 'unknown' bucket."""
     host = getattr(request.client, 'host', None) if request.client else None
-    if host:
-        return host
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return 'unknown'
+    return host or 'unknown'
 
 
 # ── Rate Limiting ────────────────────────────────────────────────────────
@@ -412,13 +463,20 @@ def _create_mcp_server():
     return mcp
 
 
-MCP_SERVER = _create_mcp_server()
+# P2 fix: when the optional `mcp` package is missing/incompatible, boot the
+# wrapper without the /mcp surface (routes already return 503 via this None).
+MCP_SERVER = _create_mcp_server() if _HAS_MCP else None
 SSE_TRANSPORT = SseServerTransport("/mcp/messages") if MCP_SERVER else None
 
 
 # ── Key Pool ──────────────────────────────────────────────────────────────
 pool = KeyPool()
 metrics = Metrics()
+
+
+def _sse_frame(obj, event_name: str = None) -> bytes:
+    """Serialise one SSE event block (event: line only when given)."""
+    return _shared_sse_block(obj, event_name)
 
 
 def _error_response(content, status_code: int = 500, headers: dict | None = None) -> JSONResponse:
@@ -558,6 +616,22 @@ async def _drain_background_tasks(timeout: float = 5.0):
 
 # ── Lifecycle ──────────────────────────────────────────────────────────────
 
+_HEAL_TASK_REF = [None]
+
+
+async def _heal_in_flight_loop():
+    """P2 fix (audit 2026-08-03, nvidia/nous parity): periodic heal of leaked
+    in_flight slots (a crashed-between-acquire-and-release request path would
+    otherwise permanently shrink effective pool capacity)."""
+    interval = int(os.environ.get("HEAL_INFLIGHT_INTERVAL_SEC", "300"))
+    while True:
+        await asyncio.sleep(max(30, interval))
+        try:
+            await pool.heal_in_flight()
+        except Exception as e:
+            logger.warning(f"[key_pool] heal_in_flight loop error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifecycle: startup and shutdown."""
@@ -574,6 +648,7 @@ async def lifespan(app: FastAPI):
             logger.warning(f"[openrouter] Catalog DB not found at {CATALOG_DB_PATH}")
 
     _MODEL_REFRESH_TASK = asyncio.create_task(_refresh_models_loop())
+    _HEAL_TASK_REF[0] = asyncio.create_task(_heal_in_flight_loop())  # P2
     logger.info(f"[openrouter] Ready on {BIND_HOST}:{LISTEN_PORT}")
 
     yield
@@ -742,13 +817,18 @@ async def auth_middleware(request: Request, call_next):
         x_api_key = request.headers.get('x-api-key', '')
         # B-26: privileged provisioning surface uses its own token.
         token = _management_token() if is_management else _bearer_token()
-        client_token = ''
+        # P0-2 fix: evaluate Authorization AND x-api-key as independent
+        # candidates (nvidia V-19 / shared-auth parity). The Anthropic SDK can
+        # send both — a stale Authorization value must not mask a valid
+        # x-api-key, or a correctly configured client gets 401 on every call.
+        candidates = []
         if auth.lower().startswith('bearer '):
-            client_token = auth[7:].strip()
-        elif x_api_key:
-            client_token = x_api_key.strip()
-        elif auth:
-            client_token = auth.strip()
+            if auth[7:].strip():
+                candidates.append(auth[7:].strip())
+        elif auth.strip():
+            candidates.append(auth.strip())
+        if x_api_key.strip():
+            candidates.append(x_api_key.strip())
 
         # B-28 fix: fail CLOSED when no token is configured instead of
         # silently allowing every request through.
@@ -767,9 +847,10 @@ async def auth_middleware(request: Request, call_next):
             logger.warning('[auth] token unset and REQUIRE_AUTH=false — serving %s OPEN (insecure)', path)
         else:
             # B-30 parity: compare as bytes so a non-ASCII token yields a
-            # clean 401 instead of a TypeError → 500.
-            ok = bool(client_token) and hmac.compare_digest(
-                client_token.encode('utf-8'), token.encode('utf-8'))
+            # clean 401 instead of a TypeError → 500. P0-2: match ANY candidate.
+            ok = any(
+                hmac.compare_digest(c.encode('utf-8'), token.encode('utf-8'))
+                for c in candidates)
             if not ok:
                 return _error_response(
                     {"error": {"message": "Unauthorized", "type": "authentication_error"}},
@@ -806,7 +887,9 @@ async def auth_middleware(request: Request, call_next):
 async def _proxy_request(method: str, path: str, body: dict | None = None,
                          headers: dict | None = None, stream: bool = False,
                          request: Request | None = None,
-                         terminal_done: bool = True) -> Response:
+                         terminal_done: bool = True,
+                         fault_accounting: bool = True,
+                         dsml_suppress: bool = True) -> Response:
     """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
     Iterates over all available keys on retriable failures (429, 5xx, network errors).
@@ -815,6 +898,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     terminal_done: COMPATIBILITY_LAYER=2 (Anthropic upstream) streams end with
     message_stop, not [DONE]; pass terminal_done=False to skip the synthesized
     [DONE] terminator.
+
+    fault_accounting: set False when the caller's own translator performs the
+    B-39 mid-stream-fault error accounting (translated surfaces /v1/messages,
+    /v1/responses) — otherwise one failed turn is counted twice.
+
+    dsml_suppress: R5/double-scrub fix — set False when the caller's own
+    translator performs DSML suppression + tool_use recovery itself
+    (/v1/messages → _translate_openai_stream_to_anthropic); suppressing at
+    the passthrough layer would strip the markup before it can be recovered.
     """
     model_id = (body or {}).get("model", "") if body else ""
 
@@ -932,31 +1024,49 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # WITHOUT a trailing blank line — a real pattern, and the
                     # resulting line is not valid JSON, so strict SDK parsers
                     # error out at the very end of an otherwise good turn.
-                    saw_done = False
-                    ends_newline = True
+                    #
+                    # Audit 2026-08-03: events are parsed + re-serialised via
+                    # the SHARED PassthroughBlockRewriter (CONTRACT §7)
+                    # (P0-4: scrub special tokens even on the raw passthrough —
+                    # user report '<unk><unk>…'; P0-1: EOF without a terminal
+                    # signal surfaces a shape-appropriate error frame per
+                    # CONTRACT §3.3). dsml_suppress=False (call-site choice)
+                    # leaves MiniMax DSML markup intact for the recovering
+                    # /v1/messages translator (R5 double-scrub fix).
+                    rw = _PassthroughBlockRewriter(dsml_suppress=dsml_suppress)
+                    completed_naturally = False
+                    cancelled = False
+
                     try:
                         async for line in resp_ref.content:
-                            if line:
-                                if b'[DONE]' in line:
-                                    saw_done = True
-                                ends_newline = line.endswith(b'\n')
-                            yield line
+                            if not line:
+                                continue
+                            for fr_b in rw.feed(line):
+                                yield fr_b
                         # COMPATIBILITY_LAYER=2: an Anthropic upstream ends its
                         # stream with message_stop, never [DONE] — appending
                         # [DONE] would corrupt the Anthropic SSE. Only
                         # synthesize [DONE] when terminal_done is requested.
-                        if terminal_done:
-                            # Only synthesize [DONE] if upstream never sent one.
-                            if not saw_done:
-                                if not ends_newline:
-                                    yield b'\n\n'
-                                yield b'data: [DONE]\n\n'
-                            elif not ends_newline:
-                                # Upstream's [DONE] lacked its frame terminator.
-                                yield b'\n\n'
-                    except asyncio.CancelledError:
+                        for fr_b in rw.finish(terminal_done=terminal_done):
+                            yield fr_b
+                        completed_naturally = True
+                    except (GeneratorExit, asyncio.CancelledError):
+                        # Client went away — NOT an upstream fault (and never
+                        # yield anything on this path, CONTRACT §3.5).
+                        cancelled = True
                         raise
                     finally:
+                        # B-39 parity (CONTRACT §10): count mid-stream faults —
+                        # HTTP 200 was already committed. A client disconnect
+                        # (cancelled) is NOT an upstream fault and must not
+                        # inflate the error rate. fault_accounting=False means
+                        # the caller's own translator counts it (exactly-once).
+                        if fault_accounting and (getattr(rw, '_premature_emitted', False) or (
+                                not completed_naturally and not cancelled)):
+                            try:
+                                metrics.record_error()
+                            except Exception:
+                                pass
                         if not released:
                             released = True
                             try:
@@ -1170,6 +1280,10 @@ async def chat_completions(request: Request):
             if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
                 oai_resp = anthropic_to_openai_response(payload, model)
                 return JSONResponse(oai_resp, status_code=200)
+            # P0-4: scrub special tokens from the non-stream reply body too.
+            if isinstance(payload, dict) and "choices" in payload:
+                _scrub_openai_response_inplace(payload)
+                return JSONResponse(payload, status_code=200)
         except Exception:
             pass
     return res
@@ -1246,7 +1360,10 @@ async def responses(request: Request):
                 return JSONResponse(resp_obj, status_code=response.status_code)
         return response
 
-    response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
+    # fault_accounting=False: the Responses translator records mid-stream
+    # faults itself — one failed turn must not be counted twice.
+    response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request,
+                                    fault_accounting=False)
 
     if isinstance(response, JSONResponse):
         # R-05 (CRITICAL, same class): the raw OpenAI ChatCompletion body was
@@ -1329,6 +1446,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
     msg_id = f"msg_{int(time.time()*1000)}"
     full_text = ''
     upstream_error = None  # R-03: mid-stream upstream failure
+    gen_fault = False  # B-39: transport-level fault surfaced via response.failed
     # Reasoning output item (CODEX-RESP-01): reasoning-only streams must still
     # open and close their output items or Codex hangs waiting for completion.
     reasoning_started = False
@@ -1339,6 +1457,15 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
     tool_accs: list = []
     next_output_index = 1  # 0 = assistant message; 1+ = reasoning / tool items
     msg_open = False
+    # P0-1: did the upstream send a finish_reason? EOF without one (and
+    # without an error frame) is a premature close → response.failed.
+    saw_finish: list = []
+    acc_usage: list = []  # P1-3: last upstream usage (canonical details shape)
+    # P0-4: cross-chunk special-token scrubbers (one per visible channel).
+    _tok_text = _SpecialTokenFilter()
+    _tok_reason = _SpecialTokenFilter()
+    # R5 audit: DSML markup suppression on the visible text channel.
+    _dsml_text = _DsmlMarkupFilter()
 
     def _sse(event_type: str, payload: dict) -> str:
         """Build a complete SSE frame: event:\ndata:\n\n"""
@@ -1351,6 +1478,8 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             'response': {
                 'id': resp_id, 'object': 'response', 'created_at': created_at,
                 'model': model, 'status': 'in_progress', 'output': [],
+                # P1-3: full usage shape (details structures) for strict SDKs.
+                'usage': _responses_usage(),
             },
         })
 
@@ -1423,6 +1552,10 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 upstream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                 logger.error(f'[openrouter responses] upstream error frame: {upstream_error}')
                 return events, True
+            if data.get('usage'):
+                # P1-3: canonical full-details usage for response.completed.
+                acc_usage.clear()
+                acc_usage.append(_responses_usage(*_tokens_from_chat_usage(data['usage'])))
             if data.get('object') != 'chat.completion.chunk':
                 return events, False
             choices = data.get('choices', [])
@@ -1438,6 +1571,10 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
             content = delta.get('content')
             if isinstance(content, str):
                 if content:
+                    # R5: suppress DSML markup first (cross-chunk), then P0-4
+                    # scrub special tokens (cross-chunk).
+                    content = _tok_text.feed(_dsml_text.feed(content))
+                if content:
                     full_text += content
                     events.append(_sse('response.output_text.delta', {
                         'type': 'response.output_text.delta', 'item_id': msg_id,
@@ -1447,12 +1584,13 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 parts = [p.get('text') for p in content
                          if isinstance(p, dict) and isinstance(p.get('text'), str) and p.get('text')]
                 if parts:
-                    joined = ''.join(parts)
-                    full_text += joined
-                    events.append(_sse('response.output_text.delta', {
-                        'type': 'response.output_text.delta', 'item_id': msg_id,
-                        'output_index': 0, 'content_index': 0, 'delta': joined,
-                    }))
+                    joined = _tok_text.feed(_dsml_text.feed(''.join(parts)))
+                    if joined:
+                        full_text += joined
+                        events.append(_sse('response.output_text.delta', {
+                            'type': 'response.output_text.delta', 'item_id': msg_id,
+                            'output_index': 0, 'content_index': 0, 'delta': joined,
+                        }))
 
             # Reasoning (OpenRouter reasoning_content / reasoning) — MUST be
             # streamed so the client sees progress during thinking (Codex /
@@ -1462,6 +1600,9 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 delta.get('reasoning_content') if isinstance(delta.get('reasoning_content'), str)
                 else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else '')
             )
+            if reason_delta:
+                # P0-4: scrub special tokens from the reasoning channel.
+                reason_delta = _tok_reason.feed(reason_delta)
             if reason_delta:
                 if not reasoning_started:
                     reasoning_started = True
@@ -1496,11 +1637,11 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                         },
                     }))
                 if isinstance(fn.get('name'), str) and fn['name']:
+                    # P0-3 fix: never emit the NAME as an arguments delta —
+                    # delta-accumulating clients collected `name{...}` (invalid
+                    # JSON). The name is carried by output_item.added.item and
+                    # by function_call_arguments.done ('name' field) instead.
                     acc['name'] += fn['name']
-                    events.append(_sse('response.function_call_arguments.delta', {
-                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
-                        'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name'],
-                    }))
                 if isinstance(fn.get('arguments'), str) and fn['arguments']:
                     acc['args'] += fn['arguments']
                     events.append(_sse('response.function_call_arguments.delta', {
@@ -1509,6 +1650,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     }))
 
             if choice.get('finish_reason'):
+                saw_finish.append(True)
                 return events, True
             return events, False
 
@@ -1543,7 +1685,31 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         # The old text-gated guard skipped them when the model emitted only
         # reasoning/thinking, so Codex never saw output items close and hung
         # waiting for the terminal events.
+        # P0-1 (CONTRACT §3.3): the upstream stream ended WITHOUT any terminal
+        # signal (no finish_reason, no error frame). Completing now would
+        # persist a truncated answer as a successful turn — fail visibly.
+        if upstream_error is None and not saw_finish:
+            upstream_error = ('upstream stream ended prematurely: EOF without '
+                              'finish_reason or [DONE]; the response may be '
+                              'truncated — client may retry')
+            logger.error('[openrouter responses] upstream stream ended prematurely (no finish_reason)')
+        # P0-4/R5: release filter-withheld tail text (DSML remnant still
+        # passes the token scrubber) before the done events.
+        _rest_text = _tok_text.feed(_dsml_text.flush()) + _tok_text.flush()
+        if _rest_text:
+            full_text += _rest_text
+            yield _sse('response.output_text.delta', {
+                'type': 'response.output_text.delta', 'item_id': msg_id,
+                'output_index': 0, 'content_index': 0, 'delta': _rest_text,
+            })
         if reasoning_started:
+            _rest_rsn = _tok_reason.flush()
+            if _rest_rsn:
+                acc_reason += _rest_rsn
+                yield _sse('response.reasoning_text.delta', {
+                    'type': 'response.reasoning_text.delta', 'item_id': rsn_id,
+                    'output_index': rsn_index, 'content_index': 0, 'delta': _rest_rsn,
+                })
             yield _sse('response.reasoning_text.done', {
                 'type': 'response.reasoning_text.done', 'item_id': rsn_id,
                 'output_index': rsn_index, 'content_index': 0, 'text': acc_reason,
@@ -1631,6 +1797,8 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 'id': resp_id, 'object': 'response', 'created_at': created_at,
                 'model': model, 'status': 'completed', 'output': output,
                 'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
+                # P1-3: full usage (details structures) — strict SDKs require it.
+                'usage': acc_usage[0] if acc_usage else _responses_usage(),
             },
         })
 
@@ -1645,6 +1813,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         # a fabricated response.completed carrying partial text — the client
         # otherwise persists a truncated answer as a successful turn and
         # cannot retry. (blackbox B20 parity.)
+        gen_fault = True
         try:
             if msg_open:
                 if reasoning_started:
@@ -1689,6 +1858,13 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
         except Exception:
             pass
     finally:
+        # B-39 parity (CONTRACT §10): count mid-stream faults — response.failed
+        # after a committed HTTP 200 is invisible to per-status accounting.
+        if gen_fault or upstream_error is not None:
+            try:
+                metrics.record_error()
+            except Exception:
+                pass
         # B-09 fix: deterministically release the upstream response + pool key.
         try:
             aclose = getattr(openai_gen, 'aclose', None)
@@ -1842,6 +2018,19 @@ async def messages(request: Request):
                             status_code=400)
     model = body.get("model", "")
 
+    # P3 fix (fleet parity, audit 2026-08-03): the other four wrappers
+    # REQUIRE max_tokens on /v1/messages (Anthropic contract) — a request
+    # without it got 200 here while nous/opencode/blackbox/nvidia answered
+    # 400, so behaviour differed per backend and unbounded generations could
+    # blow through cost limits. Validate like the fleet: positive int ≤ 1e6.
+    _mt = body.get("max_tokens")
+    if not isinstance(_mt, int) or _mt <= 0:
+        return _error_response({"error": {"message": "max_tokens is required and must be a positive integer",
+                                          "type": "invalid_request_error"}}, status_code=400)
+    if _mt > 1000000:
+        return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
+                                          "type": "invalid_request_error"}}, status_code=400)
+
     # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
     for _m in body.get("messages") or []:
         if isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
@@ -1878,8 +2067,14 @@ async def messages(request: Request):
     openai_body = _anthropic_to_openai(body)
     openai_body["stream"] = body.get("stream", False)
 
+    # fault_accounting=False: the OpenAI→Anthropic translator below records
+    # mid-stream faults itself — one failed turn must not be counted twice.
+    # dsml_suppress=False: that translator does its own DSML suppression +
+    # tool_use recovery — stripping the markup here first would silently
+    # lose the tool call (R5 double-scrub finding, runtime e2e dsml_stream).
     response = await _proxy_request("POST", "chat/completions", openai_body,
-                                     stream=openai_body["stream"], request=request)
+                                     stream=openai_body["stream"], request=request,
+                                     fault_accounting=False, dsml_suppress=False)
 
     if isinstance(response, JSONResponse):
         # RUNTIME FINDING R-05 (CRITICAL): this branch returned the RAW OpenAI
@@ -1936,18 +2131,29 @@ async def count_tokens(request: Request):
     except Exception:
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
+    if not isinstance(body, dict):
+        return _error_response({"error": {"message": "Request body must be a JSON object",
+                                          "type": "invalid_request_error"}}, status_code=400)
     # Best-effort: count characters / 4 as a rough token estimate without burning quota.
-    msgs = body.get("messages", [])
+    # Round-4 audit: iterate defensively — the JSONBodyGuard only inspects
+    # inference surfaces, and a malformed nested shape (non-dict messages,
+    # string content blocks) used to detonate an AttributeError here = HTTP 500.
+    msgs = body.get("messages") or []
     total_chars = 0
-    for m in msgs:
-        c = m.get("content", "")
-        if isinstance(c, str):
-            total_chars += len(c)
-        elif isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict):
-                    total_chars += len(b.get("text", ""))
-                    total_chars += len(json.dumps(b.get("input", {})))
+    if isinstance(msgs, list):
+        for m in msgs:
+            if not isinstance(m, dict):
+                continue
+            c = m.get("content", "")
+            if isinstance(c, str):
+                total_chars += len(c)
+            elif isinstance(c, list):
+                for b in c:
+                    if isinstance(b, dict):
+                        total_chars += len(b.get("text") or "")
+                        inp = b.get("input")
+                        if inp is not None:
+                            total_chars += len(json.dumps(inp, ensure_ascii=False))
     est_tokens = max(1, total_chars // 4)
     return JSONResponse({"input_tokens": est_tokens})
 
@@ -2078,9 +2284,9 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
                 if role == 'developer':
                     role = 'system'
                 c = it.get('content', '')
-                if isinstance(c, list):
-                    c = ''.join(p.get('text', '') for p in c
-                                if isinstance(p, dict) and p.get('type') in ('input_text', 'text', 'output_text'))
+                # P1-1 fix: input_image parts were silently dropped — the
+                # shared helper converts them to OpenAI image_url parts.
+                c = _responses_content_to_chat(c)
                 msgs.append({'role': role or 'user', 'content': c})
     if body.get('instructions'):
         if msgs and msgs[0].get('role') == 'system':
@@ -2121,12 +2327,14 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
 def chat_to_responses(model: str, data: dict, request_body: dict | None = None) -> dict:
     """Convert OpenAI Chat Completions response → Responses API response."""
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
-    text = msg.get('content') or ''
+    # P0-4: scrub special tokens from non-stream visible channels too.
+    # R5 audit: strip DSML tool markup from the visible output text too.
+    text = _strip_dsml_markup(_filter_special_tokens(msg.get('content') or ''))
     output = []
     # Surface upstream reasoning_content as a reasoning output item.
     # CODEX-RESP-02: the SDK's ResponseReasoningItem expects summary/content
     # as lists — `text` alone parses with serializer warnings.
-    reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    reasoning = _filter_special_tokens(msg.get('reasoning_content') or msg.get('reasoning') or '')
     if reasoning:
         output.append({'id': f"rsn_{int(time.time()*1000)}", 'type': 'reasoning',
                        'status': 'completed', 'summary': [],
@@ -2140,7 +2348,8 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
     output.append({'id': f"msg_{int(time.time()*1000)}", 'type': 'message',
                    'status': 'completed', 'role': 'assistant',
                    'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
-    u = data.get('usage') or {}
+    # P1-3 fix: the Responses usage object requires the *_details structures.
+    _in, _out, _cached, _rsn = _tokens_from_chat_usage(data.get('usage'))
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — missing them fails
     # non-streaming client.responses.create() parsing.
@@ -2148,9 +2357,7 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
             'object': 'response', 'created_at': int(time.time()),
             'model': model, 'status': 'completed', 'output': output,
             'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
-            'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0,
-                      'output_tokens': u.get('completion_tokens', 0) or 0,
-                      'total_tokens': u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
+            'usage': _responses_usage(_in, _out, _cached, _rsn)}
     return resp
 
 
@@ -2335,11 +2542,34 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     # Transparent passthrough: surface reasoning_content as a thinking block
     # (parity with nous/opencode/blackbox/shared translators). Dropping it
     # silently removes part of the model's output.
-    reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
+    # P0-4: scrub special tokens from visible channels.
+    reasoning = _filter_special_tokens(message.get("reasoning_content") or message.get("reasoning") or "")
     if reasoning:
-        content_blocks.append({"type": "thinking", "thinking": reasoning})
-    if message.get("content"):
-        content_blocks.append({"type": "text", "text": message["content"]})
+        # P1-2: thinking blocks require a `signature` field (strict SDK parse).
+        content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": ""})
+    _msg_raw = message.get("content")
+    _dsml_tools: list = []
+    if isinstance(_msg_raw, str) and 'DSML' in _msg_raw.replace('\uff5c', '|'):
+        # R5 (non-stream parity with nous/opencode/blackbox/nvidia): recover
+        # MiniMax DSML tool markup leaking through the reply as real
+        # tool_use blocks — never forward the raw markup to the client.
+        try:
+            from common.translations import parse_dsml_from_text as _pdsml
+            _msg_raw, _dsml_tools = _pdsml(_msg_raw)
+        except Exception:
+            _dsml_tools = []
+    _msg_text = _filter_special_tokens(_msg_raw or "") if isinstance(_msg_raw, str) else _msg_raw
+    if _msg_text:
+        content_blocks.append({"type": "text", "text": _msg_text})
+    for _tu in _dsml_tools:
+        if not isinstance(_tu, dict):
+            continue
+        content_blocks.append({
+            "type": "tool_use",
+            "id": _tu.get("id") or f"toolu_dsml_{len(content_blocks)}",
+            "name": _tu.get("name") or "",
+            "input": _tu.get("input") if isinstance(_tu.get("input"), dict) else {},
+        })
     if message.get("tool_calls"):
         for tc in message["tool_calls"]:
             fn = tc.get("function", {})
@@ -2359,6 +2589,10 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     finish_reason = choice.get("finish_reason", "stop")
     stop_reason = {"stop": "end_turn", "length": "max_tokens", "tool_calls": "tool_use",
                    "function_call": "tool_use", "content_filter": "refusal"}.get(finish_reason, "end_turn")
+    # R5: DSML-recovered tool_use blocks — MiniMax reports finish 'stop';
+    # upgrade so the client executes the tool instead of ending the turn.
+    if _dsml_tools and stop_reason == "end_turn":
+        stop_reason = "tool_use"
 
     usage = openai_resp.get("usage", {})
     return {
@@ -2406,6 +2640,39 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     output_tokens = 0
     input_tokens = 0
     upstream_error = None  # B-07: set when upstream reports a mid-stream error
+    # B-39: one-shot mid-stream fault accounting. A CLIENT DISCONNECT is not
+    # an upstream fault, so the counters key off natural-EOF / exceptions only.
+    body_exhausted = False
+    gen_fault = False
+    # P0-4: stateful special-token scrubbers (one per channel) — catch tokens
+    # fragmented across chunks ('<un' + 'k>').
+    _tok_text = _SpecialTokenFilter()
+    _tok_reason = _SpecialTokenFilter()
+    # R5 audit: DSML markup suppression on the visible text channel
+    # (cross-chunk safe; complete markup collected for tool recovery).
+    _dsml_text = _DsmlMarkupFilter()
+
+    def _flush_text_events(idx: int):
+        """P0-4: emit any filter-withheld text into its own channel before
+        the block at `idx` closes."""
+        out = []
+        rest = _tok_text.flush()
+        if rest:
+            out.append(_sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': idx,
+                'delta': {'type': 'text_delta', 'text': rest},
+            }))
+        return out
+
+    def _flush_think_events(idx: int):
+        out = []
+        rest = _tok_reason.flush()
+        if rest:
+            out.append(_sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': idx,
+                'delta': {'type': 'thinking_delta', 'thinking': rest},
+            }))
+        return out
 
     try:
         # message_start (always first)
@@ -2495,11 +2762,16 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else '')
                 )
                 if reason_delta:
+                    # P0-4: scrub tokenizer specials (incl. cross-chunk).
+                    reason_delta = _tok_reason.feed(reason_delta)
+                if reason_delta:
                     if not thinking_started:
                         # Close only an open TEXT block (tool blocks stay open
                         # concurrently — R-02). The next block gets a fresh
-                        # index.
+                        # index. P0-4: flush filter-withheld text first.
                         if block_open and text_started:
+                            for _fe in _flush_text_events(block_index):
+                                yield _fe
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': block_index,
                             })
@@ -2509,7 +2781,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                         thinking_index = block_index
                         yield _sse('content_block_start', {
                             'type': 'content_block_start', 'index': thinking_index,
-                            'content_block': {'type': 'thinking', 'thinking': ''},
+                            # P1-2: thinking blocks require a `signature`.
+                            'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''},
                         })
                         thinking_started = True
                         block_open = True
@@ -2520,11 +2793,21 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     })
 
                 # Text content
-                if delta.get('content'):
+                _content_raw = delta.get('content')
+                if isinstance(_content_raw, str) and _content_raw:
+                    # R5: suppress DSML markup first (cross-chunk), then P0-4
+                    # scrub tokenizer specials (incl. cross-chunk).
+                    _content_raw = _tok_text.feed(_dsml_text.feed(_content_raw))
+                else:
+                    _content_raw = None
+                if _content_raw:
                     if not text_started:
                         # Close an open thinking block if any (tool blocks stay
-                        # open concurrently — R-02).
+                        # open concurrently — R-02). P0-4: flush withheld
+                        # thinking text first.
                         if block_open and thinking_started:
+                            for _fe in _flush_think_events(thinking_index):
+                                yield _fe
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': thinking_index,
                             })
@@ -2538,7 +2821,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                         block_open = True
                     yield _sse('content_block_delta', {
                         'type': 'content_block_delta', 'index': block_index,
-                        'delta': {'type': 'text_delta', 'text': delta['content']},
+                        'delta': {'type': 'text_delta', 'text': _content_raw},
                     })
 
                 # Tool calls
@@ -2569,6 +2852,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                         # open concurrently and are all closed at the
                         # terminal path.
                         if block_open and text_started:
+                            for _fe in _flush_text_events(block_index):
+                                yield _fe
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': block_index,
                             })
@@ -2576,6 +2861,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             text_started = False
                             block_open = False
                         elif block_open and thinking_started:
+                            for _fe in _flush_think_events(thinking_index):
+                                yield _fe
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': thinking_index,
                             })
@@ -2606,14 +2893,28 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
+        # Natural upstream EOF (the async-for above fell through) — distinct
+        # from a client disconnect, which unwinds via GeneratorExit instead.
+        body_exhausted = True
+
         # B-04 / R-02: close the open TEXT/THINKING block (if any), then every
-        # concurrently-open tool_use block, lowest index first.
+        # concurrently-open tool_use block, lowest index first. P0-4: flush
+        # any filter-withheld channel text BEFORE its block closes.
         if block_open and text_started:
+            for _fe in _flush_text_events(block_index):
+                yield _fe
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': block_index,
             })
+            # Next block gets a fresh index (parity with every other close
+            # site — without this the R5 DSML drain below reused the just-
+            # closed index: harness gate "content_block index reused after
+            # close").
+            block_index += 1
             text_started = False
         if block_open and thinking_started:
+            for _fe in _flush_think_events(thinking_index):
+                yield _fe
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': thinking_index,
             })
@@ -2625,6 +2926,46 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
         open_tool_blocks.clear()
         block_open = False
 
+        # R5 audit: drain DSML-withheld clean text + re-emit complete DSML
+        # tool markup recovered mid-stream as real tool_use blocks
+        # (cross-wrapper stream/non-stream parity, CONTRACT §8).
+        _dsml_rest = _tok_text.feed(_dsml_text.flush()) + _tok_text.flush()
+        if _dsml_rest:
+            yield _sse('content_block_start', {
+                'type': 'content_block_start', 'index': block_index,
+                'content_block': {'type': 'text', 'text': ''}})
+            yield _sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': block_index,
+                'delta': {'type': 'text_delta', 'text': _dsml_rest}})
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': block_index})
+            block_index += 1
+        try:
+            from common.translations import parse_dsml_from_text as _pdsml
+            _clean_dsml, _dsml_tools = _pdsml(_dsml_text.collected_text or '')
+        except Exception:
+            _dsml_tools = []
+        for _tu in _dsml_tools:
+            if not isinstance(_tu, dict):
+                continue
+            try:
+                _args_json = json.dumps(_tu.get('input') or {}, ensure_ascii=False)
+            except Exception:
+                _args_json = '{}'
+            yield _sse('content_block_start', {
+                'type': 'content_block_start', 'index': block_index,
+                'content_block': {
+                    'type': 'tool_use',
+                    'id': _tu.get('id') or f'toolu_dsml_{block_index}',
+                    'name': _tu.get('name') or '', 'input': {},
+                }})
+            yield _sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': block_index,
+                'delta': {'type': 'input_json_delta', 'partial_json': _args_json}})
+            yield _sse('content_block_stop', {
+                'type': 'content_block_stop', 'index': block_index})
+            block_index += 1
+
         # B-07 fix: an upstream error must NOT be reported as a successful
         # end_turn — the client would persist a truncated answer and could not
         # retry. Emit a real Anthropic `error` event first.
@@ -2633,11 +2974,34 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'type': 'error',
                 'error': {'type': 'api_error', 'message': str(upstream_error)[:2000]},
             })
+        # P0-1 (CONTRACT §3.3): the upstream stream ended WITHOUT any terminal
+        # signal (no finish_reason, no error frame). The old code closed with
+        # a fabricated end_turn, so a truncated answer persisted as a
+        # successful turn ("stops mid-way" symptom). Surface a real error.
+        elif finish_reason is None:
+            logger.error('[openrouter] upstream stream ended prematurely (no finish_reason)')
+            yield _sse('error', {
+                'type': 'error',
+                'error': {'type': 'api_error',
+                          'message': 'upstream stream ended prematurely: EOF without '
+                                     'finish_reason or [DONE]; the response may be '
+                                     'truncated — client may retry'},
+            })
 
         # B-06 parity: map strictly from finish_reason; never infer tool_use
         # merely because a tool was seen earlier in the turn.
+        # Audit 2026-08-03: finish_reason=None (premature EOF) → stop_reason
+        # None; the `error` event above is the real failure signal (a claimed
+        # end_turn would fabricate a clean completion).
         stop_reason = {'stop': 'end_turn', 'length': 'max_tokens', 'tool_calls': 'tool_use',
-                       'content_filter': 'refusal'}.get(finish_reason, 'end_turn')
+                       'content_filter': 'refusal'}.get(finish_reason, None)
+        # R5 parity (shared anthropic_stream): DSML-recovered tool_use blocks
+        # were emitted above but MiniMax reports finish_reason 'stop' for
+        # those turns — upgrade end_turn → tool_use so Claude Code executes
+        # the tool instead of closing the turn. A failed turn keeps
+        # stop_reason None (CONTRACT §3.3, error event already emitted).
+        if _dsml_tools and stop_reason == 'end_turn':
+            stop_reason = 'tool_use'
 
         yield _sse('message_delta', {
             'type': 'message_delta',
@@ -2654,6 +3018,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     except Exception as e:
         logger.error(f'[openrouter] anthropic stream translation error: {e}')
         # B-07 fix: surface the failure instead of fabricating a clean turn.
+        gen_fault = True
         try:
             if block_open and text_started:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
@@ -2670,15 +3035,24 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'error': {'type': 'api_error',
                           'message': f'upstream stream error: {str(e)[:2000]}'},
             })
+            # stop_reason=None: failed turn; never claim end_turn.
             yield _sse('message_delta', {
                 'type': 'message_delta',
-                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+                'delta': {'stop_reason': None, 'stop_sequence': None},
                 'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
             })
             yield _sse('message_stop', {'type': 'message_stop'})
         except Exception:
             pass
     finally:
+        # B-39 parity (CONTRACT §10): count mid-stream faults — an error event
+        # after a committed HTTP 200 is invisible to per-status accounting.
+        # Client disconnects are excluded (they are not upstream faults).
+        if gen_fault or upstream_error is not None or (body_exhausted and finish_reason is None):
+            try:
+                metrics.record_error()
+            except Exception:
+                pass
         # B-09 fix: deterministically close the inner generator so the upstream
         # response is released and the pool key returned exactly once, even on
         # client disconnect. Previously this was left to GC, leaking in-flight
@@ -2973,6 +3347,19 @@ async def prom_metrics():
         content=pool_metrics + "\n" + req_metrics,
         media_type="text/plain; version=0.0.4",
     )
+
+
+@app.get("/metrics/model-status")
+async def model_status():
+    """P2 fix (fleet parity, audit 2026-08-03): every other wrapper exposes
+    the per-model health/error state here; openrouter was the only one
+    without it, so dashboards/ops checks had no visibility into which models
+    were failing behind this wrapper."""
+    return {
+        "provider": "openrouter",
+        "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+        "states": await asyncio.to_thread(MODEL_STORE.status_map),
+    }
 
 
 @app.get("/stats")

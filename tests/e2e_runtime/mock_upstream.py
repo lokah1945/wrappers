@@ -19,6 +19,17 @@ but *legal* upstream behaviour that real providers actually produce:
   usage_after       usage-only chunk after finish_reason
   empty             finishes with no content at all
   unicode           multibyte content split across chunk boundaries
+  special_tokens    content/reasoning carry tokenizer control tokens
+                    (<unk>, <s>, <|im_start|>) — audit 2026-08-03 P0-4
+  special_tokens_split  <unk> fragmented across chunk boundaries
+  abort             clean TCP EOF after complete frames: no finish_reason,
+                    no [DONE], no error frame — audit 2026-08-03 P0-1
+  abort_tool        clean TCP EOF in the middle of tool_call arguments —
+                    a truncated tool call must NEVER survive as a success
+                    (user report: agent executed `{"cmd": "ls` )
+  donewofinish      [DONE] arrives with NO preceding finish_reason — a
+                    middlebox truncation signal (audit 2026-08-03); wrappers
+                    must surface an error, not a fabricated clean turn
 """
 
 from __future__ import annotations
@@ -47,6 +58,15 @@ MODES = (
     'longtool',      # tool arguments split across 8 fragments
     'http500',       # upstream returns 500 before streaming
     'http429',       # upstream returns 429 (retry/cooldown path)
+    # Round-3 (audit 2026-08-03): special-token leakage + premature EOF
+    'special_tokens',
+    'special_tokens_split',
+    'abort',
+    'abort_tool',
+    'donewofinish',
+    # Round-5 (audit 2026-08-03): MiniMax DSML tool markup leaked into the
+    # visible content channel, fragmented across chunks (mid-token).
+    'dsml_stream',
 )
 
 
@@ -110,6 +130,18 @@ async def chat_completions(request: web.Request):
             })
         if mode == 'empty':
             msg = {'role': 'assistant', 'content': None}
+        elif mode == 'dsml_stream':
+            msg = {'role': 'assistant',
+                   'content': ('Let me check the weather. '
+                               '<|DSML|tool_calls>\n<|DSML|invoke name="get_weather">\n'
+                               '<|DSML|parameter name="city" string="true">Jakarta</|DSML|parameter>\n'
+                               '</|DSML|invoke>\n</|DSML|tool_calls> Done.')}
+        elif mode == 'special_tokens':
+            msg = {'role': 'assistant',
+                   'content': 'Visible <unk> text <s> with <|im_start|> tokens'}
+        elif mode == 'special_tokens_split':
+            msg = {'role': 'assistant', 'content': 'Hello <unk> world',
+                   'reasoning_content': 'think <unk> deep'}
         elif mode in ('reasoning', 'reasoning_only'):
             msg = {'role': 'assistant', 'content': None if mode == 'reasoning_only' else 'Hello from mock upstream.',
                    'reasoning_content': 'Let me think...'}
@@ -148,6 +180,70 @@ async def chat_completions(request: web.Request):
         if mode == 'abrupt':
             await resp.write(b'data: {"id":"x","object":"chat.completion.chunk","choi')
             await resp.write_eof()
+            return resp
+
+        if mode == 'abort':
+            # Clean TCP FIN after two COMPLETE frames: no finish_reason, no
+            # [DONE], no error frame. The wrapper must surface an error
+            # (CONTRACT §3.3 / audit P0-1), never a fabricated success.
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': 'This answer is cut off'}), space=space, crlf=crlf)
+            await resp.write_eof()
+            return resp
+
+        if mode == 'abort_tool':
+            # Clean TCP FIN in the middle of tool_call arguments. The partial
+            # JSON must never reach the client as a successful tool call.
+            await _write(resp, _chunk({'role': 'assistant', 'content': None}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'tool_calls': [
+                {'index': 0, 'id': 'call_cut', 'type': 'function',
+                 'function': {'name': 'run_shell', 'arguments': '{"cmd": "ls'}}]}), space=space, crlf=crlf)
+            await resp.write_eof()
+            return resp
+
+        if mode == 'donewofinish':
+            # Content frames, then a bare [DONE] — NO finish_reason chunk.
+            # Healthy OpenAI streams always carry finish_reason first, so a
+            # bare [DONE] means a middlebox cut the stream (audit 2026-08-03).
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': 'Partial answer'}), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
+            return resp
+
+        if mode == 'dsml_stream':
+            # MiniMax DSML tool markup in the VISIBLE content channel, split
+            # MID-TAG across chunks — the classic leak producer when a wrapper
+            # checks 'DSML' per chunk (audit 2026-08-03 R5).
+            dsml = ('Let me check the weather. '
+                    '<|DSML|tool_calls>\n<|DSML|invoke name="get_weather">\n'
+                    '<|DSML|parameter name="city" string="true">Jakarta</|DSML|parameter>\n'
+                    '</|DSML|invoke>\n</|DSML|tool_calls> Done.')
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': dsml[:40]}), space=space, crlf=crlf)   # 'Let me check the weather. <|DSML'
+            await _write(resp, _chunk({'content': dsml[40:90]}), space=space, crlf=crlf)  # '|tool_calls>\n<|DSML|invoke …' mid
+            await _write(resp, _chunk({'content': dsml[90:170]}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': dsml[170:]}), space=space, crlf=crlf)
+            await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
+            return resp
+
+        if mode == 'special_tokens':
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': 'Result <unk> visible'}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': ' text <s>and <|im_start|>tokens'}), space=space, crlf=crlf)
+            await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
+            return resp
+
+        if mode == 'special_tokens_split':
+            # Tokenizer literals fragmented ACROSS chunk boundaries — the
+            # classic '\"><unk><unk><unk>…' producer (audit 2026-08-03 P0-4).
+            await _write(resp, _chunk({'role': 'assistant', 'content': ''}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': 'Hello <un'}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'content': 'k> world'}), space=space, crlf=crlf)
+            await _write(resp, _chunk({'reasoning_content': 'think <unk> deep'}), space=space, crlf=crlf)
+            await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
+            await _write(resp, '[DONE]', space=space, crlf=crlf)
             return resp
 
         if mode == 'slow':

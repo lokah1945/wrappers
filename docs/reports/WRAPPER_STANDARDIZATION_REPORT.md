@@ -194,12 +194,13 @@ uvicorn blackbox.src.main:app --reload --port 9104
 uvicorn nvidia_python.src.main:app --reload --port 9101
 uvicorn vercel.src.main:app --reload --port 9105
 
-# Production
-uvicorn nous.src.main:app --host 0.0.0.0 --port 9102 --workers 4
-uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103 --workers 4
-uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104 --workers 4
-uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101 --workers 4
-uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105 --workers 4
+# Production — ONE worker process per instance (WRAPPER_CONTRACT §6.3: the
+# response store, key pool and rate limiter live in per-process memory)
+uvicorn nous.src.main:app --host 0.0.0.0 --port 9102 --workers 1
+uvicorn opencode.src.main:app --host 0.0.0.0 --port 9103 --workers 1
+uvicorn blackbox.src.main:app --host 0.0.0.0 --port 9104 --workers 1
+uvicorn nvidia_python.src.main:app --host 0.0.0.0 --port 9101 --workers 1
+uvicorn vercel.src.main:app --host 0.0.0.0 --port 9105 --workers 1
 ```
 
 **Note:** `nvidia-python` uses `nvidia_python` (underscore) in Python imports because hyphens are not valid in Python module names.

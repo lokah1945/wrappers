@@ -26,6 +26,40 @@ from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
 
 from .anthropic_compat import extract_internal_reasoning
 
+# P0-4 fix (audit 2026-08-03): central special-token scrubbing (see
+# anthropic_compat.py for the full rationale — user report '<unk><unk>…').
+try:
+    from common.sanitize_tokens import (
+        SpecialTokenFilter as _SpecialTokenFilter,
+        filter_special_tokens as _filter_special_tokens,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    class _SpecialTokenFilter:  # type: ignore[no-redef]
+        def feed(self, t):
+            return t
+
+        def flush(self):
+            return ''
+
+    def _filter_special_tokens(t):  # type: ignore[misc]
+        return t
+
+# P1-3: canonical full-details Responses usage shape (strict SDKs require
+# the input_tokens_details / output_tokens_details structures).
+try:
+    from common.translations.shared import (
+        responses_usage as _responses_usage,
+        tokens_from_chat_usage as _tokens_from_chat_usage,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    def _responses_usage(i=0, o=0, c=0, r=0):  # type: ignore[misc]
+        return {'input_tokens': int(i or 0), 'output_tokens': int(o or 0),
+                'total_tokens': int(i or 0) + int(o or 0)}
+
+    def _tokens_from_chat_usage(u):  # type: ignore[misc]
+        u = u if isinstance(u, dict) else {}
+        return (u.get('prompt_tokens') or 0, u.get('completion_tokens') or 0, 0, 0)
+
 # previous_response_id store for Codex multi-turn server-side history.
 # Values are OpenAI chat messages, including the assistant message that contained
 # tool_calls. Without that assistant message a later role=tool result is orphaned
@@ -35,10 +69,14 @@ from .anthropic_compat import extract_internal_reasoning
 # to prevent cross-tenant data leaks. Any client providing another tenant's
 # previous_response_id will NOT find their conversation — the lookup key
 # includes the caller's own principal so the store is per-tenant isolated.
-_RESPONSE_STORE: Dict[str, list] = {}
-_RESPONSE_STORE_SIZES: Dict[str, int] = {}
-# V-22 fix: also bound the store by total bytes, not just entry count.
-_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(64 * 1024 * 1024)))
+# Audit 2026-08-03 (CONTRACT §6.3): the store is bounded on ALL THREE axes —
+# entry count, total bytes, AND TTL — with the canonical env names and
+# defaults. Previously: hard-coded 200-count, a 64 MiB byte default (contract
+# says 32 MiB), and NO TTL at all (entries lived until eviction).
+_RESPONSE_STORE: Dict[str, dict] = {}
+_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
 
 
 def _rand(suffix: str) -> str:
@@ -49,7 +87,9 @@ def _rand(suffix: str) -> str:
 
 
 def _zero_usage() -> dict:
-    return {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0}
+    # P1-3: include the *_details structures — strict openai SDK models
+    # require them on every usage object (created/completed alike).
+    return _responses_usage()
 
 
 def _extract_principal(request: Any) -> str:
@@ -83,22 +123,41 @@ def _store_key(principal: str, resp_id: str) -> str:
 
 
 def _bounded_store(principal: str, resp_id: str, messages: list) -> None:
-    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
+    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix).
+
+    3-axis bounded (CONTRACT §6.3): TTL expiry + entry-count + total bytes.
+    """
     if not resp_id:
         return
     key = _store_key(principal, resp_id)
     try:
-        size = len(json.dumps(messages, ensure_ascii=False))
+        size = len(json.dumps(messages, ensure_ascii=False).encode('utf-8'))
     except Exception:
         size = 0
-    _RESPONSE_STORE[key] = messages
-    _RESPONSE_STORE_SIZES[key] = size
-    # V-22 fix: evict oldest entries by count (200) AND by total byte budget.
-    while len(_RESPONSE_STORE) > 200 or (
-            len(_RESPONSE_STORE) > 1 and sum(_RESPONSE_STORE_SIZES.values()) > _STORE_MAX_BYTES):
-        oldest = next(iter(_RESPONSE_STORE))
+    _RESPONSE_STORE[key] = {"ts": time.time(), "messages": messages, "size": size}
+    now = time.time()
+    # Axis 3 (audit 2026-08-03): TTL sweep — drop expired entries first.
+    if _STORE_TTL_SEC > 0:
+        for k in [k for k, v in _RESPONSE_STORE.items() if now - v["ts"] > _STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(k, None)
+    # Axis 1+2: evict oldest by timestamp until count AND bytes fit.
+    def _total_bytes() -> int:
+        return sum(v["size"] for v in _RESPONSE_STORE.values())
+    while len(_RESPONSE_STORE) > _STORE_MAX_ENTRIES or (
+            len(_RESPONSE_STORE) > 1 and _total_bytes() > _STORE_MAX_BYTES):
+        oldest = min(_RESPONSE_STORE, key=lambda k: _RESPONSE_STORE[k]["ts"])
         _RESPONSE_STORE.pop(oldest, None)
-        _RESPONSE_STORE_SIZES.pop(oldest, None)
+
+
+def _load_stored(prev_key: str):
+    """TTL-checked store read (CONTRACT §6.3 axis 3)."""
+    if not prev_key or prev_key not in _RESPONSE_STORE:
+        return None
+    entry = _RESPONSE_STORE[prev_key]
+    if _STORE_TTL_SEC > 0 and time.time() - entry["ts"] > _STORE_TTL_SEC:
+        _RESPONSE_STORE.pop(prev_key, None)
+        return None
+    return entry["messages"]
 
 
 def http_status_from_error(err: dict) -> int:
@@ -312,13 +371,10 @@ def convert_tools(tools: Optional[list]) -> Optional[list]:
 def convert_usage(u: Optional[dict]) -> dict:
     if not u:
         return _zero_usage()
-    prompt_tokens = u.get('prompt_tokens', u.get('input_tokens', 0)) or 0
-    completion_tokens = u.get('completion_tokens', u.get('output_tokens', 0)) or 0
-    return {
-        'input_tokens': int(prompt_tokens),
-        'output_tokens': int(completion_tokens),
-        'total_tokens': int(u.get('total_tokens') or (prompt_tokens + completion_tokens)),
-    }
+    # P1-3: canonical full-details usage (cached_tokens/reasoning_tokens are
+    # lifted from the chat usage's *_details structures when present).
+    _in, _out, _cached, _rsn = _tokens_from_chat_usage(u)
+    return _responses_usage(_in, _out, _cached, _rsn)
 
 
 def base_response(resp_id: str, model: str, status: str, output: list = None, usage: dict = None) -> dict:
@@ -370,8 +426,15 @@ def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs:
 def respond_non_streaming(data: dict, model: str) -> dict:
     msg = (data.get('choices') or [{}])[0].get('message', {}) if data.get('choices') else {}
     nr = extract_internal_reasoning(msg)
-    text = nr.get('content', '') or ''
-    reason_text = nr.get('reasoning', '')
+    # P0-4/R5: strip DSML tool markup, then scrub special tokens from
+    # non-stream visible channels too.
+    text = _filter_special_tokens(nr.get('content', '') or '')
+    reason_text = _filter_special_tokens(nr.get('reasoning', ''))
+    try:
+        from common.sanitize_tokens import strip_dsml_markup as _strip_dsml
+        text = _strip_dsml(text)
+    except Exception:
+        pass
     tool_calls = msg.get('tool_calls') if msg else None
     resp_id = _rand('resp')
     output = []
@@ -536,6 +599,12 @@ class ResponsesHandler:
             usage = _zero_usage()
             buffer = ''
             stream_error = None
+            # P0-1: did the upstream send a finish_reason? EOF without one
+            # (and without an error frame) is a premature close → failed.
+            saw_finish = False
+            # P0-4: cross-chunk special-token scrubbers (one per channel).
+            _tok_text = _SpecialTokenFilter()
+            _tok_reason = _SpecialTokenFilter()
 
             def next_seq() -> int:
                 nonlocal seq
@@ -614,15 +683,23 @@ class ResponsesHandler:
                             if not _cl:
                                 continue
                             ch = _cl[0] or {}
+                            if ch.get('finish_reason'):
+                                saw_finish = True  # P0-1
                             d = ch.get('delta') or {}
                             if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
+                                # P0-4: scrub special tokens (cross-chunk).
+                                _ct = _tok_text.feed(d['content'])
+                                if _ct:
+                                    acc_text += _ct
+                                    yield emit({
+                                        'type': 'response.output_text.delta', 'sequence_number': next_seq(),
+                                        'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
+                                        'content_index': 0, 'delta': _ct,
+                                    })
                             reason_delta = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
+                            if reason_delta:
+                                # P0-4: scrub special tokens (cross-chunk).
+                                reason_delta = _tok_reason.feed(reason_delta)
                             if reason_delta:
                                 if not rsn_started:
                                     rsn_started = True
@@ -656,12 +733,12 @@ class ResponsesHandler:
                                                  'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
                                     })
                                 if fn.get('name'):
+                                    # P0-3 fix: never emit the function NAME as
+                                    # an arguments delta — delta-accumulating
+                                    # clients collected `name{...}` (invalid
+                                    # JSON). Name rides output_item.added and
+                                    # function_call_arguments.done instead.
                                     acc['name'] += fn['name']
-                                    yield emit({
-                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
-                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                                        'delta': fn['name'], 'name': acc['name'],
-                                    })
                                 if fn.get('arguments'):
                                     acc['args'] += fn['arguments']
                                     yield emit({
@@ -685,15 +762,22 @@ class ResponsesHandler:
                             if c.get('usage'):
                                 usage = convert_usage(c['usage'])
                             ch = (c.get('choices') or [{}])[0]
+                            if isinstance(ch, dict) and ch.get('finish_reason'):
+                                saw_finish = True  # P0-1
                             d = ch.get('delta') or {}
                             if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
+                                # P0-4: scrub special tokens (cross-chunk).
+                                _ct = _tok_text.feed(d['content'])
+                                if _ct:
+                                    acc_text += _ct
+                                    yield emit({
+                                        'type': 'response.output_text.delta', 'sequence_number': next_seq(),
+                                        'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
+                                        'content_index': 0, 'delta': _ct,
+                                    })
                             reason_tail = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
+                            if reason_tail:
+                                reason_tail = _tok_reason.feed(reason_tail)  # P0-4
                             if reason_tail and rsn_started:
                                 acc_reason += reason_tail
                                 yield emit({
@@ -737,13 +821,46 @@ class ResponsesHandler:
                 })
                 yield 'data: [DONE]\n\n'
                 return
-            if not acc_text and not has_tool:
-                acc_text = '[No text response; the model returned no visible text.]'
+            # P0-1 (CONTRACT §3.3): the upstream stream ended WITHOUT any
+            # terminal signal — no finish_reason, no error frame. Completing
+            # now would persist a truncated answer as a successful turn
+            # (the agent's "stops mid-way" symptom). Emit response.failed.
+            if not saw_finish:
+                yield emit({
+                    'type': 'response.failed', 'sequence_number': next_seq(),
+                    'response': {
+                        'id': resp_id, 'object': 'response', 'model': model,
+                        'status': 'failed',
+                        'error': {'code': 'upstream_premature_eof',
+                                  'message': 'upstream stream ended prematurely: EOF without '
+                                             'finish_reason or [DONE]; the response may be '
+                                             'truncated — client may retry'},
+                    },
+                })
+                yield 'data: [DONE]\n\n'
+                return
+            # P0-4: release filter-withheld tail text before the done events.
+            _rest_text = _tok_text.flush()
+            if _rest_text:
+                acc_text += _rest_text
                 yield emit({
                     'type': 'response.output_text.delta', 'sequence_number': next_seq(),
                     'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                    'content_index': 0, 'delta': acc_text,
+                    'content_index': 0, 'delta': _rest_text,
                 })
+            _rest_rsn = _tok_reason.flush()
+            if _rest_rsn and rsn_started:
+                acc_reason += _rest_rsn
+                yield emit({
+                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
+                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
+                    'delta': _rest_rsn,
+                })
+            # P1-4 fix (audit 2026-08-03): the old code INJECTED a synthetic
+            # '[No text response; the model returned no visible text.]'
+            # assistant message when the model produced no visible text — a
+            # fabricated utterance persisted into client history as if the
+            # model had said it. An empty text item is the honest shape.
 
             outputs_by_index = {
                 msg_index: {'id': msg_id, 'type': 'message', 'status': 'completed', 'role': 'assistant',
@@ -807,8 +924,8 @@ class ResponsesHandler:
         principal = _extract_principal(request)
         prev = body.get('previous_response_id')
         prev_key = _store_key(principal, prev) if prev else None
-        if prev_key and prev_key in _RESPONSE_STORE:
-            stored = _RESPONSE_STORE[prev_key]
+        stored = _load_stored(prev_key) if prev_key else None
+        if stored is not None:
             cur = body.get('input')
             if isinstance(cur, list):
                 body['input'] = stored + cur

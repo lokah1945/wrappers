@@ -165,6 +165,11 @@ async def main():
                                      {'type': 'function', 'function': {'name': 'beta', 'parameters': {'type': 'object'}}}]}),
                 ('reasoning_only', {'model': 'mock/reasoning_only', 'stream': True, 'input': 'hi'}),
                 ('reasoning', {'model': 'mock/reasoning', 'stream': True, 'input': 'hi'}),
+                # audit 2026-08-03 additions: premature EOF must surface as
+                # response.failed (SDK-visible), and special tokens must be
+                # scrubbed before the strict SDK ever sees them.
+                ('abort', {'model': 'mock/abort', 'stream': True, 'input': 'hi'}),
+                ('special_tokens_split', {'model': 'mock/special_tokens_split', 'stream': True, 'input': 'hi'}),
             ):
                 st, raw = await drive(PORT[name], payload, headers)
                 if st != 200:
@@ -189,8 +194,29 @@ async def main():
                     if not dones:
                         FAILURES.append(f'{name} [tools]: no function_call_arguments.done events: {names}')
                         log(f'    classes: {names}')
-                if deltas and dones:
-                    log(f'    tool args streamed via {len(deltas)} deltas + {len(dones)} done events')
+                    if deltas and dones:
+                        log(f'    tool args streamed via {len(deltas)} deltas + {len(dones)} done events')
+                if mode == 'abort':
+                    # P0-1: truncation must surface as response.failed — the
+                    # SDK can then raise/flag it — never as response.completed.
+                    names = [type(e).__name__ for e in evs]
+                    if 'ResponseFailedEvent' not in names:
+                        FAILURES.append(f'{name} [abort]: no ResponseFailedEvent '
+                                        f'(truncated turn faked as success): {names}')
+                    if 'ResponseCompletedEvent' in names:
+                        FAILURES.append(f'{name} [abort]: response.completed emitted '
+                                        'on a truncated stream (fabricated success)')
+                if mode == 'special_tokens_split':
+                    # P0-4: no tokenizer control literal may survive into any
+                    # SDK-visible text delta.
+                    leaked = []
+                    for e in evs:
+                        d = getattr(e, 'delta', None)
+                        if isinstance(d, str) and '<unk>' in d:
+                            leaked.append(d)
+                    if leaked:
+                        FAILURES.append(f'{name} [special_tokens_split]: '
+                                        f'<unk> leaked into SDK-visible deltas: {leaked[:2]}')
             # non-streaming Responses must also parse with the SDK's strict
             # Response model (client.responses.create path)
             st, raw = await drive(PORT[name],

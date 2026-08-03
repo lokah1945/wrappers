@@ -21,8 +21,10 @@ nous/
 # Development
 uvicorn src.main:app --reload --port 9102
 
-# Production
-uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 4
+# Production — ONE worker process (see WRAPPER_CONTRACT §6.3: the response
+# store, key pool and rate limiter live in per-process memory; --workers 4
+# splits previous_response_id/rate-limit state across workers)
+uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 1
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.
@@ -187,9 +189,12 @@ client.messages.create(
 
 Use the provided `wrapper-nous.service` (updated for uvicorn).
 
-For high load, you can run with multiple workers:
+For high load, do NOT raise `--workers` — the response store, key pool and
+rate limiter live in per-process memory (WRAPPER_CONTRACT §6.3), so multiple
+workers split `previous_response_id` / rate-limit state. Scale horizontally
+with multiple single-worker instances behind a sticky LB instead:
 ```bash
-uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 4
+uvicorn src.main:app --host 0.0.0.0 --port 9102 --workers 1
 ```
 
 ## Verification

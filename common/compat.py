@@ -209,10 +209,36 @@ async def _chunks_with_heartbeat(src, hb_interval: float):
 
 
 async def passthrough_anthropic_sse(src, hb_interval: float):
-    """Forward Anthropic Messages SSE verbatim (no [DONE] appended) with
-    heartbeats — used by the layer-2 `/v1/messages` surface."""
-    async for chunk in _chunks_with_heartbeat(src, hb_interval):
-        yield chunk
+    """Forward Anthropic Messages SSE with heartbeats — used by the layer-2
+    `/v1/messages` surface.
+
+    Audit 2026-08-03: now re-serialised via the shared
+    PassthroughBlockRewriter (terminal_done=False — Anthropic ends with
+    message_stop, never [DONE]):
+      * P0-4 — special tokens are scrubbed even on this verbatim path
+        (user report '\"><unk><unk>…'), catching tokens fragmented across
+        chunks,
+      * P0-1 / CONTRACT §3.3 — upstream EOF without message_stop/message_delta
+        surfaces an Anthropic `error` event instead of a fabricated success
+        framing, and
+      * heartbeat comments are block-aligned (never split a data: line).
+    """
+    from common.sanitize_tokens import PassthroughBlockRewriter
+    from common.sse import IDLE, iter_chunks_with_idle
+    rw = PassthroughBlockRewriter()
+    last = time.time()
+    async for raw in iter_chunks_with_idle(src, hb_interval):
+        if raw is IDLE:
+            now = time.time()
+            if rw.at_block_boundary() and now - last >= hb_interval:
+                yield b': heartbeat\n\n'
+                last = now
+            continue
+        last = time.time()
+        for fr in rw.feed(raw):
+            yield fr
+    for fr in rw.finish(terminal_done=False):
+        yield fr
 
 
 async def translate_anthropic_stream_to_openai_chat(src, model: str, hb_interval: float):
@@ -233,8 +259,39 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     Responses translator (CODEX-RESP-01/02 shapes): full response.created,
     eager item add, standard function_call_arguments events, unconditional
     completion, single [DONE].
+
+    Audit 2026-08-03:
+      * P0-4 — content/reasoning deltas are scrubbed through stateful
+        special-token filters (tokens fragmented across chunks included),
+        flushed into their channel before the .done events;
+      * P0-1 / CONTRACT §3.3 — an upstream EOF without finish_reason and
+        without an error frame is surfaced as response.failed
+        (code=upstream_premature_eof) instead of a fabricated success;
+      * P1-3 — usage is accumulated from upstream usage chunks and emitted
+        as a full Responses usage object (input/output details scaffolding;
+        strict Response.model_validate_json passes).
     """
-    import random
+    from common.translations.shared import (
+        responses_usage as _responses_usage,
+        tokens_from_chat_usage as _tokens_from_chat_usage,
+    )
+    try:
+        from common.sanitize_tokens import (
+            SpecialTokenFilter as _STF,
+            PREMATURE_EOF_MSG as _PREMATURE_EOF_MSG,
+        )
+    except ImportError:  # pragma: no cover - standalone fallback
+        class _STF:  # type: ignore[no-redef]
+            def feed(self, t):
+                return t
+
+            def flush(self):
+                return ''
+
+        _PREMATURE_EOF_MSG = (
+            'upstream stream ended prematurely: EOF without a terminal '
+            'signal; the response may be truncated — client may retry')
+
     resp_id = f"resp_{int(time.time()*1000)}"
     created_at = int(time.time())
     msg_id = f"msg_{int(time.time()*1000)}"
@@ -247,6 +304,11 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     next_output_index = 1
     msg_open = False
     upstream_error = None
+    error_code = 'upstream_error'
+    saw_finish = False  # P0-1: finish_reason seen in any choice chunk
+    acc_usage = (0, 0, 0, 0)  # (input, output, cached, reasoning)
+    _ftext = _STF()  # P0-4: content channel
+    _freason = _STF()  # P0-4: reasoning channel
     seq = 0
 
     def _sse(event_type: str, payload: dict) -> str:
@@ -257,7 +319,7 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     yield _sse('response.created', {'response': {
         'id': resp_id, 'object': 'response', 'created_at': created_at,
         'model': model, 'status': 'in_progress', 'output': [],
-        'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0},
+        'usage': _responses_usage(0, 0, 0, 0),
     }})
     yield _sse('response.in_progress', {'response': {'id': resp_id, 'status': 'in_progress'}})
     yield _sse('response.output_item.added', {
@@ -287,7 +349,7 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
         return acc
 
     async def _process_frame(frame: str):
-        nonlocal full_text, upstream_error, reasoning_started, acc_reason, rsn_index, next_output_index
+        nonlocal full_text, upstream_error, error_code, reasoning_started, acc_reason, rsn_index, next_output_index, saw_finish, acc_usage
         for line in frame.split('\n'):
             line = line.strip()
             if not line.startswith('data:'):
@@ -306,19 +368,29 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
             if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
                 e = c['error']
                 upstream_error = (e.get('message') if isinstance(e, dict) else str(e)) or 'upstream error'
+                if isinstance(e, dict) and e.get('code'):
+                    error_code = str(e['code'])
                 continue
+            if isinstance(c, dict) and isinstance(c.get('usage'), dict):
+                acc_usage = _tokens_from_chat_usage(c['usage'])
             if not isinstance(c, dict) or 'choices' not in c:
                 continue
             choice = (c.get('choices') or [{}])[0] or {}
+            if choice.get('finish_reason'):
+                saw_finish = True
             delta = choice.get('delta') or {}
             content = delta.get('content')
             if isinstance(content, str) and content:
-                full_text += content
-                yield _sse('response.output_text.delta', {
-                    'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': content})
+                content = _ftext.feed(content)  # P0-4
+                if content:
+                    full_text += content
+                    yield _sse('response.output_text.delta', {
+                        'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': content})
             reason = (delta.get('reasoning_content')
                       if isinstance(delta.get('reasoning_content'), str)
                       else (delta.get('reasoning') if isinstance(delta.get('reasoning'), str) else ''))
+            if reason:
+                reason = _freason.feed(reason)  # P0-4
             if reason:
                 if not reasoning_started:
                     reasoning_started = True
@@ -343,10 +415,10 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
                         'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
                                  'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''}})
                 if isinstance(fn.get('name'), str) and fn['name']:
+                    # P0-3 fix: never emit the NAME as an arguments delta —
+                    # delta-accumulating clients collected `name{...}` (invalid
+                    # JSON). Name rides output_item.added.item.name instead.
                     acc['name'] += fn['name']
-                    yield _sse('response.function_call_arguments.delta', {
-                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                        'delta': fn['name'], 'name': acc['name']})
                 if isinstance(fn.get('arguments'), str) and fn['arguments']:
                     acc['args'] += fn['arguments']
                     yield _sse('response.function_call_arguments.delta', {
@@ -365,6 +437,33 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
                     yield out
     finally:
         pass  # upstream cleanup owned by caller
+
+    # P0-1 / CONTRACT §3.3: EOF with NO finish_reason AND NO error frame is a
+    # truncated turn — it must surface as failed, not completed.
+    if not upstream_error and not saw_finish:
+        upstream_error = _PREMATURE_EOF_MSG
+        error_code = 'upstream_premature_eof'
+
+    # P0-4: release filter-withheld text into its own channel BEFORE the
+    # .done events so the totals and the delta stream agree.
+    rest_reason = _freason.flush()
+    if rest_reason:
+        if not reasoning_started:
+            reasoning_started = True
+            rsn_index = next_output_index
+            next_output_index += 1
+            yield _sse('response.output_item.added', {
+                'output_index': rsn_index,
+                'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress',
+                         'summary': [], 'content': []}})
+        acc_reason += rest_reason
+        yield _sse('response.reasoning_text.delta', {
+            'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0, 'delta': rest_reason})
+    rest_text = _ftext.flush()
+    if rest_text:
+        full_text += rest_text
+        yield _sse('response.output_text.delta', {
+            'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'delta': rest_text})
 
     if reasoning_started:
         yield _sse('response.reasoning_text.done', {
@@ -395,8 +494,8 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     if upstream_error:
         yield _sse('response.failed', {'response': {
             'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model,
-            'status': 'failed',
-            'error': {'code': 'upstream_error', 'message': str(upstream_error)[:2000]}}})
+            'status': 'failed', 'usage': _responses_usage(*acc_usage),
+            'error': {'code': error_code, 'message': str(upstream_error)[:2000]}}})
         yield 'data: [DONE]\n\n'
         return
     outputs_by_index = {
@@ -417,6 +516,6 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
         'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model,
         'status': 'completed', 'output': output,
         'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
-        'usage': {'input_tokens': 0, 'output_tokens': 0, 'total_tokens': 0},
+        'usage': _responses_usage(*acc_usage),
     }})
     yield 'data: [DONE]\n\n'

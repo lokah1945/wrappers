@@ -117,6 +117,33 @@ class CentralRegistry:
 central = CentralRegistry()
 app = FastAPI(title="model-registry", version="0.1.0", docs_url=None, redoc_url=None)
 
+# P2 fix (audit 2026-08-03): request body cap — catalog ingest posts an
+# unbounded JSON list; a pathological body could exhaust the small service.
+# Same shared middleware the five wrappers use (CONTRACT §7 parity).
+try:
+    from common.middleware import RequestSizeLimiter  # noqa: E402
+
+    app.add_middleware(
+        RequestSizeLimiter,
+        max_bytes=int(os.environ.get("MODEL_REGISTRY_MAX_REQUEST_BYTES", str(2 * 1024 * 1024))),
+    )
+except ImportError:  # pragma: no cover - common/ missing
+    import logging as _logging
+
+    _logging.getLogger("model-registry").warning(
+        "common.middleware unavailable — running WITHOUT a request size limit")
+
+
+@app.on_event("shutdown")
+async def _graceful_shutdown() -> None:
+    """Drain hook: ModelStateStore opens short-lived SQLite connections per
+    call (closed via finally:), so there is nothing persistent to close —
+    but the hook gives uvicorn's graceful shutdown a place to await in-flight
+    requests and keeps parity with the wrappers' lifespans."""
+    import logging as _logging
+
+    _logging.getLogger("model-registry").info("model-registry shutting down; in-flight requests drained")
+
 
 def _require_internal(request: Request) -> None:
     """Fail closed: internal writes are disabled without an admin token."""

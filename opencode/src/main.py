@@ -108,6 +108,36 @@ except ImportError as _imp_err:
         "common.translations import failed; wrapper requires shared translations"
     ) from _imp_err
 
+# P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
+# shape-aware passthrough re-serialisation (see common/sanitize_tokens.py).
+try:
+    from common.sanitize_tokens import (
+        PassthroughBlockRewriter as _PassthroughBlockRewriter,
+        PassthroughSSE as _PassthroughSSE,
+        SpecialTokenFilter as _SpecialTokenFilter,
+        DsmlMarkupFilter as _DsmlMarkupFilter,
+        filter_special_tokens as _filter_special_tokens,
+        strip_dsml_markup as _strip_dsml_markup,
+        scrub_openai_response_inplace as _scrub_openai_response_inplace,
+        sse_block as _shared_sse_block,
+    )
+except ImportError as _imp_err:  # OC-7 parity: fail fast at boot.
+    raise RuntimeError(
+        "common.sanitize_tokens import failed; wrapper requires shared sanitizer"
+    ) from _imp_err
+
+# P1-1/P1-3 shared helpers (input_image passthrough, full Responses usage).
+try:
+    from common.translations.shared import (
+        responses_content_to_chat as _responses_content_to_chat,
+        tokens_from_chat_usage as _tokens_from_chat_usage,
+        responses_usage as _responses_usage,
+    )
+except ImportError as _imp_err:
+    raise RuntimeError(
+        "common.translations.shared import failed; wrapper requires shared helpers"
+    ) from _imp_err
+
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
     load_dotenv(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env'))
 # Fallback: also try cwd-relative .env (for direct uvicorn launches)
@@ -332,15 +362,12 @@ def _bearer_token() -> str:
 def _client_ip(request: Request) -> str:
     """OC-8 / DR-7: key rate limiting by the real peer, not a client-supplied
     X-Forwarded-For value (which is trivially spoofable and lets an attacker
-    rotate values to bypass the limiter and grow the store unbounded). XFF is
-    only trusted as a fallback when no direct peer host is available."""
+    rotate values to bypass the limiter and grow the store unbounded).
+    P2 fix (audit 2026-08-03): the XFF fallback is removed entirely — when no
+    peer is known (unix socket / test client) everything shares the 'unknown'
+    bucket rather than trusting a spoofable header."""
     host = getattr(request.client, 'host', None) if request.client else None
-    if host:
-        return host
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return 'unknown'
+    return host or 'unknown'
 
 # ── Per-IP Rate Limiting ──
 from collections import defaultdict
@@ -854,16 +881,19 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     text = msg.get('content') or ''
     if text is None:
         text = ''
-    reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    # P0-4: scrub special tokens from visible channels.
+    reasoning = _filter_special_tokens(msg.get('reasoning_content') or msg.get('reasoning') or '')
     content = []
     if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning})
+        # P1-2: thinking blocks require a `signature` field (strict SDK parse).
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
 
     # Structured tool_calls (preferred) + DSML fallback if upstream leaked markup into content
     tool_calls = list(msg.get('tool_calls') or [])
     dsml_tools = []
     if isinstance(text, str) and 'DSML' in text.replace('\uff5c', '|'):
         text, dsml_tools = _parse_dsml_from_text(text)
+    text = _filter_special_tokens(text) if isinstance(text, str) else text
 
     if text or (not tool_calls and not dsml_tools):
         content.append({"type": "text", "text": text if isinstance(text, str) else str(text)})
@@ -892,6 +922,12 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     else:
         # Only infer tool_use when upstream omitted finish_reason entirely.
         stop = "tool_use" if (tool_calls or dsml_tools) else "end_turn"
+    # R5 audit (shared-translator parity): DSML markup is the ONLY tool-call
+    # signal MiniMax emits — the turn reports finish 'stop'. With recovered
+    # tool_use blocks in content, end_turn would make the agent close the
+    # turn and never execute the tool. Stream paths already upgrade.
+    if dsml_tools and stop == "end_turn":
+        stop = "tool_use"
     u = data.get('usage') or {}
     return {"id": data.get('id') or f"msg_{int(time.time()*1000)}", "type": "message", "role": "assistant",
             "model": model, "content": content, "stop_reason": stop, "stop_sequence": None,
@@ -900,8 +936,15 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
 
 # G11 fix: previous_response_id store for codex multi-turn server-side history
 _RESPONSE_STORE: dict = {}  # namespaced key -> {"ts": float, "data": list}
-_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSE_STORE_TTL_SEC', '3600'))
-_RESPONSE_STORE_MAX_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_CHARS', '4000000'))
+# Audit 2026-08-03 (CONTRACT §6.3): canonical env names RESPONSES_STORE_*.
+# The legacy RESPONSE_STORE_* spellings stay as fallback so deployed .env
+# files keep working. Bounds: TTL + entry count + total budget (chars≈bytes
+# for mostly-ASCII histories; entries are pre-truncated below).
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC',
+                                              os.environ.get('RESPONSE_STORE_TTL_SEC', '3600')))
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_MAX_CHARS = int(os.environ.get('RESPONSES_STORE_MAX_BYTES',
+                                               os.environ.get('RESPONSE_STORE_MAX_CHARS', '33554432')))
 _RESPONSE_STORE_MAX_ENTRY_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_ENTRY_CHARS', '500000'))
 
 
@@ -917,6 +960,7 @@ def _store_response(principal: str, key: str, data) -> None:
     turns using the precomputed per-entry sizes.
     """
     # B-22: `global _RESPONSE_STORE` removed — mutated in place, never rebound.
+    entry_size = 0
     if isinstance(data, list):
         entries, sizes = [], []
         for item in data:
@@ -936,16 +980,44 @@ def _store_response(principal: str, key: str, data) -> None:
             total -= sizes[start]
             start += 1
         data = entries[start:]
+        entry_size = sum(sizes[start:])
+    else:
+        try:
+            entry_size = len(json.dumps(data, ensure_ascii=False))
+        except Exception:
+            entry_size = 0
     store_key = f"{principal}\x00{key}"
-    _RESPONSE_STORE[store_key] = {"ts": time.time(), "data": data}
-    # Evict expired entries and bound total size to 200.
-    if len(_RESPONSE_STORE) > 200:
-        now = time.time()
-        for k in [k for k, v in _RESPONSE_STORE.items() if now - v["ts"] > _RESPONSE_STORE_TTL_SEC]:
+    _RESPONSE_STORE[store_key] = {"ts": time.time(), "data": data, "size": entry_size}
+    # Evict expired entries and bound entry COUNT (audit 2026-08-03: the 200
+    # was hard-coded; now the canonical RESPONSES_STORE_MAX_ENTRIES knob).
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for k in [k for k, v in list(_RESPONSE_STORE.items()) if now - v.get("ts", 0) > _RESPONSE_STORE_TTL_SEC]:
             _RESPONSE_STORE.pop(k, None)
-        if len(_RESPONSE_STORE) > 200:
-            for k in sorted(_RESPONSE_STORE, key=lambda k: _RESPONSE_STORE[k]["ts"])[:len(_RESPONSE_STORE) - 200]:
-                _RESPONSE_STORE.pop(k, None)
+    if len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
+        for k in sorted(_RESPONSE_STORE, key=lambda k: _RESPONSE_STORE[k].get("ts", 0))[:len(_RESPONSE_STORE) - _RESPONSE_STORE_MAX_ENTRIES]:
+            _RESPONSE_STORE.pop(k, None)
+    # CONTRACT §6.3 third axis: bound TOTAL store bytes across ALL entries,
+    # not just per-conversation. Previously 200 entries × per-entry trim could
+    # still hold ~200 × MAX_ENTRY_CHARS (≈100 MB) — the store was bounded per
+    # conversation only. Evict OLDEST entries until the whole store fits
+    # (round-4 audit; blackbox/nous/openrouter/nvidia parity).
+    def _entry_bytes(v) -> int:
+        if isinstance(v, dict):
+            s = v.get("size")
+            if isinstance(s, int):
+                return s
+            try:
+                return len(json.dumps(v.get("data"), ensure_ascii=False))
+            except Exception:
+                return 0
+        return 0
+
+    total_store = sum(_entry_bytes(v) for v in _RESPONSE_STORE.values())
+    while total_store > _RESPONSE_STORE_MAX_CHARS and len(_RESPONSE_STORE) > 1:
+        oldest = min(_RESPONSE_STORE, key=lambda k: _RESPONSE_STORE[k].get("ts", 0))
+        v = _RESPONSE_STORE.pop(oldest, None)
+        total_store -= _entry_bytes(v)
 
 
 def _load_response(principal: str, key: str):
@@ -997,8 +1069,9 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
                 if role == 'developer':
                     role = 'system'
                 c = it.get('content', '')
-                if isinstance(c, list):
-                    c = " ".join(p.get('text', '') for p in c if isinstance(p, dict) and p.get('type') in ('input_text', 'text', 'output_text'))
+                # P1-1 fix: input_image parts were silently dropped — the
+                # shared helper converts them to OpenAI image_url parts.
+                c = _responses_content_to_chat(c)
                 msgs.append({"role": role or 'user', "content": c})
     if body.get('instructions'):
         if msgs and msgs[0].get('role') == 'system':
@@ -1039,8 +1112,10 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
 
 def chat_to_responses(model: str, data: dict) -> dict:
     msg = (data.get('choices') or [{}])[0].get('message', {}) or {}
-    text = msg.get('content') or ''
-    reasoning = msg.get('reasoning_content') or msg.get('reasoning') or ''
+    # P0-4: scrub special tokens from non-stream visible channels too.
+    # R5 audit: strip DSML tool markup from the visible output text too.
+    text = _strip_dsml_markup(_filter_special_tokens(msg.get('content') or ''))
+    reasoning = _filter_special_tokens(msg.get('reasoning_content') or msg.get('reasoning') or '')
     output = []
     if reasoning:
         # CODEX-RESP-02: SDK ResponseReasoningItem expects summary/content as
@@ -1053,16 +1128,15 @@ def chat_to_responses(model: str, data: dict) -> dict:
                        "call_id": tc.get('id'), "name": fn.get('name', ''), "arguments": fn.get('arguments', '') or ''})
     output.append({"id": f"msg_{int(time.time()*1000)}", "type": "message", "status": "completed", "role": "assistant",
                    "content": [{"type": "output_text", "text": text, "annotations": []}]})
-    u = data.get('usage') or {}
+    # P1-3 fix: the Responses usage object requires the *_details structures.
+    _in, _out, _cached, _rsn = _tokens_from_chat_usage(data.get('usage'))
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — missing them fails
     # non-streaming client.responses.create() parsing.
     return {"id": data.get('id') or f"resp_{int(time.time()*1000)}", "object": "response",
             "created_at": int(time.time()), "model": model, "status": "completed", "output": output,
             "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
-            "usage": {"input_tokens": u.get('prompt_tokens', 0) or 0,
-                      "output_tokens": u.get('completion_tokens', 0) or 0,
-                      "total_tokens": u.get('total_tokens') or ((u.get('prompt_tokens', 0) or 0) + (u.get('completion_tokens', 0) or 0))}}
+            "usage": _responses_usage(_in, _out, _cached, _rsn)}
 
 
 def _assistant_message_from_chat(data: dict, fallback_text: str = "", tool_accs=None) -> dict:
@@ -1116,6 +1190,11 @@ async def _chunk_stream(resp):
             chunk_task.cancel()
 
 
+def _sse_block(obj, event_name: str = None) -> bytes:
+    """Serialise one SSE event block (event: line only when given)."""
+    return _shared_sse_block(obj, event_name)
+
+
 async def stream_passthrough(resp, key, heartbeat=True, terminal_done=True):
     """Yield upstream SSE bytes + proxy heartbeats; always release key/resp.
 
@@ -1126,30 +1205,49 @@ async def stream_passthrough(resp, key, heartbeat=True, terminal_done=True):
     OC-4 / DR-1: heartbeats fire during upstream idle gaps via _chunk_stream.
     OC-5: the heartbeat comment is only injected after a clean SSE line boundary
     (the last yielded byte was a newline) so it never splits a `data:` line.
+
+    Audit 2026-08-03 fixes (block logic now shared in common/sanitize_tokens —
+    CONTRACT §7; only pool/release semantics stay local):
+    P0-4 — frames are re-serialised through PassthroughSSE so tokenizer
+    control tokens (<unk>, <|im_start|>, … — user-visible as
+    '"><unk><unk><unk>…"') are scrubbed even on the verbatim-forward path,
+    catching tokens fragmented across chunks.
+    P0-1 — an upstream that closes WITHOUT a terminal signal (no
+    finish_reason, no message_stop, no response.completed, no error frame)
+    now surfaces a shape-appropriate ERROR frame before the synthesized
+    terminator instead of masquerading as a completed turn (CONTRACT §3.3).
     """
     last_hb = time.time()
-    saw_done = False
-    buffer_ends_newline = True
+    rw = _PassthroughBlockRewriter()
+    gen_exc: list = []
+
     try:
         async for idle, chunk in _chunk_stream(resp):
             if idle:
                 if heartbeat and (time.time() - last_hb) > (HEARTBEAT_MS / 1000.0):
-                    if buffer_ends_newline:  # OC-5: line-aligned injection
+                    if rw.at_block_boundary():  # OC-5: block-aligned injection
                         yield b": heartbeat\n\n"
                         last_hb = time.time()
                 continue
-            if isinstance(chunk, (bytes, bytearray)):
-                if b"data: [DONE]" in chunk or b"data:[DONE]" in chunk:
-                    saw_done = True
-            else:
-                if "data: [DONE]" in str(chunk) or "data:[DONE]" in str(chunk):
-                    saw_done = True
-            yield chunk
-            if chunk:
-                buffer_ends_newline = chunk[-1:] in (b"\n", b"\r")
-        if terminal_done and not saw_done:
-            yield b"data: [DONE]\n\n"
+            for fr_b in rw.feed(chunk):
+                yield fr_b
+            last_hb = time.time()
+        for fr_b in rw.finish(terminal_done=terminal_done):
+            yield fr_b
+    except (GeneratorExit, asyncio.CancelledError):
+        raise
+    except Exception as e:
+        gen_exc.append(e)  # B-39: transport faults count too
+        raise
     finally:
+        # B-39 parity (CONTRACT §10): a premature close/termination surfaced
+        # mid-stream must be counted as an error — HTTP 200 was already
+        # committed, so per-status accounting reports these as healthy turns.
+        if getattr(rw, '_premature_emitted', False) or gen_exc:
+            try:
+                metrics.record_error()
+            except Exception:
+                pass
         try:
             resp.release()
         except Exception:
@@ -1221,6 +1319,22 @@ async def model_catalog_refresh_loop():
         await refresh_model_catalog_once()
 
 
+_HEAL_TASK_REF = [None]
+
+
+async def _heal_in_flight_loop():
+    """P2 fix (audit 2026-08-03, nvidia/nous parity): periodic heal of leaked
+    in_flight slots (a crashed-between-acquire-and-release request path would
+    otherwise permanently shrink effective pool capacity)."""
+    interval = int(os.environ.get("HEAL_INFLIGHT_INTERVAL_SEC", "300"))
+    while True:
+        await asyncio.sleep(max(30, interval))
+        try:
+            await pool.heal_in_flight()
+        except Exception as e:
+            logger.warning(f"[key_pool] heal_in_flight loop error: {e}")
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # B-22: `_session` dropped from this global stmt — never rebound here.
@@ -1248,6 +1362,7 @@ async def lifespan(app: FastAPI):
         logger.warning(f'[model-catalog] boot refresh failed: {_boot_exc}')
     _MODEL_REFRESH_TASK = asyncio.create_task(model_catalog_refresh_loop())
     _METRICS_PERSIST_TASK = asyncio.create_task(_metrics_persist_loop())  # OC-14
+    _HEAL_TASK_REF[0] = asyncio.create_task(_heal_in_flight_loop())  # P2
     yield
 
     # Graceful shutdown: wait for in-flight requests
@@ -1384,7 +1499,10 @@ async def health():
 
 @app.get("/ready")
 async def ready(request: Request):
-    _auth_check(request)
+    # P3 fix (fleet parity, audit 2026-08-03): /ready is a PUBLIC probe
+    # endpoint like /health on every other wrapper — gating it behind auth
+    # broke external load-balancer/orchestrator health checks (they saw 401
+    # and marked the instance down).
     try:
         status, data, _ = await proxy_request_with_pool("GET", f"{OPENCODE_BASE}/models", None, request)
         return {"ready": status == 200, "upstream_ok": status == 200, "status_code": status, "last_error": None if status == 200 else (data.get("error") if isinstance(data, dict) else str(data)), "keys": pool.total_keys, "available": pool.available_keys}
@@ -1628,6 +1746,8 @@ async def chat_completions(request: Request):
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
         if isinstance(data, dict) and data.get("type") == "message" and "content" in data:
             data = anthropic_to_openai_response(data, body.get("model", ""))
+        # P0-4: scrub special tokens from the non-stream reply body too.
+        _scrub_openai_response_inplace(data)
         await metrics.record_request(model=body.get("model"), path="/v1/chat/completions",
                                      prompt_tokens=(data.get("usage") or {}).get("prompt_tokens", 0),
                                      completion_tokens=(data.get("usage") or {}).get("completion_tokens", 0))
@@ -1749,6 +1869,19 @@ async def responses(request: Request):
                 rsn_id = f"rsn_{int(time.time()*1000)}"
                 acc_reason = ""
                 upstream_err: list = []  # R-03: mid-stream upstream error frames
+                # P0-1: did the upstream send a finish_reason? EOF without one
+                # (and without an error frame) is a premature close → failed.
+                saw_finish: list = []
+                # B-39: natural-EOF + exception tracking for one-shot error
+                # accounting (a CLIENT DISCONNECT must not inflate the error
+                # rate — it is not an upstream fault).
+                body_exhausted = False
+                gen_fault = False
+                # P0-4: cross-chunk special-token scrubbers (one per channel).
+                _tok_text = _SpecialTokenFilter()
+                # R5 audit: DSML markup suppression (cross-chunk safe).
+                _dsml_text = _DsmlMarkupFilter()
+                _tok_reason = _SpecialTokenFilter()
 
                 def emit(etype, payload):
                     nonlocal seq
@@ -1758,7 +1891,8 @@ async def responses(request: Request):
                 def usage_obj():
                     if acc_usage:
                         return acc_usage
-                    return {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+                    # P1-3: full usage shape (details) for strict SDK parsing.
+                    return _responses_usage()
 
                 def get_tool_acc(tc):
                     nonlocal next_output_index
@@ -1795,19 +1929,27 @@ async def responses(request: Request):
                         upstream_err.append(str(_m or 'upstream error'))
                         return
                     if c.get("usage"):
-                        u = c["usage"]
-                        acc_usage = {"input_tokens": u.get("prompt_tokens", u.get("input_tokens", 0)) or 0,
-                                     "output_tokens": u.get("completion_tokens", u.get("output_tokens", 0)) or 0,
-                                     "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
-                    d = ((c.get("choices") or [{}])[0].get("delta") or {})
+                        # P1-3: keep the canonical full-details usage shape.
+                        _iu = _tokens_from_chat_usage(c["usage"])
+                        acc_usage = _responses_usage(*_iu)
+                    _ch0 = (c.get("choices") or [{}])[0] or {}
+                    if _ch0.get("finish_reason"):
+                        saw_finish.append(True)
+                    d = (_ch0.get("delta") or {})
                     if d.get("content"):
-                        content = d["content"]
-                        acc_text += content
-                        yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": content})
+                        # R5: suppress DSML markup first (cross-chunk), then
+                        # P0-4 scrub special tokens (cross-chunk).
+                        content = _tok_text.feed(_dsml_text.feed(d["content"]))
+                        if content:
+                            acc_text += content
+                            yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": content})
                     # Reasoning (Nous/OpenCode reasoning_content) — MUST be streamed
                     # so the client sees progress during thinking (Codex / OpenAI SDK
                     # aborts a silent stream → "stops mid-way"). Mirror nvidia-python.
                     reason_delta = d.get("reasoning_content") if isinstance(d.get("reasoning_content"), str) else (d.get("reasoning") if isinstance(d.get("reasoning"), str) else "")
+                    if reason_delta:
+                        # P0-4: scrub special tokens from the reasoning channel.
+                        reason_delta = _tok_reason.feed(reason_delta)
                     if reason_delta:
                         if not rsn_started:
                             rsn_started = True
@@ -1823,8 +1965,12 @@ async def responses(request: Request):
                             acc["added"] = True
                             yield emit("response.output_item.added", {"output_index": acc["output_index"], "item": {"id": acc["call_id"], "type": "function_call", "status": "in_progress", "call_id": acc["call_id"], "name": acc["name"], "arguments": ""}})
                         if fn.get("name"):
+                            # P0-3 fix: track the name but NEVER emit it as a
+                            # function_call_arguments.delta — clients that
+                            # accumulate arguments from deltas would collect
+                            # `search{"q":…}` (invalid JSON). The name travels
+                            # on output_item.added.item.name (emitted above).
                             acc["name"] += fn["name"]
-                            yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
                         if fn.get("arguments"):
                             acc["args"] += fn["arguments"]
                             yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
@@ -1833,7 +1979,8 @@ async def responses(request: Request):
                     yield emit("response.created", {"response": {
                         "id": rid, "object": "response", "created_at": int(time.time()),
                         "model": model, "status": "in_progress", "output": [],
-                        "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}}})
+                        # P1-3: full usage shape (details) for strict SDKs.
+                        "usage": _responses_usage()}})
                     yield emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}})
                     yield emit("response.output_item.added", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "in_progress", "role": "assistant", "content": []}})
                     yield emit("response.content_part.added", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": ""}})
@@ -1860,14 +2007,24 @@ async def responses(request: Request):
                     if tail.startswith(b"data:"):
                         async for out in process_payload(tail[5:].strip()):
                             yield out
+                    body_exhausted = True
                 except Exception as e:
                     logger.error(f"[responses stream] {e}")
                     # OC-10 / O22: do NOT fabricate an error string as assistant
                     # output (Codex would persist it as a successful answer). Emit
                     # a proper failure event and stop.
+                    gen_fault = True
                     yield emit("response.failed", {"response": {"id": rid, "model": model, "status": "failed", "error": {"type": "api_error", "message": f"Upstream stream error: {e}"}}})
                     return
                 finally:
+                    # B-39 parity (CONTRACT §10): count mid-stream faults —
+                    # response.failed after a committed HTTP 200 is invisible
+                    # to per-status accounting (false dashboard health).
+                    if gen_fault or upstream_err or (body_exhausted and not saw_finish):
+                        try:
+                            metrics.record_error()
+                        except Exception:
+                            pass
                     try:
                         resp.release()
                     except Exception:
@@ -1882,6 +2039,33 @@ async def responses(request: Request):
                         "error": {"code": "upstream_error", "message": str(upstream_err[0])[:2000]}}})
                     yield "data: [DONE]\n\n"
                     return
+                # P0-1 (CONTRACT §3.3): the upstream closed WITHOUT any terminal
+                # signal — no finish_reason, no error frame, no [DONE]-with-
+                # completion. The old code emitted response.completed here with
+                # the (truncated) partial text, so an agent could neither detect
+                # the truncation nor retry, and persisted it as a successful
+                # turn. Emit response.failed instead.
+                if not saw_finish:
+                    logger.error("[responses] upstream stream ended prematurely (no finish_reason) — reporting failed")
+                    yield emit("response.failed", {"response": {
+                        "id": rid, "object": "response", "model": model, "status": "failed",
+                        "error": {"code": "upstream_premature_eof",
+                                  "message": "upstream stream ended prematurely: EOF without "
+                                             "finish_reason; the response may be truncated — client may retry"}}})
+                    yield "data: [DONE]\n\n"
+                    return
+                # P0-4/R5: release any filter-withheld tail text (DSML
+                # remnant still passes the token scrubber) before the done
+                # events so the visible answer is complete.
+                _rest_text = _tok_text.feed(_dsml_text.flush()) + _tok_text.flush()
+                if _rest_text:
+                    acc_text += _rest_text
+                    yield emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": _rest_text})
+                if rsn_started:
+                    _rest_rsn = _tok_reason.flush()
+                    if _rest_rsn:
+                        acc_reason += _rest_rsn
+                        yield emit("response.reasoning_text.delta", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "delta": _rest_rsn})
                 msg_item = {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": acc_text, "annotations": []}]}
                 if rsn_started:
                     yield emit("response.reasoning_text.done", {"item_id": rsn_id, "output_index": rsn_index, "content_index": 0, "text": acc_reason})
@@ -1908,6 +2092,9 @@ async def responses(request: Request):
         status, data, _ = await proxy_request_with_pool("POST", url, chat_body, request)
         if status != 200:
             return _jr(status, data if isinstance(data, dict) else {"error": {"message": str(data)}})
+        # P0-4: scrub before conversion AND persistence (previous_response_id
+        # replays must not carry special tokens back into later prompts).
+        _scrub_openai_response_inplace(data)
         resp_obj = chat_to_responses(model, data)
         # G11: store conversation for previous_response_id multi-turn
         rid_store = resp_obj.get("id")
@@ -2012,6 +2199,9 @@ async def anthropic_messages(request: Request):
             # Convert OpenAI SSE → Anthropic SSE (text + thinking + tool_use)
             state = AnthropicStreamState(model)
             async def gen():
+                # B-39: set when a transport-level fault surfaced via an error
+                # event; counted once in the finally below.
+                gen_fault = False
                 try:
                     for ev in state.start_events():
                         yield ev
@@ -2040,6 +2230,18 @@ async def anthropic_messages(request: Request):
                             if payload == b"":
                                 continue
                             if payload in (b"[DONE]", b'"[DONE]"'):
+                                # P0-1 parity (CONTRACT §3.3, audit 2026-08-03):
+                                # a healthy OpenAI stream always carries
+                                # finish_reason BEFORE [DONE]; a bare [DONE] is
+                                # a middlebox truncation signal — surface an
+                                # error instead of a fabricated clean end_turn.
+                                if not state.finished and not state.upstream_error:
+                                    for ev in state.translate_chunk({"error": {
+                                            "type": "api_error",
+                                            "message": "upstream stream ended with [DONE] but no "
+                                                       "finish_reason; the response may be "
+                                                       "truncated — client may retry"}}):
+                                        yield ev
                                 for ev in state.force_done():
                                     yield ev
                                 return
@@ -2050,6 +2252,18 @@ async def anthropic_messages(request: Request):
                             for ev in state.translate_chunk(c):
                                 yield ev
                     # upstream closed without [DONE]
+                    # P0-1 (CONTRACT §3.3): EOF without finish_reason is a
+                    # premature close — surface an Anthropic `error` event
+                    # before the terminal frames instead of a fabricated
+                    # clean end_turn (the agent could neither detect nor
+                    # retry the truncation).
+                    if not state.finished and not state.upstream_error:
+                        for ev in state.translate_chunk({"error": {
+                                "type": "api_error",
+                                "message": "upstream stream ended prematurely: EOF without "
+                                           "finish_reason or [DONE]; the response may be "
+                                           "truncated — client may retry"}}):
+                            yield ev
                     for ev in state.force_done():
                         yield ev
                 except (GeneratorExit, asyncio.CancelledError):
@@ -2059,6 +2273,7 @@ async def anthropic_messages(request: Request):
                     logger.error(f'[anthropic stream] {e}')
                     # B-07 fix: surface the failure instead of fabricating a
                     # successful end_turn (nous N-05 parity).
+                    gen_fault = True
                     try:
                         yield ('event: error\ndata: ' + json.dumps({
                             'type': 'error',
@@ -2070,6 +2285,14 @@ async def anthropic_messages(request: Request):
                     for ev in state.force_done():
                         yield ev
                 finally:
+                    # B-39 parity (CONTRACT §10): count mid-stream faults —
+                    # HTTP 200 was already committed, so per-status accounting
+                    # never sees them (false health on the dashboard).
+                    if gen_fault or getattr(state, 'upstream_error', None):
+                        try:
+                            metrics.record_error()
+                        except Exception:
+                            pass
                     try:
                         resp.release()
                     except Exception:

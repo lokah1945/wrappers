@@ -236,6 +236,31 @@ class KeyPool:
         key.decrement_in_flight()
         self._in_flight_total = max(0, self._in_flight_total - 1)
 
+    async def heal_in_flight(self):
+        """P2 fix (audit 2026-08-03, nvidia/nous parity): reset in_flight
+        counters that are stuck — a request path that crashed between acquire
+        and release would otherwise leak a slot forever, slowly shrinking the
+        pool's effective capacity until every key appeared busy."""
+        async with self._lock:
+            now = time.time()
+            total_fixed = 0
+            threshold = int(os.environ.get('HEAL_INFLIGHT_THRESHOLD_SEC', '600'))
+            for k in self.keys:
+                if k.in_flight > 0 and k.last_used > 0 and (now - k.last_used) > threshold:
+                    logger.warning(f'[blackbox] heal_in_flight: {k.label} in_flight '
+                                   f'{k.in_flight} stuck since last_used {round(now - k.last_used)}s ago -> 0')
+                    self._in_flight_total = max(0, self._in_flight_total - k.in_flight)
+                    k.in_flight = 0
+                    total_fixed += 1
+                elif k.in_flight > 0 and k.last_used == 0:
+                    logger.warning(f'[blackbox] heal_in_flight: {k.label} in_flight '
+                                   f'{k.in_flight} with no last_used -> 0')
+                    self._in_flight_total = max(0, self._in_flight_total - k.in_flight)
+                    k.in_flight = 0
+                    total_fixed += 1
+            if total_fixed:
+                logger.info(f'[blackbox] heal_in_flight: {total_fixed} key(s) corrected')
+
     def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int = None, reason: str = '', model: str = ''):
         """NO MODEL FALLBACK: model-scoped block for 429/5xx.
 

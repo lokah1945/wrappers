@@ -29,6 +29,12 @@ from common.sse import (  # noqa: E402
     IDLE, iter_chunks_with_idle, normalize_sse_newlines,
 )
 from common.translations.anthropic_stream import AnthropicStreamState  # noqa: E402
+from common.sanitize_tokens import (  # noqa: E402
+    SpecialTokenFilter, filter_special_tokens, DsmlMarkupFilter,
+)
+from common.translations.shared import (  # noqa: E402
+    responses_usage, tokens_from_chat_usage,
+)
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -67,6 +73,14 @@ def load_openrouter_translator(name: str):
         '_iter_chunks_with_idle': iter_chunks_with_idle,
         '_IDLE': IDLE,
         '_normalize_sse_newlines': normalize_sse_newlines,
+        # 2026-08-03 fixes: translators now use the shared token scrubber (P0-4)
+        # and the canonical Responses usage helper (P1-3) — provide the REAL
+        # shared implementations so the isolated exec stays faithful.
+        '_SpecialTokenFilter': SpecialTokenFilter,
+        '_DsmlMarkupFilter': DsmlMarkupFilter,
+        '_filter_special_tokens': filter_special_tokens,
+        '_responses_usage': responses_usage,
+        '_tokens_from_chat_usage': tokens_from_chat_usage,
     }
     exec(compile(src[start:end], 'openrouter_translator', 'exec'), ns)
     return ns[name]
@@ -591,7 +605,14 @@ def test_r05_openrouter_translates_non_streaming_responses():
     and Responses surfaces — `return response` fired before the translation."""
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     i = src.index('async def messages(')
-    block = src[i:i + 4500]
+    # R5 audit: the messages() body grew (DSML drain etc.) — a fixed
+    # 4500-char window pushed the translation call out of view. Bound the
+    # window by the NEXT top-level route instead of a char count.
+    try:
+        j = src.index('\n@app.', i + 100)
+    except ValueError:
+        j = i + 12000
+    block = src[i:j]
     assert '_openai_to_anthropic_response(payload, body)' in block, \
         'openrouter /v1/messages does not translate non-streaming replies'
     j = src.index('async def responses(')
@@ -612,9 +633,21 @@ def test_r06_no_duplicate_done_terminator():
     for wrapper in ('nvidia-python', 'opencode', 'blackbox', 'openrouter'):
         src = (ROOT / wrapper / 'src' / 'main.py').read_text()
         if 'data: [DONE]' in src:
-            assert 'saw_done' in src, f'{wrapper}: [DONE] emitted without a saw_done guard'
+            # Local guard idiom, or the shared PassthroughBlockRewriter which
+            # owns the canonical saw_done guard in common/sanitize_tokens.py
+            # (CONTRACT §7: no forked block logic; only `[DONE]` bytes may
+            # legitimately appear in wrapper code behind the shared driver).
+            assert ('saw_done' in src) or ('PassthroughBlockRewriter' in src), \
+                f'{wrapper}: [DONE] emitted without a saw_done guard'
+    shared = (ROOT / 'common' / 'sanitize_tokens.py').read_text()
+    if 'PassthroughBlockRewriter' in ''.join((ROOT / w / 'src' / 'main.py').read_text()
+                                             for w in ('nvidia-python', 'opencode', 'blackbox', 'openrouter')):
+        assert 'saw_done' in shared, 'shared passthrough rewriter lost its saw_done guard'
     base = (ROOT / 'common' / 'base_wrapper.py').read_text()
-    assert 'saw_done' in base, 'common/base_wrapper.py appends [DONE] unconditionally'
+    # Either the historical local guard, or delegation to the shared rewriter
+    # (which owns the canonical saw_done guard per CONTRACT §7).
+    assert ('saw_done' in base) or ('PassthroughBlockRewriter' in base), \
+        'common/base_wrapper.py appends [DONE] unconditionally'
 
     # nous: every emission site must sit inside the pass-through branch
     # (`state is None`), and the path must be single-shot via `terminated`.
@@ -724,7 +757,12 @@ def test_b06_local_non_streaming_translators_use_strict_finish_mapping():
 def test_b06_openrouter_non_streaming_content_filter_maps_to_refusal():
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     i = src.index('def _openai_to_anthropic_response(')
-    block = src[i:i + 1800]
+    # Window: up to the next top-level/async def — a fixed char window broke
+    # every time the function grew (P1-2/P0-4 fields, R5 DSML recovery).
+    j = src.find('\ndef ', i + 10)
+    k = src.find('\nasync def ', i + 10)
+    cands = [x for x in (j, k) if x != -1]
+    block = src[i:min(cands) if cands else len(src)]
     assert '"content_filter": "refusal"' in block
     assert '"content_filter": "end_turn"' not in block
 

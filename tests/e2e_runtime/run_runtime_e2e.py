@@ -54,7 +54,30 @@ STREAM_MODES = [
     # Round-2 adversarial framing / protocol modes
     'bigchunk', 'bytesplit', 'comments', 'dupfinish', 'nullcontent',
     'emptychoices', 'toolnoid', 'longtool',
+    # Round-3 (audit 2026-08-03): special-token leakage + premature EOF —
+    # the exact failure shapes behind the user report ('"><unk><unk>…',
+    # turn ends mid-way, truncated tool call executed).
+    'abrupt', 'special_tokens', 'special_tokens_split', 'abort', 'abort_tool',
+    'donewofinish',
+    # Round-5 (audit 2026-08-03): MiniMax DSML tool markup leaked into the
+    # visible content channel, fragmented mid-tag across chunks.
+    'dsml_stream',
 ]
+
+# Modes where the upstream dies WITHOUT a legal terminal signal. The wrapper
+# MUST surface an error (CONTRACT §3.3) — fabricated success is a P0 bug.
+PREMATURE_MODES = ('nofinish', 'abrupt', 'abort', 'abort_tool', 'midstream_error', 'donewofinish')
+
+# Modes whose content carries tokenizer control tokens that must be scrubbed.
+TOKEN_MODES = ('special_tokens', 'special_tokens_split')
+
+# R5: modes whose visible text channel must be free of DSML markup.
+DSML_MODES = ('dsml_stream',)
+_DSML_MARK = ('|DSML|', 'DSML｜', '｜DSML')
+
+# Tokenizer control literals that must never reach client-visible text (P0-4).
+_BANNED_TOKENS = ('<unk>', '<UNK>', '<s>', '</s>', '<|im_start|>', '<|im_end|>',
+                  '<|endoftext|>', '[UNK]')
 
 # Upstream returns an HTTP error before any streaming: the wrapper must return a
 # shaped 4xx/5xx envelope, never hang and never 200-with-empty-stream.
@@ -238,13 +261,62 @@ def check_anthropic_stream(evs, mode) -> list[str]:
         if len(args) != 2:
             errs.append(f'{len(args)} tools received arguments, expected 2')
 
-    if mode == 'midstream_error':
+    if mode in PREMATURE_MODES:
+        # CONTRACT §3.3 / audit 2026-08-03 P0-1: a truncated upstream stream
+        # must surface an Anthropic `error` event BEFORE message_stop; the
+        # old code fabricated end_turn and the agent "stopped mid-run" with
+        # the partial answer persisted as a successful turn.
         has_err = any(isinstance(d, dict) and d.get('type') == 'error' for _e, d in evs)
         stops = [d for _e, d in evs if isinstance(d, dict) and d.get('type') == 'message_delta']
         if not has_err:
             sr = stops[0].get('delta', {}).get('stop_reason') if stops else None
-            errs.append(f'upstream error reported as success (stop_reason={sr!r}); '
+            errs.append(f'upstream failure/truncation reported as success (stop_reason={sr!r}); '
                         'client cannot detect the failure or retry')
+        for _s in stops:
+            if (_s.get('delta') or {}).get('stop_reason') == 'end_turn' and mode != 'midstream_error':
+                errs.append(f'truncated stream finished with stop_reason=end_turn '
+                            '(fabricated clean completion)')
+
+    if mode in TOKEN_MODES:
+        # Audit 2026-08-03 P0-4: tokenizer control tokens must be scrubbed
+        # from every client-visible text channel (text AND thinking).
+        visible = ''.join(
+            ((d.get('delta') or {}).get('text') or '')
+            + ((d.get('delta') or {}).get('thinking') or '')
+            for _e, d in evs if isinstance(d, dict) and d.get('type') == 'content_block_delta')
+        for tok in _BANNED_TOKENS:
+            if tok in visible:
+                errs.append(f'special token {tok!r} leaked into client-visible text')
+
+    if mode in DSML_MODES:
+        # R5: no DSML protocol markup may leak into the visible text channel,
+        # and the recovered tool call must surface as a real tool_use block.
+        visible = ''.join(
+            ((d.get('delta') or {}).get('text') or '')
+            for _e, d in evs if isinstance(d, dict) and d.get('type') == 'content_block_delta')
+        for mark in _DSML_MARK:
+            if mark in visible:
+                errs.append(f'DSML markup {mark!r} leaked into client-visible text')
+        tool_names = [(d.get('content_block') or {}).get('name')
+                      for _e, d in evs if isinstance(d, dict)
+                      and d.get('type') == 'content_block_start'
+                      and (d.get('content_block') or {}).get('type') == 'tool_use']
+        tool_json = ''.join((d.get('delta') or {}).get('partial_json') or ''
+                            for _e, d in evs if isinstance(d, dict)
+                            and d.get('type') == 'content_block_delta'
+                            and (d.get('delta') or {}).get('type') == 'input_json_delta')
+        if 'get_weather' not in tool_names:
+            errs.append(f'DSML tool call not recovered as tool_use block (got {tool_names})')
+        elif 'Jakarta' not in tool_json:
+            errs.append('DSML tool arguments lost (expected city=Jakarta in input_json_delta)')
+        # R5: MiniMax reports finish 'stop' for DSML turns — the translator
+        # must upgrade the terminal stop_reason to tool_use or the agent
+        # closes the turn and never executes the recovered tool.
+        _stops = [(d.get('delta') or {}).get('stop_reason')
+                  for _e, d in evs if isinstance(d, dict) and d.get('type') == 'message_delta'
+                  and (d.get('delta') or {}).get('stop_reason') is not None]
+        if _stops and _stops[-1] != 'tool_use':
+            errs.append(f'DSML tool turn stop_reason must be tool_use (got {_stops[-1]!r})')
 
     # AI Gateway cross-translation: upstream reasoning_content must surface as
     # a thinking block on the Anthropic surface (transparency — part of the
@@ -288,6 +360,29 @@ def check_openai_stream(evs, mode) -> list[str]:
             delta = ch.get('delta')
             if delta is None and ch.get('finish_reason') is None:
                 errs.append('choice with neither delta nor finish_reason')
+    if mode in PREMATURE_MODES:
+        # Audit 2026-08-03 P0-1: truncation must surface an error frame before
+        # [DONE]; clean success deltas with no error = fabricated success.
+        had_err = any(isinstance(d, dict) and d.get('error') is not None for d in payloads)
+        if not had_err:
+            errs.append(f'mode={mode}: truncated upstream produced NO error frame '
+                        '(fabricated success, CONTRACT §3.3)')
+    if mode in TOKEN_MODES:
+        visible = ''.join((ch.get('delta') or {}).get('content') or ''
+                          + ((ch.get('delta') or {}).get('reasoning_content') or '')
+                          + ((ch.get('delta') or {}).get('reasoning') or '')
+                          for d in payloads if isinstance(d, dict)
+                          for ch in (d.get('choices') or []))
+        for tok in _BANNED_TOKENS:
+            if tok in visible:
+                errs.append(f'special token {tok!r} leaked into client-visible text')
+    if mode in DSML_MODES:
+        visible = ''.join((ch.get('delta') or {}).get('content') or ''
+                          for d in payloads if isinstance(d, dict)
+                          for ch in (d.get('choices') or []))
+        for mark in _DSML_MARK:
+            if mark in visible:
+                errs.append(f'DSML markup {mark!r} leaked into client-visible text')
     if mode == 'tools':
         names, args = set(), {}
         for d in payloads:
@@ -323,6 +418,38 @@ def check_responses_stream(evs, mode) -> list[str]:
         errs.append('no terminal response.completed/failed event (Codex hangs)')
     if mode == 'midstream_error' and 'response.completed' in types:
         errs.append('upstream error reported as response.completed')
+    if mode in PREMATURE_MODES:
+        # Audit 2026-08-03 P0-1: truncation surfaces response.failed, never
+        # response.completed (CONTRACT §2.2.5, §3.3).
+        if 'response.completed' in types:
+            errs.append('truncated upstream reported as response.completed (fabricated success)')
+        if 'response.failed' not in types and 'response.incomplete' not in types:
+            errs.append(f'mode={mode}: no response.failed/incomplete on truncation '
+                        '(client cannot detect the failure)')
+    if mode in TOKEN_MODES:
+        visible = ''.join(
+            str(d.get('delta') or '')
+            for _e, d in evs if isinstance(d, dict)
+            and d.get('type') in ('response.output_text.delta', 'response.reasoning_text.delta'))
+        # include completed .done text snapshots (also client-visible)
+        for _e, d in evs:
+            if isinstance(d, dict) and d.get('type') in ('response.output_text.done',
+                                                         'response.reasoning_text.done'):
+                visible += str(d.get('text') or '')
+        for tok in _BANNED_TOKENS:
+            if tok in visible:
+                errs.append(f'special token {tok!r} leaked into client-visible text')
+    if mode in DSML_MODES:
+        visible = ''.join(
+            str(d.get('delta') or '')
+            for _e, d in evs if isinstance(d, dict)
+            and d.get('type') == 'response.output_text.delta')
+        for _e, d in evs:
+            if isinstance(d, dict) and d.get('type') == 'response.output_text.done':
+                visible += str(d.get('text') or '')
+        for mark in _DSML_MARK:
+            if mark in visible:
+                errs.append(f'DSML markup {mark!r} leaked into client-visible responses text')
     # CODEX-RESP-01 guard: a *completed* turn must have a complete item
     # lifecycle — every output_item.added must be matched by an
     # output_item.done. The openrouter translator used to skip the done
@@ -397,6 +524,38 @@ async def exercise(wrapper: str, port: int) -> None:
                         ok(wrapper, path, '-', f'{r.status}')
             except Exception as e:
                 fail(wrapper, path, '-', f'{type(e).__name__}: {e}')
+
+        # ── P0-2 (audit 2026-08-03, CONTRACT §5.4): Authorization and
+        # x-api-key are evaluated INDEPENDENTLY. Real agents (Claude Code,
+        # Codex) send BOTH headers; a stale value in one must not mask a valid
+        # token in the other (the auth module used to check Authorization
+        # first, so a stale bearer hard-401'd a valid x-api-key client).
+        # Probe on /v1/chat/completions — /v1/models is intentionally PUBLIC.
+        _auth_payload = {'model': 'mock/normal',
+                         'messages': [{'role': 'user', 'content': 'hi'}]}
+        for tag, auth_headers, expect in (
+            ('valid-x-api-key+stale-bearer',
+             {'x-api-key': TOKEN, 'Authorization': 'Bearer stale-garbage'}, 200),
+            ('valid-bearer+stale-x-api-key',
+             {'Authorization': f'Bearer {TOKEN}', 'x-api-key': 'stale-garbage'}, 200),
+            ('both-stale',
+             {'Authorization': 'Bearer stale-garbage', 'x-api-key': 'stale-garbage'}, 401),
+        ):
+            try:
+                async with s.post(base + '/v1/chat/completions', json=_auth_payload,
+                                  headers={**auth_headers},
+                                  timeout=aiohttp.ClientTimeout(total=15)) as r:
+                    await r.text()
+                    if expect == 200 and r.status != 200:
+                        fail(wrapper, '/v1/chat/completions', 'auth-dual-header',
+                             f'{tag}: HTTP {r.status}, expected 200 (independent header auth broken)')
+                    elif expect == 401 and r.status != 401:
+                        fail(wrapper, '/v1/chat/completions', 'auth-dual-header',
+                             f'{tag}: HTTP {r.status}, expected 401 (invalid token accepted?)')
+                    else:
+                        ok(wrapper, '/v1/chat/completions', 'auth-dual-header', f'{tag}={r.status}')
+            except Exception as e:
+                fail(wrapper, '/v1/chat/completions', 'auth-dual-header', f'{tag}: {type(e).__name__}: {e}')
 
         # ── /v1/messages (Claude Code) ──
         for mode in STREAM_MODES:
@@ -546,6 +705,23 @@ async def exercise(wrapper: str, port: int) -> None:
              {'model': 'mock/tools', 'max_tokens': 64,
               'messages': [{'role': 'user', 'content': 'hi'}]}, 'anthropic_tools'),
             ('/v1/responses', {'model': 'mock/tools', 'input': 'hi'}, 'responses_tools'),
+            # P0-4 (audit 2026-08-03): special tokens must be scrubbed in
+            # non-stream bodies too, on every surface.
+            ('/v1/chat/completions',
+             {'model': 'mock/special_tokens', 'messages': [{'role': 'user', 'content': 'hi'}]}, 'openai_scrub'),
+            ('/v1/messages',
+             {'model': 'mock/special_tokens', 'max_tokens': 64,
+              'messages': [{'role': 'user', 'content': 'hi'}]}, 'anthropic_scrub'),
+            ('/v1/responses', {'model': 'mock/special_tokens_split', 'input': 'hi'}, 'responses_scrub'),
+            # R5 (audit 2026-08-03): DSML tool markup — chat/responses strip
+            # it from visible text; the messages surface recovers it as a
+            # tool_use block (stream/non-stream parity).
+            ('/v1/chat/completions',
+             {'model': 'mock/dsml_stream', 'messages': [{'role': 'user', 'content': 'hi'}]}, 'openai_dsml'),
+            ('/v1/messages',
+             {'model': 'mock/dsml_stream', 'max_tokens': 128,
+              'messages': [{'role': 'user', 'content': 'hi'}]}, 'anthropic_dsml'),
+            ('/v1/responses', {'model': 'mock/dsml_stream', 'input': 'hi'}, 'responses_dsml'),
         ):
             try:
                 async with s.post(base + path, json=payload, headers=headers,
@@ -564,6 +740,78 @@ async def exercise(wrapper: str, port: int) -> None:
                             fail(wrapper, path, 'nonstream', 'message.content is null (SDK crash)')
                         else:
                             ok(wrapper, path, 'nonstream')
+                    elif shape == 'openai_scrub':
+                        msg = d.get('choices', [{}])[0].get('message', {})
+                        visible = str(msg.get('content') or '') + str(msg.get('reasoning_content') or '')
+                        bad = [t for t in _BANNED_TOKENS if t in visible]
+                        if bad:
+                            fail(wrapper, path, 'nonstream', f'special tokens leaked in body: {bad}')
+                        elif not msg.get('content'):
+                            fail(wrapper, path, 'nonstream', 'scrubbed body lost all content')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'scrubbed')
+                    elif shape == 'anthropic_scrub':
+                        visible = ''.join(str(b.get('text') or '') + str(b.get('thinking') or '')
+                                          for b in d.get('content', []) if isinstance(b, dict))
+                        bad = [t for t in _BANNED_TOKENS if t in visible]
+                        if bad:
+                            fail(wrapper, path, 'nonstream', f'special tokens leaked in body: {bad}')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'scrubbed')
+                    elif shape == 'responses_scrub':
+                        visible = ''
+                        for o in d.get('output', []):
+                            for c in (o.get('content') or []):
+                                if isinstance(c, dict):
+                                    visible += str(c.get('text') or '')
+                        for o in d.get('output', []):
+                            for c in (o.get('summary') or []):
+                                if isinstance(c, dict):
+                                    visible += str(c.get('text') or '')
+                        bad = [t for t in _BANNED_TOKENS if t in visible]
+                        if bad:
+                            fail(wrapper, path, 'nonstream', f'special tokens leaked in body: {bad}')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'scrubbed')
+                    elif shape == 'openai_dsml':
+                        msg = d.get('choices', [{}])[0].get('message', {})
+                        visible = str(msg.get('content') or '')
+                        if any(m in visible for m in _DSML_MARK):
+                            fail(wrapper, path, 'nonstream', f'DSML markup leaked in chat body: {visible[:120]!r}')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'dsml stripped')
+                    elif shape == 'responses_dsml':
+                        visible = ''
+                        for o in d.get('output', []):
+                            for c in (o.get('content') or []):
+                                if isinstance(c, dict):
+                                    visible += str(c.get('text') or '')
+                        if any(m in visible for m in _DSML_MARK):
+                            fail(wrapper, path, 'nonstream', f'DSML markup leaked in responses body: {visible[:120]!r}')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'dsml stripped')
+                    elif shape == 'anthropic_dsml':
+                        visible_text = ''.join(str(b.get('text') or '')
+                                               for b in d.get('content', []) if isinstance(b, dict)
+                                               and b.get('type') == 'text')
+                        tool_names = [b.get('name') for b in d.get('content', [])
+                                      if isinstance(b, dict) and b.get('type') == 'tool_use']
+                        tool_inputs = [b.get('input') for b in d.get('content', [])
+                                       if isinstance(b, dict) and b.get('type') == 'tool_use']
+                        if any(m in visible_text for m in _DSML_MARK):
+                            fail(wrapper, path, 'nonstream', f'DSML markup leaked in anthropic body: {visible_text[:120]!r}')
+                        elif 'get_weather' not in tool_names:
+                            fail(wrapper, path, 'nonstream', f'DSML tool not recovered (got {tool_names})')
+                        elif not any(isinstance(i, dict) and i.get('city') == 'Jakarta' for i in tool_inputs):
+                            fail(wrapper, path, 'nonstream', f'DSML tool input lost (got {tool_inputs})')
+                        elif d.get('stop_reason') != 'tool_use':
+                            # R5: MiniMax reports finish 'stop' for DSML turns;
+                            # end_turn would make the agent close the turn and
+                            # never execute the recovered tool (stream parity).
+                            fail(wrapper, path, 'nonstream',
+                                 f'DSML tool turn must end stop_reason=tool_use (got {d.get("stop_reason")!r})')
+                        else:
+                            ok(wrapper, path, 'nonstream', 'dsml recovered')
                     elif shape == 'anthropic':
                         if d.get('type') != 'message':
                             fail(wrapper, path, 'nonstream', f'type={d.get("type")!r}, expected message')
@@ -670,13 +918,78 @@ async def exercise(wrapper: str, port: int) -> None:
         except Exception as e:
             fail(wrapper, 'concurrency', '12x', f'{type(e).__name__}: {e}')
 
+        # ── B-39 (CONTRACT §10, audit 2026-08-03 round-4): mid-stream faults
+        # must bump the observable error counter EXACTLY ONCE per failed turn.
+        # The stream commits HTTP 200, so per-status accounting reported these
+        # as healthy turns forever. nvidia's prom summary is cached 5s, so
+        # poll instead of reading once.
+        async def _errors_total():
+            try:
+                async with s.get(base + '/metrics', headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    d = await r.json()
+                    v = d.get('total_errors')
+                    if isinstance(v, int):
+                        return v
+            except Exception:
+                pass
+            try:
+                async with s.get(base + '/metrics/prom', headers=headers,
+                                 timeout=aiohttp.ClientTimeout(total=10)) as r:
+                    txt = await r.text()
+                    total = 0
+                    found = False
+                    for line in txt.splitlines():
+                        if line.startswith('#'):
+                            continue
+                        parts = line.split()
+                        if len(parts) == 2 and 'errors' in parts[0]:
+                            found = True
+                            try:
+                                total += int(float(parts[1]))
+                            except ValueError:
+                                pass
+                    return total if found else None
+            except Exception:
+                return None
+
+        try:
+            before = await _errors_total()
+            st, raw, err = await drive_stream(s, base + '/v1/messages',
+                                              {'model': 'mock/abort', 'max_tokens': 64, 'stream': True,
+                                               'messages': [{'role': 'user', 'content': 'hi'}]}, headers)
+            if err or st != 200:
+                fail(wrapper, 'metrics', 'midfault-count', f'abort drive failed: {err or st}')
+            await asyncio.sleep(1.0)
+            after = None
+            for _poll in range(8):  # nvidia prom summary caches 5s — poll
+                after = await _errors_total()
+                if isinstance(before, int) and isinstance(after, int) and after > before:
+                    break
+                await asyncio.sleep(0.8)
+            if not isinstance(before, int) or not isinstance(after, int):
+                fail(wrapper, 'metrics', 'midfault-count',
+                     f'no observable errors_total metric (before={before} after={after})')
+            elif after != before + 1:
+                fail(wrapper, 'metrics', 'midfault-count',
+                     f'expected +1 mid-stream fault, got before={before} after={after} '
+                     f'(double-count or lost-count)')
+            else:
+                ok(wrapper, 'metrics', 'midfault-count', f'{before} -> {after}')
+        except Exception as e:
+            fail(wrapper, 'metrics', 'midfault-count', f'{type(e).__name__}: {e}')
+
         # ── malformed input must yield 4xx, never 5xx ──
         for name, raw_body in (
             ('badjson', b'{not json'),
             ('empty', b''),
             ('nonobject', b'[1,2,3]'),
+            ('scalar-num', b'42'),
+            ('scalar-str', b'"just a string"'),
+            ('scalar-null', b'null'),
+            ('scalar-bool', b'true'),
         ):
-            for path in ('/v1/chat/completions', '/v1/messages'):
+            for path in ('/v1/chat/completions', '/v1/messages', '/v1/responses'):
                 try:
                     async with s.post(base + path, data=raw_body,
                                       headers={**headers, 'Content-Type': 'application/json'},
@@ -688,6 +1001,105 @@ async def exercise(wrapper: str, port: int) -> None:
                             ok(wrapper, path, name, f'{r.status}')
                 except Exception as e:
                     fail(wrapper, path, name, f'{type(e).__name__}: {e}')
+
+        # ── edge-body sweep (audit 2026-08-03 round-4): VALID JSON with broken
+        # semantics must never produce 5xx — only a shaped 4xx or a forwarded
+        # 2xx. Real agents (Claude Code / Codex / OpenHands) sometimes emit
+        # odd-but-parseable bodies; a wrapper-side AttributeError means HTTP
+        # 500, and OpenAI SDKs retry 500s — amplifying load and surfacing as
+        # "the agent randomly died mid-run".
+        _msg_base = {'model': 'mock/normal', 'max_tokens': 32,
+                     'messages': [{'role': 'user', 'content': 'hi'}]}
+        edge_cases = []
+        for surf in ('/v1/chat/completions', '/v1/messages'):
+            edge_cases += [
+                (surf, 'msgs-list-of-str',      {**_msg_base, 'messages': ['hello', 42, None]}),
+                (surf, 'messages-is-string',    {**_msg_base, 'messages': 'just a string'}),
+                (surf, 'messages-is-dict',      {**_msg_base, 'messages': {'role': 'user'}}),
+                (surf, 'messages-null-items',   {**_msg_base, 'messages': [None, None]}),
+                (surf, 'messages-empty',        {**_msg_base, 'messages': []}),
+                (surf, 'tools-list-of-str',     {**_msg_base, 'tools': ['x', None]}),
+                (surf, 'tools-no-function',     {**_msg_base, 'tools': [{'type': 'function'}]}),
+                (surf, 'tools-is-dict',         {**_msg_base, 'tools': {'name': 'alpha'}}),
+                (surf, 'max-tokens-str',        {**_msg_base, 'max_tokens': 'abc'}),
+                (surf, 'max-tokens-negative',   {**_msg_base, 'max_tokens': -5}),
+                (surf, 'max-tokens-over-cap',   {**_msg_base, 'max_tokens': 999999999999}),
+                (surf, 'max-tokens-bool',       {**_msg_base, 'max_tokens': True}),
+                (surf, 'max-tokens-float',      {**_msg_base, 'max_tokens': 3.7}),
+                (surf, 'max-tokens-missing',    {k: v for k, v in _msg_base.items() if k != 'max_tokens'}),
+                (surf, 'content-nondict-items', {**_msg_base, 'messages':
+                                                 [{'role': 'user', 'content': ['x', None, 7]}]}),
+                (surf, 'content-block-no-text', {**_msg_base, 'messages':
+                                                 [{'role': 'user', 'content': [{'type': 'text'}]}]}),
+                (surf, 'image-no-source',       {**_msg_base, 'messages':
+                                                 [{'role': 'user', 'content': [{'type': 'image'}]}]}),
+                (surf, 'temperature-str',       {**_msg_base, 'temperature': 'hot'}),
+                (surf, 'stream-is-string',      {**_msg_base, 'stream': 'yes'}),
+                (surf, 'model-is-number',       {**_msg_base, 'model': 42}),
+                (surf, 'role-unknown',          {**_msg_base, 'messages':
+                                                 [{'role': 'wizard', 'content': 'hi'}]}),
+                (surf, 'tool-orphan',           {**_msg_base, 'messages':
+                                                 [{'role': 'tool', 'content': 'x'}]}),
+                (surf, 'tool_calls-malformed',  {**_msg_base, 'messages': [
+                                                 {'role': 'assistant', 'tool_calls': ['x', {'id': 1}]},
+                                                 {'role': 'user', 'content': 'hi'}]}),
+                (surf, 'n-is-zero',             {**_msg_base, 'n': 0}),
+                (surf, 'system-block-nonstr',   {**_msg_base, 'messages': [
+                                                 {'role': 'system', 'content': [{'type': 'text', 'text': 's'}, 5]},
+                                                 {'role': 'user', 'content': 'hi'}]}),
+            ]
+        for surf in ('/v1/responses',):
+            edge_cases += [
+                (surf, 'input-is-number',       {'model': 'mock/normal', 'input': 12345}),
+                (surf, 'input-is-dict',         {'model': 'mock/normal', 'input': {'role': 'user'}}),
+                (surf, 'input-bogus-item',      {'model': 'mock/normal', 'input': [{'type': 'bogus'}]}),
+                (surf, 'input-str-items',       {'model': 'mock/normal', 'input': ['hi', None]}),
+                (surf, 'prev-resp-bogus',       {'model': 'mock/normal', 'input': 'hi',
+                                                 'previous_response_id': 'resp_does_not_exist'}),
+                (surf, 'max-output-str',        {'model': 'mock/normal', 'input': 'hi',
+                                                 'max_output_tokens': 'lots'}),
+                (surf, 'max-output-zero',       {'model': 'mock/normal', 'input': 'hi',
+                                                 'max_output_tokens': 0}),
+                (surf, 'tools-list-of-str',     {'model': 'mock/normal', 'input': 'hi', 'tools': ['x']}),
+            ]
+        for name, payload in (
+            ('ct-ok',               {'model': 'mock/normal', 'max_tokens': 32,
+                                     'messages': [{'role': 'user', 'content': 'hello world'}]}),
+            ('ct-list-of-str',      {'messages': ['hello', 'world', 42, None]}),
+            ('ct-messages-string',  {'messages': 'a string'}),
+            ('ct-system-list',      {'system': [{'type': 'text', 'text': 'x'}, 5, None],
+                                     'messages': [{'role': 'user', 'content': 'hi'}]}),
+            ('ct-content-blocks',   {'messages': [{'role': 'user', 'content':
+                                     [{'type': 'text', 'text': 'a'},
+                                      {'type': 'tool_result', 'tool_use_id': 't1', 'content': 'r'},
+                                      'bogus']}]}),
+        ):
+            edge_cases.append(('/v1/messages/count_tokens', name, payload))
+
+        for path, name, payload in edge_cases:
+            try:
+                async with s.post(base + path, json=payload,
+                                  headers={**headers, 'anthropic-version': '2023-06-01'},
+                                  timeout=aiohttp.ClientTimeout(total=20)) as r:
+                    body = await r.text()
+                    if r.status >= 500:
+                        fail(wrapper, path, f'edgebody:{name}',
+                             f'HTTP {r.status} on valid-JSON broken-semantics body: {body[:200]}')
+                    elif r.status >= 400:
+                        try:
+                            d = json.loads(body)
+                            if not isinstance(d, dict) or 'error' not in d:
+                                fail(wrapper, path, f'edgebody:{name}',
+                                     f'HTTP {r.status} body not error-shaped: {body[:150]}')
+                            else:
+                                ok(wrapper, path, f'edgebody:{name}', f'{r.status} shaped')
+                        except json.JSONDecodeError:
+                            fail(wrapper, path, f'edgebody:{name}',
+                                 f'HTTP {r.status} body is not JSON: {body[:150]}')
+                    else:
+                        ok(wrapper, path, f'edgebody:{name}', f'{r.status}')
+            except Exception as e:
+                fail(wrapper, path, f'edgebody:{name}', f'{type(e).__name__}: {e}')
 
 
 # ── process management ─────────────────────────────────────────────────────

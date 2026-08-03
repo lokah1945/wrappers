@@ -21,8 +21,10 @@ nvidia-python/
 # Development
 uvicorn src.main:app --reload --port 9101
 
-# Production
-uvicorn src.main:app --host 0.0.0.0 --port 9101 --workers 4
+# Production — ONE worker process (see WRAPPER_CONTRACT §6.3: the response
+# store, key pool and rate limiter live in per-process memory; --workers 4
+# splits previous_response_id/rate-limit state across workers)
+uvicorn src.main:app --host 0.0.0.0 --port 9101 --workers 1
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.

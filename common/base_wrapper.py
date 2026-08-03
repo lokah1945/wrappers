@@ -81,6 +81,9 @@ from common.auth import (
     check_auth as _shared_check_auth,
     is_public_path as _shared_is_public_path,
 )
+from common.sanitize_tokens import (
+    PassthroughBlockRewriter as _PassthroughBlockRewriter,
+)
 from common.translations import (
     parse_retry_after,
     is_retriable_status,
@@ -573,37 +576,31 @@ class BaseWrapper:
                         # replaces asyncio.wait_for, which cancelled the pending
                         # read and could not distinguish an idle upstream from a
                         # dead one — a failed stream was heartbeated forever.
-                        # Also fixes the dead `last_hb` (it was assigned but
-                        # never read, so the interval was unthrottled).
+                        #
+                        # Audit 2026-08-03 (CONTRACT §7): the reference base
+                        # drives the SAME shared rewriter as the five concrete
+                        # wrappers — P0-4 token scrubbing on the verbatim path,
+                        # P0-1 premature-EOF error frame (§3.3), R-06 duplicate
+                        # [DONE] guard. Forking this logic breeds exactly the
+                        # bug classes this base exists to prevent.
+                        rw = _PassthroughBlockRewriter()
                         last_hb = time.time()
-                        at_line_boundary = True
-                        # R-06: never append a second [DONE]. Doing so
-                        # unconditionally produced the corrupt frame
-                        # '[DONE]data: [DONE]' when the upstream already sent
-                        # one without a trailing blank line — not valid JSON, so
-                        # strict SDK parsers error at the end of a good turn.
-                        saw_done = False
+                        eof_finalized = False
                         hb_interval = float(self.config.heartbeat_interval_ms) / 1000.0
                         try:
                             async for line in _iter_chunks_with_idle(resp_ref, hb_interval):
                                 now = time.time()
                                 if line is _IDLE:
-                                    if at_line_boundary and (now - last_hb) > hb_interval:
+                                    if rw.at_block_boundary() and (now - last_hb) > hb_interval:
                                         yield b': heartbeat\n\n'
                                         last_hb = now
                                     continue
-                                if line and b'[DONE]' in (line if isinstance(line, (bytes, bytearray)) else str(line).encode()):
-                                    saw_done = True
-                                yield line
-                                if isinstance(line, (bytes, bytearray)) and len(line):
-                                    at_line_boundary = line.endswith(b'\n')
-                                elif line:
-                                    at_line_boundary = str(line).endswith('\n')
+                                for fr_b in rw.feed(line):
+                                    yield fr_b
                                 last_hb = time.time()
-                            if not at_line_boundary:
-                                yield b'\n\n'
-                            if not saw_done:
-                                yield b'data: [DONE]\n\n'
+                            for fr_b in rw.finish(terminal_done=True):
+                                yield fr_b
+                            eof_finalized = True
                         except (GeneratorExit, asyncio.CancelledError):
                             raise
                         except Exception as e:
@@ -611,8 +608,9 @@ class BaseWrapper:
                                 '[stream] upstream error (%s: %s); finalizing',
                                 type(e).__name__, e)
                             yield f': upstream-error {type(e).__name__}\n\n'.encode()
-                            if not saw_done:
-                                yield b'data: [DONE]\n\n'
+                            if not eof_finalized:
+                                for fr_b in rw.finish(terminal_done=True):
+                                    yield fr_b
                         finally:
                             if not released:
                                 released = True

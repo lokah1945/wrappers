@@ -72,9 +72,17 @@ entry point `src.main:app` (WRAPPER_CONTRACT §1.1):
 # Development (hot reload) — from inside the wrapper directory
 cd <wrapper> && uvicorn src.main:app --reload --port XXXX
 
-# Production (multiple workers)
-uvicorn src.main:app --host 0.0.0.0 --port XXXX --workers 4
+# Production — ONE worker process per wrapper instance
+uvicorn src.main:app --host 0.0.0.0 --port XXXX --workers 1
 ```
+
+> **Do NOT run `--workers 4`.** The key pool, rate limiter, response store
+> (`/v1/responses` idempotency + `previous_response_id`), and usage counters
+> all live **in this process's memory**. With 4 workers each request lands on
+> a random worker, so `previous_response_id` misses (~75 % of the time with 4
+> workers), rate limits are multiplied ×N, and key rotation state diverges.
+> Scale horizontally instead: run N single-worker instances behind a sticky
+> LB if you truly need more capacity.
 
 ### Path Reference Pattern
 

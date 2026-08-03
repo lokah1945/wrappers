@@ -48,8 +48,8 @@ This wrapper follows the standardized structure:
 # Development
 uvicorn {wrapper.replace('-', '_')}.src.main:app --reload --port {info['port']}
 
-# Production
-uvicorn {wrapper.replace('-', '_')}.src.main:app --host 0.0.0.0 --port {info['port']} --workers 4
+# Production — ONE worker process (WRAPPER_CONTRACT §6.3)
+uvicorn {wrapper.replace('-', '_')}.src.main:app --host 0.0.0.0 --port {info['port']} --workers 1
 ```
 
 See WRAPPER_STANDARDIZATION_REPORT.md for details.

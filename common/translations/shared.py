@@ -19,6 +19,97 @@ except Exception:  # pragma: no cover - fallback for standalone use
     def looks_anti_bot_challenge(payload: Any) -> bool:  # type: ignore[misc]
         return False
 
+try:
+    from common.sanitize_tokens import (
+        filter_special_tokens as _filter_special_tokens,
+        new_filter as _new_token_filter,
+    )
+except Exception:  # pragma: no cover - fallback for standalone use
+    def _filter_special_tokens(t: str) -> str:  # type: ignore[misc]
+        return t
+
+    def _new_token_filter():  # type: ignore[misc]
+        class _Passthrough:
+            def feed(self, t):
+                return t
+
+            def flush(self):
+                return ''
+        return _Passthrough()
+
+
+def responses_usage(input_tokens: int = 0, output_tokens: int = 0,
+                    cached_tokens: int = 0, reasoning_tokens: int = 0) -> dict:
+    """Full OpenAI Responses API usage object.
+
+    P1-3 fix: the spec (and the strict openai SDK models) require the
+    ``input_tokens_details`` and ``output_tokens_details`` nested objects;
+    wrappers previously emitted a flat {input, output, total} triple that
+    fails ``Response.model_validate_json``.
+    """
+    it = int(input_tokens or 0)
+    ot = int(output_tokens or 0)
+    return {
+        "input_tokens": it,
+        "input_tokens_details": {"cached_tokens": int(cached_tokens or 0)},
+        "output_tokens": ot,
+        "output_tokens_details": {"reasoning_tokens": int(reasoning_tokens or 0)},
+        "total_tokens": it + ot,
+    }
+
+
+def tokens_from_chat_usage(u: Any) -> tuple:
+    """(input, output, cached, reasoning) from an OpenAI chat usage dict."""
+    u = u if isinstance(u, dict) else {}
+    inp = u.get("prompt_tokens") or u.get("input_tokens") or 0
+    out = u.get("completion_tokens") or u.get("output_tokens") or 0
+    cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+    reasoning = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
+    return inp, out, cached, reasoning
+
+
+def scrub_visible_text(text: str) -> str:
+    """P0-4: one-shot special-token scrub for non-stream translations."""
+    return _filter_special_tokens(text) if isinstance(text, str) else text
+
+
+def responses_content_to_chat(content: Any) -> Any:
+    """Convert an OpenAI Responses API input content array to chat content.
+
+    P1-1 fix (audit 2026-08-03): ``input_image`` parts were silently DROPPED
+    by the nous/opencode/blackbox/openrouter ``responses_to_chat`` converters
+    (only text parts survived the join), so a vision request reached the
+    model with the image missing and the model hallucinated an answer.
+    nvidia-python already converted them; this helper is the single shared
+    implementation (WRAPPER_CONTRACT §7).
+
+    Returns a plain string when every part is text (legacy upstreams accept
+    it everywhere), otherwise an OpenAI chat content-parts list with
+    ``input_image`` → ``image_url`` conversion. Non-dict / unknown parts are
+    skipped rather than crashing the turn.
+    """
+    if not isinstance(content, list):
+        return content
+    parts: list = []
+    for p in content:
+        if not isinstance(p, dict):
+            continue
+        pt = p.get("type")
+        if pt in ("input_text", "text", "output_text"):
+            txt = p.get("text")
+            parts.append({"type": "text", "text": txt if isinstance(txt, str) else ""})
+        elif pt in ("input_image", "image_url", "image"):
+            url = p.get("image_url") or p.get("url") or ""
+            if isinstance(url, dict):
+                url = url.get("url", "")
+            if isinstance(url, str) and url:
+                parts.append({"type": "image_url", "image_url": {"url": url}})
+    if not parts:
+        return ""
+    if all(part.get("type") == "text" for part in parts):
+        return " ".join(part["text"] for part in parts if part.get("text"))
+    return parts
+
 
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use blocks).
@@ -53,8 +144,10 @@ def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
             clean_parts.append(normalized[cursor:s_idx])
         e_idx = normalized.find(CLOSE, s_idx)
         if e_idx == -1:
-            # Incomplete DSML — don't leak partial markup
-            clean_parts.append(normalized[s_idx:])
+            # Incomplete DSML — MUST NOT leak partial markup (R5 audit: the
+            # code appended the unterminated markup to clean_parts, doing the
+            # exact opposite of this comment — a max_tokens-truncated tool
+            # call arrived at the client as raw protocol text).
             break
         segment = normalized[s_idx:e_idx + len(CLOSE)]
         for name, inner in re.findall(
@@ -471,8 +564,9 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
                     }
                 })
 
-    final_text = "".join(text_parts)
-    final_reasoning = "".join(reasoning_parts)
+    # P0-4: scrub tokenizer specials from visible channels.
+    final_text = _filter_special_tokens("".join(text_parts))
+    final_reasoning = _filter_special_tokens("".join(reasoning_parts))
 
     anthro_stop = a_resp.get("stop_reason")
     finish_map = {
@@ -534,17 +628,29 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     # Reasoning
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning and isinstance(reasoning, str):
-        content.append({"type": "thinking", "thinking": reasoning})
+        # P0-4 scrub + P1-2 signature field (required by strict SDK models).
+        content.append({"type": "thinking",
+                        "thinking": _filter_special_tokens(reasoning),
+                        "signature": ""})
 
     # Text content
     raw_text = msg.get("content") or ""
+    _dsml_tool_n = 0
     if raw_text:
         clean_text, dsml_tools = parse_dsml_from_text(raw_text)
+        _dsml_tool_n = len(dsml_tools)
+        # P0-4: scrub after DSML extraction so markup removal can't create
+        # new token-looking fragments from legitimate text.
+        clean_text = _filter_special_tokens(clean_text)
         if clean_text:
             content.append({"type": "text", "text": clean_text})
         for dt in dsml_tools:
             content.append(dt)
     elif not reasoning and not msg.get("tool_calls"):
+        content.append({"type": "text", "text": ""})
+    # P0-4 safety: if the special-token scrub emptied an otherwise contentless
+    # message, keep a valid (empty) text block so the envelope stays parseable.
+    if not content and not msg.get("tool_calls"):
         content.append({"type": "text", "text": ""})
 
     # Tool calls
@@ -583,6 +689,15 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     else:
         # Only infer tool_use when the upstream omitted finish_reason entirely.
         stop_reason = "tool_use" if any(c.get("type") == "tool_use" for c in content) else "end_turn"
+    # R5 audit: DSML markup is the ONLY tool-call signal MiniMax emits — the
+    # turn still reports finish 'stop' (it does not know its markup is a
+    # protocol). With recovered tool_use blocks in the message, end_turn
+    # would make the agent close the turn and never execute the tool (the
+    # "stops mid-process" class). Stream surfaces already upgrade; non-stream
+    # must match (CONTRACT §8 parity). REAL tool_calls with finish 'stop'
+    # still map to end_turn per B-06.
+    if _dsml_tool_n and stop_reason == "end_turn":
+        stop_reason = "tool_use"
 
     u = o_resp.get("usage") or {}
     prompt_tok = u.get("prompt_tokens") or u.get("input_tokens") or 0
@@ -612,6 +727,9 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
 async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
     """Async generator: consume Anthropic SSE stream, yield OpenAI Chat SSE events."""
     msg_id = f"chatcmpl-{int(time.time() * 1000)}"
+    # P0-4: stateful scrubbers for visible channels (cross-chunk fragments).
+    _tok_text = _new_token_filter()
+    _tok_reason = _new_token_filter()
     async def iter_lines():
         buffer = ""
         async for chunk in anthropic_stream:
@@ -649,11 +767,15 @@ async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
                 if d_type == "text_delta":
                     text = delta.get("text", "")
                     if text:
-                        yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
+                        text = _tok_text.feed(text)
+                        if text:
+                            yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'content': text}, 'finish_reason': None}]})}\n\n"
                 elif d_type == "thinking_delta":
                     thinking = delta.get("thinking", "")
                     if thinking:
-                        yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'reasoning_content': thinking}, 'finish_reason': None}]})}\n\n"
+                        thinking = _tok_reason.feed(thinking)
+                        if thinking:
+                            yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'reasoning_content': thinking}, 'finish_reason': None}]})}\n\n"
                 elif d_type == "input_json_delta":
                     partial = delta.get("partial_json", "")
                     idx = data.get("index", 0)
@@ -672,6 +794,10 @@ async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
                 stop_reason = delta.get("stop_reason")
                 finish_map = {"end_turn": "stop", "max_tokens": "length", "tool_use": "tool_calls", "refusal": "content_filter"}
                 finish = finish_map.get(stop_reason, "stop") if stop_reason else None
+                # P0-4: release withheld tail text before the finish chunk.
+                for _txt, _key in ((_tok_text.flush(), 'content'), (_tok_reason.flush(), 'reasoning_content')):
+                    if _txt:
+                        yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {_key: _txt}, 'finish_reason': None}]})}\n\n"
                 usage = data.get("usage") or {}
                 oai_usage = {
                     "prompt_tokens": usage.get("input_tokens", 0),

@@ -381,7 +381,8 @@ class Metrics:
                        SUM(pacing_ms)         AS total_pacing_ms,
                        SUM(CASE WHEN pacing_ms > 0 THEN 1 ELSE 0 END) AS paced_requests,
                        SUM(streaming)         AS streaming_count,
-                       AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END) AS avg_ttft_ms
+                       AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END) AS avg_ttft_ms,
+                       SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS total_errors
                   FROM requests WHERE ts >= ?
             ''', (since,))
             r = await cursor.fetchone()
@@ -442,6 +443,12 @@ class Metrics:
                 'paced_requests': r[9] or 0,
                 'streaming_count': r[10] or 0,
                 'avg_ttft_ms': round(r[11], 1) if r[11] else 0.0,
+                # B-39 visibility: the error count must be observable, not just
+                # internally correct — /metrics and /metrics/prom both surface
+                # it (audit 2026-08-03 round-4: nvidia had NO errors_total
+                # anywhere in the summary/prom output).
+                'total_errors': r[12] or 0,
+                'error_rate': round((r[12] or 0) / total_requests, 4) if total_requests else 0.0,
                 'req_per_min': req_1m,
                 'req_per_5min': req_5m,
                 'req_per_hour': req_1h,

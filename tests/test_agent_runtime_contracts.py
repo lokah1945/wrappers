@@ -139,6 +139,9 @@ def test_nvidia_responses_nonstream_stores_assistant_tool_calls_for_next_turn():
     store_key = f"{principal}\x00{resp['id']}"
     stored = _STORE.get(store_key)
     assert stored is not None, f"Store key {repr(store_key)} not found in store. Available keys: {list(_STORE.keys())}"
+    # 3-axis store (CONTRACT §6.3) wraps messages with ts/size metadata.
+    if isinstance(stored, dict) and 'messages' in stored:
+        stored = stored['messages']
     assert any(m.get("role") == "assistant" and m.get("tool_calls") for m in stored)
     assert stored[-1]["tool_calls"][0]["id"] == "call_1"
 

@@ -937,6 +937,15 @@ function getAuthHeaders() {
   const urlToken = params.get('token');
   if (urlToken) {
     try { sessionStorage.setItem('wrapper-bearer', urlToken); } catch {}
+    // SEC (audit 2026-08-03): strip ?token= from the URL immediately so the
+    // bearer token does not linger in browser history, bookmarks, referrer
+    // headers or get re-submitted on navigation. It lives only in
+    // sessionStorage from here on.
+    try {
+      const url = new URL(window.location.href);
+      url.searchParams.delete('token');
+      window.history.replaceState({}, document.title, url.pathname + url.search + url.hash);
+    } catch {}
     return { 'Authorization': 'Bearer ' + urlToken };
   }
   // 2. sessionStorage (set by prior ?token=... or promptForToken)

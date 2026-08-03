@@ -88,6 +88,8 @@ class Metrics:
                 "total_tokens": self.tokens_in + self.tokens_out,
                 "input_tokens": self.tokens_in,
                 "output_tokens": self.tokens_out,
+                # B-39 visibility (2026-08-03 R4): absolute count, not just the rate.
+                "total_errors": self.errors,
                 # NB-12: clamp defensively (legacy persisted counters may still
                 # have errors > requests from before the accounting fix).
                 "error_rate": min(1.0, round(self.errors / max(1, self.requests), 4)),

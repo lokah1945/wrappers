@@ -55,27 +55,54 @@ def require_auth() -> bool:
     return True
 
 
-def extract_client_token(headers) -> str:
-    """Pull the caller's credential from either SDK's header.
+def extract_client_tokens(headers) -> list:
+    """Pull ALL of the caller's credential candidates from either SDK's headers.
 
     OpenAI SDKs send `Authorization: Bearer <t>`; Anthropic SDKs send
-    `x-api-key: <t>`. A malformed Authorization header must not mask a valid
-    x-api-key, so both are considered independently.
+    `x-api-key: <t>` — and Claude Code / the Anthropic SDK send BOTH when the
+    operator set ANTHROPIC_API_KEY *and* ANTHROPIC_AUTH_TOKEN. Historically the
+    first non-empty Authorization won and a stale/placeholder value there
+    masked the valid x-api-key, so a correctly configured client got 401 on
+    every request (audit P0-2). Callers must evaluate every candidate
+    (contract §5.4: "evaluated independently").
     """
+    candidates = []
+    # Case-insensitive header lookup: Starlette/aiohttp headers are already
+    # case-insensitive, but plain-dict callers (tests, in-process tooling)
+    # may carry 'Authorization'/'X-Api-Key' capitals — those credentials
+    # must not silently vanish (same 401-masking class as P0-2).
     try:
-        auth = (headers.get('authorization') or '').strip()
+        items = list(headers.items())
     except Exception:
-        auth = ''
-    try:
-        api_key = (headers.get('x-api-key') or '').strip()
-    except Exception:
-        api_key = ''
+        items = []
+    auth = ''
+    api_key = ''
+    for k, v in items:
+        try:
+            lk = str(k).lower()
+        except Exception:
+            continue
+        if lk == 'authorization' and not auth:
+            auth = str(v or '')
+        elif lk == 'x-api-key' and not api_key:
+            api_key = str(v or '')
+    auth = auth.strip()
+    api_key = api_key.strip()
 
     if auth:
-        if auth.lower().startswith('bearer '):
-            return auth[7:].strip()
-        return auth
-    return api_key
+        candidates.append(auth[7:].strip() if auth.lower().startswith('bearer ') else auth)
+    if api_key:
+        candidates.append(api_key)
+    return [c for c in candidates if c]
+
+
+def extract_client_token(headers) -> str:
+    """Back-compat shim: first credential candidate only.
+
+    Auth decisions MUST use extract_client_tokens() + match-any instead.
+    """
+    candidates = extract_client_tokens(headers)
+    return candidates[0] if candidates else ''
 
 
 def tokens_match(client_token: str, server_token: str) -> bool:
@@ -145,9 +172,12 @@ def check_auth(headers, *, env_var: str = 'BEARER_TOKEN',
         )
         return _OK
 
-    client_token = extract_client_token(headers)
-    if tokens_match(client_token, server_token):
-        return _OK
+    # P0-2 fix: test EVERY candidate independently (contract §5.4). A garbage
+    # or stale Authorization header must not mask a valid x-api-key, and vice
+    # versa — matching nvidia-python's V-19 reference behaviour.
+    for client_token in extract_client_tokens(headers):
+        if tokens_match(client_token, server_token):
+            return _OK
     return AuthResult(False, 401, 'Unauthorized')
 
 

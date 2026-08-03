@@ -18,6 +18,39 @@ from typing import Optional, AsyncGenerator
 
 from .capabilities import get_context_window
 
+# P0-4 fix (audit 2026-08-03): central special-token scrubbing — NVIDIA's
+# byte-level-BPE models (Nemotron, DeepSeek-distill, Qwen, Kimi) leak
+# tokenizer control tokens (<unk>, often fragmented across SSE chunks as
+# '<un' + 'k>', <s>, </s>, <|im_start|>, U+0800 …) into content/reasoning
+# streams; they arrived verbatim in Claude Code (user report
+# '"><unk><unk><unk>…"'). One stateful filter per visible channel.
+try:
+    from common.sanitize_tokens import (
+        SpecialTokenFilter as _SpecialTokenFilter,
+        filter_special_tokens as _filter_special_tokens,
+        DsmlMarkupFilter as _DsmlMarkupFilter,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    class _SpecialTokenFilter:  # type: ignore[no-redef]
+        def feed(self, t):
+            return t
+
+        def flush(self):
+            return ''
+
+    _DsmlMarkupFilter = None  # type: ignore[assignment]
+
+    def _filter_special_tokens(t):  # type: ignore[misc]
+        return t
+
+
+try:
+    # Shared DSML tool-markup parser (strip + recover), used to re-emit
+    # recovered MiniMax tool calls as Anthropic tool_use blocks.
+    from common.translations import parse_dsml_from_text as _parse_dsml_markup
+except ImportError:  # pragma: no cover - standalone fallback
+    _parse_dsml_markup = None  # type: ignore[assignment]
+
 
 def _env_flag(name: str, default: str = '0') -> bool:
     return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
@@ -480,11 +513,13 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     content = []
 
     _nr = extract_internal_reasoning(msg)
-    reasoning = _nr['reasoning']
-    raw_content = _nr['content'] or ''
+    # P0-4: scrub special tokens from visible channels.
+    reasoning = _filter_special_tokens(_nr['reasoning'] or '')
+    raw_content = _filter_special_tokens(_nr['content'] or '')
 
     if reasoning:
-        content.append({'type': 'thinking', 'thinking': reasoning})
+        # P1-2: thinking blocks require a `signature` field (strict SDK parse).
+        content.append({'type': 'thinking', 'thinking': reasoning, 'signature': ''})
 
     # Parse DSML tool calls from content
     normalized_raw = raw_content.replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
@@ -503,7 +538,10 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
                 segments.append({'type': 'text', 'text': normalized[cursor:s_idx]})
             e_idx = normalized.find(CLOSE, s_idx)
             if e_idx == -1:
-                segments.append({'type': 'text', 'text': normalized[s_idx:]})
+                # R5/§8 parity fix (same class as common.translations.shared):
+                # an UNTERMINATED DSML segment was appended to the visible
+                # text — leaking raw tool-protocol markup to Claude Code when
+                # a non-stream reply was truncated mid-markup. Drop it.
                 break
             segments.append({'type': 'dsml', 'text': normalized[s_idx:e_idx + len(CLOSE)]})
             cursor = e_idx + len(CLOSE)
@@ -544,7 +582,8 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     # opt-in via WRAPPER_SYNTHETIC_THINKING. Default OFF: omit the block.
     if (expect_thinking and _env_flag('WRAPPER_SYNTHETIC_THINKING', '0')
             and not any(c.get('type') == 'thinking' for c in content) and content):
-        content.insert(0, {'type': 'thinking', 'thinking': '[Reasoning not supported by this model; responding directly.]'})
+        # P1-2: thinking blocks require a `signature` field (strict SDK parse).
+        content.insert(0, {'type': 'thinking', 'thinking': '[Reasoning not supported by this model; responding directly.]', 'signature': ''})
 
     if not any(c.get('type') in ('text', 'tool_use') for c in content):
         content.append({'type': 'text', 'text': ''})
@@ -613,7 +652,25 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     synthetic_thinking_emitted = False
     errored = False
     error_message = ''
+    # P0-1: did the upstream send a finish_reason? EOF without one (and
+    # without an error frame) is a premature close → surface an error, don't
+    # fabricate end_turn (CONTRACT §3.3).
+    saw_finish = False
     client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
+    # P0-4: stateful special-token scrubbers (one per channel) — catch tokens
+    # fragmented across chunks ('<un' + 'k>').
+    _tok_text = _SpecialTokenFilter()
+    _tok_reason = _SpecialTokenFilter()
+    # R5 (double-scrub fix): cross-chunk MiniMax DSML tool-markup suppressor
+    # + collector (shared common.sanitize_tokens.DsmlMarkupFilter). The old
+    # per-chunk `chunk.find('<|DSML|tool_calls>')` check missed an opener
+    # split across two chunks and leaked the fragment ('<|DSML') as visible
+    # assistant text. Complete markup is collected and re-emitted as real
+    # tool_use blocks at stream end — parity with
+    # common.translations.anthropic_stream (CONTRACT §7/§8). When the shared
+    # module is unavailable the legacy per-chunk machine below still applies.
+    _dsml_text = _DsmlMarkupFilter() if _DsmlMarkupFilter is not None else None
+    dsml_tool_n = 0
 
     async def stop_open():
         """Close the open TEXT/THINKING block only.
@@ -680,7 +737,8 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
             sent_content_block_start = True
             yield _sse('content_block_start', {
                 'type': 'content_block_start', 'index': thinking_index,
-                'content_block': {'type': 'thinking', 'thinking': ''},
+                # P1-2: thinking blocks require a `signature` (strict SDK parse).
+                'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''},
             })
 
     async def emit_synthetic_thinking():
@@ -698,7 +756,8 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         next_index += 1
         yield _sse('content_block_start', {
             'type': 'content_block_start', 'index': thinking_index,
-            'content_block': {'type': 'thinking', 'thinking': ''},
+            # P1-2: thinking blocks require a `signature` (strict SDK parse).
+            'content_block': {'type': 'thinking', 'thinking': '', 'signature': ''},
         })
         yield _sse('content_block_delta', {
             'type': 'content_block_delta', 'index': thinking_index,
@@ -1040,14 +1099,23 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 content_text = delta.get('content', '') or ''
                 reasoning = delta.get('reasoning_content') or delta.get('reasoning')
 
+                # P0-4: scrub special tokens (incl. cross-chunk fragments).
                 if reasoning:
-                    generated_chars += len(reasoning)
-                    async for c in parse_and_emit(reasoning, True):
-                        yield c
+                    reasoning = _tok_reason.feed(reasoning)
+                    if reasoning:
+                        generated_chars += len(reasoning)
+                        async for c in parse_and_emit(reasoning, True):
+                            yield c
                 if content_text:
-                    generated_chars += len(content_text)
-                    async for c in parse_and_emit(content_text, False):
-                        yield c
+                    # R5: suppress DSML markup first (cross-chunk safe),
+                    # then P0-4 tokenizer-special scrub (shared order).
+                    if _dsml_text is not None:
+                        content_text = _dsml_text.feed(content_text)
+                    content_text = _tok_text.feed(content_text)
+                    if content_text:
+                        generated_chars += len(content_text)
+                        async for c in parse_and_emit(content_text, False):
+                            yield c
 
                 for tc in (delta.get('tool_calls') or []):
                     oi = tc.get('index', 0)
@@ -1078,6 +1146,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                         })
 
                 if ch.get('finish_reason'):
+                    saw_finish = True  # P0-1
                     final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
 
         if buffer:
@@ -1093,15 +1162,24 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                             delta = ch.get('delta', {})
                             content_text = delta.get('content', '') or ''
                             reasoning = delta.get('reasoning_content') or delta.get('reasoning')
+                            # P0-4: scrub special tokens (cross-chunk fragments).
                             if reasoning:
-                                generated_chars += len(reasoning)
-                                async for c in parse_and_emit(reasoning, True):
-                                    yield c
+                                reasoning = _tok_reason.feed(reasoning)
+                                if reasoning:
+                                    generated_chars += len(reasoning)
+                                    async for c in parse_and_emit(reasoning, True):
+                                        yield c
                             if content_text:
-                                generated_chars += len(content_text)
-                                async for c in parse_and_emit(content_text, False):
-                                    yield c
+                                # R5: DSML suppress first, then token scrub.
+                                if _dsml_text is not None:
+                                    content_text = _dsml_text.feed(content_text)
+                                content_text = _tok_text.feed(content_text)
+                                if content_text:
+                                    generated_chars += len(content_text)
+                                    async for c in parse_and_emit(content_text, False):
+                                        yield c
                             if ch.get('finish_reason'):
+                                saw_finish = True  # P0-1
                                 final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
                     except Exception:
                         pass
@@ -1125,6 +1203,30 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         except Exception:
             pass
         if not client_gone:
+            # P0-4: release any text withheld by the special-token filters
+            # into its own channel BEFORE the blocks close.
+            _rest_r = _tok_reason.flush()
+            if _rest_r:
+                try:
+                    if thinking_index is None:
+                        async for _c in emit_thinking_start():
+                            yield _c
+                    yield _sse('content_block_delta', {
+                        'type': 'content_block_delta', 'index': thinking_index,
+                        'delta': {'type': 'thinking_delta', 'thinking': _rest_r},
+                    })
+                except Exception:
+                    pass
+            # R5: flush the DSML filter's clean remainder through the token
+            # filter first (shared order), then release the token holdback.
+            _rest_dsml = _dsml_text.flush() if _dsml_text is not None else ''
+            _rest_t = (_tok_text.feed(_rest_dsml) if _rest_dsml else '') + _tok_text.flush()
+            if _rest_t:
+                try:
+                    async for _c in emit_text(_rest_t):
+                        yield _c
+                except Exception:
+                    pass
             if open_idx is not None and open_idx not in set(tool_map.values()):
                 try:
                     yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
@@ -1152,7 +1254,62 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     pass
                 current_tool_index = None
 
+            # R5: re-emit complete MiniMax DSML tool markup collected by the
+            # stream filter (suppressed from the visible text channel) as
+            # real Anthropic tool_use blocks BEFORE the terminal frames —
+            # stream/non-stream parity (openai_to_anthropic above) and
+            # cross-wrapper parity (common.translations.anthropic_stream,
+            # CONTRACT §7/§8). Blocks are opened and closed cleanly here so
+            # SDK block bookkeeping never dangles.
+            if _dsml_text is not None and _parse_dsml_markup is not None:
+                try:
+                    _markup = getattr(_dsml_text, 'collected_text', '') or ''
+                    _clean_dsml, _dsml_tools = _parse_dsml_markup(_markup) if _markup else ('', [])
+                except Exception:
+                    _dsml_tools = []
+                for _tu in _dsml_tools:
+                    if not isinstance(_tu, dict):
+                        continue
+                    try:
+                        _args_json = json.dumps(_tu.get('input') or {}, ensure_ascii=False)
+                    except Exception:
+                        _args_json = '{}'
+                    ai = next_index
+                    next_index += 1
+                    dsml_tool_n += 1
+                    sent_text_or_tool_block = True
+                    try:
+                        yield _sse('content_block_start', {
+                            'type': 'content_block_start', 'index': ai,
+                            'content_block': {'type': 'tool_use',
+                                              'id': _tu.get('id') or f'toolu_dsml_{ai}',
+                                              'name': _tu.get('name') or '', 'input': {}},
+                        })
+                        yield _sse('content_block_delta', {
+                            'type': 'content_block_delta', 'index': ai,
+                            'delta': {'type': 'input_json_delta', 'partial_json': _args_json},
+                        })
+                        yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': ai})
+                    except Exception:
+                        pass
+
         _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop)
+
+    # P0-1 (CONTRACT §3.3): the upstream stream ended WITHOUT any terminal
+    # signal — no finish_reason, no error frame. The old code closed with a
+    # fabricated end_turn, so a truncated answer persisted as a successful
+    # turn (the "stops mid-way" symptom). Route through the errored path so
+    # a real Anthropic `error` event precedes the terminal frames.
+    if not errored and not saw_finish:
+        errored = True
+        error_message = ('upstream stream ended prematurely: EOF without '
+                         'finish_reason or [DONE]')
+        logger_msg = '[anthropic_compat] upstream stream ended prematurely (no finish_reason)'
+        try:
+            import logging as _logging
+            _logging.getLogger('wrapper-nvidia').error(logger_msg)
+        except Exception:
+            pass
 
     if open_idx is not None and open_idx not in set(tool_map.values()):
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
@@ -1183,9 +1340,12 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 'content_block': {'type': 'text', 'text': ''},
             })
             yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
+        # stop_reason=None (audit 2026-08-03): the turn FAILED — claiming
+        # end_turn fabricates a clean completion. The `error` event above is
+        # the real signal; message_stop still follows so no client hangs.
         yield _sse('message_delta', {
             'type': 'message_delta',
-            'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
+            'delta': {'stop_reason': None, 'stop_sequence': None},
             'usage': {'input_tokens': input_tokens or 0, 'output_tokens': 0,
                       'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
         })
@@ -1200,8 +1360,10 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         })
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
 
-    # Prefer tool_use stop when tools were emitted
-    if tool_map and final_stop == 'end_turn':
+    # Prefer tool_use stop when tools were emitted — including R5 DSML-recovered
+    # tool_use blocks (MiniMax reports finish_reason 'stop' for those turns;
+    # claiming end_turn would leave Claude Code waiting on a tool_result).
+    if (tool_map or dsml_tool_n) and final_stop == 'end_turn':
         final_stop = 'tool_use'
 
     estimated_output = max(1, (generated_chars + 3) // 4)

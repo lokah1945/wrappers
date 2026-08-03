@@ -397,6 +397,7 @@ try:
         AnthropicStreamState as _SharedAnthropicStreamState,
         parse_dsml_from_text as _shared_parse_dsml,
         build_forward_headers as _build_forward_headers,
+        parse_retry_after as _shared_parse_retry_after,
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
@@ -411,6 +412,7 @@ try:
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
+    _shared_parse_retry_after = None
     # Fallback: minimal build_forward_headers so the wrapper still works
     # if common.translations is not importable (shouldn't happen in prod).
     def _build_forward_headers(client_headers, extra=None):
@@ -424,6 +426,80 @@ except ImportError:
         if extra:
             out.update(extra)
         return out
+
+# P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
+# shared byte-level passthrough driver (see common/sanitize_tokens.py).
+try:
+    from common.sanitize_tokens import (
+        PassthroughBlockRewriter as _PassthroughBlockRewriter,
+        filter_special_tokens as _filter_special_tokens,
+        scrub_openai_response_inplace as _scrub_openai_response_inplace,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    _PassthroughBlockRewriter = None
+
+    def _filter_special_tokens(t):  # type: ignore[misc]
+        return t
+
+    def _scrub_openai_response_inplace(data):  # type: ignore[misc]
+        return None
+
+
+class _NaiveBlockPassthrough:
+    """Fallback passthrough driver when common.sanitize_tokens is unavailable:
+    verbatim block forwarding + [DONE] tracking (NO scrubbing and NO
+    premature-EOF error frame — degraded but functional). The canonical
+    implementation is common.sanitize_tokens.PassthroughBlockRewriter."""
+
+    __slots__ = ('buf', 'saw_done')
+
+    def __init__(self) -> None:
+        self.buf = b""
+        self.saw_done = False
+
+    def feed(self, chunk):
+        if isinstance(chunk, str):
+            chunk = chunk.encode("utf-8", "replace")
+        self.buf += bytes(chunk)
+        if b"\r" in self.buf:
+            self.buf = self.buf.replace(b"\r\n", b"\n")
+        out = []
+        while b"\n\n" in self.buf:
+            block, self.buf = self.buf.split(b"\n\n", 1)
+            if b"[DONE]" in block:
+                self.saw_done = True
+            out.append(block + b"\n\n")
+        return out
+
+    def at_block_boundary(self) -> bool:
+        return not self.buf
+
+    def finish(self, terminal_done: bool = True, premature_msg: str = ""):
+        out = []
+        tail = self.buf.strip()
+        if tail:
+            if b"[DONE]" in tail:
+                self.saw_done = True
+            out.append(tail + b"\n\n")
+        self.buf = b""
+        if terminal_done and not self.saw_done:
+            out.append(b"data: [DONE]\n\n")
+        return out
+
+
+def _new_block_rewriter(dsml_suppress: bool = True):
+    """Canonical (scrubbing, premature-EOF aware) driver when available.
+
+    R5/double-scrub fix: pass ``dsml_suppress=False`` on surfaces whose
+    DOWNSTREAM translator performs its own DSML suppression + tool-call
+    recovery (``/v1/messages`` → stream_openai_to_anthropic). Suppressing
+    here would strip the markup before that translator could recover it —
+    the runtime finding "DSML tool call not recovered as tool_use block".
+    """
+    if _PassthroughBlockRewriter is not None:
+        return _PassthroughBlockRewriter(dsml_suppress=dsml_suppress)
+    return _NaiveBlockPassthrough()
+
 
 from .anthropic_compat import (
     anthropic_to_openai,
@@ -496,6 +572,14 @@ class AnthropicStreamState:
         self.tool_map = {}
         self.finished = False
         self.msg_id = f"msg_{int(time.time()*1000)}"
+        # R5 audit: cross-chunk DSML markup suppression (shared filter —
+        # CONTRACT §7; the per-chunk 'DSML in chunk' check leaked fragmented
+        # markup tails). Complete markup is recoverable via collected_text.
+        try:
+            from common.sanitize_tokens import new_dsml_filter as _ndf
+            self._dsml_text = _ndf()
+        except Exception:  # pragma: no cover
+            self._dsml_text = None
 
     def _sse(self, event: str, data: dict) -> str:
         payload = dict(data or {})
@@ -546,7 +630,11 @@ class AnthropicStreamState:
             }))
 
         content = delta.get('content')
-        if isinstance(content, str) and content and 'DSML' in content.replace('\uff5c', '|'):
+        if isinstance(content, str) and content and self._dsml_text is not None:
+            content = self._dsml_text.feed(content) or None
+        elif isinstance(content, str) and content and 'DSML' in content.replace('\uff5c', '|'):
+            # fallback only when the shared filter is unavailable: per-chunk
+            # containment (known-imperfect for fragmented markup).
             content = None
         if content:
             if self.current_block != 'text':
@@ -594,7 +682,45 @@ class AnthropicStreamState:
         if not self.message_started:
             events.extend(self.start_events())
         events.extend(self._close_block())
-        if self.tool_map and stop == 'end_turn':
+        # R5 audit: emit DSML-withheld clean remainder + recover complete
+        # DSML tool markup as tool_use blocks (stream/non-stream parity).
+        dsml_n = 0
+        if self._dsml_text is not None:
+            rest = self._dsml_text.flush()
+            if rest:
+                self.index += 1
+                events.append(self._sse('content_block_start', {
+                    'type': 'content_block_start', 'index': self.index,
+                    'content_block': {'type': 'text', 'text': ''}}))
+                events.append(self._sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': self.index,
+                    'delta': {'type': 'text_delta', 'text': rest}}))
+                events.append(self._sse('content_block_stop', {
+                    'type': 'content_block_stop', 'index': self.index}))
+            try:
+                _clean, tools = _parse_dsml_from_text(self._dsml_text.collected_text or '')
+            except Exception:
+                tools = []
+            for tu in tools:
+                if not isinstance(tu, dict):
+                    continue
+                self.index += 1
+                try:
+                    args_json = json.dumps(tu.get('input') or {}, ensure_ascii=False)
+                except Exception:
+                    args_json = '{}'
+                events.append(self._sse('content_block_start', {
+                    'type': 'content_block_start', 'index': self.index,
+                    'content_block': {'type': 'tool_use',
+                                      'id': tu.get('id') or f'toolu_dsml_{self.index}',
+                                      'name': tu.get('name') or '', 'input': {}}}))
+                events.append(self._sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': self.index,
+                    'delta': {'type': 'input_json_delta', 'partial_json': args_json}}))
+                events.append(self._sse('content_block_stop', {
+                    'type': 'content_block_stop', 'index': self.index}))
+                dsml_n += 1
+        if (self.tool_map or dsml_n) and stop == 'end_turn':
             stop = 'tool_use'
         events.append(self._sse('message_delta', {
             'type': 'message_delta',
@@ -1134,6 +1260,12 @@ def resolve_target_model(requested_model: str) -> str:
     - Alias → resolve only to an explicit operator binding; otherwise pass through unchanged.
     - No hardcoded or last-request default model under any alias.
     """
+    # R5 audit (2026-08-03): a non-string model (e.g. {"model": 42} on a
+    # non-inference catch-all path the body guard does not semantically check)
+    # used to detonate `m.lower()` with AttributeError -> HTTP 500. Contract
+    # §4: malformed input must be a shaped 4xx, never a 5xx — unresolvable.
+    if not isinstance(requested_model, str):
+        return ''
     m = _strip_context_suffix(requested_model)
     if not m:
         return requested_model or ''
@@ -1340,9 +1472,21 @@ def pre_response_timeout_ms_for(model_id: str) -> int:
 def _parse_retry_after(value, default: int = 65) -> int:
     """V-12 fix: Retry-After may be an integer OR an RFC HTTP-date.
 
-    The previous bare int() raised on date format, silently skipping 429
-    registration (no cooldown) via the broad except around the request.
+    Audit 2026-08-03 (CONTRACT §7): delegates to the canonical
+    common.translations.parse_retry_after — the local copy diverged from the
+    4 other wrappers. `value` accepts the header string, an int, or a headers
+    dict (call sites pass resp.headers.get('retry-after')).
     """
+    if _shared_parse_retry_after is not None:
+        if value is None or isinstance(value, (int, str)):
+            headers = {'retry-after': str(value)} if value is not None and str(value).strip() else {}
+        else:
+            headers = value
+        try:
+            return _shared_parse_retry_after(headers, None, default)
+        except Exception:
+            pass
+    # Fallback (common unavailable): int/date parse — the V-12 semantics.
     if value is None:
         return default
     s = str(value).strip()
@@ -1826,6 +1970,9 @@ class Server:
                 '# HELP wrapper_nvidia_tokens_total Total tokens',
                 '# TYPE wrapper_nvidia_tokens_total counter',
                 f'wrapper_nvidia_tokens_total {s.get("total_tokens", 0)}',
+                '# HELP wrapper_nvidia_errors_total Total errors (status >= 400, incl. mid-stream faults)',
+                '# TYPE wrapper_nvidia_errors_total counter',
+                f'wrapper_nvidia_errors_total {s.get("total_errors", 0)}',
             ])
             return Response(content='\n'.join(lines), media_type='text/plain')
 
@@ -2164,9 +2311,35 @@ class Server:
             try:
                 result, stream, status_code = await self.responses_handler.handle_responses_api(request, raw)
                 if stream is not None:
-                    return StreamingResponse(stream, media_type='text/event-stream', headers={
-                        'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
-                    })
+                    # B-39 (CONTRACT §10): a turn that ends in response.failed
+                    # was committed to the client as HTTP 200 — per-status
+                    # accounting never sees it. Watch the event stream for the
+                    # failure marker and record one error row (a healthy turn
+                    # never emits response.failed; a client disconnect ends the
+                    # iterator without the marker, so it is never miscounted).
+                    async def _account_faults(gen, _model):
+                        fault = False
+                        try:
+                            async for chunk in gen:
+                                if not fault and isinstance(chunk, str) and 'response.failed' in chunk:
+                                    fault = True
+                                yield chunk
+                        finally:
+                            if fault and self.metrics:
+                                _fire_and_forget(self.metrics.record_request(
+                                    model=_model, status=500, streaming=1,
+                                    path='/v1/responses',
+                                ), 'metrics')
+                    try:
+                        _resp_model = str((json.loads(raw) or {}).get('model') or '')
+                    except Exception:
+                        _resp_model = ''
+                    return StreamingResponse(
+                        _account_faults(stream, _resp_model),
+                        media_type='text/event-stream',
+                        headers={
+                            'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no',
+                        })
                 if result is not None and result.get('error'):
                     sc = status_code or (400 if result['error'].get('type') == 'invalid_request_error' else 502)
                     return JSONResponse(status_code=sc, content={'error': result['error']})
@@ -2450,6 +2623,10 @@ class Server:
             return JSONResponse(status_code=status_code, content=data)
         if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
             data = anthropic_to_openai_response(data, model_id)
+        # P0-4 (audit 2026-08-03): scrub special tokens from non-stream
+        # bodies too — the user-facing '"><unk><unk>…' leak also arrived via
+        # naive non-streaming SDK calls.
+        _scrub_openai_response_inplace(data)
         ensure_nonempty_content(data)
         return JSONResponse(status_code=200, content=data)
 
@@ -2598,23 +2775,47 @@ class Server:
 
         if result.get('stream'):
             async def anthropic_stream():
+                # B-39: real capture dict so a mid-stream fault surfaced by the
+                # compat translator is visible here for metrics (CONTRACT §10 —
+                # HTTP 200 was already committed, per-status accounting would
+                # forever report the turn as healthy).
+                capture: dict = {}
+                fault = False
                 try:
                     async for chunk in stream_openai_to_anthropic(
                         result['stream'],
                         model_id,
-                        {},
+                        capture,
                         input_tokens=input_tok_est,
                         expect_thinking=expect_thinking,
                         start_ms=result.get('start_ms', time.time() * 1000),
                     ):
                         yield chunk
                 except Exception as e:
+                    fault = True
                     logger.error(f'[anthropic_stream] error: {e}')
-                    # Best-effort terminal event so clients don't hang mid-turn
+                    # CONTRACT §3.3: surface the failure as an Anthropic `error`
+                    # event — a lone fabricated message_stop masquerades as a
+                    # clean (if empty) turn end. Terminal frames still follow
+                    # so no client hangs.
                     try:
+                        yield "event: error\ndata: " + json.dumps({
+                            'type': 'error',
+                            'error': {'type': 'api_error',
+                                      'message': f'upstream stream error: {str(e)[:2000]}'},
+                        }, ensure_ascii=False) + "\n\n"
                         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
                     except Exception:
                         pass
+                finally:
+                    if (fault or capture.get('errored')) and self.metrics:
+                        # Mid-stream fault — record an error row so the
+                        # dashboard error-rate reflects reality.
+                        _fire_and_forget(self.metrics.record_request(
+                            model=model_id, status=500, streaming=1,
+                            path='/v1/messages',
+                            latency_ms=int((time.time() * 1000) - result.get('start_ms', time.time() * 1000)),
+                        ), 'metrics')
             return StreamingResponse(
                 anthropic_stream(),
                 media_type='text/event-stream',
@@ -2694,19 +2895,33 @@ class Server:
     async def proxy_openai(self, body: dict, req_headers: dict, model: str, req: Request = None, metric_path: str = '/v1/chat/completions'):
         sanitize_nvidia_payload(body)
         model_id = body.get('model') or model or ''
+
+        def _record_local_reject(_status: int) -> None:
+            """R5/CONTRACT §10: a locally rejected turn is still a client-
+            visible error turn — count it exactly once (off the hot path)."""
+            if self.metrics:
+                _fire_and_forget(self.metrics.record_request(
+                    model=model_id, status=_status,
+                    streaming=1 if body.get('stream') else 0, path=metric_path,
+                ), 'metrics')
+
         if is_model_unavailable(model_id):
+            _record_local_reject(404)
             return {'status': 404, 'data': {'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}}}
 
         stream_guard = guard_stream_unsupported(body, model_id)
         if stream_guard:
+            _record_local_reject(stream_guard.get('status', 400))
             return stream_guard
 
         client_surface = 'anthropic_messages' if metric_path == '/v1/messages' else 'openai_chat'
         try:
             call_plan = MODEL_REGISTRY.call_plan(model_id, client_surface)
             if not same_provider_model_id('nvidia', call_plan.model.provider_model_id, model_id):
+                _record_local_reject(500)
                 return {'status': 500, 'data': {'error': {'message': 'Model identity changed during call-plan resolution', 'type': 'server_error', 'code': 'MODEL_ID_MUTATION'}}}
         except ValueError as exc:
+            _record_local_reject(400)
             return {'status': 400, 'data': {'error': {'message': str(exc), 'type': 'invalid_request_error', 'code': 'MODEL_CALL_PLAN_INVALID'}}}
 
         # Transparent contract: exactly one requested model.  Retries below
@@ -2761,12 +2976,25 @@ class Server:
         start_ms = time.time() * 1000
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
+        # R5 audit: distinguish WHY the loop exhausted. Pure transport
+        # failures (upstream down/unreachable) used to fall out of the loop
+        # into the 429 "rate-limited" terminal — a lie the SDK retries with
+        # backoff forever instead of surfacing the outage (nous returns 502).
+        last_failure_kind = ''   # 'rate_limit' | 'transport'
+        last_transport_msg = ''
 
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id)
             if not key_result:
                 # Return 429 (not 503) so client SDKs (Anthropic/OpenAI) auto-retry with backoff.
                 # 503 is treated as non-retryable fatal server error by most SDKs.
+                if self.metrics:
+                    # R5/CONTRACT §10: client-visible error turn — count it.
+                    _fire_and_forget(self.metrics.record_request(
+                        model=model_id, status=429,
+                        latency_ms=int((time.time() * 1000) - start_ms),
+                        streaming=1 if body.get('stream') else 0, path=metric_path,
+                    ), 'metrics')
                 return {'status': 429, 'headers': {'Retry-After': '30'}, 'data': {'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}}}
 
             key = key_result['key']
@@ -2796,6 +3024,7 @@ class Server:
                         if self.metrics:
                             # F2 fix: DB write off the hot path
                             _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                        last_failure_kind = 'rate_limit'
                         attempt += 1
                         continue
                     if resp.status >= 400:
@@ -2812,6 +3041,15 @@ class Server:
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
+                        if self.metrics:
+                            # R5/CONTRACT §10: terminal upstream error turn —
+                            # client-visible, must be counted (was invisible).
+                            _fire_and_forget(self.metrics.record_request(
+                                model=model_id, key_label=key.label,
+                                status=norm_status,
+                                latency_ms=int((time.time() * 1000) - start_ms),
+                                streaming=1, path=metric_path,
+                            ), 'metrics')
                         return {'status': norm_status, 'data': resp_body}
 
                     # Keep in-flight until the stream consumer finishes. The wrapper
@@ -2819,16 +3057,41 @@ class Server:
                     # /messages, /responses) closes capacity exactly once.
                     released = False
 
+                    if self.metrics:
+                        # R5/CONTRACT §10: count the turn at headers (nous
+                        # parity). Before this, EVERY healthy streamed turn was
+                        # invisible while mid-stream faults were counted —
+                        # dashboards showed ~100% stream error rate.
+                        _fire_and_forget(self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status,
+                            latency_ms=int((time.time() * 1000) - start_ms),
+                            streaming=1, path=metric_path,
+                        ), 'metrics')
+
                     async def stream_wrapper(resp=resp, key=key):
                         nonlocal released
                         # Idle-aware heartbeat: uses sentinel-task pattern so
                         # heartbeat fires EVEN when upstream is silent (reasoning
                         # models thinking 30+ sec). Without this, client/LB idle
                         # timeouts kill the stream mid-turn → "response berhenti".
+                        #
+                        # Audit 2026-08-03: events are parsed + re-serialised via
+                        # the SHARED PassthroughBlockRewriter (CONTRACT §7) —
+                        # P0-4: special tokens (<unk>, <|im_start|>, …) scrubbed
+                        # even on this raw forward path, catching tokens
+                        # fragmented across chunks; P0-1 / CONTRACT §3.3: EOF
+                        # without finish_reason/[DONE] surfaces an error frame
+                        # instead of a silently fabricated success terminator.
                         last_hb = time.time()
-                        at_line_boundary = True
-                        saw_done = False
                         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+                        # R5/double-scrub fix: on /v1/messages the outer
+                        # translator (stream_openai_to_anthropic) performs its
+                        # own DSML suppression + tool_use recovery — the
+                        # rewriter must NOT strip the markup first, or the
+                        # tool call is silently lost to the client.
+                        rw = _new_block_rewriter(dsml_suppress=(metric_path != '/v1/messages'))
+                        gen_exc: list = []
                         try:
                             # B-08 fix: sentinel-task idle detection replaces
                             # asyncio.wait_for, which cancels the pending read
@@ -2838,26 +3101,39 @@ class Server:
                             async for chunk in _iter_chunks_with_idle(resp, hb_interval):
                                 if chunk is _IDLE:
                                     _now = time.time()
-                                    if at_line_boundary and (_now - last_hb) > hb_interval:
+                                    # Block-aligned injection: a heartbeat can
+                                    # never split a data: line (OC-5 parity).
+                                    if rw.at_block_boundary() and (_now - last_hb) > hb_interval:
                                         yield b': heartbeat\n\n'
                                         last_hb = _now
                                     continue
-                                # Check for [DONE] marker
-                                if isinstance(chunk, (bytes, bytearray)):
-                                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
-                                        saw_done = True
-                                else:
-                                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
-                                        saw_done = True
-                                yield chunk
-                                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                                    at_line_boundary = chunk.endswith(b'\n')
-                                elif chunk:
-                                    at_line_boundary = str(chunk).endswith('\n')
-                            # Synthesize [DONE] if upstream EOF'd without one
-                            if not saw_done:
-                                yield b'data: [DONE]\n\n'
+                                for fr_b in rw.feed(chunk):
+                                    yield fr_b
+                                last_hb = time.time()
+                            # EOF: flush tail + withheld text; error frame on
+                            # premature EOF; synthesized [DONE] if needed.
+                            for fr_b in rw.finish(terminal_done=True):
+                                yield fr_b
+                        except (GeneratorExit, asyncio.CancelledError):
+                            raise
+                        except Exception as e:
+                            gen_exc.append(e)  # B-39: transport faults count too
+                            raise
                         finally:
+                            # B-39 parity (CONTRACT §10): a premature close or
+                            # transport fault surfaced mid-stream must be
+                            # counted as an error — HTTP 200 was already
+                            # committed, so per-status accounting reports these
+                            # as healthy turns.
+                            # Translated surfaces (/v1/messages, /v1/responses)
+                            # are counted by their OUTER translator instead —
+                            # exactly-once per failed turn, never double.
+                            _count_here = metric_path not in ('/v1/messages', '/v1/responses')
+                            if (getattr(rw, '_premature_emitted', False) or gen_exc) and self.metrics and _count_here:
+                                _fire_and_forget(self.metrics.record_request(
+                                    model=model_id, key_label=key.label, status=500,
+                                    streaming=1, path=metric_path,
+                                ), 'metrics')
                             if not released:
                                 released = True
                                 try:
@@ -2887,6 +3163,7 @@ class Server:
                         if self.metrics:
                             # F2 fix: DB write off the hot path
                             _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                        last_failure_kind = 'rate_limit'
                         attempt += 1
                         continue
 
@@ -2903,6 +3180,16 @@ class Server:
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
+                        if self.metrics:
+                            # R5/CONTRACT §10: terminal upstream error turn —
+                            # must be counted (was invisible in per-status
+                            # accounting; error counters lied).
+                            _fire_and_forget(self.metrics.record_request(
+                                model=model_id, key_label=key.label,
+                                status=norm_status,
+                                latency_ms=int((time.time() * 1000) - start_ms),
+                                streaming=0, path=metric_path,
+                            ), 'metrics')
                         return {'status': norm_status, 'data': resp_data}
 
                     if self.metrics:
@@ -2919,15 +3206,37 @@ class Server:
             except asyncio.TimeoutError:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = 'upstream request timed out'
                 attempt += 1
                 continue
             except Exception as e:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = f'{type(e).__name__}: {e}'
                 logger.error(f'[proxy_openai] error: {e}')
                 attempt += 1
                 continue
 
+        if last_failure_kind == 'transport':
+            # R5 fix: upstream down/unreachable is a 502, not a 429. The old
+            # terminal told the SDK "rate limited — retry in 30s", hiding the
+            # outage and retry-looping forever (nous/opencode parity: 502).
+            if self.metrics:
+                _fire_and_forget(self.metrics.record_request(
+                    model=model_id, status=502,
+                    latency_ms=int((time.time() * 1000) - start_ms),
+                    streaming=1 if body.get('stream') else 0, path=metric_path,
+                ), 'metrics')
+            return {'status': 502, 'data': {'error': {'message': f'Upstream unreachable for model {model_id}: {last_transport_msg or "connection failed"}', 'type': 'api_error', 'code': 'upstream_connection_error'}}}
+        if self.metrics:
+            # R5/CONTRACT §10: terminal 429 turn (retries exhausted) — count it.
+            _fire_and_forget(self.metrics.record_request(
+                model=model_id, status=429,
+                latency_ms=int((time.time() * 1000) - start_ms),
+                streaming=1 if body.get('stream') else 0, path=metric_path,
+            ), 'metrics')
         return {'status': 429, 'headers': {'Retry-After': '30'}, 'data': {'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}}}
 
 
@@ -2941,10 +3250,21 @@ class Server:
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
         is_streaming = bool(body.get('stream'))
+        loop_start_ms = time.time() * 1000
+        # R5 audit: see proxy_openai — transport outages must terminate 502,
+        # not masquerade as 429; terminal error turns must be counted (§10).
+        last_failure_kind = ''
+        last_transport_msg = ''
 
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id)
             if not key_result:
+                if self.metrics:
+                    _fire_and_forget(self.metrics.record_request(
+                        model=model_id, status=429,
+                        latency_ms=int((time.time() * 1000) - loop_start_ms),
+                        streaming=1 if is_streaming else 0, path=path,
+                    ), 'metrics')
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
             key = key_result['key']
@@ -2977,6 +3297,7 @@ class Server:
                     if self.metrics:
                         # F2 fix: DB write off the hot path
                         _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                    last_failure_kind = 'rate_limit'
                     attempt += 1
                     continue
 
@@ -3009,6 +3330,14 @@ class Server:
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
+                    if self.metrics:
+                        # R5/CONTRACT §10: terminal upstream error turn.
+                        _fire_and_forget(self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status,
+                            latency_ms=int((time.time() * 1000) - start_ms),
+                            streaming=0, path=path,
+                        ), 'metrics')
                     return JSONResponse(status_code=resp.status, content=err_data)
 
                 if self.metrics:
@@ -3024,47 +3353,73 @@ class Server:
             except asyncio.TimeoutError:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = 'upstream request timed out'
                 attempt += 1
                 continue
             except Exception as e:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = f'{type(e).__name__}: {e}'
                 logger.error(f'[_proxy_post] error: {e}')
                 attempt += 1
                 continue
 
+        if last_failure_kind == 'transport':
+            # R5 fix: upstream down/unreachable → truthful 502 (was a fake
+            # 429 rate-limit, retry-looped forever — nous/opencode parity).
+            if self.metrics:
+                _fire_and_forget(self.metrics.record_request(
+                    model=model_id, status=502,
+                    latency_ms=int((time.time() * 1000) - loop_start_ms),
+                    streaming=1 if is_streaming else 0, path=path,
+                ), 'metrics')
+            return JSONResponse(status_code=502, content={'error': {'message': f'Upstream unreachable for model {model_id}: {last_transport_msg or "connection failed"}', 'type': 'api_error', 'code': 'upstream_connection_error'}})
+        if self.metrics:
+            # R5/CONTRACT §10: terminal 429 turn (retries exhausted) — count it.
+            _fire_and_forget(self.metrics.record_request(
+                model=model_id, status=429,
+                latency_ms=int((time.time() * 1000) - loop_start_ms),
+                streaming=1 if is_streaming else 0, path=path,
+            ), 'metrics')
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
     async def _stream_proxy(self, resp, key):
         # Idle-aware heartbeat: fires even when upstream is silent.
+        # Audit 2026-08-03: same shared rewriter as stream_wrapper (P0-4
+        # scrub, P0-1 premature-EOF error frame, CONTRACT §3.3/§7).
         last_hb = time.time()
-        at_line_boundary = True
-        saw_done = False
         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+        rw = _new_block_rewriter()
+        gen_exc: list = []
         try:
             # B-08 fix: sentinel-task idle detection (see common/sse.py).
             async for chunk in _iter_chunks_with_idle(resp, hb_interval):
                 if chunk is _IDLE:
                     _now = time.time()
-                    if at_line_boundary and (_now - last_hb) > hb_interval:
+                    if rw.at_block_boundary() and (_now - last_hb) > hb_interval:
                         yield b': heartbeat\n\n'
                         last_hb = _now
                     continue
-                if isinstance(chunk, (bytes, bytearray)):
-                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
-                        saw_done = True
-                else:
-                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
-                        saw_done = True
-                yield chunk
-                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                    at_line_boundary = chunk.endswith(b'\n')
-                elif chunk:
-                    at_line_boundary = str(chunk).endswith('\n')
+                for fr_b in rw.feed(chunk):
+                    yield fr_b
                 last_hb = time.time()
-            if not saw_done:
-                yield b'data: [DONE]\n\n'
+            for fr_b in rw.finish(terminal_done=True):
+                yield fr_b
+        except (GeneratorExit, asyncio.CancelledError):
+            raise
+        except Exception as e:
+            gen_exc.append(e)  # B-39: transport faults count too
+            raise
         finally:
+            # B-39 parity (CONTRACT §10): count premature-close faults — HTTP
+            # 200 was already committed (false dashboard health otherwise).
+            if (getattr(rw, '_premature_emitted', False) or gen_exc) and self.metrics:
+                _fire_and_forget(self.metrics.record_request(
+                    model='', key_label=getattr(key, 'label', ''), status=500,
+                    streaming=1, path='catch-all',
+                ), 'metrics')
             try:
                 resp.release()
             except Exception:
@@ -3099,11 +3454,38 @@ class Server:
         if is_post:
             raw = await request.body()
             try:
-                body = json.loads(raw)
+                parsed_body = json.loads(raw)
+                body_parse_failed = False
             except (json.JSONDecodeError, ValueError):
-                pass
+                parsed_body = None
+                body_parse_failed = True
+            if isinstance(parsed_body, dict):
+                body = parsed_body
+            elif not body_parse_failed and raw.strip():
+                # R5 audit: valid JSON that is not an object (null/[1,2,3]/
+                # "str"/42) slips past the body guard on NON-inference paths
+                # (e.g. /v1/moderations, /v1/audio/*) when the client
+                # mislabels the Content-Type, then `body.get(...)` detonated
+                # with AttributeError -> HTTP 500. Contract §4: shaped 4xx.
+                if path.startswith('/v1/messages') or path.startswith('/v1/complete'):
+                    return JSONResponse(status_code=400, content={
+                        'type': 'error',
+                        'error': {'type': 'invalid_request_error',
+                                  'message': f'Request body must be a JSON object, got {type(parsed_body).__name__}'}})
+                return JSONResponse(status_code=400, content={'error': {
+                    'message': f'Request body must be a JSON object, got {type(parsed_body).__name__}',
+                    'type': 'invalid_request_error'}})
+            # else: unparseable (multipart/binary/text) — keep the legacy
+            # pass-through flow; the model comes from the URL path or the
+            # request 404s below as unroutable.
 
         requested_model = body.get('model') or model_from_path(path) or 'unknown'
+        if not isinstance(requested_model, str):
+            # R5 audit: {"model": 42} on a catch-all path crashed in
+            # resolve_target_model (int has no .lower()) -> HTTP 500.
+            return JSONResponse(status_code=400, content={'error': {
+                'message': f'model must be a string, got {type(requested_model).__name__}',
+                'type': 'invalid_request_error'}})
         model_id = resolve_target_model(requested_model)
         if is_post:
             body['model'] = model_id
@@ -3120,10 +3502,21 @@ class Server:
 
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
+        loop_start_ms = time.time() * 1000
+        # R5 audit: see proxy_openai — transport outages must terminate 502,
+        # not masquerade as 429; terminal error turns must be counted (§10).
+        last_failure_kind = ''
+        last_transport_msg = ''
 
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id)
             if not key_result:
+                if self.metrics:
+                    _fire_and_forget(self.metrics.record_request(
+                        model=model_id, status=429,
+                        latency_ms=int((time.time() * 1000) - loop_start_ms),
+                        streaming=1 if is_streaming else 0, path=path,
+                    ), 'metrics')
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
             key = key_result['key']
@@ -3158,6 +3551,7 @@ class Server:
                     if self.metrics:
                         # F2 fix: DB write off the hot path
                         _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                    last_failure_kind = 'rate_limit'
                     attempt += 1
                     continue
 
@@ -3192,6 +3586,14 @@ class Server:
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
+                    if self.metrics:
+                        # R5/CONTRACT §10: terminal upstream error turn.
+                        _fire_and_forget(self.metrics.record_request(
+                            model=model_id, key_label=key.label,
+                            status=resp.status,
+                            latency_ms=int((time.time() * 1000) - start_ms),
+                            streaming=0, path=path,
+                        ), 'metrics')
                     return JSONResponse(status_code=resp.status, content=err_data)
 
                 if self.metrics:
@@ -3210,15 +3612,36 @@ class Server:
             except asyncio.TimeoutError:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = 'upstream request timed out'
                 attempt += 1
                 continue
             except Exception as e:
                 self._in_flight = max(0, self._in_flight - 1)
                 key.decrement_in_flight()
+                last_failure_kind = 'transport'
+                last_transport_msg = f'{type(e).__name__}: {e}'
                 logger.error(f'[_handle_catch_all] error: {e}')
                 attempt += 1
                 continue
 
+        if last_failure_kind == 'transport':
+            # R5 fix: upstream down/unreachable → truthful 502 (was a fake
+            # 429 rate-limit — nous/opencode parity).
+            if self.metrics:
+                _fire_and_forget(self.metrics.record_request(
+                    model=model_id, status=502,
+                    latency_ms=int((time.time() * 1000) - loop_start_ms),
+                    streaming=1 if is_streaming else 0, path=path,
+                ), 'metrics')
+            return JSONResponse(status_code=502, content={'error': {'message': f'Upstream unreachable for model {model_id}: {last_transport_msg or "connection failed"}', 'type': 'api_error', 'code': 'upstream_connection_error'}})
+        if self.metrics:
+            # R5/CONTRACT §10: terminal 429 turn (retries exhausted) — count it.
+            _fire_and_forget(self.metrics.record_request(
+                model=model_id, status=429,
+                latency_ms=int((time.time() * 1000) - loop_start_ms),
+                streaming=1 if is_streaming else 0, path=path,
+            ), 'metrics')
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
 

@@ -73,7 +73,11 @@ class JSONBodyGuard:
         headers = {k.lower(): v for k, v in scope.get('headers', [])}
         ctype = headers.get(b'content-type', b'').decode('latin-1', 'replace').lower()
         # Only inspect JSON payloads; leave multipart/binary uploads alone.
-        if ctype and 'json' not in ctype:
+        # Round-4 audit: INFERENCE surfaces are always inspected regardless of
+        # Content-Type — a client labelling a JSON body text/plain otherwise
+        # bypassed the guard and detonated the same handler-side AttributeErrors
+        # (Starlette's request.json() parses regardless of Content-Type).
+        if ctype and 'json' not in ctype and not _is_inference_surface(path):
             await self.app(scope, receive, send)
             return
 
@@ -115,12 +119,38 @@ class JSONBodyGuard:
                 # Malformed JSON: routes already return a shaped 400 for this,
                 # and their message includes the parser detail. Pass through.
                 parsed = None
-            if parsed is not None and not isinstance(parsed, dict):
-                logger.warning(
-                    '[body-guard] rejecting non-object JSON body on %s (%s)',
-                    path, type(parsed).__name__)
-                await _reject(send, path, type(parsed).__name__)
-                return
+            else:
+                # Round-4 audit (2026-08-03): a parsed body of JSON `null`
+                # decodes to None and used to take the same pass-through path
+                # as unparseable JSON — the route then did `body.get(...)` on
+                # None and 500'd on EVERY wrapper. Parse failure and JSON-null
+                # must be distinguished.
+                if parsed is None:
+                    logger.warning('[body-guard] rejecting JSON null body on %s', path)
+                    await _reject(send, path, 'Request body must be a JSON object, got null. '
+                                             'Send an object like {"model": "...", "messages": [...]}.')
+                    return
+                if not isinstance(parsed, dict):
+                    logger.warning(
+                        '[body-guard] rejecting non-object JSON body on %s (%s)',
+                        path, type(parsed).__name__)
+                    await _reject(send, path,
+                                  f'Request body must be a JSON object, got {type(parsed).__name__}. '
+                                  f'Send an object like {{"model": "...", "messages": [...]}}.')
+                    return
+                # Round-4 audit: on the LLM inference surfaces, VALID JSON with
+                # broken semantics (messages: ["hi"], tools: {"name": ...},
+                # max_tokens: "lots", model: 42, content blocks that are bare
+                # strings) escaped every handler's validation and detonated an
+                # AttributeError mid-handler (500 — or a 502 blaming the
+                # upstream). Validate the structural contract once, here, for
+                # every wrapper (CONTRACT §4: malformed ⇒ shaped 4xx, never 5xx).
+                if _is_inference_surface(path):
+                    sem_err = _semantic_error(parsed, path)
+                    if sem_err:
+                        logger.warning('[body-guard] rejecting %s: %s', path, sem_err)
+                        await _reject(send, path, sem_err)
+                        return
 
         await self.app(scope, _replay(chunks, receive), send)
 
@@ -165,15 +195,110 @@ def _is_anthropic_surface(path: str) -> bool:
     return path.startswith('/v1/messages') or path.startswith('/v1/complete')
 
 
-async def _reject(send: Any, path: str, got: str) -> None:
-    msg = (f'Request body must be a JSON object, got {got}. '
-           f'Send an object like {{"model": "...", "messages": [...]}}.')
+# Surfaces whose request bodies follow the OpenAI/Anthropic message contract.
+# Only these get SEMANTIC validation; management/catalog endpoints are left
+# alone (they own their own body shapes).
+_INFERENCE_SURFACES: tuple[str, ...] = (
+    '/v1/chat/completions',
+    '/v1/completions',
+    '/v1/messages',          # covers /v1/messages/count_tokens
+    '/v1/responses',
+    '/v1/embeddings',
+    '/v1/ranking',
+    '/v1/images',
+)
+
+_MAX_TOKENS_CAP = 1_000_000  # CONTRACT §4
+
+
+def _is_inference_surface(path: str) -> bool:
+    return any(path.startswith(p) for p in _INFERENCE_SURFACES)
+
+
+def _semantic_error(body: dict, path: str) -> 'str | None':
+    """Structural contract for message-style inference bodies.
+
+    Returns a human-readable error string, or None when the body is
+    structurally sound. Only shapes that would otherwise detonate an
+    AttributeError/TypeError inside a handler or translator are rejected —
+    everything else is forwarded verbatim (transparent-proxy principle):
+    unknown roles, odd parameter *values*, unrecognised block types are the
+    upstream's business, not the wrapper's.
+    """
+    model = body.get('model')
+    if model is not None and not isinstance(model, str):
+        return f'model must be a string, got {type(model).__name__}'
+
+    msgs = body.get('messages')
+    if msgs is not None:
+        if not isinstance(msgs, list):
+            return f'messages must be an array, got {type(msgs).__name__}'
+        for i, m in enumerate(msgs):
+            if not isinstance(m, dict):
+                return f'messages[{i}] must be an object, got {type(m).__name__}'
+            c = m.get('content')
+            if isinstance(c, list):
+                for j, blk in enumerate(c):
+                    if not isinstance(blk, dict):
+                        return (f'messages[{i}].content[{j}] must be an object '
+                                f'({{"type": ...}} block), got {type(blk).__name__}')
+            tcs = m.get('tool_calls')
+            if tcs is not None:
+                if not isinstance(tcs, list):
+                    return f'messages[{i}].tool_calls must be an array'
+                for j, tc in enumerate(tcs):
+                    if not isinstance(tc, dict):
+                        return (f'messages[{i}].tool_calls[{j}] must be an object, '
+                                f'got {type(tc).__name__}')
+
+    tools = body.get('tools')
+    if tools is not None:
+        if not isinstance(tools, list):
+            return f'tools must be an array, got {type(tools).__name__}'
+        for i, t in enumerate(tools):
+            if not isinstance(t, dict):
+                return f'tools[{i}] must be an object, got {type(t).__name__}'
+
+    for field in ('max_tokens', 'max_output_tokens', 'max_completion_tokens'):
+        v = body.get(field)
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int):
+            return f'{field} must be a positive integer, got {v!r}'
+        if v <= 0:
+            return f'{field} must be a positive integer'
+        if v > _MAX_TOKENS_CAP:
+            return f'{field} exceeds maximum allowed value of {_MAX_TOKENS_CAP}'
+
+    if path.startswith('/v1/responses'):
+        inp = body.get('input')
+        if inp is not None:
+            if isinstance(inp, list):
+                for i, item in enumerate(inp):
+                    if not isinstance(item, dict):
+                        return f'input[{i}] must be an object, got {type(item).__name__}'
+            elif not isinstance(inp, str):
+                return f'input must be a string or an array, got {type(inp).__name__}'
+
+    system = body.get('system')
+    if system is not None and not isinstance(system, str):
+        if isinstance(system, list):
+            for i, blk in enumerate(system):
+                if not isinstance(blk, dict):
+                    return f'system[{i}] must be an object, got {type(blk).__name__}'
+        else:
+            return f'system must be a string or an array, got {type(system).__name__}'
+
+    return None
+
+
+async def _reject(send: Any, path: str, message: str) -> None:
     if _is_anthropic_surface(path):
         payload = {'type': 'error',
-                   'error': {'type': 'invalid_request_error', 'message': msg}}
+                   'error': {'type': 'invalid_request_error', 'message': message}}
     else:
-        payload = {'error': {'type': 'invalid_request_error', 'message': msg,
-                             'code': 'invalid_body_shape'}}
+        payload = {'error': {'type': 'invalid_request_error', 'message': message,
+                             'code': 'invalid_request'}}
     body = json.dumps(payload).encode()
     await send({'type': 'http.response.start', 'status': 400,
                 'headers': [(b'content-type', b'application/json'),

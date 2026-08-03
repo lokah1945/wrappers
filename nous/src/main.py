@@ -93,6 +93,75 @@ try:
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
 
+# P0-4 fix (audit 2026-08-03): central special-token scrubbing. Byte-level-BPE
+# upstream models leak tokenizer control tokens (<unk> — often fragmented
+# across SSE chunks as '<un' + 'k>' — <s>, </s>, <|im_start|>, U+0800 …) into
+# content and reasoning streams; they arrived verbatim in Claude Code output
+# (user report: '"><unk><unk><unk>…"'). One filter per visible channel.
+try:
+    from common.sanitize_tokens import (
+        SpecialTokenFilter as _SpecialTokenFilter,
+        DsmlMarkupFilter as _DsmlMarkupFilter,
+        filter_special_tokens as _filter_special_tokens,
+        strip_dsml_markup as _strip_dsml_markup,
+        scrub_openai_response_inplace as _scrub_openai_response_inplace,
+        scrub_chat_chunk_inplace as _scrub_chat_chunk_inplace,
+        flushed_deltas as _flushed_deltas,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    class _SpecialTokenFilter:  # type: ignore[no-redef]
+        def feed(self, t):
+            return t
+
+        def flush(self):
+            return ''
+
+    class _DsmlMarkupFilter:  # type: ignore[no-redef]
+        collected_text = ''
+
+        def feed(self, t):
+            return t
+
+        def flush(self):
+            return ''
+
+    def _filter_special_tokens(t):  # type: ignore[misc]
+        return t
+
+    def _strip_dsml_markup(t):  # type: ignore[misc]
+        return t
+
+    def _scrub_openai_response_inplace(d):  # type: ignore[misc]
+        return None
+
+    def _scrub_chat_chunk_inplace(o, ft, fr, dsml=None):  # type: ignore[misc]
+        return None
+
+    def _flushed_deltas(ft, fr):  # type: ignore[misc]
+        return '', ''
+
+# P1-1/P1-3 shared helpers (input_image passthrough, full Responses usage).
+try:
+    from common.translations.shared import (
+        responses_content_to_chat as _responses_content_to_chat,
+        tokens_from_chat_usage as _tokens_from_chat_usage,
+        responses_usage as _responses_usage,
+    )
+except ImportError:  # pragma: no cover - standalone fallback
+    def _responses_content_to_chat(c):  # type: ignore[misc]
+        if isinstance(c, list):
+            return " ".join(p.get("text", "") for p in c
+                            if isinstance(p, dict) and p.get("type") in ("input_text", "text", "output_text"))
+        return c
+
+    def _tokens_from_chat_usage(u):  # type: ignore[misc]
+        u = u if isinstance(u, dict) else {}
+        return (u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0, 0, 0)
+
+    def _responses_usage(i=0, o=0, c=0, r=0):  # type: ignore[misc]
+        return {"input_tokens": int(i or 0), "output_tokens": int(o or 0),
+                "total_tokens": int(i or 0) + int(o or 0)}
+
 
 # ============================================================================
 # KeyPool for multi-key rotation (parity with opencode/nvidia-python)
@@ -1025,8 +1094,9 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
             else:
                 role = it.get("role", "user")
                 c = it.get("content", "")
-                if isinstance(c, list):
-                    c = " ".join(p.get("text", "") for p in c if isinstance(p, dict) and p.get("type") in ("input_text", "text", "output_text"))
+                # P1-1 fix: input_image parts were silently dropped here —
+                # the shared helper converts them to OpenAI image_url parts.
+                c = _responses_content_to_chat(c)
                 msgs.append({"role": role, "content": c})
 
     if body.get("instructions"):
@@ -1069,20 +1139,36 @@ _STORE_LOCK = asyncio.Lock()
 # nvidia-python/src/responses_compat.py — FIFO cap (200 entries) plus a TTL
 # prune using the stored timestamp, so long-running Codex sessions cannot leak
 # memory monotonically.
+# P2 fix (audit 2026-08-03): WRAPPER_CONTRACT §6.3 requires the store bounded
+# on THREE axes — entries, BYTES, and TTL (defaults 200 / 32MiB / 3600s).
+# nous previously had no byte bound and an 86400s TTL: 200 multi-MB Codex
+# histories were still unbounded in RAM and stale histories lived a full day.
 _RESPONSE_STORE_MAX = int(os.environ.get("RESPONSES_STORE_MAX_ENTRIES", "200"))
-_RESPONSE_STORE_TTL_SEC = int(os.environ.get("RESPONSES_STORE_TTL_SEC", "86400"))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get("RESPONSES_STORE_TTL_SEC", "3600"))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get("RESPONSES_STORE_MAX_BYTES", str(32 * 1024 * 1024)))
 
 def _prune_response_store_locked():
-    """Evict expired then oldest entries. Caller must hold _STORE_LOCK."""
+    """Evict expired then oldest entries until within all bounds.
+    Caller must hold _STORE_LOCK. Entries are (ts, size_bytes, msgs)."""
     now = time.time()
     if _RESPONSE_STORE_TTL_SEC > 0:
-        expired = [rid for rid, (ts, _msgs) in _RESPONSE_STORE.items() if now - ts > _RESPONSE_STORE_TTL_SEC]
+        expired = [rid for rid, entry in _RESPONSE_STORE.items()
+                   if isinstance(entry, tuple) and now - entry[0] > _RESPONSE_STORE_TTL_SEC]
         for rid in expired:
             _RESPONSE_STORE.pop(rid, None)
     # dict preserves insertion order → first key is the oldest (FIFO evict)
     while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX:
         oldest = next(iter(_RESPONSE_STORE))
         _RESPONSE_STORE.pop(oldest, None)
+    # Byte budget: evict oldest-first until the total fits (never the entry
+    # just written unless it alone exceeds the budget — store_conversation
+    # rejects oversized histories up front).
+    total = sum(e[1] for e in _RESPONSE_STORE.values() if isinstance(e, tuple) and len(e) == 3)
+    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+        oldest = next(iter(_RESPONSE_STORE))
+        entry = _RESPONSE_STORE.pop(oldest, None)
+        if isinstance(entry, tuple) and len(entry) == 3:
+            total -= entry[1]
 
 def _extract_principal(request) -> str:
     """Extract a stable tenant identifier from the request for store namespacing.
@@ -1120,7 +1206,15 @@ async def store_conversation(principal: str, rid: str, msgs: list):
         except (TypeError, ValueError, RecursionError):
             msgs = list(msgs)
         key = _response_store_key(principal, rid)
-        _RESPONSE_STORE[key] = (time.time(), msgs)
+        # P2 fix: track the payload size so the store honours the byte budget.
+        try:
+            size = len(json.dumps(msgs, ensure_ascii=False))
+        except (TypeError, ValueError):
+            size = 0
+        if size > _RESPONSE_STORE_MAX_BYTES:
+            logger.warning(f"[responses] history for {rid} too large ({size}B); not stored")
+            return
+        _RESPONSE_STORE[key] = (time.time(), size, msgs)
         _prune_response_store_locked()
 
 def get_stored_conversation(principal: str, rid: str) -> Optional[list]:
@@ -1129,15 +1223,17 @@ def get_stored_conversation(principal: str, rid: str) -> Optional[list]:
 
     Runs synchronously on the single event loop; there is no await point
     between lookup and copy, so the read is consistent without the lock.
+    Entries are (ts, size_bytes, msgs) — tolerate the legacy 2-tuple shape.
     """
     key = _response_store_key(principal, rid)
     stored = _RESPONSE_STORE.get(key)
     if not stored:
         return None
+    msgs = stored[-1]
     try:
-        return copy.deepcopy(stored[1])
+        return copy.deepcopy(msgs)
     except (TypeError, ValueError, RecursionError):
-        return list(stored[1])
+        return list(msgs)
 
 
 def _ensure_chat_content(data: dict) -> dict:
@@ -1156,12 +1252,14 @@ def _ensure_chat_content(data: dict) -> dict:
 
 def chat_to_responses(model: str, chat: dict) -> dict:
     msg = (chat.get("choices") or [{}])[0].get("message", {})
-    text = msg.get("content") or ""
+    # P0-4: scrub special tokens from non-stream visible channels too.
+    # R5 audit: strip DSML tool markup from the visible output text too.
+    text = _strip_dsml_markup(_filter_special_tokens(msg.get("content") or ""))
     tool_calls = msg.get("tool_calls") or []
     output = []
     # B18 parity: surface upstream reasoning_content as a reasoning output
     # item (opencode/blackbox/openrouter parity) instead of dropping it.
-    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    reasoning = _filter_special_tokens(msg.get("reasoning_content") or msg.get("reasoning") or "")
     if reasoning:
         # CODEX-RESP-02: the SDK's ResponseReasoningItem expects
         # summary/content as lists — `text` alone parses with serializer
@@ -1172,8 +1270,13 @@ def chat_to_responses(model: str, chat: dict) -> dict:
     for tc in tool_calls:
         fn = tc.get("function", {})
         output.append({"id": tc.get("id"), "type": "function_call", "call_id": tc.get("id"), "name": fn.get("name"), "arguments": fn.get("arguments", ""), "status": "completed"})
-    output.append({"id": "msg-local", "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}]})
-    u = chat.get("usage", {})
+    # P1-3 fix (SDK-strict): the message item needs a `status` and output_text
+    # parts require an `annotations` array — strict Response parsing failed
+    # without them.
+    output.append({"id": "msg-local", "type": "message", "status": "completed", "role": "assistant",
+                   "content": [{"type": "output_text", "text": text, "annotations": []}]})
+    # P1-3 fix: the Responses usage object requires the *_details structures.
+    _in, _out, _cached, _rsn = _tokens_from_chat_usage(chat.get("usage"))
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — a response missing them
     # fails non-streaming client.responses.create() parsing.
@@ -1182,8 +1285,7 @@ def chat_to_responses(model: str, chat: dict) -> dict:
         "object": "response", "created_at": int(time.time()), "model": model,
         "output": output, "status": "completed",
         "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
-        "usage": {"input_tokens": u.get("prompt_tokens", 0), "output_tokens": u.get("completion_tokens", 0),
-                  "total_tokens": u.get("total_tokens") or ((u.get("prompt_tokens", 0) or 0) + (u.get("completion_tokens", 0) or 0))}
+        "usage": _responses_usage(_in, _out, _cached, _rsn),
     }
 
 def anthropic_to_openai(req: dict) -> dict:
@@ -1300,17 +1402,20 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     text = msg.get("content") or ""
     if text is None:
         text = ""
-    reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
+    # P0-4: scrub special tokens from visible channels.
+    reasoning = _filter_special_tokens(msg.get("reasoning_content") or msg.get("reasoning") or "")
 
     content = []
     # Keep thinking SEPARATE — never concatenate into text (Claude Code contract)
     if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning})
+        # P1-2: thinking blocks require a `signature` field (strict SDK parse).
+        content.append({"type": "thinking", "thinking": reasoning, "signature": ""})
 
     tool_calls = list(msg.get("tool_calls") or [])
     dsml_tools = []
     if isinstance(text, str) and "DSML" in text.replace("\uff5c", "|"):
         text, dsml_tools = _parse_dsml_from_text(text)
+    text = _filter_special_tokens(text) if isinstance(text, str) else text
 
     if text or (not tool_calls and not dsml_tools):
         content.append({"type": "text", "text": text if isinstance(text, str) else str(text)})
@@ -1342,6 +1447,12 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     else:
         # Only infer tool_use when the upstream omitted finish_reason entirely.
         stop_reason = "tool_use" if (tool_calls or dsml_tools) else "end_turn"
+    # R5 audit (shared-translator parity): DSML markup is the ONLY tool-call
+    # signal MiniMax emits — the turn reports finish 'stop'. With recovered
+    # tool_use blocks in content, end_turn would make the agent close the
+    # turn and never execute the tool. Stream paths already upgrade.
+    if dsml_tools and stop_reason == "end_turn":
+        stop_reason = "tool_use"
     return {
         "id": chat.get("id", "msg_proxy"),
         "type": "message",
@@ -1399,6 +1510,34 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
     last_hb = time.time()
     buffer = b""
     terminated = False
+    # P0-1: track whether the upstream signalled a NATURAL end of turn — a
+    # finish_reason (or an upstream error frame). [DONE] alone sets
+    # `terminated`. EOF with neither is a premature close and MUST surface as
+    # an error (WRAPPER_CONTRACT §3.3), not a fabricated success.
+    saw_finish = False
+    # P0-4: scrubbing for the raw passthrough surface (state=None) — one
+    # filter pair per stream so tokens fragmented across chunks are removed.
+    _pt_text = _SpecialTokenFilter()
+    _pt_reason = _SpecialTokenFilter()
+    # R5 audit: DSML markup suppression on the raw passthrough text channel.
+    _pt_dsml = _DsmlMarkupFilter()
+    _pt_scaffold = {"id": "chatcmpl-proxy", "created": int(time.time()), "model": ""}
+
+    def _pt_flush_chunk():
+        """Final passthrough delta carrying text withheld by the filters."""
+        _ft = _pt_text.feed(_pt_dsml.flush())
+        _ft2, _fr = _flushed_deltas(_pt_text, _pt_reason)
+        _ft = (_ft or '') + (_ft2 or '')
+        _d = {}
+        if _ft:
+            _d["content"] = _ft
+        if _fr:
+            _d["reasoning_content"] = _fr
+        if not _d:
+            return None
+        return {"id": _pt_scaffold["id"], "object": "chat.completion.chunk",
+                "created": _pt_scaffold["created"], "model": _pt_scaffold["model"],
+                "choices": [{"index": 0, "delta": _d, "finish_reason": None}]}
 
     async def emit_state_done():
         if state and hasattr(state, "done"):
@@ -1412,12 +1551,42 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                     yield serialize_fn(ev) if callable(serialize_fn) else ev
 
     async def handle_payload(data: bytes):
-        nonlocal terminated
+        nonlocal terminated, saw_finish, mid_fault
         # N-09 fix: an empty data: payload is a valid (empty) SSE event /
         # keep-alive, NOT end-of-stream. Only literal [DONE] terminates.
         if data == b"":
             return
         if data in (b"[DONE]", b'"[DONE]"'):
+            # P0-4: release withheld tail text before the terminator.
+            if state is None:
+                _fl = _pt_flush_chunk()
+                if _fl is not None:
+                    yield f"data: {json.dumps(_fl, ensure_ascii=False)}\n\n"
+            # P0-1 parity (CONTRACT §3.3): a healthy OpenAI stream always
+            # carries finish_reason BEFORE [DONE]; a bare [DONE] is a
+            # truncation signal from a middlebox. The other four wrappers now
+            # surface an error in this case — nous must too instead of
+            # fabricating a clean completion (agent "stops mid-run").
+            _done_premature = ("upstream stream ended with [DONE] but no "
+                               "finish_reason; the response may be truncated — "
+                               "client may retry")
+            if state is not None and hasattr(state, "translate_chunk"):
+                _st_terminal = (
+                    getattr(state, "finished", False)
+                    or getattr(state, "_finished", False)
+                    or getattr(state, "_completed", False)
+                    or getattr(state, "upstream_error", None)
+                )
+                if not _st_terminal:
+                    for ev in state.translate_chunk(
+                            {"error": {"type": "api_error", "message": _done_premature}}):
+                        if isinstance(ev, str):
+                            yield ev
+                        else:
+                            yield serialize_fn(ev) if callable(serialize_fn) else ev
+            elif state is None and not saw_finish:
+                mid_fault = True
+                yield f"data: {json.dumps({'error': {'type': 'api_error', 'code': 'upstream_done_without_finish', 'message': _done_premature}}, ensure_ascii=False)}\n\n"
             async for ev in emit_state_done():
                 yield ev
             if state is None:
@@ -1446,6 +1615,19 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                 else:
                     yield serialize_fn(ev) if callable(serialize_fn) else ev
         else:
+            if isinstance(parsed, dict):
+                # P0-1: remember whether a natural terminal was seen.
+                _ch0 = ((parsed.get("choices") or [None])[0])
+                if (isinstance(_ch0, dict) and _ch0.get("finish_reason")) \
+                        or parsed.get("error") is not None:
+                    saw_finish = True
+                # P0-4: scrub visible text/reasoning through the cross-chunk
+                # filters before forwarding (user report: '<unk><unk>…').
+                # R5: also suppress DSML tool markup on the text channel.
+                _scrub_chat_chunk_inplace(parsed, _pt_text, _pt_reason, dsml=_pt_dsml)
+                for _k in ("id", "model", "created"):
+                    if parsed.get(_k):
+                        _pt_scaffold[_k] = parsed[_k]
             # B-10 fix (second leak path): re-serialise the PARSED object rather
             # than echoing raw upstream bytes, so a non-OpenAI frame can never
             # be forwarded verbatim onto an OpenAI-SSE surface.
@@ -1461,6 +1643,10 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
     chunk_task = None
     client_disconnected = False
     upstream_error = None
+    # B-39 parity (CONTRACT §10): a mid-stream fault must be visible in the
+    # error counters — the stream started with HTTP 200, so `status != 200`
+    # accounting at the call site forever reports these as successful turns.
+    mid_fault = False
     try:
         # Get an async iterator over chunks
         chunk_iter = upstream_resp.content.iter_any().__aiter__()
@@ -1539,11 +1725,54 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                         # N-05 fix: surface the timeout/error cause to the client
                         # instead of a silent synthetic completion.
                         yield f": upstream-error {type(upstream_error).__name__}\n\n"
+                    # P0-1 (WRAPPER_CONTRACT §3.3): the upstream connection
+                    # CLOSED without a terminal signal — no finish_reason, no
+                    # error frame, no [DONE]. The old code fabricated a clean
+                    # completion here (end_turn / response.completed), so a
+                    # truncated answer persisted as a successful turn and the
+                    # agent saw the run "stop half-way" with no way to detect
+                    # or retry it. Surface a real error event instead; the
+                    # terminal events still follow so no client hangs.
+                    _premature = (
+                        f"upstream stream ended prematurely ({type(upstream_error).__name__}); "
+                        "the response may be truncated — client may retry"
+                        if upstream_error is not None else
+                        "upstream stream ended prematurely: EOF without finish_reason or [DONE]; "
+                        "the response may be truncated — client may retry"
+                    )
+                    if state is not None and hasattr(state, "translate_chunk"):
+                        _st_terminal = (
+                            getattr(state, "finished", False)
+                            or getattr(state, "_finished", False)
+                            or getattr(state, "_completed", False)
+                            or getattr(state, "upstream_error", None)
+                        )
+                        if not _st_terminal:
+                            for ev in state.translate_chunk(
+                                    {"error": {"type": "api_error", "message": _premature}}):
+                                if isinstance(ev, str):
+                                    yield ev
+                                else:
+                                    yield serialize_fn(ev) if callable(serialize_fn) else ev
+                    elif state is None and not saw_finish:
+                        _fl = _pt_flush_chunk()
+                        if _fl is not None:
+                            yield f"data: {json.dumps(_fl, ensure_ascii=False)}\n\n"
+                        yield f"data: {json.dumps({'error': {'type': 'api_error', 'code': 'upstream_premature_eof', 'message': _premature}}, ensure_ascii=False)}\n\n"
+                        mid_fault = True
                     async for ev in emit_state_done():
                         yield ev
                     if state is None:
                         yield "data: [DONE]\n\n"
         finally:
+            # B-39 parity (CONTRACT §10): count mid-stream faults — the 200
+            # response was already committed, so per-status accounting never
+            # sees these; the dashboard must not report false health.
+            if upstream_error is not None or mid_fault or getattr(state, "upstream_error", None):
+                try:
+                    metrics.record(error=True)
+                except Exception:
+                    pass
             try:
                 upstream_resp.release()
             except Exception:
@@ -1558,11 +1787,53 @@ class AnthropicStreamState:
         self.message_started = False
         self.current_block = None
         self.tool_map = {}
+        # R-03/B-39 parity with common.translations.anthropic_stream: set when
+        # an upstream error frame (or injected premature-close error) fired, so
+        # the stream driver can count the fault in metrics (CONTRACT §10).
+        self.upstream_error = None
         # R-02: Anthropic indices of tool_use blocks still open. Parallel tool
         # calls must remain open CONCURRENTLY (see common/translations).
         self.open_tool_blocks = set()
         self.finished = False
         self.msg_id = f"msg-{int(time.time()*1000)}"
+        # P0-4: stateful special-token scrubbers (one per channel) — catch
+        # tokens fragmented across chunks ('<un' + 'k>').
+        self._tok_text = _SpecialTokenFilter()
+        self._tok_reason = _SpecialTokenFilter()
+        # R5 audit: stateful MiniMax DSML markup suppressor (cross-chunk).
+        # Complete markup is re-emitted as real tool_use blocks in done() —
+        # parity with common/translations/anthropic_stream.py (CONTRACT §7)
+        # and with the non-streaming openai_to_anthropic translator.
+        self._dsml_text = _DsmlMarkupFilter()
+
+    def _close_nontool_block(self, events):
+        """Close the open text/thinking block, flushing any text withheld by
+        the special-token filter into its own channel first (P0-4). Tool
+        blocks are tracked separately (R-02) and are NOT closed here."""
+        if self.current_block is None or self.current_block == "tool_use":
+            return
+        if self.current_block == "thinking":
+            rest = self._tok_reason.flush()
+            if rest:
+                events.append({"type": "content_block_delta", "data": {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "thinking_delta", "thinking": rest}}})
+        elif self.current_block == "text":
+            rest = self._tok_text.flush()
+            if rest:
+                events.append({"type": "content_block_delta", "data": {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "text_delta", "text": rest}}})
+        events.append({"type": "content_block_stop", "data": {
+            "type": "content_block_stop", "index": self.index}})
+        self.current_block = None
+
+    def _close_all_tool_blocks(self, events):
+        for _ti in sorted(self.open_tool_blocks):
+            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+        self.open_tool_blocks.clear()
+        if self.current_block == "tool_use":
+            self.current_block = None
 
     def _usage(self, raw=None):
         raw = raw or {}
@@ -1590,18 +1861,18 @@ class AnthropicStreamState:
             msg = err.get("message") if isinstance(err, dict) else str(err)
             etype = (err.get("type") if isinstance(err, dict) else None) or "api_error"
             logger.error(f"[nous] upstream error frame mid-stream: {msg}")
-            for _ti in sorted(self.open_tool_blocks):
-                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-            self.open_tool_blocks.clear()
-            if self.current_block is not None and self.current_block != "tool_use":
-                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-            self.current_block = None
+            self.upstream_error = str(msg or 'upstream error')  # R-03/B-39
+            self._close_all_tool_blocks(events)
+            self._close_nontool_block(events)
             events.append({"type": "error", "data": {
                 "type": "error",
                 "error": {"type": etype, "message": str(msg)[:2000]}}})
+            # stop_reason=None (audit 2026-08-03): the turn FAILED — claiming
+            # end_turn fabricates a clean completion. `error` is the real
+            # signal; message_stop still follows so no client hangs.
             events.append({"type": "message_delta", "data": {
                 "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "delta": {"stop_reason": None, "stop_sequence": None},
                 "usage": self._usage()}})
             events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.finished = True
@@ -1615,17 +1886,21 @@ class AnthropicStreamState:
         # reasoning / thinking delta
         reason = delta.get("reasoning_content") or delta.get("reasoning")
         if isinstance(reason, str) and reason:
+            # P0-4: scrub tokenizer specials (incl. cross-chunk fragments).
+            reason = self._tok_reason.feed(reason)
+        else:
+            reason = None
+        if reason:
             if self.current_block != "thinking":
-                # R-02: close every open tool block before opening thinking.
-                for _ti in sorted(self.open_tool_blocks):
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-                self.open_tool_blocks.clear()
-                if self.current_block and self.current_block != "tool_use":
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                # P3-4 fix: close ONLY the current text/thinking block.
+                # Tool blocks stay OPEN (R-02/shared parity): a reasoning blip
+                # between tool-argument fragments must not orphan them.
+                self._close_nontool_block(events)
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
                     "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "thinking", "thinking": ""},
+                    # P1-2: thinking blocks require a `signature` field.
+                    "content_block": {"type": "thinking", "thinking": "", "signature": ""},
                 }})
                 self.current_block = "thinking"
             events.append({"type": "content_block_delta", "data": {
@@ -1633,20 +1908,27 @@ class AnthropicStreamState:
                 "delta": {"type": "thinking_delta", "thinking": reason},
             }})
 
-        # If content looks like DSML tool markup, do NOT emit as text_delta (prevent leak)
+        # R5 audit: suppress DSML markup statefully (cross-chunk safe) — the
+        # old per-chunk `'DSML' in chunk` check leaked parameter values and
+        # closing tags of fragmented markup, and dropped whole chunks of
+        # legitimate text that merely mentioned DSML. Complete markup is
+        # recovered as tool_use blocks in done().
         content = delta.get("content")
-        if isinstance(content, str) and content and "DSML" in content.replace("\uff5c", "|"):
-            # skip raw DSML text; structured tool_calls path should carry tools
+        if isinstance(content, str) and content:
+            content = self._dsml_text.feed(content)
+        else:
+            content = None
+        if isinstance(content, str) and content:
+            # P0-4: scrub tokenizer specials (incl. cross-chunk fragments).
+            content = self._tok_text.feed(content)
+        else:
             content = None
 
         if content:
             if self.current_block != "text":
-                # R-02: close every open tool block before opening text.
-                for _ti in sorted(self.open_tool_blocks):
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-                self.open_tool_blocks.clear()
-                if self.current_block and self.current_block != "tool_use":
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+                # P3-4 fix: close ONLY the current text/thinking block (see
+                # reasoning branch above); tool blocks stay open.
+                self._close_nontool_block(events)
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
                     "type": "content_block_start", "index": self.index,
@@ -1665,10 +1947,9 @@ class AnthropicStreamState:
                 # R-02: close only a text/thinking block here. Closing the
                 # previous TOOL block orphaned its later argument fragments
                 # (content_block_delta on a closed index -> Claude Code drops
-                # the tool call and the agent turn stalls).
-                if self.current_block and self.current_block != "tool_use":
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-                    self.current_block = None
+                # the tool call and the agent turn stalls). P0-4: flush any
+                # filter-withheld text into its channel before the close.
+                self._close_nontool_block(events)
                 self.index += 1
                 self.tool_map[idx] = self.index
                 self.open_tool_blocks.add(self.index)
@@ -1687,12 +1968,14 @@ class AnthropicStreamState:
 
         if ch.get("finish_reason") and not self.finished:
             self.finished = True
-            # R-02: close all open tool blocks, then any text/thinking block.
-            for _ti in sorted(self.open_tool_blocks):
-                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-            self.open_tool_blocks.clear()
-            if self.current_block is not None and self.current_block != "tool_use":
-                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            # R-02: close all open tool blocks, then any text/thinking block
+            # (the close helpers flush filter-withheld text first, P0-4).
+            self._close_all_tool_blocks(events)
+            self._close_nontool_block(events)
+            # R5 audit: drain DSML-withheld text + re-emit recovered DSML
+            # tool_use blocks BEFORE the terminal frames (finish_reason stays
+            # authoritative for stop_reason below).
+            dsml_tool_n = self._drain_dsml_terminal(events)
             fr = ch.get("finish_reason")
             # B-06 fix: map STRICTLY from finish_reason. Forcing tool_use
             # whenever any tool had been seen made Claude Code wait for a
@@ -1703,6 +1986,13 @@ class AnthropicStreamState:
                 "tool_calls": "tool_use", "function_call": "tool_use",
                 "content_filter": "refusal",
             }.get(fr, "end_turn")
+            # R5 audit: DSML markup is the ONLY tool-call signal MiniMax
+            # emits — the turn reports finish 'stop'. With recovered tool_use
+            # blocks emitted above, end_turn would make the agent close the
+            # turn and never execute the tool (done() + non-stream parity,
+            # CONTRACT §8).
+            if dsml_tool_n and stop == "end_turn":
+                stop = "tool_use"
             events.append({"type": "message_delta", "data": {
                 "type": "message_delta",
                 "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -1711,6 +2001,60 @@ class AnthropicStreamState:
             events.append({"type": "message_stop", "data": {"type": "message_stop"}})
             self.current_block = None
         return events
+
+    def _drain_dsml_terminal(self, events):
+        """R5 audit: at stream end, flush DSML-withheld clean text into the
+        text channel and re-emit complete DSML tool markup collected
+        mid-stream as real tool_use blocks (parity with the non-streaming
+        openai_to_anthropic translator + common/translations/anthropic_stream
+        — CONTRACT §7). Returns the number of recovered tool calls."""
+        pre = self._dsml_text.flush()
+        if pre:
+            self._tok_text.feed(pre)
+        rest = self._tok_text.flush()
+        if rest:
+            if self.current_block != "text" or self.open_tool_blocks:
+                self._close_all_tool_blocks(events)
+                self._close_nontool_block(events)
+                self.index += 1
+                events.append({"type": "content_block_start", "data": {
+                    "type": "content_block_start", "index": self.index,
+                    "content_block": {"type": "text", "text": ""}}})
+                self.current_block = "text"
+            events.append({"type": "content_block_delta", "data": {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "text_delta", "text": rest}}})
+        tools = []
+        markup = getattr(self._dsml_text, "collected_text", "") or ""
+        if markup:
+            try:
+                _clean, tools = _parse_dsml_from_text(markup)
+            except Exception:
+                tools = []
+        for tu in tools:
+            if not isinstance(tu, dict):
+                continue
+            self._close_all_tool_blocks(events)
+            self._close_nontool_block(events)
+            self.index += 1
+            try:
+                args_json = json.dumps(tu.get("input") or {}, ensure_ascii=False)
+            except Exception:
+                args_json = "{}"
+            events.append({"type": "content_block_start", "data": {
+                "type": "content_block_start", "index": self.index,
+                "content_block": {"type": "tool_use",
+                                  "id": tu.get("id") or f"toolu_dsml_{self.index}",
+                                  "name": tu.get("name") or "", "input": {}}}})
+            events.append({"type": "content_block_delta", "data": {
+                "type": "content_block_delta", "index": self.index,
+                "delta": {"type": "input_json_delta", "partial_json": args_json}}})
+            self.open_tool_blocks.add(self.index)
+            self.current_block = "tool_use"
+            self.tool_map[f"dsml_{self.index}"] = self.index
+        # Close the recovered tool blocks before the terminal frames.
+        self._close_all_tool_blocks(events)
+        return len([t for t in tools if isinstance(t, dict)])
 
     def done(self):
         """Emit terminal events if stream ended without finish_reason (prevent hang)."""
@@ -1726,16 +2070,16 @@ class AnthropicStreamState:
             }}})
         # B-06: capture before clearing.
         was_in_tool_block = (self.current_block == "tool_use") or bool(self.open_tool_blocks)
-        # R-02: close every open tool block first.
-        for _ti in sorted(self.open_tool_blocks):
-            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-        self.open_tool_blocks.clear()
-        if self.current_block is not None and self.current_block != "tool_use":
-            events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-        self.current_block = None
+        # R-02: close every open tool block first, then text/thinking (P0-4:
+        # the close helpers flush any filter-withheld text into its channel).
+        self._close_all_tool_blocks(events)
+        self._close_nontool_block(events)
+        # R5 audit: drain DSML-withheld clean text + re-emit recovered DSML
+        # tool markup as real tool_use blocks (stream/non-stream parity).
+        dsml_tool_n = self._drain_dsml_terminal(events)
         # B-06: this is the no-finish_reason path, so inferring from tool state
         # is legitimate — but narrow it to a tool block that was still open.
-        stop = "tool_use" if (self.tool_map and was_in_tool_block) else "end_turn"
+        stop = "tool_use" if (self.tool_map and was_in_tool_block) or dsml_tool_n else "end_turn"
         events.append({"type": "message_delta", "data": {
             "type": "message_delta",
             "delta": {"stop_reason": stop, "stop_sequence": None},
@@ -1765,6 +2109,14 @@ class ResponsesStreamState:
         self._finished = False
         self.accum_usage = {}
         self.upstream_error = None  # R-03
+        # P0-4: stateful special-token scrubbers (cross-chunk fragments).
+        # final_text/acc_reason accumulate the FILTERED text only; withheld
+        # remainders are flushed in done() before the *.done events.
+        self._tok_text = _SpecialTokenFilter()
+        self._tok_reason = _SpecialTokenFilter()
+        # R5 audit: stateful DSML markup suppressor on the visible text
+        # channel (cross-chunk); complete markup becomes function_call items.
+        self._dsml_text = _DsmlMarkupFilter()
 
     def next_seq(self):
         self.seq += 1
@@ -1792,7 +2144,8 @@ class ResponsesStreamState:
             self.emit("response.created", {"response": {
                 "id": rid, "object": "response", "created_at": int(time.time()),
                 "model": self.model, "status": "in_progress", "output": [],
-                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+                # P1-3: full usage shape (details structures) for strict SDKs.
+                "usage": _responses_usage(),
             }}),
             self.emit("response.in_progress", {"response": {"id": rid, "status": "in_progress"}}),
             self.emit("response.output_item.added", {
@@ -1807,6 +2160,12 @@ class ResponsesStreamState:
         ]
 
     def delta(self, text):
+        # R5 audit: suppress DSML markup first (cross-chunk), then P0-4 scrub
+        # special tokens. Only clean, emittable text is accumulated/streamed;
+        # the withheld tail is flushed in done().
+        text = self._tok_text.feed(self._dsml_text.feed(text))
+        if not text:
+            return ""
         self.final_text = getattr(self, "final_text", "") + text
         return self.emit("response.output_text.delta", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": text})
 
@@ -1839,14 +2198,10 @@ class ResponsesStreamState:
             u = self.accum_usage or {}
         else:
             self.accum_usage.update(u)
-        prompt = u.get("prompt_tokens") or u.get("input_tokens") or 0
-        completion = u.get("completion_tokens") or u.get("output_tokens") or 0
-        # OpenAI Responses API schema requires total_tokens alongside input/output.
-        return {
-            "input_tokens": int(prompt),
-            "output_tokens": int(completion),
-            "total_tokens": int(prompt) + int(completion),
-        }
+        _in, _out, _cached, _rsn = _tokens_from_chat_usage(u)
+        # P1-3 fix: the Responses usage object requires total_tokens alongside
+        # input/output AND the *_details structures (strict SDK validation).
+        return _responses_usage(_in, _out, _cached, _rsn)
 
     def done(self, usage=None):
         # MUST return a list — stream_with_heartbeat iterates this.
@@ -1868,16 +2223,33 @@ class ResponsesStreamState:
                           "message": str(self.upstream_error)[:2000]},
             }})]
         text = getattr(self, "final_text", "")
-        events = [
+        events = []
+        # P0-4/R5: release any text withheld by the DSML + special-token
+        # filters before the terminal *.done events so the visible answer is
+        # complete (DSML remnant still passes the token scrubber).
+        _rest_text = self._tok_text.feed(self._dsml_text.flush()) + self._tok_text.flush()
+        if _rest_text:
+            text += _rest_text
+            self.final_text = text
+            events.append(self.emit("response.output_text.delta", {
+                "item_id": "msg-1", "output_index": 0, "content_index": 0, "delta": _rest_text}))
+        # P1-3: output_text parts carry `annotations` for strict SDK parsing.
+        events.extend([
             self.emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": text}),
-            self.emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text}}),
-            self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]}}),
-        ]
+            self.emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": text, "annotations": []}}),
+            self.emit("response.output_item.done", {"output_index": 0, "item": {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]}}),
+        ])
         # Close the reasoning item opened during thinking (if any).
         # CODEX-RESP-02: the reasoning item's `summary` MUST be a list (the SDK
         # model expects list[Summary]); an empty string triggers serializer
         # failures in the openai SDK.
         if self.reasoning_started:
+            # P0-4: flush any withheld reasoning tail before the done event.
+            _rest_rsn = self._tok_reason.flush()
+            if _rest_rsn:
+                self.acc_reason += _rest_rsn
+                events.append(self.emit("response.reasoning_text.delta", {
+                    "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "delta": _rest_rsn}))
             events.append(self.emit("response.reasoning_text.done", {
                 "item_id": self.rsn_id, "output_index": self.rsn_index, "content_index": 0, "text": self.acc_reason,
             }))
@@ -1886,6 +2258,10 @@ class ResponsesStreamState:
                 "item": {"id": self.rsn_id, "type": "reasoning", "status": "completed",
                          "summary": [], "content": [{"type": "reasoning_text", "text": self.acc_reason}]},
             }))
+        # R5 note: DSML markup collected on this surface is suppressed (not
+        # re-emitted) for cross-wrapper parity (CONTRACT §8): tool-call
+        # recovery happens on the Messages surface (stream + non-stream).
+        _ = getattr(self._dsml_text, "collected_text", "")
         # Close every tool item that was opened (Codex hangs if a function_call
         # item is added but never marked done). CODEX-RESP-02: emit the
         # standard `response.function_call_arguments.done` before closing the
@@ -1906,7 +2282,7 @@ class ResponsesStreamState:
         # Build the final output array sorted by output_index (0=text, 1=reasoning,
         # 2+ = tools) so the client's response.completed parse is well-ordered.
         outputs_by_index = {
-            0: {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text}]},
+            0: {"id": "msg-1", "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": text, "annotations": []}]},
         }
         if self.reasoning_started:
             outputs_by_index[self.rsn_index] = {"id": self.rsn_id, "type": "reasoning", "status": "completed",
@@ -1967,7 +2343,9 @@ class ResponsesStreamState:
         content = delta.get("content")
         if isinstance(content, str):
             if content:
-                events.append(self.delta(content))
+                ev = self.delta(content)
+                if ev:
+                    events.append(ev)
         elif isinstance(content, list):
             parts = []
             for part in content:
@@ -1976,7 +2354,9 @@ class ResponsesStreamState:
                     if isinstance(text, str) and text:
                         parts.append(text)
             if parts:
-                events.append(self.delta("".join(parts)))
+                ev = self.delta("".join(parts))
+                if ev:
+                    events.append(ev)
 
         # Reasoning (Nous reasoning_content / reasoning) — MUST be streamed so the
         # client keeps receiving progress during the model's thinking phase.
@@ -1988,6 +2368,9 @@ class ResponsesStreamState:
             delta.get("reasoning_content") if isinstance(delta.get("reasoning_content"), str)
             else (delta.get("reasoning") if isinstance(delta.get("reasoning"), str) else "")
         )
+        if reason_delta:
+            # P0-4: scrub special tokens from the reasoning channel too.
+            reason_delta = self._tok_reason.feed(reason_delta)
         if reason_delta:
             if not self.reasoning_started:
                 self.reasoning_started = True
@@ -2091,6 +2474,10 @@ class Metrics:
             "total_tokens": self.tokens_in + self.tokens_out,
             "input_tokens": self.tokens_in,
             "output_tokens": self.tokens_out,
+            # B-39 visibility (audit 2026-08-03 round-4): the counter itself was
+            # never exposed — only the derived rate. Dashboards and /metrics/prom
+            # had no way to show the absolute error count.
+            "total_errors": self.errors,
             "error_rate": round(self.errors / max(1, self.requests), 4)
         }
 
@@ -2784,6 +3171,8 @@ async def chat_completions(request: Request):
     if isinstance(result, dict):
         if result.get("type") == "message" and "content" in result:
             result = anthropic_to_openai_response(result, body.get("model", ""))
+        # P0-4: scrub special tokens from the non-stream reply body too.
+        _scrub_openai_response_inplace(result)
         _ensure_chat_content(result)
         if not result.get('usage'):
             result['usage'] = {
@@ -2897,6 +3286,9 @@ async def responses(request: Request):
                     logger.warning(f"[responses] store_conversation scheduling failed: {e}")
         return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 
+    # P0-4: scrub before conversion AND before the history is persisted, so
+    # special tokens cannot poison later previous_response_id turns.
+    _scrub_openai_response_inplace(result)
     resp = chat_to_responses(chat_body["model"], result)
     # Store the FULL conversation (user input + assistant reply incl. tool_calls)
     # so that a later tool-result turn has the preceding assistant tool_calls —
@@ -3012,6 +3404,7 @@ async def prom(request: Request):
     lines = [
         f'# HELP wrapper_nous_requests_total Total requests\nwrapper_nous_requests_total {snap["total_requests"]}',
         f'wrapper_nous_tokens_total {snap["total_tokens"]}',
+        f'# HELP wrapper_nous_errors_total Total errors (incl. mid-stream faults)\nwrapper_nous_errors_total {snap["total_errors"]}',
     ]
     return Response("\n".join(lines), media_type="text/plain")
 

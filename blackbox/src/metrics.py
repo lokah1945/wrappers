@@ -107,6 +107,8 @@ class Metrics:
                 "total_tokens": self.tokens_in + self.tokens_out,
                 "input_tokens": self.tokens_in,
                 "output_tokens": self.tokens_out,
+                # B-39 visibility (2026-08-03 R4): absolute count, not just the rate.
+                "total_errors": self.errors,
                 "error_rate": error_rate,
             }
 
