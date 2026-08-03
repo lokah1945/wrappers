@@ -20,7 +20,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **model-registry** | ✅ Verified | 9200 | internal | `service:app` |
 
 **Verification (all reproducible, 8 gates — see [Testing](#-testing)):**
-- ✅ 300 unit + regression tests (incl. 63 streaming regressions, AI Gateway translation matrix)
+- ✅ 308 unit + regression tests (incl. 63 streaming regressions, AI Gateway translation matrix)
 - ✅ 990/990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 streaming modes)
 - ✅ SDK-compat gate — every wrapper's Responses output parses with the official openai SDK (Codex parser)
 - ✅ COMPATIBILITY_LAYER E2E — layer 2 (Anthropic upstream) + layer 3 (auto-discovery)
@@ -293,7 +293,7 @@ wrappers/
 
 ### Latest Audit Results
 
-**Audit:** 2026-08-04 · **300 unit tests · 990 E2E checks · 240 full-matrix checks · 55 agent-loop checks · concurrency storm · 0 failures**  
+**Audit:** 2026-08-04 · **308 unit tests · 990 E2E checks · 240 full-matrix checks · 55 agent-loop checks · concurrency storm · 0 failures**  
 **Report:** [FULL_MATRIX_AUDIT_2026-08-01.md](docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md) · continuous deep-audit reports under `audit_report/` (INDEX.md)
 
 ### Audit Reports
@@ -338,7 +338,7 @@ A wrapper is **not** contract-compliant until it passes the gates below
 ```bash
 pip install -r tests/requirements.txt
 
-# 1. Unit + parity + regression suite (300 tests, incl. translation matrix)
+# 1. Unit + parity + regression suite (308 tests, incl. translation matrix)
 python -m pytest tests -q
 
 # 2. Live agent-traffic E2E — real servers × mock upstream (990 checks)
@@ -383,7 +383,7 @@ curl http://localhost:XXXX/v1/chat/completions \
 ### 2026-08-04 (Current) — Contract v3.2
 - ✅ **Deep-audit rounds 5–7** — stream-integrity, DSML tool-call recovery parity, cross-tenant store-key uniqueness (`new_response_id`), openrouter `/v1/responses` turn persistence + `/metrics` JSON + `/health` in-flight parity
 - ✅ **Two new gates** — real-SDK agent loop (55 checks) + multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk)
-- ✅ 8/8 gates green — 300 unit · 990 E2E · 240 matrix · 55 agent-loop · soak, 0 failures
+- ✅ 8/8 gates green — 308 unit · 990 E2E · 240 matrix · 55 agent-loop · soak, 0 failures
 - 📄 Contract: [WRAPPER_CONTRACT.md §12](WRAPPER_CONTRACT.md) (v3.2 changelog)
 
 ### 2026-08-01 — Contract v3.1
@@ -483,5 +483,5 @@ Internal use only.
 
 **Last Updated:** 2026-08-04  
 **Version:** 3.2  
-**Status:** Verified compatible (300 unit · 990 E2E · 240 matrix · 55 agent-loop · multi-agent storm · 8/8 gates · 0 failures)  
+**Status:** Verified compatible (308 unit · 990 E2E · 240 matrix · 55 agent-loop · multi-agent storm · 8/8 gates · 0 failures)  
 **Repository:** https://github.com/lokah1945/wrappers

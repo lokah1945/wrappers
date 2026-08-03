@@ -524,7 +524,9 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
     if "choices" in a_resp:
         return a_resp
 
-    msg_id = a_resp.get("id") or f"msg_{int(time.time() * 1000)}"
+    # R9: the fallback id must be unique per message — an ms timestamp alone
+    # collides across concurrent turns (same class as the R7 store-key fix).
+    msg_id = a_resp.get("id") or f"msg_{int(time.time() * 1000)}-{secrets.token_hex(4)}"
     oai_id = f"chatcmpl-{msg_id}"
     model = a_resp.get("model") or request_model or ""
     role = a_resp.get("role", "assistant")
@@ -720,7 +722,8 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     cached_tok = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
 
     res_model = o_resp.get("model") or model or ""
-    res_id = request_id or o_resp.get("id") or f"msg_{int(time.time() * 1000)}"
+    # R9: unique fallback id (ms alone collides across concurrent turns).
+    res_id = request_id or o_resp.get("id") or f"msg_{int(time.time() * 1000)}-{secrets.token_hex(4)}"
 
     return {
         "id": str(res_id) if str(res_id).startswith("msg_") else f"msg_{res_id}",
@@ -741,7 +744,7 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
 
 async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
     """Async generator: consume Anthropic SSE stream, yield OpenAI Chat SSE events."""
-    msg_id = f"chatcmpl-{int(time.time() * 1000)}"
+    msg_id = f"chatcmpl-{int(time.time() * 1000)}-{secrets.token_hex(4)}"  # R9: unique id
     # P0-4: stateful scrubbers for visible channels (cross-chunk fragments).
     _tok_text = _new_token_filter()
     _tok_reason = _new_token_filter()

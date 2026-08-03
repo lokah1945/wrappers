@@ -79,6 +79,29 @@ class CentralRegistry:
         import threading
         self._guard = threading.RLock()
 
+    def providers(self) -> list[str]:
+        """R9 fix: snapshot the provider list under the guard. /health ran
+        `sorted(central.registries)` directly — a dict ITERATION, while
+        register_catalog (running in the threadpool under this guard) may
+        create a provider entry concurrently → RuntimeError "dictionary
+        changed size during iteration" → 500 on the monitoring endpoint.
+        Same class as the MR-2 fix in list_models; this call site was
+        missed."""
+        with self._guard:
+            return sorted(self.registries)
+
+    def bind_aliases(self, provider: str, bindings: list[AliasBinding]) -> list[dict[str, Any]]:
+        """R9 fix (MR-2 class): alias ingest performed sync SQLite work
+        (LocalModelRegistry.bind_alias → profile_store.save_alias) ON THE
+        EVENT LOOP and outside the guard, while catalog ingest
+        (asyncio.to_thread) holds the guard for the same registry. Route
+        through the guard; callers run this via asyncio.to_thread."""
+        registry = self.registry(provider)
+        with self._guard:
+            for binding in bindings:
+                registry.bind_alias(binding)
+        return [b.to_dict() for b in bindings]
+
     def registry(self, provider: str) -> LocalModelRegistry:
         provider = str(provider).strip().lower()
         if not provider:
@@ -187,7 +210,7 @@ def health() -> dict[str, Any]:
         "git_commit": GIT_COMMIT,
         "source_root": SOURCE_ROOT,
         "pid": os.getpid(),
-        "providers_loaded": sorted(central.registries),
+        "providers_loaded": central.providers(),  # R9: guarded snapshot
         "model_substitution": False,
         "provider_substitution": False,
         "key_rotation": True,
@@ -291,19 +314,22 @@ async def ingest_aliases(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="bindings must be a list of at most 1000 items")
     registered = []
     try:
+        parsed = []
         for item in bindings:
             if not isinstance(item, dict):
                 raise ValueError("alias binding must be an object")
-            binding = AliasBinding(
+            parsed.append(AliasBinding(
                 scope_type=str(item.get("scope_type") or "wrapper"),
                 scope_id=str(item.get("scope_id") or provider),
                 alias=str(item.get("alias") or ""),
                 canonical_target=str(item.get("canonical_target") or ""),
                 revision=str(item.get("revision") or ""),
                 source=str(item.get("source") or "central"),
-            )
-            central.registry(provider).bind_alias(binding)
-            registered.append(binding.to_dict())
+            ))
+        # R9 fix (MR-2 class): run the sync SQLite-backed binding loop off the
+        # event loop and inside CentralRegistry._guard (catalog ingest parity).
+        import asyncio as _asyncio
+        registered = await _asyncio.to_thread(central.bind_aliases, provider, parsed)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {"provider": provider, "registered": len(registered), "bindings": registered}

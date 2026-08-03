@@ -20,6 +20,7 @@ Production features:
 
 import asyncio
 import copy
+import secrets
 import hmac
 import json
 import logging
@@ -1464,7 +1465,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str,
     """
     resp_id = _new_response_id()  # R7: unique per turn (history-store safety)
     created_at = int(time.time())
-    msg_id = f"msg_{int(time.time()*1000)}"
+    msg_id = _new_msg_id()  # R9: unique per stream
     full_text = ''
     upstream_error = None  # R-03: mid-stream upstream failure
     gen_fault = False  # B-39: transport-level fault surfaced via response.failed
@@ -2208,6 +2209,13 @@ _RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
 _RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
 
 
+
+def _new_msg_id() -> str:
+    """R9: unique Anthropic/message-item id (bare ms timestamps collided across
+    concurrent turns; CSPRNG suffix closes the window — R7-class)."""
+    return f"msg_{int(time.time()*1000)}-{secrets.token_hex(4)}"
+
+
 def _store_response(principal: str, response_id: str, messages: list) -> None:
     """Bounded, TTL-pruned write to the response store (B-33)."""
     if not response_id or not principal:
@@ -2419,7 +2427,7 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
                        'status': 'completed', 'call_id': tc.get('id'),
                        'name': fn.get('name', '') or '',
                        'arguments': fn.get('arguments', '') or ''})
-    output.append({'id': f"msg_{int(time.time()*1000)}", 'type': 'message',
+    output.append({'id': _new_msg_id(), 'type': 'message',
                    'status': 'completed', 'role': 'assistant',
                    'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
     # P1-3 fix: the Responses usage object requires the *_details structures.
@@ -2673,7 +2681,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
 
     usage = openai_resp.get("usage", {})
     return {
-        "id": openai_resp.get("id", f"msg_{int(time.time()*1000)}"),
+        "id": openai_resp.get("id", _new_msg_id()),
         "type": "message",
         "role": "assistant",
         "model": request_body.get("model", ""),
@@ -2699,7 +2707,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     receives a partial frame (`event: ...\n` with no data and no blank-line
     terminator) and surfaces it as raw text (Claude Code bug).
     """
-    msg_id = f"msg_{int(time.time()*1000)}"
+    msg_id = _new_msg_id()  # R9: unique per stream (ms alone collides across concurrent turns)
     model = request_body.get("model", "")
 
     def _sse(event_type: str, payload: dict) -> str:

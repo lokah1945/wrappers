@@ -47,6 +47,7 @@ import json
 import hmac
 import time
 import uuid
+import secrets
 import asyncio
 import logging
 import re as re_module
@@ -571,7 +572,8 @@ class AnthropicStreamState:
         self.current_block = None
         self.tool_map = {}
         self.finished = False
-        self.msg_id = f"msg_{int(time.time()*1000)}"
+        # R9: unique per stream (ms alone collides across concurrent turns).
+        self.msg_id = f"msg_{int(time.time()*1000)}-{secrets.token_hex(4)}"
         # R5 audit: cross-chunk DSML markup suppression (shared filter —
         # CONTRACT §7; the per-chunk 'DSML in chunk' check leaked fragmented
         # markup tails). Complete markup is recoverable via collected_text.
@@ -2841,7 +2843,10 @@ class Server:
         if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
             anthropic_resp = data
         else:
-            anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
+            # R9: let the translator mint the id — the previous pre-prefixed
+            # `msg_<epoch_seconds>` request_id produced `msg_msg_<secs>` (double
+            # prefix) and was non-unique within a second.
+            anthropic_resp = openai_to_anthropic(data, model_id, expect_thinking=expect_thinking, estimated_input=input_tok_est)
         return JSONResponse(status_code=200, content=anthropic_resp)
 
     def _select_timeout(self, is_streaming: bool, metric_path: str) -> int:

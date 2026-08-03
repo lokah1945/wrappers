@@ -12,6 +12,7 @@ import sys
 
 import os
 import copy
+import secrets
 import hmac
 import json
 import time
@@ -827,7 +828,7 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
     if dsml_tools and stop == 'end_turn':
         stop = 'tool_use'
     u = data.get('usage') or {}
-    return {'id': data.get('id') or f"msg_{int(time.time()*1000)}", 'type': 'message', 'role': 'assistant', 'model': model, 'content': content, 'stop_reason': stop, 'stop_sequence': None, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0}}
+    return {'id': data.get('id') or _new_msg_id(), 'type': 'message', 'role': 'assistant', 'model': model, 'content': content, 'stop_reason': stop, 'stop_sequence': None, 'usage': {'input_tokens': u.get('prompt_tokens', 0) or 0, 'output_tokens': u.get('completion_tokens', 0) or 0}}
 
 
 _RESPONSE_STORE: dict[str, tuple] = {}  # key -> (ts, size, messages)
@@ -957,7 +958,7 @@ def chat_to_responses(model: str, data: dict) -> dict:
     for tc in msg.get('tool_calls') or []:
         fn = tc.get('function') or {}
         output.append({'id': tc.get('id') or f'fc_{len(output)}', 'type': 'function_call', 'status': 'completed', 'call_id': tc.get('id'), 'name': fn.get('name', '') or '', 'arguments': fn.get('arguments', '') or ''})
-    output.append({'id': f"msg_{int(time.time()*1000)}", 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
+    output.append({'id': _new_msg_id(), 'type': 'message', 'status': 'completed', 'role': 'assistant', 'content': [{'type': 'output_text', 'text': text, 'annotations': []}]})
     # P1-3 fix: the Responses usage object requires the *_details structures.
     _in, _out, _cached, _rsn = _tokens_from_chat_usage(data.get('usage'))
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
@@ -1855,6 +1856,13 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
 _RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
 _RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
 _RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+
+
+
+def _new_msg_id() -> str:
+    """R9: unique Anthropic/message-item id (bare ms timestamps collided across
+    concurrent turns; CSPRNG suffix closes the window — R7-class)."""
+    return f"msg_{int(time.time()*1000)}-{secrets.token_hex(4)}"
 
 
 def _store_response(principal: str, rid: str, messages: list):

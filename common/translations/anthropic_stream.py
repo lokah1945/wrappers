@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+import secrets
 import time
 from typing import List, Optional
 
@@ -95,7 +96,8 @@ class AnthropicStreamState:
         self.dropped_after_finish: int = 0
         # R-03: set when the upstream reported a mid-stream error frame.
         self.upstream_error: Optional[str] = None
-        self.msg_id: str = f"msg_{int(time.time() * 1000)}"
+        # R9: unique per stream (ms alone collides across concurrent turns).
+        self.msg_id: str = f"msg_{int(time.time() * 1000)}-{secrets.token_hex(4)}"
         # P0-4: stateful special-token scrubbers (one per channel so a token
         # fragmented across chunks — e.g. '<un' + 'k>' — is still caught).
         # Flushed via _close_block so remainder text lands in its own channel.

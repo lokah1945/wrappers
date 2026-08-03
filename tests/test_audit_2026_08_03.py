@@ -390,6 +390,54 @@ class TestAnthropicErrorStopReason(unittest.TestCase):
         self.assertIn('message_stop', types)
 
 
+class TestR9UniqueMessageIds(unittest.TestCase):
+    """R9: every 'msg_*'/'chatcmpl-*' minting fallback must be unique per turn
+    (bare ms timestamps collided across concurrent turns — same class as the
+    R7 store-key fix), and nvidia's compat translator must never emit a
+    double 'msg_msg_' prefix."""
+
+    def test_shared_openai_to_anthropic_fallback_ids_unique(self):
+        from common.translations.shared import openai_to_anthropic_response
+        resp = {'choices': [{'message': {'content': 'hi'}, 'finish_reason': 'stop'}],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}
+        ids = {openai_to_anthropic_response(resp, 'm')['id'] for _ in range(50)}
+        self.assertEqual(len(ids), 50, 'msg ids collide across sequential mints')
+        self.assertTrue(all(i.startswith('msg_') for i in ids))
+
+    def test_shared_stream_anthropic_to_openai_id_unique(self):
+        from common.translations.shared import new_response_id
+        # the stream translator mints chatcmpl-<ms>-<hex> inline; assert the
+        # same instantiation pattern cannot collide within a millisecond.
+        ids = {new_response_id('chatcmpl') for _ in range(50)}
+        self.assertEqual(len(ids), 50)
+
+    def test_anthropic_stream_state_msg_id_unique(self):
+        from common.translations.anthropic_stream import AnthropicStreamState
+        ids = {AnthropicStreamState('m').msg_id for _ in range(50)}
+        self.assertEqual(len(ids), 50, 'msg_id collides within a millisecond')
+
+    def test_nvidia_compat_single_prefix_and_unique(self):
+        import importlib
+        sys.path.insert(0, str(ROOT / 'nvidia-python'))
+        for name in ('src.anthropic_compat', 'src'):
+            sys.modules.pop(name, None)
+        try:
+            mod = importlib.import_module('src.anthropic_compat')
+            resp = {'choices': [{'message': {'content': 'hi'}, 'finish_reason': 'stop'}],
+                    'usage': {'prompt_tokens': 1, 'completion_tokens': 1}}
+            # historical bug: caller passed 'msg_<epoch_secs>' → id came back
+            # 'msg_msg_<epoch_secs>' (double prefix, non-unique)
+            self.assertEqual(mod.openai_to_anthropic(resp, 'm', request_id='msg_abc')['id'], 'msg_abc')
+            self.assertEqual(mod.openai_to_anthropic(resp, 'm', request_id='rawtoken')['id'], 'msg_rawtoken')
+            ids = {mod.openai_to_anthropic(resp, 'm')['id'] for _ in range(50)}
+            self.assertEqual(len(ids), 50, 'nvidia msg ids collide')
+            self.assertFalse(any(i.startswith('msg_msg_') for i in ids))
+        finally:
+            sys.path.remove(str(ROOT / 'nvidia-python'))
+            for name in [n for n in sys.modules if n == 'src' or n.startswith('src.')]:
+                sys.modules.pop(name, None)
+
+
 # ────────────────────────────────────────────────────────────────────────────
 # CONTRACT §6.3 — response store bounded on all three axes
 # ────────────────────────────────────────────────────────────────────────────

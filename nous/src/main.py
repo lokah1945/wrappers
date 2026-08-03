@@ -23,6 +23,7 @@ import os
 import json
 import time
 import copy
+import secrets
 import random
 import asyncio
 import threading
@@ -1803,7 +1804,8 @@ class AnthropicStreamState:
         # calls must remain open CONCURRENTLY (see common/translations).
         self.open_tool_blocks = set()
         self.finished = False
-        self.msg_id = f"msg-{int(time.time()*1000)}"
+        # R9: unique per stream (ms alone collides across concurrent turns).
+        self.msg_id = f"msg-{int(time.time()*1000)}-{secrets.token_hex(4)}"
         # P0-4: stateful special-token scrubbers (one per channel) — catch
         # tokens fragmented across chunks ('<un' + 'k>').
         self._tok_text = _SpecialTokenFilter()

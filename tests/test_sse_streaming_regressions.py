@@ -84,6 +84,9 @@ def load_openrouter_translator(name: str):
         # R7: translators mint UNIQUE response ids via the shared helper —
         # provide the REAL implementation here too.
         '_new_response_id': new_response_id,
+        # R9: translators mint UNIQUE message/item ids via a module helper —
+        # provide an equivalent mint so the isolated exec stays faithful.
+        '_new_msg_id': lambda: f"msg_{int(__import__('time').time()*1000)}-{__import__('secrets').token_hex(4)}",
     }
     exec(compile(src[start:end], 'openrouter_translator', 'exec'), ns)
     return ns[name]

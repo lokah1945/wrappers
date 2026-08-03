@@ -12,11 +12,26 @@ Three translators:
 import os
 import re
 import json
+import secrets
 import time
 import asyncio
 from typing import Optional, AsyncGenerator
 
 from .capabilities import get_context_window
+
+
+def _compose_msg_id(request_id: Optional[str]) -> str:
+    """Anthropic message id with exactly one ``msg_`` prefix and uniqueness.
+
+    R9 fixes: (a) the non-stream caller used to pass a pre-prefixed
+    ``msg_<epoch_seconds>`` → ids became ``msg_msg_<epoch_seconds>``;
+    (b) the no-request-id fallback used a bare ms timestamp, which collides
+    across concurrent turns (same class as the R7 store-key fix).
+    """
+    if request_id:
+        rid = str(request_id)
+        return rid if rid.startswith('msg_') else f'msg_{rid}'
+    return f'msg_{int(time.time() * 1000)}-{secrets.token_hex(4)}'
 
 # P0-4 fix (audit 2026-08-03): central special-token scrubbing — NVIDIA's
 # byte-level-BPE models (Nemotron, DeepSeek-distill, Qwen, Kimi) leak
@@ -606,7 +621,7 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     }
 
     return {
-        'id': f'msg_{request_id}' if request_id else f'msg_{int(time.time() * 1000)}',
+        'id': _compose_msg_id(request_id),
         'type': 'message',
         'role': 'assistant',
         'model': model,
@@ -629,7 +644,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         capture = {}
     if start_ms is not None:
         capture['_startMs'] = int(start_ms)
-    msg_id = f'msg_{request_id}' if request_id else f'msg_{int(time.time() * 1000)}'
+    msg_id = _compose_msg_id(request_id)
     text_index = None
     thinking_index = None
     tool_map = {}
