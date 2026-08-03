@@ -1356,7 +1356,10 @@ async def responses(request: Request):
                 resp_obj = chat_to_responses(model, oai_chat, body)
                 rid = resp_obj.get('id')
                 if rid and principal:
-                    _store_response(principal, rid, chat_body.get('messages', []))
+                    # R6 audit: store request messages + the assistant reply —
+                    # replaying without the assistant tool_calls turn orphans
+                    # the next function_call_output (upstream 400, §8 parity).
+                    _store_response(principal, rid, chat_body.get('messages', []) + [_assistant_message_from_chat(oai_chat)])
                 return JSONResponse(resp_obj, status_code=response.status_code)
         return response
 
@@ -1382,14 +1385,18 @@ async def responses(request: Request):
             resp_obj = chat_to_responses(model, payload, body)
             rid = resp_obj.get('id')
             if rid and principal:
-                _store_response(principal, rid, chat_body.get('messages', []))
+                # R6 audit: store request messages + the assistant reply
+                # (orphan function_call_output on replay → upstream 400).
+                _store_response(principal, rid, chat_body.get('messages', []) + [_assistant_message_from_chat(payload)])
             return JSONResponse(resp_obj, status_code=response.status_code)
         return response
 
     # Streaming: translate OpenAI SSE → Responses SSE event lifecycle.
     if is_stream and isinstance(response, StreamingResponse):
         return StreamingResponse(
-            _translate_openai_stream_to_responses(response.body_iterator, model),
+            _translate_openai_stream_to_responses(
+                response.body_iterator, model,
+                store_ctx=(principal, list(chat_body.get('messages', [])))),
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
@@ -1408,15 +1415,27 @@ async def responses(request: Request):
             resp_id = resp.get('id')
             if resp_id and principal:
                 # B-33: bounded + TTL-pruned write.
-                _store_response(principal, resp_id, chat_body.get('messages', []))
+                # R6 audit: store request messages + the assistant reply —
+                # without the assistant tool_calls turn, the next turn's
+                # function_call_output replays as an orphan (upstream 400,
+                # agent loop dies mid-run; nous/opencode/blackbox parity).
+                _store_response(principal, resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat(payload)])
             return JSONResponse(resp, status_code=response.status_code)
     except Exception as e:
         logger.warning(f"[openrouter] /v1/responses translation failed: {e}")
     return response
 
 
-async def _translate_openai_stream_to_responses(openai_gen, model: str):
+async def _translate_openai_stream_to_responses(openai_gen, model: str,
+                                                store_ctx: "tuple | None" = None):
     """Translate OpenAI Chat Completions SSE stream → Responses API SSE stream.
+
+    store_ctx: optional (principal, request_messages) — on a successful
+    response.completed, the full turn (request messages + assistant reply
+    incl. tool_calls) is written to the tenant store so a later
+    previous_response_id turn replays an orphan-free history (R6 audit:
+    streamed turns were never stored at all, so Codex streaming death-looped
+    on the follow-up turn).
 
     Emits the full Responses event lifecycle:
       response.created → response.in_progress → response.output_item.added →
@@ -1801,6 +1820,19 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 'usage': acc_usage[0] if acc_usage else _responses_usage(),
             },
         })
+
+        # R6 audit: persist the completed streamed turn (request + assistant
+        # reply incl. tool_calls) — previous_response_id replay must see an
+        # orphan-free history. Never on failure/disconnect paths.
+        if store_ctx is not None:
+            try:
+                _principal, _req_msgs = store_ctx
+                _store_response(
+                    _principal, resp_id,
+                    list(_req_msgs) + [_assistant_message_from_chat(
+                        {}, full_text, [a for a in tool_accs if a])])
+            except Exception as _se:
+                logger.warning(f'[openrouter] responses store write failed: {_se}')
 
         yield 'data: [DONE]\n\n'
 
@@ -2218,6 +2250,32 @@ def _get_stored_conversation(principal: str, response_id: str) -> list:
         _RESPONSE_STORE.pop(key, None)
         return []
     return list(msgs)
+
+
+def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs=None) -> dict:
+    """Persistable assistant chat message for the response store
+    (opencode/blackbox/nous/nvidia parity — §8).
+
+    R6 audit: openrouter stored ONLY the request messages — a later
+    previous_response_id turn replayed a history whose assistant tool_calls
+    turn was missing, so the client's function_call_output became an orphan
+    role:tool upstream (400, agent loop dies mid-run). The stored history is
+    the request messages + THIS assistant reply (incl. tool_calls)."""
+    msg = (data.get('choices') or [{}])[0].get('message', {}) if isinstance(data, dict) else {}
+    content = msg.get('content')
+    if content is None:
+        content = fallback_text if fallback_text is not None else None
+    tool_calls = msg.get('tool_calls') or []
+    if tool_accs:
+        tool_calls = [
+            {'id': acc.get('call_id'), 'type': 'function',
+             'function': {'name': acc.get('name', ''), 'arguments': acc.get('args', '')}}
+            for acc in tool_accs if acc
+        ]
+    out = {'role': 'assistant', 'content': content if content not in ('', None) else (None if tool_calls else '')}
+    if tool_calls:
+        out['tool_calls'] = tool_calls
+    return out
 
 
 def _response_store_key(principal: str, response_id: str) -> str:

@@ -325,7 +325,7 @@
    "component": "openai-responses",
    "test": "prev-response-id",
    "status": "PASS",
-   "evidence": "resp_tw3vzc1xctaa0.. -> turn two ok",
+   "evidence": "resp_fmyh3zizu20d6.. -> turn two ok",
    "detail": ""
   },
   {
