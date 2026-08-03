@@ -1050,6 +1050,13 @@ def normalize_schema(s):
 
 
 def repair_orphan_tool_messages(messages):
+    """CONTRACT §7 (no forking): delegate to the SHARED implementation when
+    common.translations is importable (production). The local body only runs
+    in the documented ImportError fallback path (isolated tooling) — the
+    previous local copy had drifted (list-typed tool content stringified as
+    raw JSON instead of joining text blocks)."""
+    if _USING_SHARED_TRANSLATIONS:
+        return _repair_orphan_tool_messages(messages)
     seen = set()
     out = []
     for m in messages:
@@ -1062,7 +1069,11 @@ def repair_orphan_tool_messages(messages):
             out.append(m)
         elif m.get("role") == "tool" and (m.get("tool_call_id") not in seen):
             tcid = m.get("tool_call_id") or ""
-            out.append({"role": "user", "content": f"Tool result{(' for ' + tcid) if tcid else ''}: {m.get('content', '')}"})
+            _c = m.get('content', '')
+            if isinstance(_c, list):
+                _c = " ".join(b.get("text", "") for b in _c
+                              if isinstance(b, dict) and b.get("type") == "text")
+            out.append({"role": "user", "content": f"Tool result{(' for ' + tcid) if tcid else ''}: {_c}"})
         else:
             out.append(m)
     return out

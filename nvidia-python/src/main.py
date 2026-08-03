@@ -527,7 +527,14 @@ def openai_to_anthropic(*args, **kwargs):
 
 
 def _parse_dsml_from_text(text: str) -> tuple:
-    """Split leaked MiniMax DSML tool markup into (clean_text, tool_use blocks)."""
+    """Split leaked MiniMax DSML tool markup into (clean_text, tool_use blocks).
+
+    CONTRACT §7 (no forking): delegate to the SHARED parser when importable
+    (production). The body below only runs in the documented ImportError
+    fallback path (isolated tooling) — it must be kept semantically identical
+    (incomplete markup suppressed, unique tool ids)."""
+    if _shared_parse_dsml is not None:
+        return _shared_parse_dsml(text)
     if not text or 'DSML' not in str(text).replace('\uff5c', '|'):
         return text or '', []
     normalized = str(text).replace('\uff5c', '|').replace('<|DSML|', '|DSML|')

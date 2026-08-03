@@ -446,6 +446,67 @@ class TestR9UniqueMessageIds(unittest.TestCase):
             ids.add(payload['content_block']['id'])
         self.assertEqual(len(ids), 50, 'fallback tool_use ids collide across turns')
 
+
+class TestR11SharedNoFork(unittest.TestCase):
+    """R11 (CONTRACT §7): wrapper-local copies of shared helpers must DELEGATE
+    to common/translations in production — the old copies had drifted (nous
+    repair_orphan stringified list tool-content as raw JSON; the nvidia DSML
+    parser was a manually-synced twin)."""
+
+    def _pop_src_modules(self):
+        for name in [n for n in sys.modules if n == 'src' or n.startswith('src.')]:
+            sys.modules.pop(name, None)
+
+    def test_nous_repair_orphan_matches_shared_semantics(self):
+        import importlib
+        from common.translations.shared import repair_orphan_tool_messages as shared_repair
+        sys.path.insert(0, str(ROOT / 'nous'))
+        self._pop_src_modules()
+        try:
+            mod = importlib.import_module('src.main')
+            msgs = [
+                {'role': 'assistant', 'content': '',
+                 'tool_calls': [{'id': 'kept', 'type': 'function',
+                                 'function': {'name': 'f', 'arguments': '{}'}}]},
+                {'role': 'tool', 'tool_call_id': 'ORPHAN',
+                 'content': [{'type': 'text', 'text': 'partial result'}]},
+                {'role': 'tool', 'tool_call_id': 'kept', 'content': 'ok'},
+            ]
+            got = mod.repair_orphan_tool_messages(msgs)
+            want = shared_repair(msgs)
+            self.assertEqual(got, want, 'nous repair drifted from shared semantics')
+            # list-typed tool content must be joined, never raw-stringified
+            self.assertEqual(got[1]['content'], 'Tool result for ORPHAN: partial result')
+            self.assertNotIn('{\'type\'', got[1]['content'])
+            self.assertEqual(got[2]['role'], 'tool', 'paired tool message must survive')
+        finally:
+            sys.path.remove(str(ROOT / 'nous'))
+            self._pop_src_modules()
+
+    def test_nvidia_dsml_parser_delegates_to_shared(self):
+        import importlib
+        from common.translations.shared import parse_dsml_from_text as shared_parse
+        sys.path.insert(0, str(ROOT / 'nvidia-python'))
+        self._pop_src_modules()
+        try:
+            mod = importlib.import_module('src.main')
+            markup = ('pre |DSML|tool_calls>|DSML|invoke name="get_weather">'
+                      '|DSML|parameter name="city">Paris</|DSML|parameter>'
+                      '</|DSML|invoke></|DSML|tool_calls> post')
+            clean, tools = mod._parse_dsml_from_text(markup)
+            sclean, stools = shared_parse(markup)
+            self.assertEqual(clean, sclean)
+            self.assertEqual(len(tools), len(stools))
+            self.assertEqual(tools[0]['name'], stools[0]['name'] == 'get_weather' and 'get_weather')
+            self.assertEqual(tools[0]['input'], stools[0]['input'])
+            # incomplete markup is suppressed, never leaked (R5 invariant)
+            clean_inc, tools_inc = mod._parse_dsml_from_text('tail |DSML|tool_calls>|DSML|invoke name="x"')
+            self.assertEqual(tools_inc, [])
+            self.assertNotIn('|DSML|', clean_inc)
+        finally:
+            sys.path.remove(str(ROOT / 'nvidia-python'))
+            self._pop_src_modules()
+
     def test_nvidia_compat_single_prefix_and_unique(self):
         import importlib
         sys.path.insert(0, str(ROOT / 'nvidia-python'))
