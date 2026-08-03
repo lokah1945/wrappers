@@ -6,7 +6,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 
 ---
 
-## 🏆 Current Status (2026-08-01)
+## 🏆 Current Status (2026-08-04)
 
 ### Verified by Executable Gates — not by score claims
 
@@ -19,14 +19,15 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 | **openrouter** | ✅ Verified | 9106 | OpenRouter | `src.main:app` |
 | **model-registry** | ✅ Verified | 9200 | internal | `service:app` |
 
-**Verification (all reproducible, see [Testing](#-testing)):**
-- ✅ 241 unit + regression tests (incl. AI Gateway translation matrix)
-- ✅ 63 streaming regression tests · 67 translation-matrix tests
-- ✅ 445/445 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes)
-- ✅ SDK-compat gate — every wrapper's Responses output parses with the official openai SDK (Codex parser), 5 wrappers × 4 modes
+**Verification (all reproducible, 8 gates — see [Testing](#-testing)):**
+- ✅ 298 unit + regression tests (incl. 63 streaming regressions, AI Gateway translation matrix)
+- ✅ 990/990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 streaming modes)
+- ✅ SDK-compat gate — every wrapper's Responses output parses with the official openai SDK (Codex parser)
 - ✅ COMPATIBILITY_LAYER E2E — layer 2 (Anthropic upstream) + layer 3 (auto-discovery)
 - ✅ 240/240 full-matrix audit checks (real anthropic + openai SDK clients)
-- ✅ Soak ~20k requests, 0 failures
+- ✅ 55/55 real-SDK agent-loop checks — tool_use ⇄ tool_result round trips, DSML recovery, replay, tenant isolation
+- ✅ Multi-agent concurrency storm — 12 concurrent SDK agents × 5 wrappers, zero cross-talk, zero leaked in-flight reservations
+- ✅ Soak — sustained load, 0 failures
 
 ---
 
@@ -292,8 +293,8 @@ wrappers/
 
 ### Latest Audit Results
 
-**Audit:** 2026-08-01 · **241 unit tests · 445 E2E checks · 240 full-matrix checks · 0 failures**  
-**Report:** [FULL_MATRIX_AUDIT_2026-08-01.md](docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md)
+**Audit:** 2026-08-04 · **298 unit tests · 990 E2E checks · 240 full-matrix checks · 55 agent-loop checks · concurrency storm · 0 failures**  
+**Report:** [FULL_MATRIX_AUDIT_2026-08-01.md](docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md) · continuous deep-audit reports under `audit_report/` (INDEX.md)
 
 ### Audit Reports
 
@@ -337,10 +338,10 @@ A wrapper is **not** contract-compliant until it passes the gates below
 ```bash
 pip install -r tests/requirements.txt
 
-# 1. Unit + parity + regression suite (241 tests, incl. translation matrix)
+# 1. Unit + parity + regression suite (298 tests, incl. translation matrix)
 python -m pytest tests -q
 
-# 2. Live agent-traffic E2E — real servers × mock upstream (445 checks)
+# 2. Live agent-traffic E2E — real servers × mock upstream (990 checks)
 python tests/e2e_runtime/run_runtime_e2e.py
 
 # 3. SDK compatibility — Responses output must parse with the official
@@ -355,6 +356,14 @@ python tests/e2e_runtime/full_matrix_audit.py
 
 # 6. Sustained load — leak / pool-starvation / degradation
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
+
+# 7. Real-SDK agent loop — tool_use ⇄ tool_result round trips, DSML
+#    recovery, streamed/non-streamed replay, tenant isolation (55 checks)
+python tests/e2e_runtime/agent_loop_e2e.py
+
+# 8. Multi-agent CONCURRENCY E2E — 12 concurrent SDK agents per wrapper,
+#    zero cross-talk markers, zero leaked in-flight reservations
+python tests/e2e_runtime/multiagent_concurrency_e2e.py
 ```
 
 Quick smoke test after booting a wrapper:
@@ -371,12 +380,18 @@ curl http://localhost:XXXX/v1/chat/completions \
 
 ## 📈 Version History
 
-### 2026-08-01 (Current)
+### 2026-08-04 (Current) — Contract v3.2
+- ✅ **Deep-audit rounds 5–7** — stream-integrity, DSML tool-call recovery parity, cross-tenant store-key uniqueness (`new_response_id`), openrouter `/v1/responses` turn persistence + `/metrics` JSON + `/health` in-flight parity
+- ✅ **Two new gates** — real-SDK agent loop (55 checks) + multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk)
+- ✅ 8/8 gates green — 298 unit · 990 E2E · 240 matrix · 55 agent-loop · soak, 0 failures
+- 📄 Contract: [WRAPPER_CONTRACT.md §12](WRAPPER_CONTRACT.md) (v3.2 changelog)
+
+### 2026-08-01 — Contract v3.1
 - ✅ **COMPATIBILITY_LAYER** — operator-declared upstream dialect (1=OpenAI, 2=Anthropic, 3=Auto) in every wrapper
 - ✅ **SDK compatibility** — every wrapper's Responses output parses with the official openai SDK (Codex)
 - ✅ **AI Gateway translation layer** — lossless OpenAI↔Anthropic / Responses↔Chat round trips (F1-F7)
 - ✅ **Full matrix audit** — 240/240 checks with real SDK clients; contract §4/§10 enforcement
-- ✅ 241 unit tests, 445 E2E checks, 0 soak failures
+- ✅ Unit tests, runtime E2E checks, 0 soak failures
 
 ### 2026-07-28
 - ✅ Standardized wrapper structure
@@ -466,7 +481,7 @@ Internal use only.
 
 ---
 
-**Last Updated:** 2026-08-01  
-**Version:** 3.1  
-**Status:** Verified compatible (241 unit · 445 E2E · 240 matrix checks · 0 failures)  
+**Last Updated:** 2026-08-04  
+**Version:** 3.2  
+**Status:** Verified compatible (298 unit · 990 E2E · 240 matrix · 55 agent-loop · multi-agent storm · 8/8 gates · 0 failures)  
 **Repository:** https://github.com/lokah1945/wrappers

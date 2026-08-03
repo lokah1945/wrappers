@@ -164,6 +164,7 @@ try:
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
         openai_chat_to_anthropic_request,
+        new_response_id as _new_response_id,
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
@@ -1460,7 +1461,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str,
     yields causes Starlette to flush them as separate HTTP chunks; the client
     receives a partial frame and surfaces it as raw text.
     """
-    resp_id = f"resp_{int(time.time()*1000)}"
+    resp_id = _new_response_id()  # R7: unique per turn (history-store safety)
     created_at = int(time.time())
     msg_id = f"msg_{int(time.time()*1000)}"
     full_text = ''
@@ -2411,7 +2412,10 @@ def chat_to_responses(model: str, data: dict, request_body: dict | None = None) 
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — missing them fails
     # non-streaming client.responses.create() parsing.
-    resp = {'id': data.get('id') or f"resp_{int(time.time()*1000)}",
+    # R7 concurrency: ALWAYS mint a fresh unique id — reusing the upstream
+    # chat completion id (or an ms timestamp) collides across concurrent
+    # turns and agents then replayed each other's stored history.
+    resp = {'id': _new_response_id(),
             'object': 'response', 'created_at': int(time.time()),
             'model': model, 'status': 'completed', 'output': output,
             'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': [],
@@ -3380,6 +3384,10 @@ async def health():
         "version": VERSION,
         "git_commit": GIT_COMMIT,
         "keys": pool.available_keys,
+        # CONTRACT §10: /health MUST report in-flight counts (was missing —
+        # the only signal that detects a leaked pool reservation).
+        "in_flight": sum(k.in_flight for k in pool.keys),
+        "keys_status_detail": pool.all_stats(),
         "uptime_seconds": int(time.time() - metrics.start),
         "catalog": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
         "management": _HAS_MANAGEMENT,
@@ -3397,6 +3405,16 @@ async def ready():
 
 
 @app.get("/metrics")
+async def metrics_json():
+    """CONTRACT §8/§10 parity fix: the four siblings serve the JSON metrics
+    summary at /metrics and Prometheus exposition at /metrics/prom; openrouter
+    served exposition on BOTH, so dashboards poll the wrong format and the
+    per-key in-flight gauges were invisible to JSON clients."""
+    s = await metrics.summary()
+    s['pool'] = pool.all_stats()
+    return s
+
+
 @app.get("/metrics/prom")
 async def prom_metrics():
     pool_metrics = pool.prom_metrics()

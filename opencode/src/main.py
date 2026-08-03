@@ -93,6 +93,7 @@ try:
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
         openai_chat_to_anthropic_request,
+        new_response_id as _new_response_id,
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
@@ -1133,7 +1134,10 @@ def chat_to_responses(model: str, data: dict) -> dict:
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — missing them fails
     # non-streaming client.responses.create() parsing.
-    return {"id": data.get('id') or f"resp_{int(time.time()*1000)}", "object": "response",
+    # R7 concurrency: ALWAYS mint a fresh unique id — reusing the upstream
+    # chat completion id (or an ms timestamp) collides across concurrent
+    # turns and agents then replayed each other's stored history.
+    return {"id": _new_response_id(), "object": "response",
             "created_at": int(time.time()), "model": model, "status": "completed", "output": output,
             "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
             "usage": _responses_usage(_in, _out, _cached, _rsn)}
@@ -1856,7 +1860,7 @@ async def responses(request: Request):
             status, resp, key = await proxy_request_with_pool("POST", url, chat_body, request, is_stream=True)
             if status != 200:
                 return _jr(status, resp if isinstance(resp, dict) else {"error": {"message": str(resp)}})
-            rid = f"resp_{int(time.time()*1000)}"
+            rid = _new_response_id()  # R7: unique per turn (history-store safety)
             async def gen():
                 seq = 0
                 acc_text = ""

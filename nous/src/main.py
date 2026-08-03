@@ -82,6 +82,7 @@ try:
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
         openai_chat_to_anthropic_request,
+        new_response_id as _new_response_id,
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
@@ -92,6 +93,10 @@ try:
     _USING_SHARED_TRANSLATIONS = True
 except ImportError:
     _USING_SHARED_TRANSLATIONS = False
+
+    def _new_response_id(prefix: str = "resp") -> str:  # type: ignore[misc]
+        import secrets as _s
+        return f"{prefix}_{int(time.time() * 1000)}-{_s.token_hex(6)}"
 
 # P0-4 fix (audit 2026-08-03): central special-token scrubbing. Byte-level-BPE
 # upstream models leak tokenizer control tokens (<unk> — often fragmented
@@ -1280,8 +1285,11 @@ def chat_to_responses(model: str, chat: dict) -> dict:
     # CODEX-RESP-02: the openai SDK's Response model REQUIRES top-level
     # parallel_tool_calls / tool_choice / tools — a response missing them
     # fails non-streaming client.responses.create() parsing.
+    # R7 concurrency: ALWAYS mint a fresh unique id — reusing the upstream
+    # chat completion id (or an ms timestamp) collides across concurrent
+    # turns and agents then replayed each other's stored history.
     return {
-        "id": chat.get("id", f"resp-{int(time.time()*1000)}"),
+        "id": _new_response_id(),
         "object": "response", "created_at": int(time.time()), "model": model,
         "output": output, "status": "completed",
         "parallel_tool_calls": True, "tool_choice": "auto", "tools": [],
@@ -3253,7 +3261,7 @@ async def responses(request: Request):
         return JSONResponse(status_code=status, content=result)
 
     if is_stream:
-        rid = f"resp-{int(time.time()*1000)}"
+        rid = _new_response_id()  # R7: unique per turn (history-store safety)
         state = ResponsesStreamState(rid, chat_body["model"])
         async def gen():
             # Codex requires output_item.added BEFORE first delta.

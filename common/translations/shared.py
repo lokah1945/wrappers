@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
 import time
 from typing import Any
 
@@ -607,6 +608,20 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
             "total_tokens": in_tok + out_tok,
         }
     }
+
+
+def new_response_id(prefix: str = "resp") -> str:
+    """Mint a UNIQUE, time-ordered Responses-id: ``resp_<ms>-<12 hex>``.
+
+    R7 concurrency finding (multi-agent storm): ms-timestamp ids collide
+    under concurrent turns, and reusing an upstream ``chatcmpl-*`` id means
+    every 429-retry or id-recycling gateway replays the SAME store key — two
+    tenants then stored under one key and replayed each other's history
+    (cross-agent data corruption). Store keys must be unique per turn; the
+    millisecond prefix keeps ids roughly sortable for logs, the secrets
+    suffix guarantees uniqueness. Use at every Responses-id minting site in
+    every wrapper (CONTRACT §7 — do not fork this)."""
+    return f"{prefix}_{int(time.time() * 1000)}-{secrets.token_hex(6)}"
 
 
 def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str = None) -> dict:

@@ -33,7 +33,7 @@ from common.sanitize_tokens import (  # noqa: E402
     SpecialTokenFilter, filter_special_tokens, DsmlMarkupFilter,
 )
 from common.translations.shared import (  # noqa: E402
-    responses_usage, tokens_from_chat_usage,
+    responses_usage, tokens_from_chat_usage, new_response_id,
 )
 
 
@@ -81,6 +81,9 @@ def load_openrouter_translator(name: str):
         '_filter_special_tokens': filter_special_tokens,
         '_responses_usage': responses_usage,
         '_tokens_from_chat_usage': tokens_from_chat_usage,
+        # R7: translators mint UNIQUE response ids via the shared helper —
+        # provide the REAL implementation here too.
+        '_new_response_id': new_response_id,
     }
     exec(compile(src[start:end], 'openrouter_translator', 'exec'), ns)
     return ns[name]

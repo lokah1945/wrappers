@@ -25,6 +25,7 @@ from .shared import (
     tokens_from_chat_usage,
     scrub_visible_text,
     responses_content_to_chat,
+    new_response_id,
 )
 
 __all__ = [
@@ -48,4 +49,5 @@ __all__ = [
     "tokens_from_chat_usage",
     "scrub_visible_text",
     "responses_content_to_chat",
+    "new_response_id",
 ]

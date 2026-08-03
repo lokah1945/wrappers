@@ -7,9 +7,9 @@
 | 2026-08-01 | [DEEP_AUDIT_REPORT_2026-08-01.md](DEEP_AUDIT_REPORT_2026-08-01.md) | Previous audit (pre-fix baseline) |
 | 2026-08-02 | [DEEP_AUDIT_REPORT_2026-08-02.md](DEEP_AUDIT_REPORT_2026-08-02.md) | Comprehensive audit — 5 Critical, 6 High, 6 Medium findings |
 | 2026-08-03 | [DEEP_AUDIT_REPORT_2026-08-03.md](DEEP_AUDIT_REPORT_2026-08-03.md) | End-to-end live reproduction audit. Official gates all green (241/445/240/20), yet 8 live bug classes found via adversarial harness: 4 Critical (fabricated success on mid-stream disconnect, auth precedence, function-name-in-args-delta, special token `<unk>` leakage), 5 High |
-| 2026-08-03 R5 | [DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md](DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md) | **Current — round 5 (final).** Post-green re-audit: MiniMax DSML tool-markup class — double-scrub deleting tool calls on `/v1/messages` (nvidia/openrouter), fragmented opener leak, `end_turn` on recovered tool turns (8 variants fixed), incomplete-markup leak fork, env-gated suppression, block-index reuse. **Audit-from-zero sweep done. All 6 gates green: 298 unit / 990 runtime / 240 matrix / SDK / L2+L3 / soak.** |
-| 2026-08-03 R5 | [DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md](DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md) | Round 5: MiniMax DSML tool-markup class — double-scrub deleting tool calls on `/v1/messages` (nvidia/openrouter), fragmented opener leak, `end_turn` on recovered tool turns (8 variants), incomplete-markup leak fork, env-gated suppression, block-index reuse. All 6 gates green. |
-| 2026-08-04 R6 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md) | **Current — round 6 (final).** New instrument: REAL `anthropic`/`openai` SDK agent loops (55 checks × 5 wrappers: tool_use round trips, DSML recovery through the SDK, streamed/non-streamed store replay, SDK-internal 429 retry, tenant isolation, shaped errors). Found & fixed P0 openrouter `/v1/responses` store replay losing the assistant tool_calls turn (incl. streamed turns never stored) — the Codex "dies on turn 2" class. **All 7 gates green: 298 unit / 990 runtime / 55 agent-loop / 240 matrix / SDK / L2+L3 / soak.** |
+| 2026-08-03 R5 | [DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md](DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md) | Round 5: MiniMax DSML tool-markup class — double-scrub deleting tool calls on `/v1/messages` (nvidia/openrouter), fragmented opener leak, `end_turn` on recovered tool turns (8 variants fixed), incomplete-markup leak fork, env-gated suppression, block-index reuse. All 6 gates green: 298 unit / 990 runtime / 240 matrix / SDK / L2+L3 / soak. |
+| 2026-08-04 R6 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md) | Round 6: instrument = REAL `anthropic`/`openai` SDK agent loops (55 checks × 5 wrappers: tool_use round trips, DSML recovery through the SDK, streamed/non-streamed store replay, SDK-internal 429 retry, tenant isolation, shaped errors). Found & fixed P0 openrouter `/v1/responses` store replay losing the assistant tool_calls turn (incl. streamed turns never stored) — the Codex "dies on turn 2" class. All 7 gates green. |
+| 2026-08-04 R7 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md) | **Current — round 7 (final).** New instrument: multi-agent CONCURRENCY storm (12 concurrent SDK agents × 5 wrappers, unique per-agent markers, store-chained turns + parallel fault modes). Found & fixed **P0 cross-tenant store-key collision** (`resp_<ms>` timestamps and upstream-id reuse collided across concurrent turns → agents replayed each other's history): single shared `new_response_id()` helper now mints `resp_<ms>-<12hex>` at every site (§7 no-fork). Also openrouter §10 parity (`/metrics` JSON + `/metrics/prom`, `/health` in-flight). Contract → **v3.2 (8 gates)**. **All 8 gates green: 298 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
 
 ## Summary of Findings (2026-08-03)
 
@@ -20,15 +20,19 @@
 | 🟡 Medium | 6 | nous store no byte cap, no heal_in_flight in 3 wrappers, openrouter `/metrics/model-status` missing, XFF fallback rate limit, registry drain/size-limit missing, openrouter mcp>=2 boot crash |
 | ⚪ Low | 4 | `/ready` auth inconsistency, openrouter missing max_tokens validation, nvidia duplicate retry-after parser, tool-block close on reasoning interleave |
 
-## Test Status (2026-08-03 run)
+## Test Status (2026-08-04 R7 run — contract v3.2, all 8 gates)
 
 | Test Suite | Result |
 |------------|--------|
-| Unit (241) | ✅ 241 pass |
-| Runtime E2E (445) | ✅ 445 pass |
-| SDK Compat (20) | ✅ 20 pass |
-| Full Matrix (240, incl. L2) | ✅ 240 pass |
-| Adversarial probes (45, new) | ❌ **33 fail** — all failures map to P0/P1 findings |
+| Unit + regressions (298) | ✅ 298 pass |
+| Runtime E2E (990) | ✅ 990 pass |
+| SDK Compat (openai Codex parser) | ✅ clean |
+| COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers |
+| Full Matrix (240) | ✅ 240 pass |
+| Real-SDK agent loop (55) | ✅ 55 pass |
+| Multi-agent concurrency storm (10) | ✅ zero cross-talk, zero leaked in-flight |
+| Soak | ✅ 0 failures |
+| Adversarial probes | ✅ folded into the harnesses above (modes + agent scenarios) |
 
 ## Coverage gaps identified (why bugs survived all gates)
 

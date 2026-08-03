@@ -1,7 +1,7 @@
 # Wrapper Monorepo Contract
 
-**Version:** 3.1 (2026-08-01)
-**Supersedes:** 3.0 (2026-08-01)
+**Version:** 3.2 (2026-08-04)
+**Supersedes:** 3.1 (2026-08-01)
 **Status:** Normative. This document is the specification every wrapper is held to.
 
 This monorepo contains provider-specific wrappers that must behave as **one coherent product**. Upstreams differ (NVIDIA NIM, Nous Research, OpenCode Zen, BLACKBOX AI, OpenRouter), but the client-facing contract is intentionally identical across all wrappers.
@@ -328,17 +328,17 @@ Port 9105 is intentionally unused.
 
 ## 11. Testing and verification
 
-A wrapper is **not** contract-compliant until it passes all six gates.
+A wrapper is **not** contract-compliant until it passes all eight gates.
 
 ```bash
 python -m pip install -r tests/requirements.txt
 
 # 1. Unit + parity + regression suite (incl. AI Gateway translation matrix)
-python -m pytest tests -q                        # 241 tests
+python -m pytest tests -q                        # 298 tests
 
 # 2. Live agent-traffic E2E — boots each wrapper as a real server against a
 #    mock upstream and drives it as Claude Code / Codex / OpenAI SDK would.
-python tests/e2e_runtime/run_runtime_e2e.py      # 445 checks, exits non-zero on failure
+python tests/e2e_runtime/run_runtime_e2e.py      # 990 checks, exits non-zero on failure
 
 # 3. SDK compatibility — every wrapper's /v1/responses output (streaming +
 #    non-streaming) must parse with the official openai SDK (Codex's parser).
@@ -354,6 +354,18 @@ python tests/e2e_runtime/full_matrix_audit.py    # 240 checks
 
 # 6. Sustained load — leak, pool-starvation and degradation detection
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
+
+# 7. Agent-loop E2E — full tool-use round trips with the REAL anthropic +
+#    openai SDKs: tool_use → tool_result → next turn, DSML recovery through
+#    the SDK, streamed + non-streamed /v1/responses replay, SDK-internal
+#    transient-429 retry, tenant isolation, shaped error surfaces.
+python tests/e2e_runtime/agent_loop_e2e.py       # 55 checks (11 × 5 wrappers)
+
+# 8. Multi-agent CONCURRENCY E2E — 12 concurrent SDK agents per wrapper
+#    mixing all surfaces and fault modes; asserts zero cross-talk (unique
+#    per-agent markers), event integrity under load, and zero leaked
+#    in-flight reservations after the storm (CONTRACT §2.2.4).
+python tests/e2e_runtime/multiagent_concurrency_e2e.py
 ```
 
 The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `usage_after`, `empty`, `unicode`, `slow`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`. The mock upstream additionally provides non-stream modes (`echo`, `error`, `http429once`, `abrupt`, `http500`, `http429`) for parameter/error/retry probes.
@@ -363,6 +375,19 @@ The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrap
 ---
 
 ## 12. Changelog
+
+### v3.1 → v3.2 (2026-08-04)
+
+Three deep-audit rounds (2026-08-03…04) hardened the five wrappers without adding features; every clause was re-verified end-to-end.
+
+- **§2.2.4 / §3.3 stream integrity:** premature upstream EOF now always surfaces an error frame (never a clean-looking truncated stream); upstream DSML tool-call markup is suppressed at the SSE layer and recovered tool calls are emitted as first-class `tool_calls`/`tool_use` blocks with correct `stop_reason` (`tool_use` upgrade) and lifecycle block indices on all 5 wrappers.
+- **§4:** special-token sanitisation (`<unk>`, `<|im_start|>`, U+0800 fragments) holds partial fragments across chunk boundaries so a token split mid-chunk cannot leak raw to the client; valid-JSON-but-semantically-broken bodies get shaped 4xx instead of upstream echoes.
+- **§5:** stale `Authorization` headers from outer gateways can no longer mask `x-api-key` auth; both headers are evaluated independently (dual-header Claude Code / Hermes style).
+- **§6.1 / §6.3:** mid-stream fault accounting is exactly-once per reservation; store bounds enforced on all three axes with tenant-namespaced keys.
+- **§6.3 / cross-tenant corruption fix (P0):** Responses-store keys are now minted by a single shared helper `new_response_id()` (`common/translations/shared.py`, `resp_<ms>-<12hex>`). Millisecond-timestamp and upstream-`chatcmpl-*` reuse collided under concurrent turns — two tenants shared one store key and replayed each other's history. All minting sites in the 4 OpenAI-store wrappers use the shared helper (§7 — no forking).
+- **§6.3 openrouter:** `/v1/responses` previous-response replay now persists assistant turns (including `tool_calls`) for both streamed and non-streamed turns, so multi-turn tool loops survive `previous_response_id` chaining.
+- **§10:** openrouter `/metrics` now serves the JSON summary like its four siblings (Prometheus exposition moved to `/metrics/prom`); `/health` reports live in-flight reservations on every wrapper.
+- **§11:** expanded from six to **eight gates** — added the real-SDK agent-loop E2E (55 checks: tool_use round trips, DSML recovery, replay, retry, tenant isolation) and the multi-agent concurrency storm (12 concurrent SDK agents × 5 wrappers asserting zero cross-talk and zero leaked in-flight reservations).
 
 ### v3.0 → v3.1 (2026-08-01)
 
@@ -417,5 +442,5 @@ The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrap
 
 ---
 
-**Version:** 3.1 · **Last updated:** 2026-08-01
-**Verification at this version:** 241 unit tests · 63 streaming regressions · 67 translation-matrix tests · 445 live E2E checks · 5 wrappers × 4 modes SDK-compat · 240 full-matrix checks · ~20k soak requests · 0 failures
+**Version:** 3.2 · **Last updated:** 2026-08-04
+**Verification at this version:** 298 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · soak; **8/8 gates green, 0 failures**
