@@ -9,7 +9,8 @@
 | 2026-08-03 | [DEEP_AUDIT_REPORT_2026-08-03.md](DEEP_AUDIT_REPORT_2026-08-03.md) | End-to-end live reproduction audit. Official gates all green (241/445/240/20), yet 8 live bug classes found via adversarial harness: 4 Critical (fabricated success on mid-stream disconnect, auth precedence, function-name-in-args-delta, special token `<unk>` leakage), 5 High |
 | 2026-08-03 R5 | [DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md](DEEP_AUDIT_REPORT_2026-08-03_ROUND5.md) | Round 5: MiniMax DSML tool-markup class — double-scrub deleting tool calls on `/v1/messages` (nvidia/openrouter), fragmented opener leak, `end_turn` on recovered tool turns (8 variants fixed), incomplete-markup leak fork, env-gated suppression, block-index reuse. All 6 gates green: 298 unit / 990 runtime / 240 matrix / SDK / L2+L3 / soak. |
 | 2026-08-04 R6 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND6.md) | Round 6: instrument = REAL `anthropic`/`openai` SDK agent loops (55 checks × 5 wrappers: tool_use round trips, DSML recovery through the SDK, streamed/non-streamed store replay, SDK-internal 429 retry, tenant isolation, shaped errors). Found & fixed P0 openrouter `/v1/responses` store replay losing the assistant tool_calls turn (incl. streamed turns never stored) — the Codex "dies on turn 2" class. All 7 gates green. |
-| 2026-08-04 R7 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md) | **Current — round 7 (final).** New instrument: multi-agent CONCURRENCY storm (12 concurrent SDK agents × 5 wrappers, unique per-agent markers, store-chained turns + parallel fault modes). Found & fixed **P0 cross-tenant store-key collision** (`resp_<ms>` timestamps and upstream-id reuse collided across concurrent turns → agents replayed each other's history): single shared `new_response_id()` helper now mints `resp_<ms>-<12hex>` at every site (§7 no-fork). Also openrouter §10 parity (`/metrics` JSON + `/metrics/prom`, `/health` in-flight). Contract → **v3.2 (8 gates)**. **All 8 gates green: 298 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
+| 2026-08-04 R7 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND7.md) | Round 7: instrument = multi-agent CONCURRENCY storm (12 concurrent SDK agents × 5 wrappers, unique per-agent markers). Found & fixed **P0 cross-tenant store-key collision** (`resp_<ms>`/upstream-id reuse → agents replayed each other's history): shared `new_response_id()` mints `resp_<ms>-<12hex>` everywhere; openrouter §10 parity (`/metrics` JSON + `/metrics/prom`, `/health` in-flight). Contract → v3.2 (8 gates). |
+| 2026-08-04 R8 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND8.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND8.md) | **Current — round 8 (final).** Post-green re-audit of shared mutable state the gates cannot see: (1) **store dict-aliasing** — 4 of 5 wrappers stored/returned LIVE message dicts by reference (latent cross-request corruption; nous N-19 deep-copy pattern now applied both directions in all wrappers); (2) **nvidia `.env` key hot-reload silently dead** — watchdog-thread callback used `asyncio.get_event_loop()` (RuntimeError) → captured running loop at init instead; (3) axis-bound tests added for nous + openrouter stores. **All 8 gates green: 300 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
 
 ## Summary of Findings (2026-08-03)
 
@@ -20,11 +21,11 @@
 | 🟡 Medium | 6 | nous store no byte cap, no heal_in_flight in 3 wrappers, openrouter `/metrics/model-status` missing, XFF fallback rate limit, registry drain/size-limit missing, openrouter mcp>=2 boot crash |
 | ⚪ Low | 4 | `/ready` auth inconsistency, openrouter missing max_tokens validation, nvidia duplicate retry-after parser, tool-block close on reasoning interleave |
 
-## Test Status (2026-08-04 R7 run — contract v3.2, all 8 gates)
+## Test Status (2026-08-04 R8 run — contract v3.2, all 8 gates)
 
 | Test Suite | Result |
 |------------|--------|
-| Unit + regressions (298) | ✅ 298 pass |
+| Unit + regressions (300) | ✅ 300 pass |
 | Runtime E2E (990) | ✅ 990 pass |
 | SDK Compat (openai Codex parser) | ✅ clean |
 | COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers |

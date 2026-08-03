@@ -523,6 +523,153 @@ class TestNvidiaResponseStore(unittest.TestCase):
         self.assertEqual(self.mod._STORE_TTL_SEC, 3600)
 
 
+class TestStoreDeepCopyIsolation(unittest.TestCase):
+    """R8 (N-19 parity, all 5 wrappers): the Responses conversation store must
+    be isolated from LIVE request objects in BOTH directions —
+    (a) mutating the caller's message dicts AFTER store_conversation must not
+        corrupt the stored history, and
+    (b) mutating the dicts RETURNED by a replay load must not corrupt the
+        stored entry (or concurrent replays of the same response id).
+    Without this, two concurrent agents sharing a principal can poison each
+    other's replayed history through normalisation/sanitisation pipelines
+    that edit message dicts in place."""
+
+    WRAPPERS = ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter')
+
+    def _pop_src_modules(self):
+        for name in [n for n in sys.modules if n == 'src' or n.startswith('src.')]:
+            sys.modules.pop(name, None)
+
+    def _store_and_load(self, wrapper):
+        """Return (store_fn, load_fn) adapters with a uniform interface."""
+        import importlib
+        sys.path.insert(0, str(ROOT / wrapper))
+        self._pop_src_modules()
+        try:
+            if wrapper == 'nvidia-python':
+                mod = importlib.import_module('src.responses_compat')
+                mod._RESPONSE_STORE.clear()
+
+                def store(p, rid, msgs):
+                    mod._bounded_store(p, rid, msgs)
+
+                def load(p, rid):
+                    return mod._load_stored(mod._store_key(p, rid))
+
+            elif wrapper == 'nous':
+                mod = importlib.import_module('src.main')
+                mod._RESPONSE_STORE.clear()
+
+                def store(p, rid, msgs):
+                    asyncio.run(mod.store_conversation(p, rid, msgs))
+
+                def load(p, rid):
+                    return mod.get_stored_conversation(p, rid)
+
+            elif wrapper == 'opencode':
+                mod = importlib.import_module('src.main')
+                mod._RESPONSE_STORE.clear()
+
+                def store(p, rid, msgs):
+                    mod._store_response(p, rid, msgs)
+
+                def load(p, rid):
+                    return mod._load_response(p, rid)
+
+            elif wrapper in ('blackbox', 'openrouter'):
+                mod = importlib.import_module('src.main')
+                mod._RESPONSE_STORE.clear()
+
+                def store(p, rid, msgs):
+                    mod._store_response(p, rid, msgs)
+
+                def load(p, rid):
+                    return mod._get_stored_conversation(p, rid) or None
+
+            return store, load
+        finally:
+            sys.path.remove(str(ROOT / wrapper))
+            self._pop_src_modules()
+
+    def test_all_wrappers_store_isolated_both_directions(self):
+        for wrapper in self.WRAPPERS:
+            with self.subTest(wrapper=wrapper):
+                store, load = self._store_and_load(wrapper)
+                live = [{'role': 'user', 'content': [{'type': 'text', 'text': 'orig'}]},
+                        {'role': 'assistant', 'content': 'ans', 'tool_calls': [
+                            {'id': 'c1', 'type': 'function',
+                             'function': {'name': 'f', 'arguments': '{"a": 1}'}}]}]
+                store('p', 'rid', live)
+                # (a) mutate the caller's live dicts AFTER the store write —
+                # a real pipeline does this (normalisation, content coercion).
+                live[0]['content'][0]['text'] = 'MUTATED-AFTER-STORE'
+                live[1]['tool_calls'][0]['function']['arguments'] = '{"hacked": true}'
+                loaded = load('p', 'rid')
+                self.assertIsNotNone(loaded)
+                self.assertEqual(loaded[0]['content'][0]['text'], 'orig',
+                                 f'{wrapper}: store corrupted by post-write mutation')
+                self.assertEqual(loaded[1]['tool_calls'][0]['function']['arguments'],
+                                 '{"a": 1}',
+                                 f'{wrapper}: tool_calls corrupted by post-write mutation')
+                # (b) mutate the REPLAYED copy — the stored entry must survive,
+                # so a concurrent second replay sees pristine data.
+                loaded[0]['content'][0]['text'] = 'MUTATED-REPLAY'
+                loaded[1]['content'] = {'totally': 'rewritten'}
+                again = load('p', 'rid')
+                self.assertEqual(again[0]['content'][0]['text'], 'orig',
+                                 f'{wrapper}: store corrupted by replay-side mutation')
+                self.assertEqual(again[1]['content'], 'ans',
+                                 f'{wrapper}: store corrupted by replay-side mutation')
+
+    def test_nous_openrouter_store_axes_bounded(self):
+        """R8 parity lock: nous + openrouter stores honour the entry-count
+        axis (CONTRACT §6.3), same as the nvidia/opencode/blackbox tests
+        above. Openrouter uses an OrderedDict LRU; nous prunes oldest-first
+        under its async lock."""
+
+        async def _fill(mod):
+            for i in range(mod._RESPONSE_STORE_MAX + 10):
+                await mod.store_conversation(
+                    'p', f'r{i}', [{'role': 'user', 'content': f'q{i}'}])
+
+        # nous (async store path)
+        sys.path.insert(0, str(ROOT / 'nous'))
+        self._pop_src_modules()
+        try:
+            import importlib
+            mod = importlib.import_module('src.main')
+            mod._RESPONSE_STORE.clear()
+            asyncio.run(_fill(mod))
+            self.assertLessEqual(len(mod._RESPONSE_STORE),
+                                 mod._RESPONSE_STORE_MAX,
+                                 'nous store exceeds entry-count axis')
+            self.assertIn(mod._response_store_key('p', f'r{mod._RESPONSE_STORE_MAX + 9}'),
+                          mod._RESPONSE_STORE,
+                          'nous store evicted the FRESHEST entry')
+        finally:
+            sys.path.remove(str(ROOT / 'nous'))
+            self._pop_src_modules()
+
+        # openrouter (sync store path, OrderedDict LRU)
+        sys.path.insert(0, str(ROOT / 'openrouter'))
+        self._pop_src_modules()
+        try:
+            import importlib
+            mod = importlib.import_module('src.main')
+            mod._RESPONSE_STORE.clear()
+            for i in range(mod._RESPONSE_STORE_MAX_ENTRIES + 10):
+                mod._store_response('p', f'r{i}', [{'role': 'user', 'content': f'q{i}'}])
+            self.assertLessEqual(len(mod._RESPONSE_STORE),
+                                 mod._RESPONSE_STORE_MAX_ENTRIES,
+                                 'openrouter store exceeds entry-count axis')
+            self.assertIn(mod._response_store_key('p', f'r{mod._RESPONSE_STORE_MAX_ENTRIES + 9}'),
+                          mod._RESPONSE_STORE,
+                          'openrouter store evicted the FRESHEST entry')
+        finally:
+            sys.path.remove(str(ROOT / 'openrouter'))
+            self._pop_src_modules()
+
+
 class TestOpencodeStoreEnvNames(unittest.TestCase):
     def test_canonical_env_names_present(self):
         src = (ROOT / 'opencode' / 'src' / 'main.py').read_text()

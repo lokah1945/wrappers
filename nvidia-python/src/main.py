@@ -1722,6 +1722,13 @@ class Server:
         # Register a hot-reload callback so new NVIDIA_API_KEY_* entries
         # in .env are picked up without a process restart. sync_keys is
         # async, so we schedule it on the running event loop.
+        # R8 fix: capture THE RUNNING LOOP HERE (we are on the loop thread in
+        # init()). The callback itself runs on the watchdog observer THREAD,
+        # where asyncio.get_event_loop() raises RuntimeError on modern
+        # Python — hot reload silently never worked. run_coroutine_threadsafe
+        # must target this captured loop.
+        _server_loop = asyncio.get_running_loop()
+
         def _sync_pool_from_env():
             import re as _re
             new_keys = []
@@ -1734,8 +1741,7 @@ class Server:
                         new_keys.append(v)
             if new_keys:
                 try:
-                    loop = asyncio.get_event_loop()
-                    asyncio.run_coroutine_threadsafe(self.pool.sync_keys(new_keys), loop)
+                    asyncio.run_coroutine_threadsafe(self.pool.sync_keys(new_keys), _server_loop)
                     logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
                 except Exception as e:
                     logger.warning(f'[env] pool sync schedule failed: {e}')

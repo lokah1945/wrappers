@@ -19,6 +19,7 @@ Production features:
 """
 
 import asyncio
+import copy
 import hmac
 import json
 import logging
@@ -2220,6 +2221,14 @@ def _store_response(principal: str, response_id: str, messages: list) -> None:
     if size > _RESPONSE_STORE_MAX_BYTES:
         logger.warning('[responses] history for %s too large (%dB); not stored', response_id, size)
         return
+    # N-19 parity (nous): store a DEEP COPY so any later in-place mutation of
+    # the live request/assistant message dicts (normalisation, sanitisation,
+    # concurrent replays sharing the same original dicts) can never corrupt
+    # the stored replay history.
+    try:
+        messages = copy.deepcopy(messages)
+    except (TypeError, ValueError, RecursionError):
+        messages = list(messages)
     _RESPONSE_STORE[key] = (time.time(), size, messages)
     _RESPONSE_STORE.move_to_end(key)
     _prune_response_store()
@@ -2250,7 +2259,13 @@ def _get_stored_conversation(principal: str, response_id: str) -> list:
     if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
         _RESPONSE_STORE.pop(key, None)
         return []
-    return list(msgs)
+    # N-19 parity: return a DEEP COPY — the caller replays these dicts into a
+    # live request body; in-place edits on the replay must not poison the
+    # stored entry (or concurrent replays of the same response id).
+    try:
+        return copy.deepcopy(msgs)
+    except (TypeError, ValueError, RecursionError):
+        return list(msgs)
 
 
 def _assistant_message_from_chat(data: dict, fallback_text: str = '', tool_accs=None) -> dict:

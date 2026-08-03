@@ -13,6 +13,7 @@ Production features:
 """
 
 import os
+import copy
 import json
 import re
 import time
@@ -988,6 +989,14 @@ def _store_response(principal: str, key: str, data) -> None:
         except Exception:
             entry_size = 0
     store_key = f"{principal}\x00{key}"
+    # N-19 parity (nous): store a DEEP COPY so any later in-place mutation of
+    # the live request/assistant message dicts (normalisation, sanitisation,
+    # concurrent replays sharing the same original dicts) can never corrupt
+    # the stored replay history.
+    try:
+        data = copy.deepcopy(data)
+    except (TypeError, ValueError, RecursionError):
+        data = list(data) if isinstance(data, list) else data
     _RESPONSE_STORE[store_key] = {"ts": time.time(), "data": data, "size": entry_size}
     # Evict expired entries and bound entry COUNT (audit 2026-08-03: the 200
     # was hard-coded; now the canonical RESPONSES_STORE_MAX_ENTRIES knob).
@@ -1028,7 +1037,13 @@ def _load_response(principal: str, key: str):
     if time.time() - entry["ts"] > _RESPONSE_STORE_TTL_SEC:
         _RESPONSE_STORE.pop(f"{principal}\x00{key}", None)
         return None
-    return entry["data"]
+    # N-19 parity: return a DEEP COPY — the caller replays these dicts into a
+    # live request body; in-place edits on the replay must not poison the
+    # stored entry (or concurrent replays of the same response id).
+    try:
+        return copy.deepcopy(entry["data"])
+    except (TypeError, ValueError, RecursionError):
+        return list(entry["data"]) if isinstance(entry["data"], list) else entry["data"]
 
 
 

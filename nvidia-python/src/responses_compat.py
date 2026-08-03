@@ -18,6 +18,7 @@ agents stop mid-run.
 from __future__ import annotations
 
 import os
+import copy
 import json
 import time
 import random
@@ -134,6 +135,14 @@ def _bounded_store(principal: str, resp_id: str, messages: list) -> None:
         size = len(json.dumps(messages, ensure_ascii=False).encode('utf-8'))
     except Exception:
         size = 0
+    # N-19 parity (nous): store a DEEP COPY so any later in-place mutation of
+    # the live request/assistant message dicts (normalisation, sanitisation,
+    # concurrent replays sharing the same original dicts) can never corrupt
+    # the stored replay history.
+    try:
+        messages = copy.deepcopy(messages)
+    except (TypeError, ValueError, RecursionError):
+        messages = list(messages)
     _RESPONSE_STORE[key] = {"ts": time.time(), "messages": messages, "size": size}
     now = time.time()
     # Axis 3 (audit 2026-08-03): TTL sweep — drop expired entries first.
@@ -157,7 +166,13 @@ def _load_stored(prev_key: str):
     if _STORE_TTL_SEC > 0 and time.time() - entry["ts"] > _STORE_TTL_SEC:
         _RESPONSE_STORE.pop(prev_key, None)
         return None
-    return entry["messages"]
+    # N-19 parity: return a DEEP COPY — the caller replays these dicts into a
+    # live request body; in-place edits on the replay must not poison the
+    # stored entry (or concurrent replays of the same response id).
+    try:
+        return copy.deepcopy(entry["messages"])
+    except (TypeError, ValueError, RecursionError):
+        return list(entry["messages"])
 
 
 def http_status_from_error(err: dict) -> int:
