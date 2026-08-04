@@ -1167,3 +1167,19 @@ def test_r12_base_genai_follows_explicit_llm_base():
     assert ("os.environ.get('NVIDIA_GENAI_URL')" in line
             and '_explicit_llm_base' in line and 'NVIDIA_GENAI_URL' in line), line
     assert line.index('NVIDIA_GENAI_URL') < line.rindex('NVIDIA_GENAI_URL'), line
+
+
+def test_r14_nous_prom_metrics_pool_parity():
+    """R14 (CONTRACT §10): nous /metrics/prom was the only wrapper whose
+    Prometheus surface lacked pool-level series (4 siblings expose
+    keys_total/keys_available/in_flight_total + per-key gauges)."""
+    src = (ROOT / 'nous/src/main.py').read_text()
+    assert 'def prom_metrics(self)' in src, 'nous KeyPool lacks prom_metrics()'
+    assert 'KEY_POOL.prom_metrics()' in src, 'nous /metrics/prom does not emit pool series'
+    for series in ('nous_keys_total', 'nous_keys_available', 'nous_in_flight_total',
+                   'nous_key_rpm', 'nous_key_blocked', 'nous_key_failures_total'):
+        assert series in src, f'nous prom series missing: {series}'
+    # sibling parity baseline stays locked
+    for w in ('opencode', 'blackbox', 'openrouter'):
+        sib = (ROOT / f'{w}/src/key_pool.py').read_text()
+        assert 'def prom_metrics(self)' in sib, f'{w}: pool prom_metrics regressed'

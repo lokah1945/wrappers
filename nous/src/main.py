@@ -449,8 +449,28 @@ class KeyPool:
     def all_stats(self) -> list:
         return [k.stats() for k in self.keys]
 
-
-# ============================================================================
+    def prom_metrics(self) -> str:
+        """R14 fix (CONTRACT §10 parity): Prometheus exposition for the pool —
+        opencode/blackbox/openrouter/nvidia all expose pool-level series from
+        /metrics/prom; nous (inlined-pool deviation) emitted only 3 hardcoded
+        counters. Port the sibling format verbatim with nous_ metric names."""
+        lines = [
+            '# HELP nous_keys_total Total keys',
+            '# TYPE nous_keys_total gauge',
+            f'nous_keys_total {self.total_keys}',
+            '# HELP nous_keys_available Available keys',
+            '# TYPE nous_keys_available gauge',
+            f'nous_keys_available {self.available_keys}',
+            '# HELP nous_in_flight_total In flight',
+            '# TYPE nous_in_flight_total gauge',
+            f'nous_in_flight_total {sum(k.in_flight for k in self.keys)}',
+        ]
+        for k in self.keys:
+            st = k.stats()
+            lines.append(f'nous_key_rpm{{key="{k.label}"}} {st["current_rpm"]}')
+            lines.append(f'nous_key_blocked{{key="{k.label}"}} {1 if st["hard_blocked"] else 0}')
+            lines.append(f'nous_key_failures_total{{key="{k.label}"}} {st["total_failures"]}')
+        return '\n'.join(lines) + '\n'
 
 # ============================================================================
 
@@ -3432,7 +3452,10 @@ async def prom(request: Request):
         f'wrapper_nous_tokens_total {snap["total_tokens"]}',
         f'# HELP wrapper_nous_errors_total Total errors (incl. mid-stream faults)\nwrapper_nous_errors_total {snap["total_errors"]}',
     ]
-    return Response("\n".join(lines), media_type="text/plain")
+    # R14 (CONTRACT §10 parity): include pool-level Prometheus series like the
+    # four sibling wrappers (key availability, in-flight, per-key rpm/blocked/
+    # failures) instead of only the 3 hardcoded counters above.
+    return Response("\n".join(lines) + "\n" + KEY_POOL.prom_metrics(), media_type="text/plain")
 
 @app.get("/metrics/model-status")
 async def model_status(request: Request):
