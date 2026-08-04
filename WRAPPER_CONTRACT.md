@@ -1,7 +1,7 @@
 # Wrapper Monorepo Contract
 
-**Version:** 3.2 (2026-08-04)
-**Supersedes:** 3.1 (2026-08-01)
+**Version:** 3.3 (2026-08-04)
+**Supersedes:** 3.2 (2026-08-04)
 **Status:** Normative. This document is the specification every wrapper is held to.
 
 This monorepo contains provider-specific wrappers that must behave as **one coherent product**. Upstreams differ (NVIDIA NIM, Nous Research, OpenCode Zen, BLACKBOX AI, OpenRouter), but the client-facing contract is intentionally identical across all wrappers.
@@ -328,7 +328,7 @@ Port 9105 is intentionally unused.
 
 ## 11. Testing and verification
 
-A wrapper is **not** contract-compliant until it passes all eight gates.
+A wrapper is **not** contract-compliant until it passes all nine gates.
 
 ```bash
 python -m pip install -r tests/requirements.txt
@@ -366,6 +366,14 @@ python tests/e2e_runtime/agent_loop_e2e.py       # 55 checks (11 × 5 wrappers)
 #    per-agent markers), event integrity under load, and zero leaked
 #    in-flight reservations after the storm (CONTRACT §2.2.4).
 python tests/e2e_runtime/multiagent_concurrency_e2e.py
+
+# 9. Hostile-body FUZZ E2E — 32 malformed/adversarial request bodies per
+#    wrapper × surface (JSON of every type, truncated/BOM/NaN bodies,
+#    wrong-typed fields, negative/huge max_tokens, deep nesting, oversized
+#    strings, /v1/responses variants), plus a concurrent fuzz burst and a
+#    post-storm /health + /metrics integrity sweep. Asserts shaped 4xx —
+#    never an unshaped 5xx and never a process crash (CONTRACT §4, §10).
+python tests/e2e_runtime/fuzz_bodies_e2e.py      # 1081 checks
 ```
 
 The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `usage_after`, `empty`, `unicode`, `slow`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`. The mock upstream additionally provides non-stream modes (`echo`, `error`, `http429once`, `abrupt`, `http500`, `http429`) for parameter/error/retry probes.
@@ -375,6 +383,16 @@ The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrap
 ---
 
 ## 12. Changelog
+
+### v3.2 → v3.3 (2026-08-04)
+
+Round-12 deep audit: a new hostile-body fuzz gate was built and run against all 5 wrappers; it surfaced two real defects which are fixed and locked by the same gate; a third cross-dialect gap was closed in the same pass.
+
+- **§11:** expanded from eight to **nine gates** — added the hostile-body fuzz E2E (`tests/e2e_runtime/fuzz_bodies_e2e.py`, 1081 checks: 32 malformed/adversarial bodies × 5 wrappers × surfaces, a concurrent fuzz burst, and a post-storm `/health` + `/metrics` in-flight integrity sweep).
+- **§9.1 routing fix (B-12.1):** nvidia-python's generation base (`BASE_GENAI` — embeddings / ranking / images) ignored an operator-provided custom `NVIDIA_BASE_URL` and leaked those calls to the public NVIDIA cloud endpoint. It now falls back to the explicit LLM base URL before the cloud default; the official-cloud default is unchanged.
+- **§10 parity fix (B-12.2):** nous, opencode and blackbox `/metrics` JSON lacked the `pool` (live per-key stats from `KEY_POOL.all_stats()`) and `in_flight` fields that nvidia and openrouter already reported, breaking cross-wrapper observability parity. All five `/metrics` payloads now carry both fields.
+- **§2/§9.2 translation fix (B-12.3):** the shared OpenAI→Anthropic request converter (COMPATIBILITY_LAYER=2) silently ignored `max_completion_tokens` — the alias newer OpenAI SDKs send instead of `max_tokens` — dropping the client's output cap entirely. It now coalesces the alias (`max_tokens` still wins when both are set; no cap is injected when neither is).
+- **Verification:** 315 unit · 990 runtime E2E · 240 full-matrix · 55 agent-loop · multi-agent storm · official-SDK compat · COMPATIBILITY_LAYER E2E · soak · **1081 fuzz checks** — **9/9 gates green, 0 failures**.
 
 ### v3.1 → v3.2 (2026-08-04)
 
@@ -442,5 +460,5 @@ Three deep-audit rounds (2026-08-03…04) hardened the five wrappers without add
 
 ---
 
-**Version:** 3.2 · **Last updated:** 2026-08-04
-**Verification at this version:** 312 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · soak; **8/8 gates green, 0 failures**
+**Version:** 3.3 · **Last updated:** 2026-08-04
+**Verification at this version:** 315 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · 1081 hostile-body fuzz checks · soak; **9/9 gates green, 0 failures**

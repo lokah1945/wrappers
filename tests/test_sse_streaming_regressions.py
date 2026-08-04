@@ -1113,3 +1113,57 @@ def test_contract_shared_modules_exist():
                 'common/translations/anthropic_stream.py',
                 'common/translations/shared.py'):
         assert (ROOT / rel).exists(), f'shared module missing: {rel}'
+
+
+# ── R12 regression locks (fuzz-gate findings B-12.1/B-12.2/B-12.3) ──
+
+def test_r12_max_completion_tokens_coalesced():
+    """B-12.3: layer-2 (Anthropic upstream) converter must honour the newer
+    OpenAI `max_completion_tokens` alias — silently ignoring it dropped the
+    client's output cap (unbounded generation)."""
+    from common.translations.shared import openai_chat_to_anthropic_request
+    base = {'model': 'm', 'messages': [{'role': 'user', 'content': 'hi'}]}
+    out = openai_chat_to_anthropic_request({**base, 'max_completion_tokens': 512})
+    assert out.get('max_tokens') == 512, out
+    # explicit max_tokens wins over the alias
+    out2 = openai_chat_to_anthropic_request({**base, 'max_tokens': 100, 'max_completion_tokens': 512})
+    assert out2.get('max_tokens') == 100, out2
+    # neither present → no injected cap (no silent default mutation)
+    out3 = openai_chat_to_anthropic_request(dict(base))
+    assert 'max_tokens' not in out3, out3
+
+
+def test_r12_metrics_pool_parity_all_wrappers():
+    """B-12.2 (CONTRACT §10): every wrapper's /metrics JSON must expose the
+    live pool stats and in-flight reservation count."""
+    checks = {
+        'nous': ('nous/src/main.py', 'KEY_POOL'),
+        'opencode': ('opencode/src/main.py', 'pool'),
+        'blackbox': ('blackbox/src/main.py', 'pool'),
+    }
+    import re
+    for name, (rel, poolvar) in checks.items():
+        src = (ROOT / rel).read_text()
+        assert f"{poolvar}.all_stats()" in src, f'{name}: /metrics lacks pool stats'
+        assert re.search(rf"sum\(k\.in_flight for k in {poolvar}\.keys\)", src), \
+            f'{name}: /metrics lacks in_flight'
+    # nvidia + openrouter were the parity baselines (R7): keep them locked too
+    nv = (ROOT / 'nvidia-python/src/main.py').read_text()
+    assert 'live_keys' in nv and 'all_stats()' in nv
+    orw = (ROOT / 'openrouter/src/main.py').read_text()
+    assert re.search(r"s\['pool'\]\s*=\s*pool\.all_stats\(\)|'pool':\s*pool\.all_stats\(\)", orw), \
+        'openrouter: /metrics pool parity regressed'
+
+
+def test_r12_base_genai_follows_explicit_llm_base():
+    """B-12.1: BASE_GENAI must fall back to an operator-provided
+    NVIDIA_BASE_URL before the public cloud default (no silent leak of
+    embeddings/ranking/images traffic to ai.api.nvidia.com)."""
+    src = (ROOT / 'nvidia-python/src/main.py').read_text()
+    line = next(l for l in src.splitlines() if l.strip().startswith('BASE_GENAI')
+                and 'os.environ' in l)
+    assert '_explicit_llm_base' in src
+    # precedence: NVIDIA_GENAI_URL env > explicit NVIDIA_BASE_URL > cloud default
+    assert ("os.environ.get('NVIDIA_GENAI_URL')" in line
+            and '_explicit_llm_base' in line and 'NVIDIA_GENAI_URL' in line), line
+    assert line.index('NVIDIA_GENAI_URL') < line.rindex('NVIDIA_GENAI_URL'), line

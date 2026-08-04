@@ -14,7 +14,9 @@
 | 2026-08-04 R9 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND9.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND9.md) | Round 9 (final at 308 unit): (1) **model-registry (:9200) first line-by-line audit**: `/health` iterated `registries` unguarded while threadpool ingests inserted providers (RuntimeError → 500 on the monitoring endpoint — MR-2 class) — guarded `providers()` snapshot; alias ingest did sync SQLite on the event loop outside the guard — now `to_thread(central.bind_aliases)` under the guard. (2) **R7-class id-uniqueness closed everywhere**: nvidia non-stream Anthropic id was `msg_msg_<epoch_secs>` (double prefix + non-unique) — translator now composes single-prefix CSPRNG ids; every remaining bare-ms `msg_*`/`chatcmpl-*` mint across shared translations + all 5 wrappers uniquified (`-{secrets.token_hex(4)}` / `_new_msg_id()`). +8 regression tests. **All 8 gates green: 308 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak + 7/7 registry-service tests.** |
 | 2026-08-04 R10 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND10.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND10.md) | Round 10: R9.3 closure one layer deeper: every `toolu_*` fallback mint (14 sites across shared translations + all 5 wrappers) carried a bare ms timestamp (DSML variants added only a 10k-modulo `hash(name)` — zero cross-process uniqueness) → same-ms fallback mints collided **inside stored & replayed histories**, making `tool_result` pairing ambiguous (upstream 400 or wrong-pair derailment mid agent-run). All mints now `-{secrets.token_hex(3)}` suffixed, incl. index-scoped fallbacks (unique per message but NOT across replayed turns). +2 regression tests. **All 8 gates green: 310 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
 
-| 2026-08-04 R11 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md) | **Current — round 11 (final).** CONTRACT §7 no-fork closure: (1) nous called its own DRIFTED `repair_orphan_tool_messages` at the replay site despite importing the shared one — list-typed tool content arrived upstream as raw stringified JSON — now delegates; (2) nvidia kept a hand-synced `_parse_dsml_from_text` twin — now delegates to the shared parser on the importable path. nous' documented deviation (inlined dict-based AnthropicStreamState) fully re-verified at parity (R-02/P3-4/P0-4/R5/B-06/R-03/R9/R10). +2 regression tests. **All 8 gates green: 312 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
+| 2026-08-04 R11 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md) | Round 11: CONTRACT §7 no-fork closure: (1) nous called its own DRIFTED `repair_orphan_tool_messages` at the replay site despite importing the shared one — list-typed tool content arrived upstream as raw stringified JSON — now delegates; (2) nvidia kept a hand-synced `_parse_dsml_from_text` twin — now delegates to the shared parser on the importable path. nous' documented deviation (inlined dict-based AnthropicStreamState) fully re-verified at parity (R-02/P3-4/P0-4/R5/B-06/R-03/R9/R10). +2 regression tests. **All 8 gates green: 312 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
+| 2026-08-04 R12 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND12.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND12.md) | Round 12: instrument = hostile-body FUZZ gate (32 malformed/adversarial bodies × 5 wrappers × 3 surfaces + concurrent burst + post-storm `/health`/`/metrics` sweep — 1081 checks) → three real fixes: **B-12.1** nvidia `BASE_GENAI` ignored custom `NVIDIA_BASE_URL` (GENAI traffic leaked to the public cloud host — §9.1 routing); **B-12.2** nous/opencode/blackbox `/metrics` JSON lacked `pool` + `in_flight` (§10 parity); **B-12.3** layer-2 converter silently dropped `max_completion_tokens` (client output cap lost). Contract → **v3.3 (9 gates)**. +3 regression tests. **All 9 gates green: 315 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / 1081 fuzz / soak.** |
+| 2026-08-04 R13 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md) | **Current — round 13 (final), CLEAN ROUND.** From-zero re-audit: full re-read of least-covered code hunting whole bug classes — nous upstream retry ladder + stream-ownership hand-off, pool double-release/negative-in-flight safety ×5, stream-generator `GeneratorExit`/`finally` release patterns, shared header-forwarding allowlist, nvidia responses-store TTL/deep-copy/unique-mint, model-registry guard coverage, unbounded-loop + silent-except sweeps. **0 new defects.** All 9 gates re-verified green (315 / 990 / 240 / 55 / 10 / 1081 / SDK / L2+L3 / soak). |
 ## Summary of Findings (2026-08-03)
 
 | Severity | Count | Key Issues |
@@ -24,18 +26,20 @@
 | 🟡 Medium | 6 | nous store no byte cap, no heal_in_flight in 3 wrappers, openrouter `/metrics/model-status` missing, XFF fallback rate limit, registry drain/size-limit missing, openrouter mcp>=2 boot crash |
 | ⚪ Low | 4 | `/ready` auth inconsistency, openrouter missing max_tokens validation, nvidia duplicate retry-after parser, tool-block close on reasoning interleave |
 
-## Test Status (2026-08-04 R9 run — contract v3.2, all 8 gates + registry-service tests)
+## Test Status (2026-08-04 R13 run — contract v3.3, all 9 gates + registry-service tests)
 
 | Test Suite | Result |
 |------------|--------|
-| Unit + regressions (312) | ✅ 312 pass |
+| Unit + regressions (315) | ✅ 315 pass |
 | Runtime E2E (990) | ✅ 990 pass |
 | SDK Compat (openai Codex parser) | ✅ clean |
 | COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers |
 | Full Matrix (240) | ✅ 240 pass |
 | Real-SDK agent loop (55) | ✅ 55 pass |
 | Multi-agent concurrency storm (10) | ✅ zero cross-talk, zero leaked in-flight |
+| Hostile-body fuzz (1081) | ✅ 1081 pass — shaped 4xx, zero unshaped 5xx, zero crashes |
 | Soak | ✅ 0 failures |
+| model-registry service | ✅ 7 pass |
 | Adversarial probes | ✅ folded into the harnesses above (modes + agent scenarios) |
 
 ## Coverage gaps identified (why bugs survived all gates)

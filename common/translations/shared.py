@@ -975,7 +975,12 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
         out['system'] = '\n\n'.join(system_parts)
     if chat_body.get('stream') is not None:
         out['stream'] = bool(chat_body['stream'])
+    # R12/B-12.3: coalesce the newer OpenAI alias — clients on recent SDKs
+    # send `max_completion_tokens` instead of `max_tokens`; silently ignoring
+    # it dropped the client's output cap entirely (unbounded generation).
     mt = chat_body.get('max_tokens')
+    if mt is None:
+        mt = chat_body.get('max_completion_tokens')
     if mt is not None:
         out['max_tokens'] = mt
     for k in ('temperature', 'top_p', 'top_k'):

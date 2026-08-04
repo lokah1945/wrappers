@@ -3417,7 +3417,12 @@ async def messages(request: Request):
 # without auth friction. Security is NOT mandatory for telemetry.
 @app.get("/metrics")
 async def get_metrics(request: Request):
-    return metrics.snapshot()
+    # R12 (openrouter R7 parity, CONTRACT §10): include the live per-key pool
+    # stats so in-flight reservations are visible on the JSON surface too.
+    snap = metrics.snapshot()
+    snap['pool'] = KEY_POOL.all_stats()
+    snap['in_flight'] = sum(k.in_flight for k in KEY_POOL.keys)
+    return snap
 
 @app.get("/metrics/prom")
 async def prom(request: Request):

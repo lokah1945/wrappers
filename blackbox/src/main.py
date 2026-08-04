@@ -2122,7 +2122,12 @@ async def anthropic_messages(request: Request):
 async def get_metrics(request: Request):
     # Per project principle: dashboard must be fast/precise/accessible without
     # token. Metrics endpoints are PUBLIC so the dashboard can render live data.
-    return await metrics.summary()
+    # R12 (openrouter R7 parity, CONTRACT §10): include the live per-key pool
+    # stats so in-flight reservations are visible on the JSON surface too.
+    s = await metrics.summary()
+    s['pool'] = pool.all_stats()
+    s['in_flight'] = sum(k.in_flight for k in pool.keys)
+    return s
 
 
 @app.get('/metrics/prom')

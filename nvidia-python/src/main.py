@@ -851,8 +851,15 @@ def _env_flag(name: str, default: str = '0') -> bool:
 LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9101'))
 # V-06 fix: default bind is loopback; set LISTEN_HOST explicitly to expose.
 BIND_HOST = os.environ.get('LISTEN_HOST', '127.0.0.1')
-BASE_LLM = (os.environ.get('NVIDIA_BASE_URL') or NVIDIA_BASE_URL).rstrip('/')
-BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or NVIDIA_GENAI_URL).rstrip('/')
+_explicit_llm_base = (os.environ.get('NVIDIA_BASE_URL') or '').strip()
+BASE_LLM = (_explicit_llm_base or NVIDIA_BASE_URL).rstrip('/')
+# R12 fix (fuzz gate B-12.1): when the operator sets NVIDIA_BASE_URL to a
+# custom gateway but leaves NVIDIA_GENAI_URL unset, embeddings/ranking/images
+# must follow the SAME gateway — they previously leaked to the public
+# ai.api.nvidia.com (502s / wrong-credential failures behind every non-NVIDIA
+# backend). Official-cloud defaults are unchanged: NVIDIA_BASE_URL unset →
+# NVIDIA_GENAI_URL constant (ai.api.nvidia.com).
+BASE_GENAI = (os.environ.get('NVIDIA_GENAI_URL') or _explicit_llm_base or NVIDIA_GENAI_URL).rstrip('/')
 BASE_NVCF = (os.environ.get('NVIDIA_NVCF_URL') or NVIDIA_NVCF_URL).rstrip('/')
 DB_PATH = os.environ.get('METRICS_DB', str(Path(__file__).parent.parent / 'metrics.db'))
 MODEL_STATE_DB = os.environ.get('MODEL_STATE_DB', str(Path(__file__).resolve().parent.parent / 'model-state.db'))
