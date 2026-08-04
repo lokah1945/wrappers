@@ -1656,3 +1656,48 @@ def test_b27_2_nvidia_metrics_insert_actually_runs_and_clamps():
     assert token_vals, params
     import json as _j
     _j.dumps({'r': list(params)}, allow_nan=False)
+
+
+def test_b28_1_dashboards_escape_data_interpolations():
+    """B-28.1 (stored-XSS class lock): the public dashboard surfaces render
+    upstream/config-derived strings (model ids, key labels, error reasons).
+    Any such interpolation into innerHTML WITHOUT esc() is a stored-XSS hole
+    in the operator's browser. Lock the exact data flows + a generic title-
+    attribute scan stays at zero unescaped interpolations."""
+    import re as _re
+    files = ['common/dashboard_template.html', 'nous/dashboard.html',
+             'opencode/dashboard.html', 'blackbox/dashboard.html',
+             'nvidia-python/dashboard.html']
+    # exact render sites that MUST be escaped (one per data flow)
+    required = ["esc(r.model || '')", "esc(r.model || '—')",
+                "esc(r.state || 'unknown')", "esc(r.status || '—')",
+                "esc(r.reason || '—')", "esc(r.key_label || '—')",
+                "esc(label)", "esc(mid)", "esc(stateStr)", "esc(it.label)",
+                "esc(mbKeys.join(', '))", "esc(mbKeys.slice(0, 3).join(', '))",
+                "esc(k.label || '?')", "esc(k.label || '')",
+                "esc(prefix.length > 28"]
+    for f in files:
+        src = (ROOT / f).read_text()
+        assert 'function esc(' in src, f'{f}: esc() helper missing'
+        for site in required:
+            assert site in src, f'{f}: missing {site}'
+        # generic invariant: no bare variable interpolation into a title attr
+        for pat in ('title="\\\' + (', 'title="\\"\' + ('):
+            idx = 0
+            while True:
+                i = src.find(pat, idx)
+                if i == -1:
+                    break
+                nxt = src[i + len(pat):i + len(pat) + 4]
+                assert nxt.startswith('esc('), \
+                    f'{f}: unescaped title= interpolation at {i}: {src[i:i+80]!r}'
+                idx = i + 1
+    # openrouter's dashboard: assert ONLY server-minted/numeric interpolations
+    src = (ROOT / 'openrouter/dashboard.html').read_text()
+    for m in _re.finditer(r'\$\{([^}]+)\}', src):
+        expr = m.group(1)
+        allowed = ('health.version', 'health.uptime_', 'stats.', 'kp.total_keys',
+                   'kp.available_keys', 'k.label', 'k.current_rpm', 'k.in_flight',
+                   'k.hard_blocked', 'cHealth.ok', 'hasMgmt ?', 'e.message')
+        assert any(a in expr for a in allowed), \
+            f'openrouter dashboard: unchecked interpolation ${{{expr}}}'

@@ -874,6 +874,13 @@ applyTheme(_themeChoice);
 /* ── Helpers ───────────────────────────────────────── */
 const $ = id => document.getElementById(id);
 
+function esc(s) {
+  // B-28.1: HTML-escape ANY data-derived string before innerHTML
+  // interpolation (stored-XSS prevention on the public dashboard surface).
+  return String(s == null ? '' : s).replace(/[&<>"']/g,
+    c => ({'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'}[c]));
+}
+
 function fmt(n) {
   if (n === null || n === undefined || n === '') return '—';
   n = Number(n);
@@ -1132,7 +1139,7 @@ function renderDonut(svgSegsId, legendId, totalId, items) {
     const p = (it.value / total * 100).toFixed(1);
     return '<div class="donut-leg-item">' +
       '<span class="donut-leg-dot" style="background:' + (colors[it.key] || colors.other) + '"></span>' +
-      '<span>' + it.label + '</span>' +
+      '<span>' + esc(it.label) + '</span>' +
       '<span class="donut-leg-val">' + fmt(it.value) +
         '<span class="donut-leg-pct">(' + p + '%)</span>' +
       '</span>' +
@@ -1167,16 +1174,16 @@ function renderKeyCard(k) {
   const modelBlocks = k.model_blocks || {};
   const mbKeys = Object.keys(modelBlocks);
   const mbLine = mbKeys.length
-    ? '<div style="font-size:10px;color:var(--purple);margin:6px 0;display:flex;align-items:center;gap:4px" title="' + mbKeys.join(', ') + '">' +
-      BAN_ICON_SVG + ' <span>' + mbKeys.length + ' model(s) throttled: ' + mbKeys.slice(0, 3).join(', ') +
+    ? '<div style="font-size:10px;color:var(--purple);margin:6px 0;display:flex;align-items:center;gap:4px" title="' + esc(mbKeys.join(', ')) + '">' +
+      BAN_ICON_SVG + ' <span>' + mbKeys.length + ' model(s) throttled: ' + esc(mbKeys.slice(0, 3).join(', ')) +
       (mbKeys.length > 3 ? ' +' + (mbKeys.length - 3) : '') + '</span></div>'
     : '';
 
   return '<div class="key-card ' + badgeClass + '">' +
     '<div class="key-header">' +
       '<div>' +
-        '<div class="key-name">' + (k.label || '?') + '</div>' +
-        '<div class="key-prefix">' + (prefix.length > 28 ? prefix.slice(0, 28) + '…' : prefix) + '</div>' +
+        '<div class="key-name">' + esc(k.label || '?') + '</div>' +
+        '<div class="key-prefix">' + esc(prefix.length > 28 ? prefix.slice(0, 28) + '…' : prefix) + '</div>' +
       '</div>' +
       '<span class="key-badge ' + badgeClass + '">' + badgeText + '</span>' +
     '</div>' +
@@ -1415,10 +1422,10 @@ function renderModelsTable() {
   $('mod-table-body').innerHTML = rows.map(r => {
     const cls = r.state === 'available' ? 'ok' : (r.state === 'errored' || r.state === 'error' ? 'err' : 'warn');
     return '<tr>' +
-      '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (r.model || '') + '">' + (r.model || '—') + '</td>' +
-      '<td><span class="pill ' + cls + '">' + (r.state || 'unknown') + '</span></td>' +
-      '<td>' + (r.status || '—') + '</td>' +
-      '<td style="font-size:11px;color:var(--muted)">' + (r.reason || '—') + '</td>' +
+      '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.model || '') + '">' + esc(r.model || '—') + '</td>' +
+      '<td><span class="pill ' + cls + '">' + esc(r.state || 'unknown') + '</span></td>' +
+      '<td>' + esc(r.status || '—') + '</td>' +
+      '<td style="font-size:11px;color:var(--muted)">' + esc(r.reason || '—') + '</td>' +
       '<td style="color:var(--muted)">' + (r.checked ? fmtTime(r.checked) : '—') + '</td>' +
     '</tr>';
   }).join('');
@@ -1469,7 +1476,7 @@ async function loadKeys() {
   $('keys-bars-card').innerHTML = total ? keys.map(k => {
     const w = Math.round((k.total_requests || 0) / Math.max(maxReq, 1) * 100);
     return '<div class="bar-row">' +
-      '<div class="bar-name" title="' + (k.label || '') + '">' + (k.label || '?') + '</div>' +
+      '<div class="bar-name" title="' + esc(k.label || '') + '">' + esc(k.label || '?') + '</div>' +
       '<div class="bar-track"><div class="bar-fill" style="width:' + w + '%;background:var(--accent)"></div></div>' +
       '<div class="bar-val">' + fmt(k.total_requests || 0) + ' req</div>' +
     '</div>';
@@ -1525,8 +1532,8 @@ function renderActivityTable() {
     const cached = r.cached_tokens || 0;
     return '<tr>' +
       '<td style="white-space:nowrap;color:var(--muted)">' + (r.ts ? fmtTime(r.ts) : '—') + '</td>' +
-      '<td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (r.model || r.path || '') + '">' + label + '</td>' +
-      '<td><span class="pill info">' + (r.key_label || '—') + '</span></td>' +
+      '<td class="mono" style="max-width:240px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + esc(r.model || r.path || '') + '">' + esc(label) + '</td>' +
+      '<td><span class="pill info">' + esc(r.key_label || '—') + '</span></td>' +
       '<td>' + statusPill + '</td>' +
       '<td class="num">' + fmt(tokIn) + (cached ? ' <span style="color:var(--accent)">(' + fmt(cached) + ' cache)</span>' : '') + ' / ' + fmt(tokOut) + '</td>' +
       '<td>' + (r.streaming ? '<span class="pill stream">stream</span>' : '<span class="pill info">sync</span>') + '</td>' +
@@ -1583,8 +1590,8 @@ function renderHealthGrid() {
                   (stateStr === 'errored' || stateStr === 'error' ? 'var(--red)' : 'var(--yellow)');
     return '<div class="health-item">' +
       '<span class="health-dot" style="background:' + color + ';color:' + color + '"></span>' +
-      '<span class="health-name" title="' + mid + '">' + mid + '</span>' +
-      '<span class="health-status-text" style="color:' + color + '">' + stateStr + '</span>' +
+      '<span class="health-name" title="' + esc(mid) + '">' + esc(mid) + '</span>' +
+      '<span class="health-status-text" style="color:' + color + '">' + esc(stateStr) + '</span>' +
     '</div>';
   }).join('') + (keys.length > 200 ? '<div class="empty">… ' + (keys.length - 200) + ' more (use search)</div>' : '');
 }
