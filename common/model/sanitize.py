@@ -45,15 +45,25 @@ def _scrub(value: Any, top_level: bool = False) -> Any:
 
 
 def sanitize_error_detail(payload: Any, max_chars: int = 4000) -> str:
-    """Return bounded, JSON-safe, credential/content-redacted diagnostics."""
+    """Return bounded, JSON-safe, credential/content-redacted diagnostics.
+
+    B-24.1: never raise — a pathological (>1000-deep) nested payload made
+    json.loads/_scrub raise RecursionError, escaping the (TypeError,
+    ValueError) guard and breaking the caller's error-record path exactly
+    when the wrapper was already under upstream distress (§3.3)."""
     if isinstance(payload, str):
         try:
             parsed = json.loads(payload)
             scrubbed = _scrub(parsed, top_level=True)
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, RecursionError):
             scrubbed = _SECRET_VALUE.sub(r"\1[REDACTED]", payload[:max_chars])
     else:
-        scrubbed = _scrub(payload, top_level=True)
+        try:
+            scrubbed = _scrub(payload, top_level=True)
+        except RecursionError:
+            # NB: do NOT str(payload) here — repr of a pathologically nested
+            # structure recurses too and would re-raise inside the handler.
+            scrubbed = f"[UNSERIALIZABLE {type(payload).__name__}: recursion limit]"
     try:
         return json.dumps(scrubbed, ensure_ascii=False, default=str)[:max_chars]
     except Exception:

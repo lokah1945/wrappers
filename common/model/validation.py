@@ -50,6 +50,9 @@ def validate_catalog_entries(models: Iterable[Any]) -> list[Any]:
         validate_model_id(model_id)
         try:
             encoded = json.dumps(entry, ensure_ascii=False, default=str).encode("utf-8")
+        except RecursionError as exc:
+            # B-24.1 parity: pathologically nested metadata → clean rejection.
+            raise ValueError("catalog metadata is too deeply nested") from exc
         except (TypeError, ValueError) as exc:
             raise ValueError("catalog metadata is not serializable") from exc
         if len(encoded) > MAX_METADATA_BYTES:

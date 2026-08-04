@@ -160,7 +160,10 @@ class ModelProfileStore:
                         policy=data.get("policy") or {},
                         provenance=data.get("provenance") or {},
                     ))
-                except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+                except (KeyError, TypeError, ValueError, json.JSONDecodeError, RecursionError):
+                    # B-24.1 parity: a pathologically nested stored row must
+                    # be skipped, never crash load() (json.loads raises
+                    # RecursionError beyond ~1000 depth — not a ValueError).
                     continue
             return profiles
         finally:

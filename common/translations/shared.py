@@ -388,6 +388,11 @@ def looks_model_capacity_error(body: Any) -> bool:
         blob = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, dict) else str(body).lower()
     except (TypeError, ValueError):
         blob = str(body).lower()
+    except RecursionError:
+        # B-24.1: a pathologically nested upstream error body (json.dumps and
+        # str() both recurse) must classify as best-effort, not crash the
+        # proxy error path under upstream distress (§3.3).
+        blob = ''
     return any(marker in blob for marker in _MODEL_CAPACITY_MARKERS)
 
 

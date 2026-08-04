@@ -1355,3 +1355,52 @@ def test_b22_2_catalog_limit_clamped_against_negative_unbounded():
     assert 'min(limit, 500)' not in src.replace('min(max(1, limit), 500)', ''), \
         'an unclamped-lower-bound limit site remains'
     assert 'offset=max(0, offset)' in src, 'management offset not clamped'
+
+
+def test_b24_1_sanitize_error_detail_never_raises_on_deep_nesting():
+    """B-24.1: >1000-deep nested payloads made json.loads/_scrub raise
+    RecursionError, escaping sanitize_error_detail's guard and breaking the
+    error-record path under upstream distress (§3.3). The function's contract
+    is bounded, JSON-safe output — it must never raise."""
+    from common.model.sanitize import sanitize_error_detail
+    deep_str = '[' * 3000 + ']' * 3000
+    out = sanitize_error_detail(deep_str)
+    assert isinstance(out, str) and len(out) <= 4000
+    deep_obj: list = []
+    cur = deep_obj
+    for _ in range(3000):
+        nxt: list = []
+        cur.append(nxt)
+        cur = nxt
+    out2 = sanitize_error_detail(deep_obj)
+    assert isinstance(out2, str) and len(out2) <= 4000
+    # ordinary payloads still sanitize correctly
+    out3 = sanitize_error_detail({'message': 'boom', 'authorization': 'Bearer abc123'})
+    assert 'REDACTED' in out3 and 'abc123' not in out3
+
+
+def test_b24_1_capacity_classifier_and_catalog_validation_survive_deep_nesting():
+    """B-24.1 (class closure): the same RecursionError pattern existed in
+    looks_model_capacity_error (proxy error path — §3.3) and
+    validate_catalog_entries. Both must handle >1000-deep input cleanly."""
+    from common.translations.shared import looks_model_capacity_error
+    from common.model.validation import validate_catalog_entries
+    deep: dict = {}
+    cur = deep
+    for i in range(3000):
+        nxt: dict = {}
+        cur[f'k{i}'] = nxt
+        cur = nxt
+    # must not raise; classifies as non-capacity (markers unreachable)
+    assert looks_model_capacity_error(deep) is False
+    assert looks_model_capacity_error({'message': 'no deployments available'}) is True
+    # validation converts to a clean ValueError, never RecursionError
+    cur2 = deep
+    try:
+        validate_catalog_entries([deep])
+        raised = None
+    except ValueError:
+        raised = 'ValueError'
+    except RecursionError:
+        raised = 'RecursionError'
+    assert raised == 'ValueError', raised
