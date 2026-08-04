@@ -1183,3 +1183,25 @@ def test_r14_nous_prom_metrics_pool_parity():
     for w in ('opencode', 'blackbox', 'openrouter'):
         sib = (ROOT / f'{w}/src/key_pool.py').read_text()
         assert 'def prom_metrics(self)' in sib, f'{w}: pool prom_metrics regressed'
+
+
+def test_r18_sanitize_header_value_fallback_parity():
+    """B-18.1: per-wrapper ImportError fallbacks of sanitize_header_value must
+    behave byte-for-byte like common.middleware.sanitize_header_value — the
+    old regex fallbacks let CR/LF through (CRLF injection in degraded mode)
+    and never truncated."""
+    import re as _re
+    from common.middleware import sanitize_header_value as shared
+    battery = ['a', 'x\r\ny', 'h\re\na\nd', '\x00\x07tab\there', 'v' * 9000,
+               None, '', 'ünïcode ❤', ' \t padded \t ', 'bad\x7fval', 'a\x01b']
+    for path in ('opencode/src/main.py', 'blackbox/src/main.py',
+                 'openrouter/src/main.py', 'nvidia-python/src/main.py'):
+        src = (ROOT / path).read_text()
+        m = _re.search(r"(    def sanitize_header_value\(value.*?)(?=\n\S|\Z)", src, _re.S)
+        assert m, f'{path}: fallback def not found'
+        import textwrap as _tw
+        ns: dict = {}
+        exec(_tw.dedent(m.group(1)), ns)
+        fb = ns['sanitize_header_value']
+        for v in battery:
+            assert fb(v) == shared(v), (path, repr(v), fb(v), shared(v))

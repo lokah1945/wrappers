@@ -74,12 +74,15 @@ except ImportError:
     _HAS_SIZE_LIMITER = False
 
     def sanitize_header_value(value):
-        # Fallback sanitizer: upstream common.middleware is missing from the
-        # repo, so provide the BUG-SEC2 header-injection guard inline.
-        # Strip control chars that could be used for header injection (CRLF etc.)
-        if not isinstance(value, str):
-            value = str(value)
-        return re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
+        # R18/B-18.1: fallback MUST match common.middleware.sanitize_header_value
+        # byte-for-byte — the previous regex excluded \x0a/\x0d, so CR and LF
+        # survived (CRLF header-injection hole in degraded mode).
+        if not value:
+            return value
+        import re as _re
+        sanitized = value.replace('\r', '').replace('\n', '')
+        sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+        return sanitized.strip()
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 

@@ -118,9 +118,15 @@ except ImportError:
     import re as _re
 
     def sanitize_header_value(value):
-        if not isinstance(value, str):
-            value = str(value)
-        return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
+        # R18/B-18.1: fallback MUST match common.middleware.sanitize_header_value
+        # byte-for-byte — the previous regex excluded \x0a/\x0d, so CR and LF
+        # survived (CRLF header-injection hole in degraded mode).
+        if not value:
+            return value
+        import re as _re
+        sanitized = value.replace('\r', '').replace('\n', '')
+        sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
+        return sanitized.strip()
 
 # B-08 fix: shared sentinel-task idle iterator + CRLF normalisation.
 from common.sse import (  # noqa: E402
