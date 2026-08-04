@@ -1701,3 +1701,37 @@ def test_b28_1_dashboards_escape_data_interpolations():
                    'k.hard_blocked', 'cHealth.ok', 'hasMgmt ?', 'e.message')
         assert any(a in expr for a in allowed), \
             f'openrouter dashboard: unchecked interpolation ${{{expr}}}'
+
+
+def test_b29_1_latency_middleware_sanitizes_log_values():
+    """B-29.1 (log-forging class lock): the per-request latency middleware
+    logged client-controlled values raw — a percent-encoded %0a/%0d in the
+    request path (ASGI paths arrive decoded) or a crafted x-request-id forged
+    arbitrary log lines, poisoning operators' triage and log-based alerting.
+    All four latency-middleware sites must sanitize via _log_clean (the
+    R18-aligned CR/LF/control-stripper), and the helper must behave."""
+    import textwrap as _tw
+    for wrapper, helper_name in (('nous', '_log_clean'), ('opencode', '_log_clean'),
+                                 ('blackbox', '_log_clean'), ('nvidia-python', '_log_clean')):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert f'def {helper_name}(' in src, f'{wrapper}: _log_clean helper missing'
+        assert 'path={_log_clean(request.url.path)}' in src, \
+            f'{wrapper}: latency middleware still logs raw path'
+        assert 'request_id={_log_clean(request_id)}' in src, \
+            f'{wrapper}: latency middleware still logs raw request_id'
+    # behavior: exec the nous helper (which wraps sanitize_header_value)
+    src = (ROOT / 'nous' / 'src' / 'main.py').read_text()
+    i = src.index('def _log_clean(')
+    tail = '    return s or \'unknown\'\n'
+    j = src.index(tail, i) + len(tail)
+    block = src[i:j]
+    from common.middleware import sanitize_header_value as _shv
+    ns = {'_sanitize_header_value': _shv}
+    exec(block, ns)
+    clean = ns['_log_clean']
+    forged = '/v1/models\x0a[INFO]_FORGED\x0d/x'
+    out = clean(forged)
+    assert '\x0a' not in out and '\x0d' not in out
+    assert '[INFO]_FORGED' in out  # text survives, line structure safe
+    assert clean('') == 'unknown'
+    assert len(clean('z' * 5000)) <= 512

@@ -2790,6 +2790,16 @@ app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)
 
 
 # Request latency tracking middleware
+
+
+def _log_clean(v, max_len=512):
+    """B-29.1: strip CR/LF/control chars from client-controlled values before
+    logging — percent-decoded %0a in request paths (and attacker-set
+    x-request-id headers) otherwise forge log lines and poison operators'
+    log-based triage. Length-capped."""
+    s = _sanitize_header_value(str(v)[:max_len])
+    return s or 'unknown'
+
 @app.middleware("http")
 async def add_latency_tracking(request: Request, call_next):
     import time
@@ -2800,9 +2810,10 @@ async def add_latency_tracking(request: Request, call_next):
     latency_ms = (time.time() - start_time) * 1000
     request_id = request.headers.get("x-request-id", "N/A")
     
+    # B-29.1: sanitize client-controlled log values (log-forging prevention).
     logger.info(
-        f"[{app.title}] request_id={request_id} "
-        f"method={request.method} path={request.url.path} "
+        f"[{app.title}] request_id={_log_clean(request_id)} "
+        f"method={request.method} path={_log_clean(request.url.path)} "
         f"latency={latency_ms:.2f}ms status={response.status_code}"
     )
     
