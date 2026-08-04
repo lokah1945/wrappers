@@ -16,7 +16,9 @@
 
 | 2026-08-04 R11 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND11.md) | Round 11: CONTRACT §7 no-fork closure: (1) nous called its own DRIFTED `repair_orphan_tool_messages` at the replay site despite importing the shared one — list-typed tool content arrived upstream as raw stringified JSON — now delegates; (2) nvidia kept a hand-synced `_parse_dsml_from_text` twin — now delegates to the shared parser on the importable path. nous' documented deviation (inlined dict-based AnthropicStreamState) fully re-verified at parity (R-02/P3-4/P0-4/R5/B-06/R-03/R9/R10). +2 regression tests. **All 8 gates green: 312 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / soak.** |
 | 2026-08-04 R12 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND12.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND12.md) | Round 12: instrument = hostile-body FUZZ gate (32 malformed/adversarial bodies × 5 wrappers × 3 surfaces + concurrent burst + post-storm `/health`/`/metrics` sweep — 1081 checks) → three real fixes: **B-12.1** nvidia `BASE_GENAI` ignored custom `NVIDIA_BASE_URL` (GENAI traffic leaked to the public cloud host — §9.1 routing); **B-12.2** nous/opencode/blackbox `/metrics` JSON lacked `pool` + `in_flight` (§10 parity); **B-12.3** layer-2 converter silently dropped `max_completion_tokens` (client output cap lost). Contract → **v3.3 (9 gates)**. +3 regression tests. **All 9 gates green: 315 unit / 990 runtime / 240 matrix / SDK / L2+L3 / 55 agent-loop / 10 concurrency / 1081 fuzz / soak.** |
-| 2026-08-04 R13 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md) | **Current — round 13 (final), CLEAN ROUND.** From-zero re-audit: full re-read of least-covered code hunting whole bug classes — nous upstream retry ladder + stream-ownership hand-off, pool double-release/negative-in-flight safety ×5, stream-generator `GeneratorExit`/`finally` release patterns, shared header-forwarding allowlist, nvidia responses-store TTL/deep-copy/unique-mint, model-registry guard coverage, unbounded-loop + silent-except sweeps. **0 new defects.** All 9 gates re-verified green (315 / 990 / 240 / 55 / 10 / 1081 / SDK / L2+L3 / soak). |
+| 2026-08-04 R13 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND13.md) | Round 13, CLEAN ROUND. From-zero re-audit: full re-read of least-covered code hunting whole bug classes — nous upstream retry ladder + stream-ownership hand-off, pool double-release/negative-in-flight safety ×5, stream-generator `GeneratorExit`/`finally` release patterns, shared header-forwarding allowlist, nvidia responses-store TTL/deep-copy/unique-mint, model-registry guard coverage, unbounded-loop + silent-except sweeps. **0 new defects.** All 9 gates re-verified green (315 / 990 / 240 / 55 / 10 / 1081 / SDK / L2+L3 / soak). |
+| 2026-08-04 R14 | (folded into R14 commit 904f0c4) | Round 14: nous `/metrics/prom` was the only wrapper whose Prometheus surface lacked pool-level series (sibling format: keys_total / keys_available / in_flight_total + per-key rpm/blocked/failures gauges). Ported `KeyPool.prom_metrics()` into the inlined nous pool, emitted from `/metrics/prom`; §10 parity now holds on all 5 wrappers. +1 regression lock (316 unit). |
+| 2026-08-04 R17 | [DEEP_AUDIT_REPORT_2026-08-04_ROUND17.md](DEEP_AUDIT_REPORT_2026-08-04_ROUND17.md) | **Current — round 17, biggest finding.** Gate-flake hunt → **P1: COMPATIBILITY_LAYER=3 auto-discovery was a no-op in all 5 wrappers** (§9.2 promised, never implemented): 15/15 routing branches read env-only, probe never consumed; probe itself mis-normalized v1-style bases (`/v1/v1/messages` → 404 → silent OpenAI fallback). Shared `resolve_upstream_is_anthropic()` + `_probe_base` normalization in `common/compat.py`; all 15 call sites rewired. Harness fixed too: layer-3 race (health probes hit the still-draining prior process → false pass) → terminate/reap/port-free waits; layer-3 coverage 1→5 wrappers × both dialects. +9 unit tests (325 total); 3/3 back-to-back stable. **All gates green: 325 / 990 / 55 / 10 / L2+L3-genuine.** |
 ## Summary of Findings (2026-08-03)
 
 | Severity | Count | Key Issues |
@@ -26,14 +28,14 @@
 | 🟡 Medium | 6 | nous store no byte cap, no heal_in_flight in 3 wrappers, openrouter `/metrics/model-status` missing, XFF fallback rate limit, registry drain/size-limit missing, openrouter mcp>=2 boot crash |
 | ⚪ Low | 4 | `/ready` auth inconsistency, openrouter missing max_tokens validation, nvidia duplicate retry-after parser, tool-block close on reasoning interleave |
 
-## Test Status (2026-08-04 R13 run — contract v3.3, all 9 gates + registry-service tests)
+## Test Status (2026-08-04 R17 run — contract v3.3, all 9 gates + layer-3 genuine discovery ×5 wrappers + registry-service tests)
 
 | Test Suite | Result |
 |------------|--------|
-| Unit + regressions (315) | ✅ 315 pass |
+| Unit + regressions (325) | ✅ 325 pass |
 | Runtime E2E (990) | ✅ 990 pass |
 | SDK Compat (openai Codex parser) | ✅ clean |
-| COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers |
+| COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers; layer-3 auto-discovery genuinely probed both dialects (5 wrappers × 2 mocks), 3/3 back-to-back |
 | Full Matrix (240) | ✅ 240 pass |
 | Real-SDK agent loop (55) | ✅ 55 pass |
 | Multi-agent concurrency storm (10) | ✅ zero cross-talk, zero leaked in-flight |

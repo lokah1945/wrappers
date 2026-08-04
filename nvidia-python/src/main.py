@@ -406,6 +406,7 @@ try:
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
+        resolve_upstream_is_anthropic as _resolve_upstream_is_anthropic,
         passthrough_anthropic_sse as _passthrough_anthropic_sse,
         translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
         translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
@@ -1590,6 +1591,14 @@ def _normalize_upstream_error(status: int, data: dict, model_id: str = '') -> tu
             return 400, {'error': {'message': f'Model{model_part} not found at upstream provider', 'type': 'invalid_request_error', 'code': 'model_not_found'}}
     return status, data
 
+async def _resolve_is_anthropic_for(session) -> bool:
+    """R17 (B-17.1): defer the dialect routing decision to the shared
+    resolver so COMPATIBILITY_LAYER=3 auto-discovery actually applies."""
+    if _USING_SHARED_TRANSLATIONS:
+        return await _resolve_upstream_is_anthropic(lambda: session, BASE_LLM)
+    return _is_anthropic_upstream()
+
+
 class Server:
     def __init__(self, app: FastAPI = None):
         global _model_state_store
@@ -2301,7 +2310,7 @@ class Server:
                     return JSONResponse(status_code=400, content={'error': {'message': f'{_mt_key} exceeds maximum allowed value of 1000000', 'type': 'invalid_request_error'}})
             # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the
             # Responses request to Anthropic Messages and translate back.
-            if _is_anthropic_upstream():
+            if await _resolve_is_anthropic_for(self._session):
                 try:
                     body = json.loads(raw)
                 except (json.JSONDecodeError, ValueError):
@@ -2612,7 +2621,7 @@ class Server:
         model_id = body.get('model', '')
         # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI
         # chat request to Anthropic Messages and translate the response back.
-        if _is_anthropic_upstream():
+        if await _resolve_is_anthropic_for(self._session):
             return await self._compat2_chat(body, request)
         if is_model_unavailable(model_id):
             return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
@@ -2720,7 +2729,7 @@ class Server:
             return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
         # COMPATIBILITY_LAYER=2: Anthropic upstream — /v1/messages passes
         # through verbatim (model alias is resolved by the caller).
-        if _is_anthropic_upstream() and isinstance(body, dict):
+        if await _resolve_is_anthropic_for(self._session) and isinstance(body, dict):
             if body.get('model'):
                 body['model'] = resolve_target_model(body.get('model', ''))
             return await self._compat2_messages(body, request)

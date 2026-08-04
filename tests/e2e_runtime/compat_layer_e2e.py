@@ -53,9 +53,10 @@ def start_mock(port, mode):
         env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 
-def start_wrapper(name, port, pfx, base_style, layer):
-    base = f'http://127.0.0.1:{ANTHRO_MOCK_PORT}' if base_style == 'root' \
-        else f'http://127.0.0.1:{ANTHRO_MOCK_PORT}/v1'
+def start_wrapper(name, port, pfx, base_style, layer, base_port=None):
+    mock_port = base_port if base_port is not None else ANTHRO_MOCK_PORT
+    base = f'http://127.0.0.1:{mock_port}' if base_style == 'root' \
+        else f'http://127.0.0.1:{mock_port}/v1'
     env = os.environ.copy()
     env.update({
         'WRAPPER_SKIP_DOTENV': 'true',
@@ -97,6 +98,42 @@ def wait_health(port, timeout=60):
         except Exception:
             time.sleep(0.3)
     return False
+
+
+def wait_port_free(port, timeout=30):
+    """R17 fix (gate flake): after terminate(), the old process keeps serving
+    during graceful drain — a successor that binds the same port may never
+    come up while /health probes hit the DYING listener (observed flake:
+    layer=3 Anthropic-mock probe answered by the previous OpenAI-configured
+    process → upstream 404). Terminate → reap → wait for real connection
+    refusal before booting the next instance."""
+    import socket
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        s.settimeout(0.5)
+        try:
+            s.connect(('127.0.0.1', port))
+        except (ConnectionRefusedError, OSError):
+            s.close()
+            return True
+        else:
+            s.close()
+            time.sleep(0.3)
+    return False
+
+
+def stop_proc(p, port):
+    """Terminate + reap + port-free wait (see wait_port_free docstring)."""
+    try:
+        p.terminate()
+        p.wait(timeout=15)
+    except Exception:
+        try:
+            p.kill()
+        except Exception:
+            pass
+    wait_port_free(port)
 
 
 async def post(port, path, payload, headers, stream):
@@ -264,68 +301,39 @@ async def main():
                 continue
             await exercise_layer2(name, port)
 
-        # ── COMPATIBILITY_LAYER=3 auto-discovery ──
+        # ── COMPATIBILITY_LAYER=3 auto-discovery — ALL 5 wrappers × both mocks ──
+        # R17 (B-17.1): previously this section exercised openrouter only, and
+        # its Anthropic-mock case could "pass" against a still-draining older
+        # process (the dialect was never actually probed — no wrapper consumed
+        # the probe until R17). Every wrapper now proves real auto-discovery:
+        # OpenAI mock → chat completions shape; Anthropic mock → message shape.
         log('── COMPATIBILITY_LAYER=3 (auto-discovery) ──')
         for name, (port, pfx, style) in WRAPPERS.items():
             if name in procs:
-                procs[name][0].terminate()
-        time.sleep(1.0)
-        # layer=3 against the OPENAI mock must behave as layer 1
-        p, lf = start_wrapper('openrouter', 19106, 'OPENROUTER', 'v1', 3)
-        # override base to the openai mock: restart with different env
-        p.terminate()
-        time.sleep(0.5)
-        env_extra = {'OPENROUTER_BASE_URL': f'http://127.0.0.1:{OPENAI_MOCK_PORT}/v1'}
-        env = os.environ.copy()
-        env.update({
-            'WRAPPER_SKIP_DOTENV': 'true', 'BEARER_TOKEN': TOKEN,
-            'LISTEN_PORT': '19106', 'LISTEN_HOST': '127.0.0.1', 'RATE_LIMIT_RPM': '0',
-            'HEARTBEAT_INTERVAL_MS': '300', 'COMPATIBILITY_LAYER': '3',
-            'PYTHONPATH': f'{ROOT}:{ROOT / "openrouter"}', 'PYTHONUNBUFFERED': '1',
-            'FREE_ONLY': 'no', 'SOFT_LIMIT_RPM': '100000', 'HARD_LIMIT_RPM': '100000',
-            'OPENROUTER_API_KEY_1': 'mock-key-0000000001',
-            'OPENROUTER_BASE_URL': f'http://127.0.0.1:{OPENAI_MOCK_PORT}/v1',
-        })
-        lf2 = open('/tmp/compat-auto-openai.log', 'w')
-        p2 = subprocess.Popen(
-            [sys.executable, '-m', 'uvicorn', 'src.main:app', '--host', '127.0.0.1',
-             '--port', '19106', '--log-level', 'warning'],
-            cwd=str(ROOT / 'openrouter'), env=env, stdout=lf2, stderr=subprocess.STDOUT)
-        procs['openrouter-auto-openai'] = (p2, lf2)
-        if wait_health(19106):
-            st, raw = await post(19106, '/v1/chat/completions',
-                                 {'model': 'mock/normal', 'stream': False,
-                                  'messages': [{'role': 'user', 'content': 'hi'}]},
-                                 {'Authorization': f'Bearer {TOKEN}'}, False)
-            d = json.loads(raw) if st == 200 else {}
-            if st == 200 and d.get('choices'):
-                log('  openrouter layer=3 vs OpenAI mock: OK (detected OpenAI)')
-            else:
-                FAILURES.append(f'openrouter layer=3 vs OpenAI mock: HTTP {st}: {raw[:150]}')
-        else:
-            FAILURES.append('openrouter layer=3 vs OpenAI mock: not healthy')
-        p2.terminate()
-
-        # layer=3 against the ANTHROPIC mock must behave as layer 2
-        env['OPENROUTER_BASE_URL'] = f'http://127.0.0.1:{ANTHRO_MOCK_PORT}/v1'
-        lf3 = open('/tmp/compat-auto-anthropic.log', 'w')
-        p3 = subprocess.Popen(
-            [sys.executable, '-m', 'uvicorn', 'src.main:app', '--host', '127.0.0.1',
-             '--port', '19106', '--log-level', 'warning'],
-            cwd=str(ROOT / 'openrouter'), env=env, stdout=lf3, stderr=subprocess.STDOUT)
-        procs['openrouter-auto-anthropic'] = (p3, lf3)
-        if wait_health(19106):
-            st, raw = await post(19106, '/v1/messages',
-                                 {'model': 'mock/normal', 'max_tokens': 64, 'stream': False,
-                                  'messages': [{'role': 'user', 'content': 'hi'}]},
-                                 {'Authorization': f'Bearer {TOKEN}'}, False)
-            d = json.loads(raw) if st == 200 else {}
-            if st == 200 and d.get('type') == 'message':
-                log('  openrouter layer=3 vs Anthropic mock: OK (detected Anthropic)')
-            else:
-                FAILURES.append(f'openrouter layer=3 vs Anthropic mock: HTTP {st}: {raw[:150]}')
-        else:
-            FAILURES.append('openrouter layer=3 vs Anthropic mock: not healthy')
+                stop_proc(procs[name][0], port)
+        for name, (port, pfx, style) in WRAPPERS.items():
+            for mock_port, dialect, path, payload, expect_msg in (
+                (OPENAI_MOCK_PORT, 'OpenAI', '/v1/chat/completions',
+                 {'model': 'mock/normal', 'stream': False,
+                  'messages': [{'role': 'user', 'content': 'hi'}]}, False),
+                (ANTHRO_MOCK_PORT, 'Anthropic', '/v1/messages',
+                 {'model': 'mock/normal', 'max_tokens': 64, 'stream': False,
+                  'messages': [{'role': 'user', 'content': 'hi'}]}, True),
+            ):
+                p, lf = start_wrapper(name, port, pfx, style, 3, base_port=mock_port)
+                procs[f'{name}-l3-{dialect}'] = (p, lf)
+                if wait_health(port):
+                    st, raw = await post(port, path, payload,
+                                         {'Authorization': f'Bearer {TOKEN}'}, False)
+                    d = json.loads(raw) if st == 200 else {}
+                    ok = (d.get('type') == 'message') if expect_msg else bool(d.get('choices'))
+                    if st == 200 and ok:
+                        log(f'  {name} layer=3 vs {dialect} mock: OK (detected {dialect})')
+                    else:
+                        FAILURES.append(f'{name} layer=3 vs {dialect} mock: HTTP {st}: {raw[:150]}')
+                else:
+                    FAILURES.append(f'{name} layer=3 vs {dialect} mock: not healthy')
+                stop_proc(p, port)
 
         log('')
         if FAILURES:

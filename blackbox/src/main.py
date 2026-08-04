@@ -97,10 +97,18 @@ from common.translations import (
 )
 from common.compat import (
     is_anthropic_upstream as _is_anthropic_upstream,
+    resolve_upstream_is_anthropic as _resolve_upstream_is_anthropic,
     passthrough_anthropic_sse as _passthrough_anthropic_sse,
     translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
     translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
 )
+
+
+async def _upstream_is_anthropic() -> bool:
+    # R17 (B-17.1): defer the dialect routing decision to the shared
+    # resolver so COMPATIBILITY_LAYER=3 auto-discovery actually applies.
+    return await _resolve_upstream_is_anthropic(get_session, BLACKBOX_BASE)
+
 
 # P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
 # shape-aware passthrough re-serialisation (BB-8 parity: fail HARD at import).
@@ -1483,7 +1491,7 @@ async def chat_completions(request: Request):
 
     # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI chat
     # request to Anthropic Messages and translate the response back.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         anthro_body = openai_chat_to_anthropic_request(body)
         anthro_body['stream'] = is_stream
         url = f'{BLACKBOX_BASE}/messages'
@@ -1562,7 +1570,7 @@ async def responses(request: Request):
         # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat →
         # Anthropic request; translate the Anthropic response back through
         # OpenAI Chat to Responses.
-        if _is_anthropic_upstream():
+        if await _upstream_is_anthropic():
             anthro_body = openai_chat_to_anthropic_request(chat_body)
             anthro_body['stream'] = chat_body['stream']
             url = f'{BLACKBOX_BASE}/messages'
@@ -1963,7 +1971,7 @@ async def anthropic_messages(request: Request):
     try:
         # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
         # passes through verbatim (model alias already applied above).
-        if _is_anthropic_upstream():
+        if await _upstream_is_anthropic():
             url = f'{BLACKBOX_BASE}/messages'
             if bool(body.get('stream', False)):
                 status, resp, key = await proxy_request_with_pool('POST', url, body, request, is_stream=True)

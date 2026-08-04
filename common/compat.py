@@ -117,7 +117,23 @@ async def probe_upstream_compatibility(session: Any, base_url: str) -> str:
         return layer
 
 
+def _probe_base(base: str) -> str:
+    """R17 (B-17.1): normalize an operator base URL for probing.
+
+    `<PREFIX>_BASE_URL` may itself end in `/v1` (OpenRouter/OpenCode style).
+    The probe paths below are OpenAI/Anthropic-native absolute paths; probing
+    `{base}/v1/messages` against a base that already contains `/v1` produced
+    `/v1/v1/messages` → 404 at every step → auto-discovery ALWAYS fell
+    through to the OpenAI default for v1-style bases. Strip one trailing
+    `/v1` so both "root" and "v1" base styles probe identically."""
+    b = (base or '').rstrip('/')
+    if b.lower().endswith('/v1'):
+        b = b[:-3]
+    return b
+
+
 async def _probe(session: Any, base: str) -> str:
+    base = _probe_base(base)
     # 1. model listing -> OpenAI
     for models_path in ('/v1/models', '/models'):
         try:
@@ -160,6 +176,41 @@ async def _probe(session: Any, base: str) -> str:
 
     # 4. default: OpenAI (historical assumption)
     return LAYER_OPENAI
+
+
+async def resolve_upstream_is_anthropic(session_or_getter: Any, base_url: str) -> bool:
+    """R17 (B-17.1): the effective upstream-dialect decision for REQUEST
+    ROUTING (CONTRACT §9.2).
+
+    Every wrapper previously branched on `is_anthropic_upstream()`, which
+    reads ONLY the env var — under COMPATIBILITY_LAYER=3 (auto-discovery)
+    that is always False, so the probe result was never consumed and every
+    wrapper silently behaved as layer 1 (OpenAI dialect forwarding to an
+    Anthropic-native upstream → upstream 404 on every call).
+
+    Semantics per contract:
+      layer 1 → False (OpenAI), layer 2 → True (Anthropic), never network;
+      layer 3 → probe once per base URL (TTL-cached by
+      probe_upstream_compatibility), inconclusive → False (fall back to 1).
+
+    `session_or_getter` may be an aiohttp session or a zero-arg (async)
+    callable returning one."""
+    layer = compat_layer()
+    if layer == LAYER_ANTHROPIC:
+        return True
+    if layer == LAYER_OPENAI:
+        return False
+    session = session_or_getter
+    if callable(session):
+        session = session()
+    if asyncio.iscoroutine(session):
+        session = await session
+    try:
+        probed = await probe_upstream_compatibility(session, base_url)
+    except Exception as exc:  # probe must never break a request path
+        logger.warning('[compat] auto-discovery probe failed (%s); falling back to OpenAI', exc)
+        return False
+    return probed == LAYER_ANTHROPIC
 
 
 def upstream_messages_path(style: str) -> str:

@@ -171,6 +171,7 @@ try:
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
         is_auto_discovery as _is_auto_discovery,
+        resolve_upstream_is_anthropic as _resolve_upstream_is_anthropic,
         passthrough_anthropic_sse as _passthrough_anthropic_sse,
         translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
         translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
@@ -179,6 +180,12 @@ try:
     _USING_SHARED_TRANSLATIONS = True
 except ImportError as _imp_err:
     raise RuntimeError("common.translations import failed; wrapper requires shared translations") from _imp_err
+
+
+async def _upstream_is_anthropic() -> bool:
+    # R17 (B-17.1): defer the dialect routing decision to the shared
+    # resolver so COMPATIBILITY_LAYER=3 auto-discovery actually applies.
+    return await _resolve_upstream_is_anthropic(get_agent, OPENROUTER_BASE)
 
 # P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
 # shape-aware passthrough re-serialisation.
@@ -1248,7 +1255,7 @@ async def chat_completions(request: Request):
 
     # COMPATIBILITY_LAYER=2: upstream speaks Anthropic Messages — translate the
     # OpenAI chat request once and translate the Anthropic response back.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         anthro_body = openai_chat_to_anthropic_request(body)
         anthro_body["stream"] = stream
         res = await _proxy_request("POST", "messages", anthro_body, stream=stream,
@@ -1331,7 +1338,7 @@ async def responses(request: Request):
     # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat → Anthropic
     # request; translate the Anthropic response back through OpenAI Chat to
     # Responses.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         anthro_body = openai_chat_to_anthropic_request(chat_body)
         response = await _proxy_request("POST", "messages", anthro_body, stream=is_stream,
                                         request=request, terminal_done=False)
@@ -2081,7 +2088,7 @@ async def messages(request: Request):
 
     # COMPATIBILITY_LAYER=2: upstream speaks Anthropic — the /v1/messages
     # surface passes through verbatim (model alias only); no translation.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         response = await _proxy_request("POST", "messages", body,
                                         stream=bool(body.get("stream", False)),
                                         request=request, terminal_done=False)

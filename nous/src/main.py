@@ -87,6 +87,7 @@ try:
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
+        resolve_upstream_is_anthropic as _resolve_upstream_is_anthropic,
         passthrough_anthropic_sse as _passthrough_anthropic_sse,
         translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
         translate_openai_chat_sse_to_responses as _translate_openai_chat_sse_to_responses,
@@ -98,6 +99,14 @@ except ImportError:
     def _new_response_id(prefix: str = "resp") -> str:  # type: ignore[misc]
         import secrets as _s
         return f"{prefix}_{int(time.time() * 1000)}-{_s.token_hex(6)}"
+
+async def _upstream_is_anthropic() -> bool:
+    # R17 (B-17.1): defer the dialect routing decision to the shared
+    # resolver so COMPATIBILITY_LAYER=3 auto-discovery actually applies.
+    if _USING_SHARED_TRANSLATIONS:
+        return await _resolve_upstream_is_anthropic(get_session, NOUS_BASE)
+    return _is_anthropic_upstream()
+
 
 # P0-4 fix (audit 2026-08-03): central special-token scrubbing. Byte-level-BPE
 # upstream models leak tokenizer control tokens (<unk> — often fragmented
@@ -3176,7 +3185,7 @@ async def chat_completions(request: Request):
 
     # COMPATIBILITY_LAYER=2: Anthropic upstream — translate the OpenAI chat
     # request to Anthropic Messages and translate the response back.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         anthro_body = openai_chat_to_anthropic_request(body)
         anthro_body["stream"] = is_stream
         status, result, key_entry = await post_nous_with_retries(
@@ -3256,7 +3265,7 @@ async def responses(request: Request):
     # COMPATIBILITY_LAYER=2: Anthropic upstream — Responses → Chat → Anthropic
     # request; translate the Anthropic response back through OpenAI Chat to
     # Responses.
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         anthro_body = openai_chat_to_anthropic_request(chat_body)
         anthro_body["stream"] = is_stream
         status, result, key_entry = await post_nous_with_retries(
@@ -3381,7 +3390,7 @@ async def messages(request: Request):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested))
     # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
     # passes through verbatim (model alias already applied above).
-    if _is_anthropic_upstream():
+    if await _upstream_is_anthropic():
         if free_only_enabled() and body.get("model") and not model_allowed(body.get("model", "")):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or body.get("model") or ""))
         is_stream = body.get("stream", False)
