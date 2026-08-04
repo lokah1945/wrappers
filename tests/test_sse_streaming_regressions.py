@@ -1235,3 +1235,84 @@ def test_r19_query_int_guard():
     # the helper's own docstring; require no bare `= int(` call-site remains)
     import re as _re2
     assert not _re2.search(r"=\s*int\(request\.query_params\.get\(", src)
+
+
+def test_r21_nous_usage_content_fallback_parity():
+    """B-21.1: nous' degraded-mode fallbacks for responses_usage /
+    tokens_from_chat_usage / responses_content_to_chat drifted from the
+    shared helpers (strict-SDK-breaking flat usage, lost cached/reasoning,
+    dropped input_image). Exec the fallbacks from source and compare
+    behavior against the shared implementations on the same battery."""
+    import re as _re, textwrap as _tw
+    from common.translations.shared import (
+        responses_usage as s_usage,
+        tokens_from_chat_usage as s_tokens,
+        responses_content_to_chat as s_content,
+    )
+    src = (ROOT / 'nous/src/main.py').read_text()
+
+    def _grab(name):
+        m = _re.search(rf"(    def {name}\(.*?)(?=\n    def |\n\S|\Z)", src, _re.S)
+        assert m, f'nous fallback missing: {name}'
+        ns: dict = {}
+        exec(_tw.dedent(m.group(1)), ns)
+        return ns[name]
+
+    fb_usage = _grab('_responses_usage')
+    for args in ((0, 0, 0, 0), (11, 7, 3, 2), (None, None, None, None)):
+        assert fb_usage(*args) == s_usage(*args), args
+    fb_tokens = _grab('_tokens_from_chat_usage')
+    for u in ({}, None, {'prompt_tokens': 5, 'completion_tokens': 2,
+                         'prompt_tokens_details': {'cached_tokens': 4},
+                         'completion_tokens_details': {'reasoning_tokens': 9}},
+              {'input_tokens': 3, 'output_tokens': 1}):
+        assert fb_tokens(u) == s_tokens(u), u
+    fb_content = _grab('_responses_content_to_chat')
+    batteries = [
+        'plain',
+        [{'type': 'input_text', 'text': 'hi'}, {'type': 'output_text', 'text': ''}],
+        [{'type': 'input_text', 'text': 'see'},
+         {'type': 'input_image', 'image_url': 'http://img/x.png'}],
+        [{'type': 'image', 'url': 'data:image/png;base64,AA=='}],
+        [{'type': 'input_image', 'image_url': {'url': 'http://img/y.png'}}],
+        [42, {'type': 'mystery'}, {'type': 'text', 'text': 123}],
+        [],
+    ]
+    for b in batteries:
+        assert fb_content(b) == s_content(b), b
+
+
+def test_r21_nvidia_build_forward_headers_fallback_parity():
+    """B-21.1: nvidia's degraded-mode _build_forward_headers forwarded only 6
+    headers — the shared allowlist carries ~20 (x-stainless-* SDK identity,
+    traceparent/tracestate, openai-organization/project, x-correlation-id,
+    accept-language, conditional-caching). Exec fallback from source and
+    compare against the shared implementation."""
+    import re as _re, textwrap as _tw
+    from common.translations.shared import build_forward_headers as shared
+    src = (ROOT / 'nvidia-python/src/main.py').read_text()
+    start = src.index('    _FB_FORWARDHEADER_ALLOWLIST = (')
+    end = src.index('def _build_forward_headers(client_headers, extra=None):')
+    block = src[start:end]
+    tail = '''def _build_forward_headers(client_headers, extra=None):
+    return _fb_build_forward_headers(client_headers, extra)
+'''
+    ns: dict = {}
+    exec(_tw.dedent(block) + tail, ns)
+    fb = ns['_build_forward_headers']
+    hops = {'connection': 'keep-alive', 'authorization': 'secret-leak',
+            'x-api-key': 'secret-leak', 'host': 'h', 'content-length': '9'}
+    # NOTE: plain dicts are case-sensitive; real Starlette/aiohttp header
+    # containers are case-insensitive. Use canonical lowercase keys here —
+    # that is what the wire actually looks like after normalisation.
+    client = {'user-agent': 'codex/1.0', 'x-stainless-retry-count': '1',
+              'x-stainless-os': 'Linux', 'openai-organization': 'org-1',
+              'traceparent': '00-abc-def-01', 'x-correlation-id': 'c1',
+              'anthropic-version': '2023-06-01', 'accept-language': 'en',
+              'if-none-match': 'etag', **hops}
+    got_fb, got_sh = fb(client), shared(client)
+    assert got_fb == got_sh, (got_fb, got_sh)
+    assert 'x-stainless-retry-count' in got_fb and 'traceparent' in got_fb
+    for h in hops:
+        assert h not in got_fb, h
+    assert fb(client, {'x-extra': '1'}) == shared(client, {'x-extra': '1'})

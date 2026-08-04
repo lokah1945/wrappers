@@ -164,18 +164,51 @@ try:
     )
 except ImportError:  # pragma: no cover - standalone fallback
     def _responses_content_to_chat(c):  # type: ignore[misc]
-        if isinstance(c, list):
-            return " ".join(p.get("text", "") for p in c
-                            if isinstance(p, dict) and p.get("type") in ("input_text", "text", "output_text"))
-        return c
+        # R21/B-21.1: verbatim port of the shared helper (the old fallback
+        # silently DROPPED input_image parts — the exact P1-1 bug class).
+        # Pure-text lists collapse to a string everywhere-compatible;
+        # image parts become OpenAI image_url parts; unknown/empty parts skip.
+        if not isinstance(c, list):
+            return c
+        parts = []
+        for pp in c:
+            if not isinstance(pp, dict):
+                continue
+            pt = pp.get("type")
+            if pt in ("input_text", "text", "output_text"):
+                txt = pp.get("text")
+                parts.append({"type": "text", "text": txt if isinstance(txt, str) else ""})
+            elif pt in ("input_image", "image_url", "image"):
+                url = pp.get("image_url") or pp.get("url") or ""
+                if isinstance(url, dict):
+                    url = url.get("url", "")
+                if isinstance(url, str) and url:
+                    parts.append({"type": "image_url", "image_url": {"url": url}})
+        if not parts:
+            return ""
+        if all(part.get("type") == "text" for part in parts):
+            return " ".join(part["text"] for part in parts if part.get("text"))
+        return parts
 
     def _tokens_from_chat_usage(u):  # type: ignore[misc]
+        # R21/B-21.1: match shared tokens_from_chat_usage (aliases + details).
         u = u if isinstance(u, dict) else {}
-        return (u.get("prompt_tokens") or 0, u.get("completion_tokens") or 0, 0, 0)
+        inp = u.get("prompt_tokens") or u.get("input_tokens") or 0
+        out = u.get("completion_tokens") or u.get("output_tokens") or 0
+        cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
+        reasoning = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
+        return inp, out, cached, reasoning
 
     def _responses_usage(i=0, o=0, c=0, r=0):  # type: ignore[misc]
-        return {"input_tokens": int(i or 0), "output_tokens": int(o or 0),
-                "total_tokens": int(i or 0) + int(o or 0)}
+        # R21/B-21.1: strict openai SDK models REQUIRE the *_details objects
+        # (P1-3) — the old flat triple fails Response.model_validate_json.
+        it = int(i or 0)
+        ot = int(o or 0)
+        return {"input_tokens": it,
+                "input_tokens_details": {"cached_tokens": int(c or 0)},
+                "output_tokens": ot,
+                "output_tokens_details": {"reasoning_tokens": int(r or 0)},
+                "total_tokens": it + ot}
 
 
 # ============================================================================

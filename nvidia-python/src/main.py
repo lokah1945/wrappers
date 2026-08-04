@@ -420,17 +420,70 @@ except ImportError:
     _shared_parse_retry_after = None
     # Fallback: minimal build_forward_headers so the wrapper still works
     # if common.translations is not importable (shouldn't happen in prod).
-    def _build_forward_headers(client_headers, extra=None):
+    _FB_FORWARDHEADER_ALLOWLIST = (
+        # OpenAI / Anthropic SDK identity
+        'user-agent', 'x-stainless-lang', 'x-stainless-package-version',
+        'x-stainless-os', 'x-stainless-arch', 'x-stainless-runtime',
+        'x-stainless-runtime-version', 'x-stainless-retry-count',
+        # Anthropic-specific
+        'anthropic-version', 'anthropic-beta', 'anthropic-dangerous-direct-browser-access',
+        # OpenAI-specific
+        'openai-beta', 'openai-organization', 'openai-project',
+        # Request tracing
+        'x-request-id', 'x-correlation-id', 'traceparent', 'tracestate',
+        # Client identity (for logging/metrics upstream)
+        'x-client-id', 'x-session-id',
+        # Content negotiation
+        'accept', 'accept-language',
+        # Caching (some upstreams honor these)
+        'if-none-match', 'if-modified-since',
+    )
+    _FB_HOP_BY_HOP = frozenset({
+        'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+        'te', 'trailers', 'transfer-encoding', 'upgrade',
+    })
+
+    def _fb_build_forward_headers(client_headers, extra: dict | None = None) -> dict:
+        """Build the upstream header dict from client headers (transparent proxy).
+
+        Forwards:
+          - All headers in _FB_FORWARDHEADER_ALLOWLIST (if present in client_headers).
+          - Any additional headers from `extra` (wrapper-specific overrides).
+
+        Strips:
+          - Hop-by-hop headers (RFC 7230).
+          - Wrapper-owned headers (authorization, content-length, content-type, host,
+            accept-encoding) — these are set by the wrapper itself.
+
+        Case-insensitive lookup on client_headers (works with Starlette/aiohttp
+        headers objects that use case-insensitive .get()).
+
+        Args:
+            client_headers: dict-like with case-insensitive .get() (e.g.
+                starlette.datastructures.Headers, dict, aiohttp.ClientResponse.headers).
+            extra: optional dict of wrapper-specific headers to add/override.
+
+        Returns:
+            dict of headers to send upstream (all values sanitized to str).
+        """
         out = {}
         if client_headers and hasattr(client_headers, 'get'):
-            for h in ('user-agent', 'anthropic-version', 'anthropic-beta',
-                      'openai-beta', 'x-request-id', 'accept'):
+            for h in _FB_FORWARDHEADER_ALLOWLIST:
                 v = client_headers.get(h)
-                if v:
+                if v is not None:
                     out[h] = str(v)
         if extra:
-            out.update(extra)
+            for k, v in extra.items():
+                if v is not None and k.lower() not in _FB_HOP_BY_HOP:
+                    out[k] = str(v)
         return out
+
+
+    def _build_forward_headers(client_headers, extra=None):
+        # R21/B-21.1: must match shared build_forward_headers byte-for-byte
+        # (x-stainless SDK identity, traceparent, openai-org etc. were dropped).
+        return _fb_build_forward_headers(client_headers, extra)
+
 
 # P0-4/P0-1 fixes (audit 2026-08-03): central special-token scrubbing +
 # shared byte-level passthrough driver (see common/sanitize_tokens.py).
