@@ -105,7 +105,7 @@ def load_provider_error_manifest(provider: str) -> dict[str, Any]:
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except (OSError, json.JSONDecodeError, RecursionError):
         return {}
 
 

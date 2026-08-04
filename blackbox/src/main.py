@@ -523,7 +523,8 @@ async def proxy_request(method: str, url: str, json_body: dict = None, headers: 
                 resp.release()
                 try:
                     data = json.loads(text)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
+                    # RecursionError = over-deep upstream body (B-25.1 parity)
                     data = text
                 err = _upstream_error_body(resp.status, data)
                 if retry_after and isinstance(err, dict):
@@ -1694,7 +1695,7 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
             return
         try:
             c = json.loads(payload)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return
         # R-03: an upstream {"error": ...} frame must NOT be dropped; record it
         # so the stream terminates with response.failed instead of a fabricated
@@ -2063,7 +2064,7 @@ async def anthropic_messages(request: Request):
                                 return
                             try:
                                 c = json.loads(payload)
-                            except (json.JSONDecodeError, ValueError):
+                            except (json.JSONDecodeError, ValueError, RecursionError):
                                 continue
                             for ev in state.translate_chunk(c):
                                 yield ev

@@ -47,7 +47,7 @@ class LocalModelRegistry:
         try:
             data = json.loads(path.read_text())
             data = data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, RecursionError):
             data = {}
         # MR-5 fix: an empty/corrupt manifest previously produced zero
         # protocols, turning every request into a CallPlanError (total
@@ -73,7 +73,7 @@ class LocalModelRegistry:
         try:
             data = json.loads(path.read_text())
             return data if isinstance(data, dict) else {}
-        except (OSError, json.JSONDecodeError):
+        except (OSError, json.JSONDecodeError, RecursionError):
             return {}
 
     def bind_alias(self, binding: AliasBinding) -> None:

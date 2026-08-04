@@ -92,7 +92,7 @@ def process_line(line: str) -> None:
             Path(OUTPUT).parent.mkdir(parents=True, exist_ok=True)
             with open(OUTPUT, 'a') as f:
                 f.write(json.dumps(rec) + '\n')
-    except (json.JSONDecodeError, ValueError):
+    except (json.JSONDecodeError, ValueError, RecursionError):
         dummy_ev = {'msg': line, 'ts': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime())}
         cls = classify(dummy_ev)
         if cls and should_emit(cls['kind'], ''):
@@ -170,7 +170,7 @@ def mode_top(n: int = 20) -> None:
             entry['count'] += 1
             if rec.get('ts_iso', '') > entry['last']:
                 entry['last'] = rec['ts_iso']
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             pass
 
     by_count = sorted(

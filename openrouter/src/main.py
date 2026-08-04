@@ -1578,7 +1578,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str,
                 return events, True
             try:
                 data = json.loads(data_str)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
                 return events, False
             # R-03: surface a mid-stream upstream error instead of dropping it
             # and closing with a fabricated response.completed.
@@ -2823,7 +2823,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
 
                 try:
                     data = json.loads(data_str)
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, RecursionError):
                     continue
 
                 # B-02 (compounding) fix: surface mid-stream upstream errors

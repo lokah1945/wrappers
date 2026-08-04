@@ -2324,9 +2324,9 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.error(f'[JSON PARSE ERROR] completions: {e}')
-                return JSONResponse(status_code=400, content={'error': {'message': f'Invalid JSON: {e}', 'type': 'invalid_request_error'}})
+            except (json.JSONDecodeError, ValueError, RecursionError) as e:
+                logger.error(f'[JSON PARSE ERROR] completions: {type(e).__name__}: {e}')
+                return JSONResponse(status_code=400, content={'error': {'message': f'Invalid JSON: {type(e).__name__}', 'type': 'invalid_request_error'}})
 
             dep = get_deprecated_redirect_info(body.get('model', ''))
             if dep:
@@ -2360,7 +2360,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             if body.get('prompt') and not body.get('messages'):
                 body['messages'] = [{'role': 'user', 'content': body['prompt']}]
@@ -2374,7 +2374,7 @@ class Server:
             # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens positive + capped.
             try:
                 _rb = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 _rb = {}
             for _mt_key in ('max_output_tokens', 'max_tokens'):
                 _mtv = _rb.get(_mt_key) if isinstance(_rb, dict) else None
@@ -2387,7 +2387,7 @@ class Server:
             if await _resolve_is_anthropic_for(self._session):
                 try:
                     body = json.loads(raw)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
                 if body.get('model'):
                     body['model'] = resolve_target_model(body.get('model', ''))
@@ -2465,7 +2465,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             count = estimate_input_tokens(body)
             return {'input_tokens': count}
@@ -2475,7 +2475,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             if not body.get('input_type'):
                 if isinstance(body.get('input'), str):
@@ -2494,7 +2494,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             model_id = resolve_target_model(body.get('model', ''))
             body['model'] = model_id
@@ -2511,7 +2511,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             requested_model = body.get('model', '')
             model_id = requested_model
@@ -2532,7 +2532,7 @@ class Server:
             raw = await request.body()
             try:
                 body = json.loads(raw)
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             requested_model = body.get('model', '')
             model_id = requested_model
@@ -2603,7 +2603,7 @@ class Server:
                 key.decrement_in_flight()
                 try:
                     parsed = json.loads(data)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     parsed = {'error': {'message': data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                 if resp.status >= 400:
                     await self._record_model_response(model_id, key, resp.status, parsed, '/v1/messages')
@@ -2758,7 +2758,7 @@ class Server:
                                     generated_chars += len(d)
                                     if d:
                                         has_content = True
-                            except (json.JSONDecodeError, ValueError):
+                            except (json.JSONDecodeError, ValueError, RecursionError):
                                 pass
 
                 if re_module.search(r'data:\s*\[DONE\]', chunk_str):
@@ -2799,7 +2799,7 @@ class Server:
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
         try:
             body = json.loads(raw)
-        except (json.JSONDecodeError, ValueError):
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
         # COMPATIBILITY_LAYER=2: Anthropic upstream — /v1/messages passes
         # through verbatim (model alias is resolved by the caller).
@@ -2814,7 +2814,7 @@ class Server:
 
         try:
             body = json.loads(raw)
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, RecursionError) as e:
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f'Invalid JSON: {e}'))
         if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer'))
@@ -3430,7 +3430,7 @@ class Server:
                 if resp.status >= 400:
                     try:
                         err_data = json.loads(resp_data)
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError, RecursionError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     await self._record_model_response(model_id, key, resp.status, err_data, path)
                     classification = classify_upstream_error(resp.status, err_data)
@@ -3564,7 +3564,7 @@ class Server:
             try:
                 parsed_body = json.loads(raw)
                 body_parse_failed = False
-            except (json.JSONDecodeError, ValueError):
+            except (json.JSONDecodeError, ValueError, RecursionError):
                 parsed_body = None
                 body_parse_failed = True
             if isinstance(parsed_body, dict):
@@ -3687,7 +3687,7 @@ class Server:
                     # deterministic 400/404/422 must not be retried across keys.
                     try:
                         err_data = json.loads(resp_data)
-                    except (json.JSONDecodeError, ValueError):
+                    except (json.JSONDecodeError, ValueError, RecursionError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     classification = classify_upstream_error(resp.status, err_data)
                     retryable = self._classify_retry(resp.status, classification)
@@ -3714,7 +3714,7 @@ class Server:
 
                 try:
                     return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     return Response(content=resp_data, status_code=resp.status, media_type=content_type)
 
             except asyncio.TimeoutError:

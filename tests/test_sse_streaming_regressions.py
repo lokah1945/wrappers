@@ -1485,3 +1485,55 @@ def test_b25_1_passthrough_drops_over_deep_upstream_frame():
     assert b'[DONE]' in blob
     fin = p.finish(terminal_done=True)
     assert isinstance(b''.join(fin), bytes)
+
+
+def test_b26_1_no_narrow_json_parse_catch_without_recursion_error():
+    """B-26.1 class lock: json.loads raises RecursionError (not ValueError) on
+    syntactically valid JSON nested beyond the interpreter limit. Every narrow
+    JSON-parse catch in production code must therefore ALSO catch
+    RecursionError, or an over-deep body/frame escapes as an unshaped 500
+    (§4) / crashes the proxy error path (§3.3). Broad `except Exception` is
+    acceptable; narrow JSONDecodeError/ValueError tuples are NOT."""
+    import re
+    files = []
+    for wrapper in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        files.extend((ROOT / wrapper / 'src').glob('*.py'))
+    files.extend((ROOT / 'common').glob('*.py'))
+    files.extend((ROOT / 'common' / 'model').glob('*.py'))
+    files.extend((ROOT / 'common' / 'translations').glob('*.py'))
+    offenders = []
+    for f in files:
+        src = f.read_text()
+        # Whitelist: body_guard.py deliberately splits RecursionError into its
+        # own dedicated clause (shaped 400 reject) directly above the narrow
+        # malformed-JSON pass-through tuple — same function, stricter handling.
+        split_ok = 'except RecursionError' in src
+        for m in re.finditer(r'except \(([^)]*)\)', src):
+            clause = m.group(1)
+            if 'JSONDecodeError' in clause and 'RecursionError' not in clause:
+                if split_ok and f.name == 'body_guard.py':
+                    continue
+                offenders.append(f'{f.relative_to(ROOT)}: except ({clause})')
+        for m in re.finditer(r'except json\.JSONDecodeError\s*:', src):
+            offenders.append(f'{f.relative_to(ROOT)}: bare JSONDecodeError')
+    assert not offenders, 'narrow JSON-parse catches without RecursionError:\n' + '\n'.join(offenders)
+
+
+def test_b26_1_corrupt_deep_manifest_degrades_to_empty_not_boot_crash(tmp_path):
+    """B-26.1: an operator-edited manifest nested past the recursion limit
+    previously crashed wrapper boot (load_provider_error_manifest /
+    LocalModelRegistry init). MR-5 doctrine: corrupt manifest ⇒ degrade to
+    {} with loud logging, never crash."""
+    from pathlib import Path as _RealPath
+    from common.model import errors as _err
+    deep = '{"rules":' + '[' * 3000 + ']' * 3000 + '}'
+    # Write a fake-provider manifest where the loader already reads (repo
+    # manifests dir), then clean up.
+    repo_dir = _RealPath(_err.__file__).resolve().parents[1] / 'model-registry' / 'manifests' / 'errors'
+    repo_dir.mkdir(parents=True, exist_ok=True)
+    target = repo_dir / 'zz_auditfake.json'
+    target.write_text(deep)
+    try:
+        assert _err.load_provider_error_manifest('zz_auditfake') == {}
+    finally:
+        target.unlink(missing_ok=True)

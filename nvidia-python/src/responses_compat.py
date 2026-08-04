@@ -317,7 +317,7 @@ def input_to_messages(input_val: Any, instructions: Optional[str] = None) -> Lis
                 try:
                     raw_args = json.loads(raw_args)
                     arguments = json.dumps(raw_args, ensure_ascii=False)
-                except (json.JSONDecodeError, ValueError):
+                except (json.JSONDecodeError, ValueError, RecursionError):
                     arguments = raw_args
             elif raw_args is None:
                 arguments = ''
@@ -683,7 +683,7 @@ class ResponsesHandler:
                                 continue
                             try:
                                 c = json.loads(payload)
-                            except (json.JSONDecodeError, ValueError):
+                            except (json.JSONDecodeError, ValueError, RecursionError):
                                 continue
                             if c.get('usage'):
                                 usage = convert_usage(c['usage'])
@@ -771,7 +771,7 @@ class ResponsesHandler:
                     if payload not in ('[DONE]', '"[DONE]"', ''):
                         try:
                             c = json.loads(payload)
-                        except (json.JSONDecodeError, ValueError):
+                        except (json.JSONDecodeError, ValueError, RecursionError):
                             c = None
                         if isinstance(c, dict):
                             if c.get('usage'):
@@ -924,7 +924,7 @@ class ResponsesHandler:
     async def handle_responses_api(self, request: Any, raw_body: bytes) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]], Optional[int]]:
         try:
             body = json.loads(raw_body)
-        except (json.JSONDecodeError, ValueError) as e:
+        except (json.JSONDecodeError, ValueError, RecursionError) as e:
             return {'error': {'message': f'Invalid JSON in /v1/responses: {e}', 'type': 'invalid_request_error'}}, None, None
 
         if not body or not body.get('model'):
