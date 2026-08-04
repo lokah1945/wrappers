@@ -53,13 +53,25 @@ try:
         tokens_from_chat_usage as _tokens_from_chat_usage,
     )
 except ImportError:  # pragma: no cover - standalone fallback
+    def _finite_nonneg_int(value):  # type: ignore[misc]
+        # B-27.1: match shared finite_nonneg_int (NaN/Inf/negatives → 0).
+        try:
+            v = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return v if v > 0 else 0
+
     def _responses_usage(i=0, o=0, c=0, r=0):  # type: ignore[misc]
-        return {'input_tokens': int(i or 0), 'output_tokens': int(o or 0),
-                'total_tokens': int(i or 0) + int(o or 0)}
+        # B-27.1: clamp via _finite_nonneg_int (verbatim-parity).
+        return {'input_tokens': _finite_nonneg_int(i),
+                'output_tokens': _finite_nonneg_int(o),
+                'total_tokens': _finite_nonneg_int(i) + _finite_nonneg_int(o)}
 
     def _tokens_from_chat_usage(u):  # type: ignore[misc]
+        # B-27.1: finite non-negative ints, verbatim-parity with shared twin.
         u = u if isinstance(u, dict) else {}
-        return (u.get('prompt_tokens') or 0, u.get('completion_tokens') or 0, 0, 0)
+        return (_finite_nonneg_int(u.get('prompt_tokens') or 0),
+                _finite_nonneg_int(u.get('completion_tokens') or 0), 0, 0)
 
 # previous_response_id store for Codex multi-turn server-side history.
 # Values are OpenAI chat messages, including the assistant message that contained

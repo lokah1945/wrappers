@@ -31,6 +31,18 @@ WINDOW_SECS = {
 }
 
 
+
+
+def _finite_nonneg_int(value):
+    """B-27.1: clamp token counters to finite non-negative ints (NaN/Inf/negatives → 0).
+    Twin of common.translations.shared.finite_nonneg_int."""
+    try:
+        v = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return v if v > 0 else 0
+
+
 class Metrics:
     def __init__(self, db_path: str):
         self._db_path = db_path
@@ -162,9 +174,11 @@ class Metrics:
                     return v
                 return kwargs.get(camel, default)
 
-            prompt_tokens = _g('prompt_tokens', 'promptTokens', 0) or 0
-            completion_tokens = _g('completion_tokens', 'completionTokens', 0) or 0
-            total_tokens = _g('total_tokens', 'totalTokens', 0) or (prompt_tokens + completion_tokens)
+            # B-27.1: clamp upstream-derived counters — NaN/Inf literals must
+            # never reach SQLite (sticky poison → invalid aggregates forever).
+            prompt_tokens = _finite_nonneg_int(_g('prompt_tokens', 'promptTokens', 0))
+            completion_tokens = _finite_nonneg_int(_g('completion_tokens', 'completionTokens', 0))
+            total_tokens = _finite_nonneg_int(_g('total_tokens', 'totalTokens', 0)) or (prompt_tokens + completion_tokens)
             ttft = _g('ttft_ms', 'ttftMs', 0) or 0
 
             await self._db.execute(
@@ -178,7 +192,7 @@ class Metrics:
                     kwargs.get('model', ''), _g('key_label', 'keyLabel', ''),
                     1 if _g('streaming', 'streaming', 0) else 0, _g('status', 'statusCode', 200),
                     _g('latency_ms', 'latencyMs', 0), prompt_tokens, completion_tokens,
-                    _g('cached_tokens', 'cachedTokens', 0), total_tokens,
+                    _finite_nonneg_int(_g('cached_tokens', 'cachedTokens', 0)), total_tokens,
                     1 if _g('was_rate_limited', 'wasRateLimited', 0) else 0, _g('retries', 'retries', 0),
                     _g('request_bytes', 'requestBytes', 0), _g('pacing_ms', 'pacingMs', 0), ttft,
                 ]

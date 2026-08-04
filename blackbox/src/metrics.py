@@ -14,6 +14,20 @@ from pathlib import Path
 from typing import Dict
 
 
+def _finite_nonneg_int(value):
+    """B-27.1: clamp token counters to finite non-negative ints — a NaN/Inf
+    literal from an upstream usage object (Python's json.loads accepts them)
+    would otherwise poison the counter FOREVER (NaN is sticky) and leak into
+    persisted snapshots, making every future /metrics payload invalid JSON.
+    Twin of common.translations.shared.finite_nonneg_int."""
+    try:
+        v = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return v if v > 0 else 0
+
+
+
 class Metrics:
     def __init__(self, db_path: str = None):
         self.start = time.time()
@@ -69,8 +83,8 @@ class Metrics:
     async def record_request(self, model: str = "", prompt_tokens: int = 0, completion_tokens: int = 0, **kwargs):
         with self._lock:
             self.requests += 1
-            self.tokens_in += prompt_tokens
-            self.tokens_out += completion_tokens
+            self.tokens_in += _finite_nonneg_int(prompt_tokens)
+            self.tokens_out += _finite_nonneg_int(completion_tokens)
             if kwargs.get('status_code', 200) >= 400:
                 self.errors += 1
             # BB-15/OC-14: periodic persistence (cheap small-file JSON dump).

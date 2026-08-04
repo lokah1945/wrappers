@@ -39,6 +39,23 @@ except Exception:  # pragma: no cover - fallback for standalone use
         return _Passthrough()
 
 
+def finite_nonneg_int(value: Any) -> int:
+    """Clamp a numeric to a finite non-negative int (token counters).
+
+    B-27.1: upstream payloads may contain ``NaN``/``Infinity`` literals
+    (Python's json.loads accepts them). ``int(NaN)`` raised ValueError and
+    ``int(Inf)`` OverflowError inside response builders — turning an upstream
+    SUCCESS into a client-visible crash (CONTRACT §3.3) — while a NaN added
+    to a metrics counter poisoned it permanently (sticky), even into
+    persisted snapshots. Non-finite, non-numeric, and negative values → 0.
+    """
+    try:
+        v = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return v if v > 0 else 0
+
+
 def responses_usage(input_tokens: int = 0, output_tokens: int = 0,
                     cached_tokens: int = 0, reasoning_tokens: int = 0) -> dict:
     """Full OpenAI Responses API usage object.
@@ -48,25 +65,28 @@ def responses_usage(input_tokens: int = 0, output_tokens: int = 0,
     wrappers previously emitted a flat {input, output, total} triple that
     fails ``Response.model_validate_json``.
     """
-    it = int(input_tokens or 0)
-    ot = int(output_tokens or 0)
+    it = finite_nonneg_int(input_tokens)
+    ot = finite_nonneg_int(output_tokens)
     return {
         "input_tokens": it,
-        "input_tokens_details": {"cached_tokens": int(cached_tokens or 0)},
+        "input_tokens_details": {"cached_tokens": finite_nonneg_int(cached_tokens)},
         "output_tokens": ot,
-        "output_tokens_details": {"reasoning_tokens": int(reasoning_tokens or 0)},
+        "output_tokens_details": {"reasoning_tokens": finite_nonneg_int(reasoning_tokens)},
         "total_tokens": it + ot,
     }
 
 
 def tokens_from_chat_usage(u: Any) -> tuple:
-    """(input, output, cached, reasoning) from an OpenAI chat usage dict."""
+    """(input, output, cached, reasoning) from an OpenAI chat usage dict.
+
+    Returns finite non-negative ints (B-27.1: NaN/Inf/negatives → 0)."""
     u = u if isinstance(u, dict) else {}
     inp = u.get("prompt_tokens") or u.get("input_tokens") or 0
     out = u.get("completion_tokens") or u.get("output_tokens") or 0
     cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
     reasoning = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
-    return inp, out, cached, reasoning
+    return (finite_nonneg_int(inp), finite_nonneg_int(out),
+            finite_nonneg_int(cached), finite_nonneg_int(reasoning))
 
 
 def scrub_visible_text(text: str) -> str:

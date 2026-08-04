@@ -190,24 +190,35 @@ except ImportError:  # pragma: no cover - standalone fallback
             return " ".join(part["text"] for part in parts if part.get("text"))
         return parts
 
+    def _finite_nonneg_int(value):  # type: ignore[misc]
+        # B-27.1: match shared finite_nonneg_int (NaN/Inf/negatives → 0).
+        try:
+            v = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return v if v > 0 else 0
+
     def _tokens_from_chat_usage(u):  # type: ignore[misc]
         # R21/B-21.1: match shared tokens_from_chat_usage (aliases + details).
+        # B-27.1: finite non-negative ints, verbatim-parity with shared twin.
         u = u if isinstance(u, dict) else {}
         inp = u.get("prompt_tokens") or u.get("input_tokens") or 0
         out = u.get("completion_tokens") or u.get("output_tokens") or 0
         cached = (u.get("prompt_tokens_details") or {}).get("cached_tokens", 0) or 0
         reasoning = (u.get("completion_tokens_details") or {}).get("reasoning_tokens", 0) or 0
-        return inp, out, cached, reasoning
+        return (_finite_nonneg_int(inp), _finite_nonneg_int(out),
+                _finite_nonneg_int(cached), _finite_nonneg_int(reasoning))
 
     def _responses_usage(i=0, o=0, c=0, r=0):  # type: ignore[misc]
         # R21/B-21.1: strict openai SDK models REQUIRE the *_details objects
         # (P1-3) — the old flat triple fails Response.model_validate_json.
-        it = int(i or 0)
-        ot = int(o or 0)
+        # B-27.1: clamp via _finite_nonneg_int (verbatim-parity).
+        it = _finite_nonneg_int(i)
+        ot = _finite_nonneg_int(o)
         return {"input_tokens": it,
-                "input_tokens_details": {"cached_tokens": int(c or 0)},
+                "input_tokens_details": {"cached_tokens": _finite_nonneg_int(c)},
                 "output_tokens": ot,
-                "output_tokens_details": {"reasoning_tokens": int(r or 0)},
+                "output_tokens_details": {"reasoning_tokens": _finite_nonneg_int(r)},
                 "total_tokens": it + ot}
 
 
@@ -2540,8 +2551,10 @@ class Metrics:
     def record(self, prompt=0, completion=0, error=False):
         with self._lock:
             self.requests += 1
-            self.tokens_in += prompt
-            self.tokens_out += completion
+            # B-27.1: clamp — NaN/Inf usage literals must never poison the
+            # persisted counters (sticky NaN → invalid /metrics JSON forever).
+            self.tokens_in += _finite_nonneg_int(prompt)
+            self.tokens_out += _finite_nonneg_int(completion)
             if error:
                 self.errors += 1
             now = time.time()
@@ -2563,6 +2576,16 @@ class Metrics:
             "total_errors": self.errors,
             "error_rate": round(self.errors / max(1, self.requests), 4)
         }
+
+def _finite_nonneg_int(value):
+    """B-27.1: clamp token counters to finite non-negative ints (NaN/Inf/negatives → 0).
+    Twin of common.translations.shared.finite_nonneg_int."""
+    try:
+        v = int(value or 0)
+    except (TypeError, ValueError, OverflowError):
+        return 0
+    return v if v > 0 else 0
+
 
 metrics = Metrics()
 

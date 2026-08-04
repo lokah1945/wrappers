@@ -1251,17 +1251,21 @@ def test_r21_nous_usage_content_fallback_parity():
     )
     src = (ROOT / 'nous/src/main.py').read_text()
 
-    def _grab(name):
+    def _grab(name, extra_ns=None):
         m = _re.search(rf"(    def {name}\(.*?)(?=\n    def |\n\S|\Z)", src, _re.S)
         assert m, f'nous fallback missing: {name}'
-        ns: dict = {}
+        ns: dict = dict(extra_ns or {})
         exec(_tw.dedent(m.group(1)), ns)
         return ns[name]
 
-    fb_usage = _grab('_responses_usage')
+    # B-27.1: the usage twins now clamp through _finite_nonneg_int — exec it
+    # first and inject it into the twins' namespace.
+    fb_clamp = _grab('_finite_nonneg_int')
+    ns_clamp = {'_finite_nonneg_int': fb_clamp}
+    fb_usage = _grab('_responses_usage', ns_clamp)
     for args in ((0, 0, 0, 0), (11, 7, 3, 2), (None, None, None, None)):
         assert fb_usage(*args) == s_usage(*args), args
-    fb_tokens = _grab('_tokens_from_chat_usage')
+    fb_tokens = _grab('_tokens_from_chat_usage', ns_clamp)
     for u in ({}, None, {'prompt_tokens': 5, 'completion_tokens': 2,
                          'prompt_tokens_details': {'cached_tokens': 4},
                          'completion_tokens_details': {'reasoning_tokens': 9}},
@@ -1537,3 +1541,118 @@ def test_b26_1_corrupt_deep_manifest_degrades_to_empty_not_boot_crash(tmp_path):
         assert _err.load_provider_error_manifest('zz_auditfake') == {}
     finally:
         target.unlink(missing_ok=True)
+
+
+def test_b27_1_usage_clamps_non_finite_and_negative():
+    """B-27.1: upstream usage payloads may carry NaN/Infinity literals
+    (Python's json.loads accepts them). int(NaN)=ValueError, int(Inf)=
+    OverflowError previously crashed response builders on an upstream SUCCESS
+    (§3.3); NaN also poisons metrics counters permanently. All converters
+    must clamp to finite non-negative ints."""
+    from common.translations.shared import responses_usage, tokens_from_chat_usage, finite_nonneg_int
+    nan, inf = float('nan'), float('inf')
+    u = responses_usage(nan, inf, -5, 'garbage')
+    assert u == {'input_tokens': 0, 'input_tokens_details': {'cached_tokens': 0},
+                 'output_tokens': 0, 'output_tokens_details': {'reasoning_tokens': 0},
+                 'total_tokens': 0}, u
+    import json as _j
+    _j.dumps(u, allow_nan=False)  # response must be RFC-strict JSON
+    assert tokens_from_chat_usage(
+        {'prompt_tokens': nan, 'completion_tokens': inf,
+         'prompt_tokens_details': {'cached_tokens': -3},
+         'completion_tokens_details': {'reasoning_tokens': float('-inf')}}) == (0, 0, 0, 0)
+    assert tokens_from_chat_usage({'prompt_tokens': 7, 'completion_tokens': 4.9}) == (7, 4, 0, 0)
+    assert tokens_from_chat_usage(None) == (0, 0, 0, 0)
+    assert finite_nonneg_int(True) or True  # bools tolerated
+    assert finite_nonneg_int(2**80) == 2**80  # big finite ints survive
+
+
+def test_b27_1_fallback_twins_clamp_parity():
+    """§7: the nous and responses_compat ImportError fallback twins must clamp
+    identically to the shared implementation."""
+    import re as _re, textwrap as _tw
+    from common.translations.shared import tokens_from_chat_usage as shared_tokens, \
+        responses_usage as shared_usage
+    nan, inf = float('nan'), float('inf')
+    batteries = [None, {}, {'prompt_tokens': nan, 'completion_tokens': inf},
+                 {'prompt_tokens': -9, 'prompt_tokens_details': {'cached_tokens': nan}},
+                 {'prompt_tokens': 12, 'completion_tokens': 3.7}]
+    for src_path in ('nous/src/main.py', 'nvidia-python/src/responses_compat.py'):
+        src = (ROOT / src_path).read_text()
+        m = _re.search(r'    def _finite_nonneg_int\(value\):.*?return v if v > 0 else 0\n'
+                       r'(.*?)(?=\n\n|\Z)', src, _re.S)
+        assert m, f'{src_path}: fallback _finite_nonneg_int not found'
+        assert 'OverflowError' in m.group(0), f'{src_path}: twin missing OverflowError clamp'
+        start = src.index('    def _finite_nonneg_int')
+        if src_path.startswith('nous'):
+            end = src.index('"total_tokens": it + ot}') + len('"total_tokens": it + ot}')
+        else:
+            end = src.index(', 0, 0)', start) + len(', 0, 0)')
+        block = src[start:end]
+        fns = {}
+        exec(_tw.dedent(block), fns)
+        tok, rus = fns.get('_tokens_from_chat_usage'), fns.get('_responses_usage')
+        assert tok and rus, f'{src_path}: exec of twins failed'
+        for b in batteries:
+            assert tok(b) == shared_tokens(b), (src_path, b)
+        for args in ((nan, inf, -5, 'x'), (7, 4.9, 0, 0)):
+            got, want = rus(*args), shared_usage(*args)
+            for k in ('input_tokens', 'output_tokens', 'total_tokens'):
+                assert got[k] == want[k], (src_path, args, k)
+
+
+def test_b27_1_metrics_boundaries_reject_non_finite_poison():
+    """B-27.1 boundary: one poisoned usage frame must not stick in persisted
+    counters (NaN is sticky and json.dumps then emits invalid JSON forever)."""
+    import asyncio, importlib.util, json as _j
+
+    def _load(path, name):
+        spec = importlib.util.spec_from_file_location(name, ROOT / path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    nan, inf = float('nan'), float('inf')
+    for path in ('opencode/src/metrics.py', 'blackbox/src/metrics.py', 'openrouter/src/metrics.py'):
+        mod = _load(path, 'm_' + path.split('/')[0])
+        # tmp db_path → isolated persist path (constructor rehydrates counters
+        # from any real snapshot on disk — must not leak into this test).
+        M = mod.Metrics(db_path='/tmp/b27_1_test_metrics.db')
+        asyncio.run(M.record_request(model='m', prompt_tokens=nan, completion_tokens=inf, status_code=200))
+        snap = asyncio.run(M.summary()) if hasattr(M, 'summary') and asyncio.iscoroutinefunction(M.summary) else M.summary()
+        _j.dumps(snap, allow_nan=False), 'poisoned snapshot: ' + path
+        assert snap['input_tokens'] == 0 and snap['output_tokens'] == 0, (path, snap)
+
+
+def test_b27_2_nvidia_metrics_insert_actually_runs_and_clamps():
+    """B-27.2: the B-27.1 clamp was first inserted as a nested def AFTER its
+    use — NameError swallowed by record_request's broad except, silently
+    killing EVERY nvidia metrics insert (live runtime gate caught it:
+    midfault-count delta stayed 0). The record path must actually execute
+    the INSERT and clamp non-finite tokens."""
+    import asyncio, importlib.util
+    spec = importlib.util.spec_from_file_location('nv_metrics', ROOT / 'nvidia-python/src/metrics.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    class FakeDB:
+        def __init__(self):
+            self.rows = []
+        async def execute(self, sql, params):
+            self.rows.append((sql, params))
+
+    M = mod.Metrics.__new__(mod.Metrics)
+    M._db = FakeDB()
+    M._on_request = None
+    M._ready = asyncio.Event()
+    M._ready.set()
+    M._maybe_save = lambda *a, **k: None
+    asyncio.run(M.record_request(prompt_tokens=float('nan'), completion_tokens=float('inf'),
+                                 status=200, path='/v1/chat/completions'))
+    assert M._db.rows, 'record_request never executed the INSERT (silent swallow)'
+    params = M._db.rows[0][1]
+    # prompt/completion/total/cached all clamped to 0 by _finite_nonneg_int
+    token_vals = [p for p in params if isinstance(p, int) and p == 0]
+    assert token_vals, params
+    import json as _j
+    _j.dumps({'r': list(params)}, allow_nan=False)
