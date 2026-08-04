@@ -1205,3 +1205,33 @@ def test_r18_sanitize_header_value_fallback_parity():
         fb = ns['sanitize_header_value']
         for v in battery:
             assert fb(v) == shared(v), (path, repr(v), fb(v), shared(v))
+
+
+def test_r19_query_int_guard():
+    """R19: nvidia dashboard-metrics endpoints parsed query params with bare
+    int() — garbage (?hours=abc, ?limit=-1, ?days=1e12) raised ValueError →
+    unshaped 500 (CONTRACT §4). The shared _query_int guard must return
+    defaults on garbage and clamp to sane bounds."""
+    import re as _re
+    src = (ROOT / 'nvidia-python/src/main.py').read_text()
+    m = _re.search(r"\ndef _query_int\(.*?(?=\ndef |\nclass |\Z)", src, _re.S)
+    assert m, '_query_int helper missing'
+    ns: dict = {'Request': object}
+    exec(m.group(0), ns)
+    qint = ns['_query_int']
+
+    class _Req:
+        def __init__(self, params):
+            self.query_params = params
+
+    assert qint(_Req({'hours': 'abc'}), 'hours', 24, 1, 100) == 24
+    assert qint(_Req({'hours': ''}), 'hours', 24, 1, 100) == 24
+    assert qint(_Req({}), 'hours', 24, 1, 100) == 24
+    assert qint(_Req({'limit': '-5'}), 'limit', 50, 1, 1000) == 1
+    assert qint(_Req({'limit': '99999999'}), 'limit', 50, 1, 1000) == 1000
+    assert qint(_Req({'days': '30.9'}), 'days', 30, 1, 3660) == 30
+    assert qint(_Req({'offset': ' 17 '}), 'offset', 0, 0, 100) == 17
+    # and every endpoint site now routes through the guard (allow mentions in
+    # the helper's own docstring; require no bare `= int(` call-site remains)
+    import re as _re2
+    assert not _re2.search(r"=\s*int\(request\.query_params\.get\(", src)

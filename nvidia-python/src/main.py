@@ -1602,6 +1602,20 @@ async def _resolve_is_anthropic_for(session) -> bool:
     return _is_anthropic_upstream()
 
 
+
+def _query_int(request: Request, name: str, default: int, lo: int, hi: int) -> int:
+    """R19 fix: parse an integer query param defensively — unguarded
+    int(request.query_params.get(...)) raised ValueError -> unshaped 500 on
+    dashboard-metrics endpoints (CONTRACT 4: never an unshaped 5xx). Garbage
+    falls back to `default`; values are clamped to [lo, hi] so absurd ranges
+    (hours=1e12, limit=-5) cannot trigger heavy scans or negative LIMITs."""
+    try:
+        v = int(str(request.query_params.get(name, '')).strip() or default)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, v))
+
+
 class Server:
     def __init__(self, app: FastAPI = None):
         global _model_state_store
@@ -2042,7 +2056,7 @@ class Server:
         @app.get('/metrics/models/timeseries')
         async def metrics_models_timeseries(request: Request):
             model = request.query_params.get('model', '')
-            hours = int(request.query_params.get('hours', '24'))
+            hours = _query_int(request, 'hours', 24, 1, 24 * 366)
             return {'model': model, 'hours': hours, 'data': await self.metrics.get_model_timeseries(model, hours)}
 
         @app.get('/metrics/keys')
@@ -2068,14 +2082,14 @@ class Server:
 
         @app.get('/metrics/activity')
         async def metrics_activity(request: Request):
-            limit = int(request.query_params.get('limit', '50'))
-            offset = int(request.query_params.get('offset', '0'))
+            limit = _query_int(request, 'limit', 50, 1, 1000)
+            offset = _query_int(request, 'offset', 0, 0, 10_000_000)
             rows = await self.metrics.recent_requests(limit, offset)
             return {'limit': limit, 'offset': offset, 'count': len(rows), 'rows': rows}
 
         @app.get('/metrics/rate-limits')
         async def metrics_rate_limits(request: Request):
-            limit = int(request.query_params.get('limit', '100'))
+            limit = _query_int(request, 'limit', 100, 1, 1000)
             window = request.query_params.get('window', '24h')
             events = await self.metrics.rate_limit_events(limit)
             summary = await self.metrics.rate_limit_summary(window)
@@ -2112,12 +2126,12 @@ class Server:
 
         @app.get('/metrics/chart/hourly')
         async def metrics_chart_hourly(request: Request):
-            hours = int(request.query_params.get('hours', '24'))
+            hours = _query_int(request, 'hours', 24, 1, 24 * 366)
             return {'hours': hours, 'data': await self.metrics.get_hourly_chart(hours)}
 
         @app.get('/metrics/chart/daily')
         async def metrics_chart_daily(request: Request):
-            days = int(request.query_params.get('days', '30'))
+            days = _query_int(request, 'days', 30, 1, 3660)
             return {'days': days, 'data': await self.metrics.get_daily_chart(days)}
 
         @app.post('/admin/heal-in-flight')
