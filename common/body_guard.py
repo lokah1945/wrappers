@@ -115,6 +115,19 @@ class JSONBodyGuard:
         if raw.strip():
             try:
                 parsed = json.loads(raw)
+            except RecursionError:
+                # B-25.1 closure: syntactically VALID JSON nested deeper than
+                # the interpreter limit raises RecursionError, not ValueError —
+                # it escaped this guard AND would crash the route's own
+                # request.json() the same way, producing an unshaped 500.
+                # No downstream parser can accept this body, so the guard is
+                # the only place that CAN shape the rejection (CONTRACT §4:
+                # malformed body ⇒ shaped 4xx, never 5xx).
+                logger.warning('[body-guard] rejecting over-deep nested JSON body on %s', path)
+                await _reject(send, path,
+                              'Request body JSON is nested too deeply to be parsed safely. '
+                              'Flatten the structure (e.g. fewer nested arrays/objects).')
+                return
             except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                 # Malformed JSON: routes already return a shaped 400 for this,
                 # and their message includes the parser detail. Pass through.

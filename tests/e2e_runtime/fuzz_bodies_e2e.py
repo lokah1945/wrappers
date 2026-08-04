@@ -110,6 +110,10 @@ CORPUS: list[tuple[str, str, bytes]] = [
      _j({'model': 'm', 'messages': [], 'system': ['a', 42]})),
     ('deep-nest-100',     'application/json', _j({'model': 'm', 'messages': [], 'extra': _nest(100)})),
     ('deep-nest-900',     'application/json', _j({'model': 'm', 'messages': [], 'extra': _nest(900)})),
+    # B-25.1: cross the interpreter recursion limit (~1000) — valid JSON the
+    # guard (and any route parser) cannot even parse: must never 5xx.
+    ('deep-nest-3000',    'application/json', ('{"model":"m","messages":[],"extra":' + '{"a":' * 3000 + '1' + '}' * 3000 + '}').encode()),
+    ('deep-array-3000',   'application/json', ('{"model":"m","messages":[],"extra":' + '[' * 3000 + '1' + ']' * 3000 + '}').encode()),
     ('unicode-garbage',   'application/json',
      _j({'model': 'm􀀀￾�x', 'messages': [{'role': 'user', 'content': '\x00\x01￾🤖\uffff'}]})),
     ('empty-object',      'application/json', b'{}'),

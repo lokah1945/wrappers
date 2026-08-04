@@ -26,6 +26,7 @@
 | 2026-08-04 R22 | (this commit) | **Current — round 22.** `common/` closure sweep (base_wrapper / agent_registry / logging_utils / model.identity / catalog_integration) + §10 parity closure. **B-22.1 (§10+§8):** `/health` on nvidia/nous/opencode/blackbox (and the reference base) reported in-flight only buried inside per-key `live_keys` — openrouter was the sole wrapper with the top-level `in_flight` the contract changelog promises *on every wrapper*; all five + reference base now report `in_flight: sum(...)` (runtime-verified 5/5 against live boots). **B-22.2:** catalog search clamped `limit` only above (`min(limit, 500)`) — SQLite `LIMIT -1` is UNLIMITED, so a negative limit from any caller silently unbounded the query; all 4 search call-sites now clamp `[1, 500]`, management `offset` clamped `>= 0`. agent_registry/logging_utils/model.identity read clean. +2 tests (331 unit). README/contract verification counters refreshed. |
 | 2026-08-04 R23 | (this commit) | Round 23, CLEAN ROUND. Concurrency/store/auth sweep across dark segments: `heal_in_flight` loop parity confirmed on all 5 wrappers (300s env-tunable, threshold-guarded, `_in_flight_total` floor-clamped); per-IP rate limiter stores bounded under XFF-rotation abuse (opencode >1024-key sweep, blackbox 300s periodic sweep BB-11); route-level auth wiring audited on opencode+blackbox — every protected POST calls `_auth_check`, unknown-POST catch-all fail-closed (B-31), public reads method-gated; JSON body-shape guard (R-01) registered on all 5; response stores deep-copy BOTH directions on all 5 (R8/N-19 doctrine intact: nous L1284/1313, opencode L1016/1063, blackbox L1904/1945, openrouter L2250/2287, nvidia responses_compat L143/173); `common/model_state.py` full line-read — RLock-serialized read-modify-write counters safe under `asyncio.to_thread`, bounded events + cache pruning (CM-5), WAL+busy_timeout, connections closed in finally, schema-version guard; nvidia DSML parse loop proven terminating (strict cursor advance). **0 new defects.** |
 | 2026-08-04 R24 | (this commit) | Round 24. **B-24.1 (RecursionError class, §3.3):** pathologically deep (>1000-level) nested JSON broke three diagnostics/validation paths whose `except (TypeError, ValueError)` guards did not cover `json.loads`/`json.dumps` recursion: (1) `sanitize_error_detail` — the *second-order* trap found by test: the fallback itself called `str(payload)`, whose repr re-recursed inside the handler — now a fixed `[UNSERIALIZABLE ...]` placeholder; (2) `looks_model_capacity_error` on the proxy error path — a misbehaving upstream's deep error body could crash error classification exactly under distress; (3) `validate_catalog_entries` + `profile_store.load` narrow catch-sets. All closed; sanitize contract (bounded, never-raise, redacting) test-locked incl. under pytest's reduced stack headroom. common/model/ modules (validation/sanitize/call_plan/profile_store/identity) fully swept clean. +3 tests (333 unit · 990 runtime re-green). |
+| 2026-08-04 R25 | (this commit) | Round 25. **B-25.1 (B-24.1 class closure — hot paths):** the RecursionError sweep reached the request/stream hot paths: (1) `JSONBodyGuard` — a syntactically valid JSON body nested >1000 deep escaped the guard AND would crash every route's own `request.json()` → unshaped 500 on all 5 wrappers (§4); now shaped 400 on both envelope styles (runtime-locked: fuzz corpus grew `deep-nest-3000` + `deep-array-3000`, 1081→**1115 checks**); (2) `PassthroughBlockRewriter._emit_block` — over-deep upstream SSE frame dropped like any undecodable frame; (3) `compat.py` layer-2 translator loop skips over-deep frames; (4) `common/model/errors.py::error_text` — second-order `str(payload)` trap closed in the classifier entry point. common/model/ (registry/contracts/errors/validation/sanitize/call_plan/profile_store/identity/central_client) now fully swept. +3 unit tests (336). Gates re-green: 336 unit · 990 runtime · 1115 fuzz. |
 ## Summary of Findings (2026-08-03)
 
 | Severity | Count | Key Issues |
@@ -39,14 +40,14 @@
 
 | Test Suite | Result |
 |------------|--------|
-| Unit + regressions (333) | ✅ 333 pass |
+| Unit + regressions (336) | ✅ 336 pass |
 | Runtime E2E (990) | ✅ 990 pass |
 | SDK Compat (openai Codex parser) | ✅ clean |
 | COMPATIBILITY_LAYER (L2 + L3) | ✅ all 5 wrappers; layer-3 auto-discovery genuinely probed both dialects (5 wrappers × 2 mocks), 3/3 back-to-back |
 | Full Matrix (240) | ✅ 240 pass |
 | Real-SDK agent loop (55) | ✅ 55 pass |
 | Multi-agent concurrency storm (10) | ✅ zero cross-talk, zero leaked in-flight |
-| Hostile-body fuzz (1081) | ✅ 1081 pass — shaped 4xx, zero unshaped 5xx, zero crashes |
+| Hostile-body fuzz (1115) | ✅ 1115 pass — shaped 4xx, zero unshaped 5xx, zero crashes |
 | Soak (12s×6 and 20s×24 stress) | ✅ 0 failures, both profiles |
 | model-registry service | ✅ 7 pass |
 | Adversarial probes | ✅ folded into the harnesses above (modes + agent scenarios) |

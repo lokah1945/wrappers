@@ -27,7 +27,7 @@ This monorepo contains hardened, SDK-compatible transparent proxies that add mul
 - ✅ 240/240 full-matrix audit checks (real anthropic + openai SDK clients)
 - ✅ 55/55 real-SDK agent-loop checks — tool_use ⇄ tool_result round trips, DSML recovery, replay, tenant isolation
 - ✅ Multi-agent concurrency storm — 12 concurrent SDK agents × 5 wrappers, zero cross-talk, zero leaked in-flight reservations
-- ✅ 1081/1081 hostile-body fuzz checks — 32 malformed/adversarial bodies + concurrent fuzz burst, shaped 4xx, zero unshaped 5xx, zero crashes
+- ✅ 1081/1115 hostile-body fuzz checks — 32 malformed/adversarial bodies + concurrent fuzz burst, shaped 4xx, zero unshaped 5xx, zero crashes
 - ✅ Soak — sustained load, 0 failures
 
 ---
@@ -294,7 +294,7 @@ wrappers/
 
 ### Latest Audit Results
 
-**Audit:** 2026-08-04 · **331 unit tests · 990 E2E checks · 240 full-matrix checks · 55 agent-loop checks · concurrency storm · 1081 fuzz checks · 0 failures**  
+**Audit:** 2026-08-04 · **331 unit tests · 990 E2E checks · 240 full-matrix checks · 55 agent-loop checks · concurrency storm · 1115 fuzz checks · 0 failures**  
 **Report:** [FULL_MATRIX_AUDIT_2026-08-01.md](docs/audits/FULL_MATRIX_AUDIT_2026-08-01.md) · continuous deep-audit reports under `audit_report/` (INDEX.md)
 
 ### Audit Reports
@@ -368,7 +368,7 @@ python tests/e2e_runtime/multiagent_concurrency_e2e.py
 
 # 9. Hostile-body FUZZ E2E — 32 malformed/adversarial bodies per wrapper ×
 #    surface + concurrent fuzz burst: shaped 4xx, never an unshaped 5xx,
-#    never a crash (1081 checks)
+#    never a crash (1115 checks)
 python tests/e2e_runtime/fuzz_bodies_e2e.py
 ```
 
@@ -389,8 +389,8 @@ curl http://localhost:XXXX/v1/chat/completions \
 ### 2026-08-04 (Current) — Contract v3.3
 - ✅ **Deep-audit rounds 5–12** — stream-integrity, DSML tool-call recovery parity, cross-tenant store-key uniqueness (`new_response_id`), store deep-copy isolation, unique `msg_*`/`toolu_*` id mints, shared-helper parity (no forks), model-registry thread-race fixes
 - ✅ **Round-12 fixes** — nvidia GENAI base now honours a custom `NVIDIA_BASE_URL` (no leak to public cloud); `/metrics` JSON pool + in-flight parity across all 5 wrappers; layer-2 converter coalesces `max_completion_tokens`
-- ✅ **Three new gates** — real-SDK agent loop (55 checks), multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk), hostile-body fuzz (1081 checks)
-- ✅ 9/9 gates green — 331 unit · 990 E2E · 240 matrix · 55 agent-loop · 1081 fuzz · soak, 0 failures
+- ✅ **Three new gates** — real-SDK agent loop (55 checks), multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk), hostile-body fuzz (1115 checks)
+- ✅ 9/9 gates green — 331 unit · 990 E2E · 240 matrix · 55 agent-loop · 1115 fuzz · soak, 0 failures
 - 📄 Contract: [WRAPPER_CONTRACT.md §12](WRAPPER_CONTRACT.md) (v3.3 changelog)
 
 ### 2026-08-01 — Contract v3.1
@@ -490,5 +490,5 @@ Internal use only.
 
 **Last Updated:** 2026-08-04  
 **Version:** 3.2  
-**Status:** Verified compatible (331 unit · 990 E2E · 240 matrix · 55 agent-loop · multi-agent storm · 1081 fuzz · 9/9 gates · 0 failures)  
+**Status:** Verified compatible (331 unit · 990 E2E · 240 matrix · 55 agent-loop · multi-agent storm · 1115 fuzz · 9/9 gates · 0 failures)  
 **Repository:** https://github.com/lokah1945/wrappers

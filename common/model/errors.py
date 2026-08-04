@@ -17,8 +17,17 @@ def error_text(payload: Any) -> str:
         return payload[:4000]
     try:
         return json.dumps(payload, ensure_ascii=False, default=str)[:4000]
+    except RecursionError:
+        # B-25.1: str()/repr() on a pathologically nested structure recurses
+        # again — the naive fallback re-raised INSIDE the handler, crashing
+        # error classification (classify_upstream_error) on the proxy error
+        # path (§3.3). Use a fixed placeholder instead.
+        return f"[UNSERIALIZABLE {type(payload).__name__}: recursion limit]"
     except Exception:
-        return str(payload)[:4000]
+        try:
+            return str(payload)[:4000]
+        except RecursionError:
+            return f"[UNSERIALIZABLE {type(payload).__name__}: recursion limit]"
 
 
 def provider_account_hint(payload: Any) -> str:

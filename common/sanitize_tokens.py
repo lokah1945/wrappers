@@ -711,7 +711,9 @@ class PassthroughBlockRewriter:
             return out, True
         try:
             obj = _json.loads(payload)
-        except ValueError:
+        except (ValueError, RecursionError):
+            # B-25.1 closure: an over-deep upstream frame raises RecursionError
+            # on parse — same drop-frame treatment as undecodable JSON.
             if is_tail:
                 # Truncated final frame (e.g. TCP cut mid-JSON): forwarding it
                 # would make strict SDK SSE parsers fail at the very end of an

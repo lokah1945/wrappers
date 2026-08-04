@@ -410,7 +410,9 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
                 continue
             try:
                 c = json.loads(data_str)
-            except json.JSONDecodeError:
+            except (json.JSONDecodeError, RecursionError):
+                # B-25.1 closure: over-deep upstream frame — skip it like any
+                # other undecodable frame, never crash the translator loop.
                 continue
             if isinstance(c, dict) and c.get('type') == 'error':
                 e = c.get('error') or {}

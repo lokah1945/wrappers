@@ -1404,3 +1404,84 @@ def test_b24_1_capacity_classifier_and_catalog_validation_survive_deep_nesting()
     except RecursionError:
         raised = 'RecursionError'
     assert raised == 'ValueError', raised
+
+
+def test_b25_1_error_text_survives_deep_nesting_second_order_trap():
+    """B-25.1: error_text (classify_upstream_error's entry point — the proxy
+    error path, §3.3) had the same second-order recursion trap fixed in
+    B-24.1: json.dumps raised RecursionError, then the except handler's own
+    str(payload) re-recursed. Must return a bounded placeholder, never raise."""
+    from common.model.errors import error_text, classify_upstream_error
+    deep: dict = {}
+    cur = deep
+    for i in range(3000):
+        nxt: dict = {}
+        cur[f'k{i}'] = nxt
+        cur = nxt
+    out = error_text(deep)
+    assert isinstance(out, str) and len(out) <= 4000
+    # classification (hot proxy path) must never raise either
+    cls = classify_upstream_error(500, deep)
+    assert cls.state is not None
+    cls429 = classify_upstream_error(429, {'error': {'message': 'model capacity reached'}})
+    assert cls429.reason_code == 'MODEL_OR_DEPLOYMENT_RATE_LIMIT'
+    # ordinary payloads unchanged
+    assert error_text({'detail': 'boom'}) == '{"detail": "boom"}'
+    assert error_text('plain') == 'plain'
+    assert error_text(None) == ''
+
+
+def test_b25_1_body_guard_shapes_over_deep_json_as_400_not_500():
+    """B-25.1 closure: a syntactically valid JSON body nested >1000 deep made
+    json.loads raise RecursionError — it escaped JSONBodyGuard AND would have
+    crashed the route's own request.json(), yielding an unshaped 500 on every
+    wrapper (§4 violation). The guard must now shape a 400 on both envelope
+    styles, and still pass ordinary bodies through untouched."""
+    import asyncio
+    from common.body_guard import JSONBodyGuard
+
+    async def echo_app(scope, receive, send):
+        # downstream app: just acknowledges
+        await send({'type': 'http.response.start', 'status': 200, 'headers': []})
+        await send({'type': 'http.response.body', 'body': b'ok'})
+
+    def run(path, raw):
+        guard = JSONBodyGuard(echo_app)
+        scope = {'type': 'http', 'method': 'POST', 'path': path,
+                 'headers': [(b'content-type', b'application/json')]}
+        sent = []
+        sent_msgs = [{'type': 'http.request', 'body': raw, 'more_body': False}]
+        async def receive():
+            return sent_msgs.pop(0) if sent_msgs else {'type': 'http.disconnect'}
+        async def send(msg):
+            sent.append(msg)
+        asyncio.run(guard(scope, receive, send))
+        status = next(m['status'] for m in sent if m['type'] == 'http.response.start')
+        body = b''.join(m.get('body', b'') for m in sent if m['type'] == 'http.response.body')
+        return status, body
+
+    deep = ('[' * 3000 + ']' * 3000).encode()
+    st, body = run('/v1/chat/completions', deep)
+    assert st == 400, (st, body[:200])
+    assert b'too deeply' in body and b'"error"' in body
+    st, body = run('/v1/messages', deep)
+    assert st == 400, (st, body[:200])
+    assert b'"type": "error"' in body.replace(b'"type":"error"', b'"type": "error"') or b'invalid_request_error' in body
+    # ordinary bodies still pass through
+    st, body = run('/v1/chat/completions', b'{"model": "x", "messages": []}')
+    assert st == 200 and body == b'ok'
+
+
+def test_b25_1_passthrough_drops_over_deep_upstream_frame():
+    """B-25.1 closure: an over-deep upstream SSE frame raised RecursionError
+    inside the passthrough scrubber (caught only ValueError). It must now be
+    dropped like any other undecodable frame — stream continues, no crash."""
+    from common.sanitize_tokens import PassthroughBlockRewriter
+    p = PassthroughBlockRewriter()
+    deep_json = '[' * 3000 + ']' * 3000
+    frame = (f'data: {deep_json}\n\n').encode()
+    out = p.feed(frame + b'data: [DONE]\n\n')
+    blob = b''.join(out)
+    assert b'[DONE]' in blob
+    fin = p.finish(terminal_done=True)
+    assert isinstance(b''.join(fin), bytes)
