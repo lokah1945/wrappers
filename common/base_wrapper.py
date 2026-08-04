@@ -459,6 +459,9 @@ class BaseWrapper:
                 'provider': self.config.provider_name,
                 'keys': self.pool.total_keys,
                 'available': self.pool.available_keys,
+                # CONTRACT §10: /health reports in-flight counts — the only
+                # signal that detects a leaked pool reservation (B-22.1).
+                'in_flight': sum(k.in_flight for k in self.pool.keys),
                 'uptime': int(time.time() - self.metrics['start_time']),
             }
 

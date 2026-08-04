@@ -2004,6 +2004,10 @@ class Server:
                 'pid': os.getpid(),
                 'keys': self.pool.total_keys,
                 'available': self.pool.available_keys,
+                # CONTRACT §10: /health MUST report in-flight counts at top
+                # level — the only signal that detects a leaked pool
+                # reservation (parity with openrouter, B-22.1).
+                'in_flight': sum(k.in_flight for k in self.pool.keys),
                 'live_keys': self.pool.all_stats(),
                 'models_cached': len(self.pool.models_cached),
                 'model_registry': MODEL_REGISTRY_CLIENT.stats(),

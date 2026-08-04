@@ -167,10 +167,13 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
             if not db:
                 return json.dumps({"error": "Catalog not available"})
             try:
+                # B-22.2: clamp limit — SQLite LIMIT -1 means NO limit, so a
+                # negative value would silently unbound the result set.
                 results = search_models(
                     db, query=query or None, modality=modality or None,
                     tier=tier or None, working_only=working_only,
-                    free_only=free_only, publisher=publisher or None, limit=limit,
+                    free_only=free_only, publisher=publisher or None,
+                    limit=min(max(1, limit), 500),
                 )
                 return json.dumps({"count": len(results), "models": results},
                                   ensure_ascii=False, indent=2)
@@ -209,9 +212,10 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
             if not db:
                 return json.dumps({"error": "Catalog not available"})
             try:
+                # B-22.2: clamp limit (negative LIMIT unbounds SQLite queries).
                 results = search_provider_models(
                     db, provider=provider or None, query=query or None,
-                    free_only=free_only, limit=limit,
+                    free_only=free_only, limit=min(max(1, limit), 500),
                 )
                 return json.dumps({"count": len(results), "models": results},
                                   ensure_ascii=False, indent=2)
@@ -223,7 +227,7 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
             async def mcp_list_keys(offset: int = 0) -> str:
                 if not MGT.is_management_enabled("openrouter"):
                     return json.dumps({"error": "Management not enabled"})
-                result = MGT.openrouter_list_keys(offset=offset)
+                result = MGT.openrouter_list_keys(offset=max(0, offset))
                 return json.dumps(result.data if result.success else {"error": result.error},
                                   ensure_ascii=False, indent=2, default=str)
 
@@ -331,7 +335,8 @@ def setup_catalog_routes(app, prefix: str = "") -> None:
                 db, query=q or None, modality=modality or None,
                 tier=tier or None, working_only=working_only,
                 free_only=free_only, publisher=publisher or None,
-                limit=min(limit, 500),
+                # B-22.2: clamp lower bound too — SQLite LIMIT -1 = unlimited.
+                limit=min(max(1, limit), 500),
             )
             return {"count": len(results), "models": results}
         finally:
@@ -361,7 +366,8 @@ def setup_catalog_routes(app, prefix: str = "") -> None:
         try:
             results = search_provider_models(
                 db, provider=provider or None, query=q or None,
-                free_only=free_only, limit=min(limit, 500),
+                # B-22.2: clamp lower bound too — SQLite LIMIT -1 = unlimited.
+                free_only=free_only, limit=min(max(1, limit), 500),
             )
             return {"count": len(results), "models": results}
         finally:

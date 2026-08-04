@@ -1316,3 +1316,42 @@ def test_r21_nvidia_build_forward_headers_fallback_parity():
     for h in hops:
         assert h not in got_fb, h
     assert fb(client, {'x-extra': '1'}) == shared(client, {'x-extra': '1'})
+
+
+def test_b22_1_health_reports_top_level_in_flight_all_wrappers():
+    """B-22.1 (CONTRACT §10 + §8 parity): /health must report live in-flight
+    counts at TOP level on every wrapper — the only signal that detects a
+    leaked pool reservation. openrouter had it; nvidia/nous/opencode/blackbox
+    (and the reference base) reported in-flight only buried inside per-key
+    live_keys stats."""
+    targets = (
+        ('nvidia-python', 'self.pool'),
+        ('nous', 'KEY_POOL'),
+        ('opencode', 'pool'),
+        ('blackbox', 'pool'),
+        ('openrouter', 'pool'),
+    )
+    for wrapper, pool_name in targets:
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        i = src.index('async def health(')
+        body = src[i:i + 3000]
+        assert 'in_flight' in body, f'{wrapper}: /health lacks top-level in_flight'
+        assert f'sum(k.in_flight for k in {pool_name}.keys)' in body, \
+            f'{wrapper}: /health in_flight is not a live sum over pool keys'
+    base = (ROOT / 'common' / 'base_wrapper.py').read_text()
+    j = base.index('async def health(')
+    assert 'sum(k.in_flight for k in self.pool.keys)' in base[j:j + 1500], \
+        'reference base_wrapper /health lacks top-level in_flight'
+
+
+def test_b22_2_catalog_limit_clamped_against_negative_unbounded():
+    """B-22.2: SQLite `LIMIT -1` means NO row limit. catalog_integration
+    clamped only the upper bound (min(limit, 500)) — a negative limit from a
+    client (or MCP caller) silently unbounded the query. All search call
+    sites must clamp to [1, 500]; the management offset must be >= 0."""
+    src = (ROOT / 'common' / 'catalog_integration.py').read_text()
+    clamps = src.count('min(max(1, limit), 500)')
+    assert clamps == 4, f'expected 4 limit clamps, found {clamps}'
+    assert 'min(limit, 500)' not in src.replace('min(max(1, limit), 500)', ''), \
+        'an unclamped-lower-bound limit site remains'
+    assert 'offset=max(0, offset)' in src, 'management offset not clamped'

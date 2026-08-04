@@ -2865,6 +2865,10 @@ async def health():
         "dynamic_alias_target": get_dynamic_alias_target() or None,
         "keys": KEY_POOL.total_keys,
         "available": KEY_POOL.available_keys,
+        # CONTRACT §10: /health MUST report in-flight counts at top level —
+        # the only signal that detects a leaked pool reservation (parity
+        # with openrouter, B-22.1).
+        "in_flight": sum(k.in_flight for k in KEY_POOL.keys),
         "live_keys": KEY_POOL.all_stats(),
         "metrics": metrics.snapshot(),
         "model_registry": MODEL_REGISTRY_CLIENT.stats(),
