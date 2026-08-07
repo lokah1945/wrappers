@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import logging
+import os
+import re
 from typing import Any
 
 logger = logging.getLogger('wrapper-body-guard')
@@ -35,6 +37,47 @@ logger = logging.getLogger('wrapper-body-guard')
 _ALLOW_NON_OBJECT_PATHS: frozenset[str] = frozenset()
 
 _METHODS_WITH_BODY = (b'POST', b'PUT', b'PATCH')
+
+# B-35.1: explicit structural-depth ceiling for request bodies.
+#
+# The RecursionError catch below only detonates at the INTERPRETER limit
+# (~994 levels with the stock recursionlimit of 1000). Between the guard's
+# admission line and every downstream consumer there is a narrow band of
+# depths that json.loads (C scanner) tolerates but Python-level recursion in
+# the handlers does not — measured repr/str/json.dumps of a 994-deep body all
+# fail at the same 1000 limit, so a body a handful of frames deeper than
+# "just parseable" crashes f-string reprs (`{m.get("role")!r}` role checks in
+# all 5 wrappers), anthropics strip_cache_control(), nous count_tokens'
+# str(body), store deepcopy, etc. — an unshaped 500 on a request the guard
+# ACCEPTED (CONTRACT §4: malformed ⇒ shaped 4xx, never 5xx).
+#
+# Pathological depth has no legitimate use (agentic tool schemas nest ~15
+# levels; 256 is generous). The scan is byte-level (string-aware, C-speed per
+# match) so it adds no parse-time recursion of its own.
+BODY_MAX_DEPTH = int(os.environ.get('BODY_MAX_DEPTH', '256'))
+
+_STRUCT_SCAN = re.compile(rb'"(?:\\.|[^"\\])*"|[{}\[\]]')
+
+
+def _structure_too_deep(raw: bytes, limit: int) -> bool:
+    """True iff the raw JSON nests deeper than `limit` (string-aware scan).
+
+    Unterminated strings (malformed JSON) can miscount by ±1 around the bad
+    quote — harmless: such bodies fail json.loads immediately after and take
+    the parser-detail 400 path; a wrong reject here is still a shaped 4xx.
+    """
+    depth = 0
+    for m in _STRUCT_SCAN.finditer(raw):
+        t = m.group()[0:1]
+        if t == b'"':
+            continue
+        if t in (b'{', b'['):
+            depth += 1
+            if depth > limit:
+                return True
+        else:
+            depth -= 1
+    return False
 
 
 class JSONBodyGuard:
@@ -113,6 +156,18 @@ class JSONBodyGuard:
         # An empty body is handled by the route's own validation (some routes
         # legitimately accept no body, e.g. the openrouter key-management ones).
         if raw.strip():
+            # B-35.1: explicit depth ceiling BEFORE the parse — the parse's own
+            # RecursionError only fires at the interpreter limit (~994), which
+            # admitted bodies deep enough to crash Python-level recursion in
+            # the handlers an instant later (f-string repr, str(body),
+            # deepcopy, strip_cache_control). Reject at 256 by default.
+            if _structure_too_deep(raw, BODY_MAX_DEPTH):
+                logger.warning('[body-guard] rejecting >%d-deep nested JSON body on %s',
+                               BODY_MAX_DEPTH, path)
+                await _reject(send, path,
+                              'Request body JSON is nested too deeply to be parsed safely. '
+                              'Flatten the structure (e.g. fewer nested arrays/objects).')
+                return
             try:
                 parsed = json.loads(raw)
             except RecursionError:

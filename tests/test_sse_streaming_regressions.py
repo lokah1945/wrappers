@@ -2073,3 +2073,65 @@ def test_b34_2_registry_cache_write_is_atomic():
     assert 'os.replace(' in (ROOT / 'nvidia-python' / 'src' / 'registry.py').read_text()
     import shutil
     shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+# ── R35: body_guard structural depth ceiling (B-35.1) ───────────────────────
+
+def test_b35_1_structure_scanner_boundaries():
+    """B-35.1: byte-level scan — string/escape-aware depth verdicts."""
+    from common.body_guard import _structure_too_deep
+    assert _structure_too_deep(b'[' * 300 + b']' * 300, 256) is True
+    assert _structure_too_deep(b'[' * 100 + b']' * 100, 256) is False
+    assert _structure_too_deep(b'{"a": "[[[[[[[[["}', 256) is False      # braces in strings
+    assert _structure_too_deep('{"a": "\\\\\\"[[[["}'.encode(), 2) is False  # escaped bs+quote
+    assert _structure_too_deep('{"a": "\\" } [[[["}'.encode(), 2) is False
+    assert _structure_too_deep(b'{"x":' + b'{"a":' * 300 + b'1' + b'}' * 300 + b'}', 256) is True
+    assert _structure_too_deep(b'[[]]', 1) is True and _structure_too_deep(b'[]', 1) is False
+
+
+def test_b35_1_guard_rejects_over_cap_accepts_under():
+    """B-35.1: ASGI-level — >cap body gets the shaped depth 400; <=cap passes on."""
+    from common.body_guard import JSONBodyGuard
+
+    async def _call(raw, path=b'/v1/chat/completions'):
+        sent = []
+
+        async def app(scope, receive, send):
+            await send({'type': 'http.response.start', 'status': 299, 'headers': []})
+            await send({'type': 'http.response.body', 'body': b'{"passthrough":true}'})
+
+        async def receive():
+            return {'type': 'http.request', 'body': raw, 'more_body': False}
+
+        async def send(msg):
+            sent.append(msg)
+
+        guard = JSONBodyGuard(app)
+        await guard({'type': 'http', 'method': 'POST', 'path': path.decode(),
+                     'headers': [(b'content-type', b'application/json')]}, receive, send)
+        status = next(m['status'] for m in sent if m['type'] == 'http.response.start')
+        body = b''.join(m.get('body', b'') for m in sent if m['type'] == 'http.response.body')
+        return status, body
+
+    deep = b'{"model":"m","messages":[],"extra":' + b'{"a":' * 300 + b'1' + b'}' * 300 + b'}'
+    status, body = asyncio.run(_call(deep))
+    assert status == 400, (status, body[:120])
+    assert b'nested too deeply' in body, body[:200]
+
+    ok_body = b'{"model":"m","messages":[],"extra":' + b'{"a":' * 100 + b'1' + b'}' * 100 + b'}'
+    status, body = asyncio.run(_call(ok_body))
+    assert status == 299, (status, body[:120])  # reached the downstream app
+
+    # anthropic surface gets the anthropic error envelope
+    deep_msg = deep
+    status, body = asyncio.run(_call(deep_msg, path=b'/v1/messages'))
+    assert status == 400 and b'"type": "error"' in body, body[:200]
+
+
+def test_b35_1_cap_env_override_source_lock():
+    """B-35.1: cap is env-tunable (BODY_MAX_DEPTH) and the catch-all
+    RecursionError branch stays as belt-and-braces behind it."""
+    src = (ROOT / 'common' / 'body_guard.py').read_text()
+    assert "os.environ.get('BODY_MAX_DEPTH', '256')" in src
+    assert '_structure_too_deep(raw, BODY_MAX_DEPTH)' in src
+    assert 'except RecursionError:' in src  # interpreter-limit net retained
