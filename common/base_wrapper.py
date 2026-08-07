@@ -442,7 +442,11 @@ class BaseWrapper:
         start = time.time()
         response = await call_next(request)
         elapsed = time.time() - start
-        response.headers['x-request-id'] = request.headers.get('x-request-id', str(uuid.uuid4()))
+        # B-31.1: sanitize the echo — untrusted ids with codepoints >255 crash
+        # header encoding (UnicodeEncodeError → 500); keep printable ASCII.
+        _rid = request.headers.get('x-request-id', str(uuid.uuid4()))
+        _rid = ''.join(ch for ch in str(_rid) if 32 <= ord(ch) <= 126)[:128] or 'unknown'
+        response.headers['x-request-id'] = _rid
         response.headers['x-process-time'] = f'{elapsed:.3f}'
         self.metrics['total_requests'] += 1
         if response.status_code >= 400:

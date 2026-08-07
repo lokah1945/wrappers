@@ -807,6 +807,17 @@ _FORWARD_HEADER_ALLOWLIST = (
 )
 
 
+
+def _hdr_echo(v, max_len=128):
+    """B-31.1: response-header-safe echo of an untrusted x-request-id
+    (client- or upstream-supplied). Header values must be latin-1-encodable
+    at send time — codepoints >255 raised UnicodeEncodeError → unhandled 500
+    on the response path; control chars are equally illegal. Keep printable
+    ASCII only, length-capped."""
+    s = ''.join(ch for ch in str(v) if 32 <= ord(ch) <= 126)
+    return s[:max_len] or 'unknown'
+
+
 @app.middleware("http")
 async def auth_middleware(request: Request, call_next):
     # Exempt OPTIONS preflight from auth so browser SDKs can CORS-negotiate.
@@ -889,8 +900,10 @@ async def auth_middleware(request: Request, call_next):
     elapsed = time.time() - start
 
     # Add correlation ID and latency
+    # B-31.1: sanitize the echo — untrusted ids can carry codepoints >255
+    # (UnicodeEncodeError → 500 on the send path) or control chars.
     rid = request.headers.get('x-request-id', str(uuid.uuid4()))
-    response.headers['x-request-id'] = rid
+    response.headers['x-request-id'] = _hdr_echo(rid)
     response.headers['x-process-time'] = f"{elapsed:.3f}"
 
     return response
@@ -1274,7 +1287,7 @@ async def chat_completions(request: Request):
                 headers={
                     "Cache-Control": "no-cache", "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
-                    "x-request-id": res.headers.get("x-request-id", ""),
+                    "x-request-id": _hdr_echo(res.headers.get("x-request-id", "")),
                 },
             )
         if isinstance(res, JSONResponse):
@@ -1357,7 +1370,7 @@ async def responses(request: Request):
                 headers={
                     "Cache-Control": "no-cache", "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
-                    "x-request-id": response.headers.get("x-request-id", ""),
+                    "x-request-id": _hdr_echo(response.headers.get("x-request-id", "")),
                 },
             )
         if isinstance(response, JSONResponse):
@@ -1418,7 +1431,7 @@ async def responses(request: Request):
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
-                "x-request-id": response.headers.get("x-request-id", ""),
+                "x-request-id": _hdr_echo(response.headers.get("x-request-id", "")),
             },
         )
 
@@ -2106,7 +2119,7 @@ async def messages(request: Request):
                 headers={
                     "Cache-Control": "no-cache", "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
-                    "x-request-id": response.headers.get("x-request-id", ""),
+                    "x-request-id": _hdr_echo(response.headers.get("x-request-id", "")),
                 },
             )
         return response
@@ -2155,7 +2168,7 @@ async def messages(request: Request):
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
-                "x-request-id": response.headers.get("x-request-id", ""),
+                "x-request-id": _hdr_echo(response.headers.get("x-request-id", "")),
             },
         )
 

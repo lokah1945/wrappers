@@ -1888,6 +1888,15 @@ class Server:
         
         # Latency tracking middleware
 
+
+        def _hdr_echo(v, max_len=128):
+            """B-31.1: response-header-safe echo of an untrusted x-request-id
+            (client- or upstream-supplied). Header values must be latin-1-encodable
+            at send time — codepoints >255 raised UnicodeEncodeError → unhandled 500
+            on the response path; control chars are equally illegal. Keep printable
+            ASCII only, length-capped."""
+            s = ''.join(ch for ch in str(v) if 32 <= ord(ch) <= 126)
+            return s[:max_len] or 'unknown'
         def _log_clean(v, max_len=512):
             """B-29.1: strip CR/LF/control chars from client-controlled values
             before logging (percent-decoded %0a paths / attacker x-request-id
@@ -1914,7 +1923,7 @@ class Server:
             )
             
             response.headers["X-Process-Time"] = f"{latency_ms:.2f}ms"
-            response.headers["X-Request-ID"] = request_id
+            response.headers["X-Request-ID"] = _hdr_echo(request_id)
             return response
 
         @app.middleware('http')
