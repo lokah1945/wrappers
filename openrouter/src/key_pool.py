@@ -224,8 +224,13 @@ class KeyPool:
         """Release in-flight slot for a key."""
         if key is None:
             return
+        # B-32.1: only decrement the pool total when the per-key counter
+        # actually decremented — a double release must not drift the total
+        # below sum(per-key) (in-flight cap evasion). opencode/blackbox parity.
+        before = key.in_flight
         key.decrement_in_flight()
-        self._in_flight_total = max(0, self._in_flight_total - 1)
+        if key.in_flight < before:
+            self._in_flight_total = max(0, self._in_flight_total - 1)
 
     async def heal_in_flight(self):
         """P2 fix (audit 2026-08-03, nvidia/nous parity): reset in_flight

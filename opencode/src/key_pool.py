@@ -231,8 +231,15 @@ class KeyPool:
     def release(self, key: KeyEntry = None):
         if key is None:
             return
+        # B-32.1: only decrement the pool total when the per-key counter
+        # actually decremented. A double-release (defense-in-depth against
+        # future ownership bugs) previously floored per-key at 0 but still
+        # decremented the total — permanent drift making the pool total
+        # UNDERSHOOT sum(per-key), so the in-flight cap quietly evaded.
+        before = key.in_flight
         key.decrement_in_flight()
-        self._in_flight_total = max(0, self._in_flight_total - 1)
+        if key.in_flight < before:
+            self._in_flight_total = max(0, self._in_flight_total - 1)
 
     async def heal_in_flight(self):
         """P2 fix (audit 2026-08-03, nvidia/nous parity): reset in_flight
