@@ -2007,18 +2007,28 @@ async def list_models(request: Request):
             "Authorization": f"Bearer {key_obj.api_key}",
             "Accept": "application/json",
         }
-        async with agent.get(f"{OPENROUTER_BASE}/models", headers=headers) as resp:
-            pool.release(key_obj)
-            if resp.status != 200:
-                return JSONResponse({"data": []}, status_code=resp.status)
-            data = _sanitize_nonfinite(await resp.json())
-            models = data.get("data", [])
+        # B-37.1: release exactly once on EVERY path. Previously a raised
+        # agent.get (connect error/timeout/DNS) skipped pool.release and
+        # stranded the key's in-flight slot until heal_in_flight's ~600s
+        # threshold — repeated /v1/models pulls against a down upstream could
+        # exhaust the whole pool (agents poll discovery at startup).
+        try:
+            async with agent.get(f"{OPENROUTER_BASE}/models", headers=headers) as resp:
+                pool.release(key_obj)
+                key_obj = None
+                if resp.status != 200:
+                    return JSONResponse({"data": []}, status_code=resp.status)
+                data = _sanitize_nonfinite(await resp.json())
+                models = data.get("data", [])
 
-            # Filter FREE_ONLY
-            if free_only_enabled():
-                models = [m for m in models if is_free_model(m.get("id", ""))]
+                # Filter FREE_ONLY
+                if free_only_enabled():
+                    models = [m for m in models if is_free_model(m.get("id", ""))]
 
-            return JSONResponse({"data": models, "object": "list"})
+                return JSONResponse({"data": models, "object": "list"})
+        finally:
+            if key_obj is not None:
+                pool.release(key_obj)
     except Exception as e:
         logger.error(f"[openrouter] Error listing models: {e}")
         return JSONResponse({"data": []})

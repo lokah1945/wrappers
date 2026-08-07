@@ -2222,3 +2222,41 @@ def test_b36_1_all_ingest_sites_wired_source_lock():
         s = (ROOT / f).read_text()
         got = s.count('_sanitize_nonfinite(json.loads') + s.count('_sanitize_nonfinite(await resp')
         assert got == want, f'{f}: wrapped sites={got} want {want}'
+
+
+# ── R37: openrouter /v1/models acquire-release symmetry (B-37.1) ────────────
+
+def test_b37_1_models_release_exactly_once_all_paths():
+    """B-37.1: /v1/models must release the pool key exactly once on success,
+    non-200, AND raised-connect-error paths (pre-fix: raise path leaked the
+    in-flight slot until the ~600s heal threshold)."""
+    import re
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    m = re.search(r'async def list_models.*?(?=\n@app\.)', src, re.S)
+    assert m, 'list_models not found'
+    body = m.group(0)
+    # try/finally present with the None-guard release
+    assert 'finally:' in body and 'if key_obj is not None:' in body
+    assert body.count('pool.release(key_obj)') == 2  # early + except-path guard
+    assert 'key_obj = None' in body
+    # Bearer prefix must survive (regression lock — dropped during the fix)
+    assert 'f"Bearer {key_obj.api_key}"' in body
+
+
+def test_b37_1_pool_pattern_no_double_release():
+    """B-37.1 + B-32.1 interplay: the None-guard makes the double-release
+    unreachable, and even a hypothetical one is counter-safe (paired release)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location('or_kp37', ROOT / 'openrouter' / 'src' / 'key_pool.py')
+    kp = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(kp)
+    pool = kp.KeyPool.__new__(kp.KeyPool)
+    import threading
+    e = kp.KeyEntry('k1', 'x' * 12)
+    e.in_flight = 1
+    pool.keys = [e]
+    pool._in_flight_total = 1
+    pool._lock = threading.Lock()
+    pool.release(e)
+    pool.release(e)  # stray double — must be a no-op
+    assert pool._in_flight_total == 0 and e.in_flight == 0
