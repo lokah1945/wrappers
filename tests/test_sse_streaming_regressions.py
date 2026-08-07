@@ -1735,3 +1735,216 @@ def test_b29_1_latency_middleware_sanitizes_log_values():
     assert '[INFO]_FORGED' in out  # text survives, line structure safe
     assert clean('') == 'unknown'
     assert len(clean('z' * 5000)) <= 512
+
+
+def test_b31_1_x_request_id_echo_sanitized_response_side():
+    """B-31.1 (response-header-encoding class): wrappers echoed client- and
+    upstream-supplied x-request-id straight into response headers. Values
+    with codepoints >255 (or control chars) raised UnicodeEncodeError at the
+    latin-1 send encode → unhandled 500 mid-response (§3.3/§4). All echo
+    sites must pass through _hdr_echo (printable-ASCII, capped)."""
+    for wrapper in ('nous', 'opencode', 'blackbox', 'nvidia-python'):
+        src = (ROOT / wrapper / 'src' / 'main.py').read_text()
+        assert 'def _hdr_echo(' in src, f'{wrapper}: _hdr_echo missing'
+        assert '_hdr_echo(request_id)' in src, f'{wrapper}: raw request_id echoed'
+    src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
+    assert 'def _hdr_echo(' in src
+    assert '_hdr_echo(rid)' in src
+    # upstream echoes (4 response.headers.get + 1 res.headers.get sites)
+    assert src.count('_hdr_echo(response.headers.get("x-request-id", ""))') == 4
+    assert src.count('_hdr_echo(res.headers.get("x-request-id", ""))') == 1
+    base = (ROOT / 'common' / 'base_wrapper.py').read_text()
+    assert "ord(ch) <= 126" in base, 'reference base still echoes raw x-request-id'
+    # helper behavior (exec one)
+    i = src.index('def _hdr_echo(')
+    j = src.index("return s[:max_len] or 'unknown'", i) + len("return s[:max_len] or 'unknown'")
+    ns: dict = {}
+    exec(src[i:j], ns)
+    echo = ns['_hdr_echo']
+    assert echo('req-💥\x0aevil') == 'req-evil'  # non-ASCII/control stripped, printable kept
+    assert echo('plain-uuid-1234') == 'plain-uuid-1234'
+    assert echo('') == 'unknown'
+    assert len(echo('z' * 500)) == 128
+
+
+def test_b32_1_pool_release_never_drifts_total_below_sum_per_key():
+    """B-32.1: pool.release() decremented _in_flight_total unconditionally
+    while the per-key counter floored at 0 — a double-release drifted the
+    prom `_in_flight_total` permanently BELOW sum(per-key), silently evading
+    the in-flight cap the operator monitors. Release must be paired: total
+    only decrements when a per-key slot actually existed."""
+    import importlib.util, os
+    for name in ('opencode', 'blackbox', 'openrouter'):
+        spec = importlib.util.spec_from_file_location(
+            f'{name}_kp_b32', ROOT / name / 'src' / 'key_pool.py')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        pool = mod.KeyPool.__new__(mod.KeyPool)
+        pool.keys = [mod.KeyEntry('k1', 'x' * 32), mod.KeyEntry('k2', 'y' * 32)]
+        pool._lock = __import__('asyncio').Lock()
+        pool._in_flight_total = 0
+        pool._rr = 0  # round-robin cursor (exists on live pools)
+        pool.soft_limit = getattr(pool, 'soft_limit', 30)
+        pool.hard_limit = getattr(pool, 'hard_limit', 40)
+        import asyncio
+        acq = asyncio.run(pool.acquire())
+        assert acq is not None
+        k = acq['key']
+        assert pool._in_flight_total == 1 and k.in_flight == 1
+        pool.release(k)
+        assert pool._in_flight_total == 0 and k.in_flight == 0
+        pool.release(k)  # double release: must be a no-op on BOTH counters
+        pool.release(k)
+        assert pool._in_flight_total == 0 and k.in_flight == 0, (name, pool._in_flight_total, k.in_flight)
+        # and acquire still works after the stray releases
+        acq2 = asyncio.run(pool.acquire())
+        assert acq2 is not None and pool._in_flight_total == 1
+
+
+# ── R33: nvidia anthropic_compat tail-frame parity + usage-surface clamp ────
+
+def _load_nvidia_anthropic_compat():
+    """Import nvidia-python/src/anthropic_compat.py (hyphenated dir → synthetic pkg)."""
+    import importlib.util
+    pkg_name = 'nvidia_src_pkg'
+    if pkg_name not in sys.modules:
+        pkg = types.ModuleType(pkg_name)
+        pkg.__path__ = [str(ROOT / 'nvidia-python' / 'src')]
+        sys.modules[pkg_name] = pkg
+    name = pkg_name + '.anthropic_compat'
+    if name in sys.modules:
+        return sys.modules[name]
+    spec = importlib.util.spec_from_file_location(name, ROOT / 'nvidia-python' / 'src' / 'anthropic_compat.py')
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _run_anthropic_stream(mod, payload: bytes):
+    async def gen():
+        yield payload
+    async def drive():
+        out = []
+        async for ev in mod.stream_openai_to_anthropic(gen(), 'm', {}):
+            out.append(ev)
+        return out
+    return asyncio.run(drive())
+
+
+def _events(frames):
+    """[(event_name, data_dict)] from raw 'event:/data:' SSE strings."""
+    out = []
+    for f in frames:
+        ev = f.split('\n')[0].replace('event:', '').strip()
+        data = json.loads(f.split('data:', 1)[1].strip())
+        out.append((ev, data))
+    return out
+
+
+def test_b33_1_tail_tool_calls_parity():
+    """B-33.1: a final UNTERMINATED SSE frame carrying tool_call fragments must be
+    processed exactly like a newline-terminated one (was silently dropped →
+    truncated tool_use partial_json)."""
+    mod = _load_nvidia_anthropic_compat()
+    # no trailing '\n' — the whole frame sits in the tail buffer at EOF
+    frame = ('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x",'
+             '"function":{"name":"get_weather","arguments":"{\\"city\\":"}}]},'
+             '"finish_reason":"tool_calls"}]}')
+    events = _events(_run_anthropic_stream(mod, frame.encode()))
+    starts = [d for e, d in events if e == 'content_block_start']
+    tool_starts = [d for d in starts if d.get('content_block', {}).get('type') == 'tool_use']
+    assert tool_starts and tool_starts[0]['content_block']['id'] == 'call_x', events
+    assert tool_starts[0]['content_block']['name'] == 'get_weather'
+    deltas = [d for e, d in events if e == 'content_block_delta'
+              and d.get('delta', {}).get('type') == 'input_json_delta']
+    assert deltas and deltas[0]['delta']['partial_json'] == '{"city":', events
+    md = [d for e, d in events if e == 'message_delta']
+    assert md and md[-1]['delta']['stop_reason'] == 'tool_use', events
+    assert not [e for e, _ in events if e == 'error'], events
+    assert events[-1][0] == 'message_stop'
+
+
+def test_b33_1_tail_error_fidelity():
+    """B-33.1: an upstream error frame WITHOUT trailing newline must surface its
+    REAL message (was masked by the generic premature-EOF error)."""
+    mod = _load_nvidia_anthropic_compat()
+    frame = 'data: {"error":{"message":"upstream exploded"}}'
+    events = _events(_run_anthropic_stream(mod, frame.encode()))
+    errs = [d for e, d in events if e == 'error']
+    assert errs and 'upstream exploded' in errs[0]['error']['message'], events
+    # stop_reason must NOT be fabricated on a failed turn
+    md = [d for e, d in events if e == 'message_delta']
+    assert md and md[-1]['delta']['stop_reason'] is None, events
+
+
+def test_b33_1_tail_usage_capture():
+    """B-33.1: usage arriving only in the final unterminated frame must drive the
+    terminal message_delta (was dropped → estimates reported as real usage)."""
+    mod = _load_nvidia_anthropic_compat()
+    frame = ('data: {"choices":[{"delta":{},"finish_reason":"stop"}],'
+             '"usage":{"prompt_tokens":42,"completion_tokens":7}}')
+    events = _events(_run_anthropic_stream(mod, frame.encode()))
+    md = [d for e, d in events if e == 'message_delta']
+    assert md, events
+    assert md[-1]['usage']['input_tokens'] == 42, events
+    assert md[-1]['usage']['output_tokens'] == 7, events
+
+
+def test_b33_2_openai_to_anthropic_usage_clamp():
+    """B-33.2: NaN/Infinity/None usage counters must never reach the response
+    surface (Starlette renders allow_nan=False → ValueError → 500 on success)."""
+    mod = _load_nvidia_anthropic_compat()
+    nan, inf = float('nan'), float('inf')
+    o = {'choices': [{'message': {'content': 'hi'}, 'finish_reason': 'stop'}],
+         'usage': {'prompt_tokens': nan, 'completion_tokens': inf,
+                   'prompt_tokens_details': {'cached_tokens': nan}}}
+    resp = mod.openai_to_anthropic(o, 'm', estimated_input=5)
+    json.dumps(resp, allow_nan=False)  # must not raise
+    u = resp['usage']
+    assert u['input_tokens'] == 5, u          # NaN → local estimate
+    assert u['output_tokens'] == 1, u          # Inf → estimate ('hi' → 1)
+    assert u['cache_read_input_tokens'] == 0, u
+    for k, v in u.items():
+        assert isinstance(v, int) and v >= 0, (k, v)
+    # explicit None also collapses (was JSON-null on a required SDK int field)
+    o2 = {'choices': [{'message': {'content': ''}, 'finish_reason': 'stop'}],
+          'usage': {'prompt_tokens': None, 'completion_tokens': None}}
+    u2 = mod.openai_to_anthropic(o2, 'm', estimated_input=3)['usage']
+    json.dumps(u2, allow_nan=False)
+    assert u2['input_tokens'] == 3, u2
+
+
+def test_b33_2_stream_terminal_usage_clamp():
+    """B-33.2: a NaN usage frame inside the stream must not leak NaN/Infinity
+    literals into any emitted SSE frame."""
+    mod = _load_nvidia_anthropic_compat()
+    payload = (b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}],'
+               b'"usage":{"prompt_tokens":NaN,"completion_tokens":Infinity,'
+               b'"prompt_tokens_details":{"cached_tokens":NaN}}}\n\n')
+    frames = _run_anthropic_stream(mod, payload)
+    raw = ''.join(frames)
+    assert 'NaN' not in raw and 'Infinity' not in raw, raw[-400:]
+    md = [d for e, d in _events(frames) if e == 'message_delta']
+    assert md, frames
+    u = md[-1]['usage']
+    for k in ('input_tokens', 'output_tokens', 'cache_read_input_tokens'):
+        assert isinstance(u[k], int) and u[k] >= 0, (k, u)
+
+
+def test_b33_1_responses_compat_tail_parity_structure():
+    """B-33.1 structure lock: responses_compat's V-16 tail recovery must keep
+    error-frame fidelity AND tool_calls handling in sync with its main loop."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'responses_compat.py').read_text()
+    tail = src.split("tail = buffer.strip()", 1)[1]
+    tail = tail.split('except Exception as e:', 1)[0]
+    assert "c.get('error') is not None" in tail, 'tail error fidelity missing'
+    assert "d.get('tool_calls') or []" in tail, 'tail tool_calls loop missing'
+    assert 'function_call_arguments.delta' in tail
+    assert 'make_tool_acc(idx, tc)' in tail
+    # and anthropic_compat's own tail keeps the full parity set
+    asrc = (ROOT / 'nvidia-python' / 'src' / 'anthropic_compat.py').read_text()
+    atail = asrc.split('B-33.1 (R-08 follow-up)', 1)[1]
+    for needle in ("chunk.get('usage')", "chunk.get('error') is not None",
+                   "delta.get('tool_calls') or []", 'input_json_delta'):
+        assert needle in atail, needle

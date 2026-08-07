@@ -67,6 +67,23 @@ except ImportError:  # pragma: no cover - standalone fallback
     _parse_dsml_markup = None  # type: ignore[assignment]
 
 
+# B-33.2: shared usage-counter clamp (NaN/Inf/negative -> 0) applied at the
+# response surface so a malformed upstream usage payload can never crash the
+# JSON renderer (Starlette renders with allow_nan=False -> ValueError -> 500
+# on an otherwise successful turn; CONTRACT §3.3). §7: single-source import
+# with a byte-parity fallback twin.
+try:
+    from common.translations.shared import finite_nonneg_int as _finite_nonneg_int
+except ImportError:  # pragma: no cover - standalone fallback
+    def _finite_nonneg_int(value):  # type: ignore[misc]
+        # Twin of common.translations.shared.finite_nonneg_int (verbatim).
+        try:
+            v = int(value or 0)
+        except (TypeError, ValueError, OverflowError):
+            return 0
+        return v if v > 0 else 0
+
+
 def _env_flag(name: str, default: str = '0') -> bool:
     return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
 
@@ -604,7 +621,11 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
         content.append({'type': 'text', 'text': ''})
 
     u = o.get('usage') or {}
-    cached = (u.get('prompt_tokens_details') or {}).get('cached_tokens', 0)
+    # B-33.2: clamp every upstream usage counter before it reaches the wire —
+    # Python's json.loads ACCEPTS NaN/Infinity literals, and forwarding one
+    # made JSONResponse raise ValueError (allow_nan=False) -> HTTP 500 on a
+    # successful upstream turn (CONTRACT §3.3).
+    cached = _finite_nonneg_int((u.get('prompt_tokens_details') or {}).get('cached_tokens', 0))
 
     out_chars = 0
     for b in content:
@@ -614,8 +635,10 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
             out_chars += len(json.dumps(b['input']))
 
     usage = {
-        'input_tokens': u.get('prompt_tokens', estimated_input or 0),
-        'output_tokens': u.get('completion_tokens') or (max(1, (out_chars + 3) // 4) if out_chars > 0 else 0),
+        # B-33.2: explicit-None/NaN/negative counters collapse to the local
+        # estimate (never JSON-null / NaN on required SDK int fields).
+        'input_tokens': _finite_nonneg_int(u.get('prompt_tokens')) or (estimated_input or 0),
+        'output_tokens': _finite_nonneg_int(u.get('completion_tokens')) or (max(1, (out_chars + 3) // 4) if out_chars > 0 else 0),
         'cache_creation_input_tokens': 0,
         'cache_read_input_tokens': cached,
     }
@@ -1171,6 +1194,23 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 if data and data != '[DONE]':
                     try:
                         chunk = json.loads(data)
+                    except Exception:
+                        chunk = None
+                    if isinstance(chunk, dict):
+                        # B-33.1 (R-08 follow-up): the V-16/R-08 tail recovery
+                        # only handled text/reasoning/finish. The final frame
+                        # of a turn can equally carry usage, an upstream error,
+                        # or tool_call argument fragments — all were dropped,
+                        # reporting estimates as real usage, masking the real
+                        # upstream error behind a generic premature-EOF, or
+                        # truncating the accumulated tool_use partial_json.
+                        if chunk.get('usage') and isinstance(chunk['usage'], dict) and chunk['usage']:
+                            usage = chunk['usage']
+                            capture['usage'] = chunk['usage']
+                        if chunk.get('error') is not None and 'choices' not in chunk:
+                            _e = chunk['error']
+                            errored = True
+                            error_message = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                         if chunk.get('choices'):
                             # R-08: empty choices array is legal.
                             ch = (chunk.get('choices') or [{}])[0] or {}
@@ -1193,11 +1233,36 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                                     generated_chars += len(content_text)
                                     async for c in parse_and_emit(content_text, False):
                                         yield c
+                            for tc in (delta.get('tool_calls') or []):
+                                oi = tc.get('index', 0)
+                                fn = tc.get('function', {})
+                                if oi not in tool_map:
+                                    if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
+                                        async for c in emit_synthetic_thinking():
+                                            yield c
+                                    async for c in stop_open():
+                                        yield c
+                                    ai = next_index
+                                    tool_map[oi] = ai
+                                    open_idx = ai
+                                    sent_content_block_start = True
+                                    tool_call_id = tc.get('id') or f'toolu_{int(time.time() * 1000)}_{hash(str(ai)) % 10000:04x}_{ai}_{secrets.token_hex(3)}'
+                                    sent_text_or_tool_block = True
+                                    yield _sse('content_block_start', {
+                                        'type': 'content_block_start', 'index': ai,
+                                        'content_block': {'type': 'tool_use', 'id': tool_call_id, 'name': fn.get('name', ''), 'input': {}},
+                                    })
+                                    next_index += 1
+                                ai = tool_map[oi]
+                                if fn.get('arguments'):
+                                    generated_chars += len(fn['arguments'])
+                                    yield _sse('content_block_delta', {
+                                        'type': 'content_block_delta', 'index': ai,
+                                        'delta': {'type': 'input_json_delta', 'partial_json': fn['arguments']},
+                                    })
                             if ch.get('finish_reason'):
                                 saw_finish = True  # P0-1
                                 final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
-                    except Exception:
-                        pass
             buffer = ''
     except (GeneratorExit, asyncio.CancelledError):
         # V-15 fix (audit 2026-07-27): client disconnected / task cancelled.
@@ -1382,8 +1447,9 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         final_stop = 'tool_use'
 
     estimated_output = max(1, (generated_chars + 3) // 4)
-    reported_input = usage.get('prompt_tokens', input_tokens or 0)
-    reported_output = usage.get('completion_tokens', estimated_output)
+    # B-33.2: clamp — NaN/Inf/None upstream counters must never reach the wire.
+    reported_input = _finite_nonneg_int(usage.get('prompt_tokens')) or (input_tokens or 0)
+    reported_output = _finite_nonneg_int(usage.get('completion_tokens')) or estimated_output
     capture['reportedInputTokens'] = reported_input
     capture['reportedOutputTokens'] = reported_output
     yield _sse('message_delta', {
@@ -1393,7 +1459,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
             'input_tokens': reported_input,
             'output_tokens': reported_output,
             'cache_creation_input_tokens': 0,
-            'cache_read_input_tokens': (usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0),
+            'cache_read_input_tokens': _finite_nonneg_int((usage.get('prompt_tokens_details') or {}).get('cached_tokens', 0)),
         },
     })
     yield _sse('message_stop', {'type': 'message_stop'})

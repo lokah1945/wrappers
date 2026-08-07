@@ -786,6 +786,12 @@ class ResponsesHandler:
                         except (json.JSONDecodeError, ValueError, RecursionError):
                             c = None
                         if isinstance(c, dict):
+                            if c.get('error') is not None and 'choices' not in c:
+                                # B-33.1 (V-16 follow-up): tail error-frame
+                                # parity (R-03 class) — surface the REAL
+                                # upstream error, not the generic EOF message.
+                                _e = c['error']
+                                stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                             if c.get('usage'):
                                 usage = convert_usage(c['usage'])
                             ch = (c.get('choices') or [{}])[0]
@@ -812,6 +818,37 @@ class ResponsesHandler:
                                     'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
                                     'delta': reason_tail,
                                 })
+                            # B-33.1 (V-16 follow-up): tail tool_calls parity
+                            # with the main loop — a final unterminated frame
+                            # carrying argument fragments used to be dropped,
+                            # truncating the accumulated arguments JSON.
+                            for tc in d.get('tool_calls') or []:
+                                idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
+                                acc = tool_accs[idx] if idx < len(tool_accs) else None
+                                if acc is None:
+                                    acc = make_tool_acc(idx, tc)
+                                fn = tc.get('function') or {}
+                                if tc.get('id') and (not acc.get('call_id') or acc['call_id'].startswith('call_')):
+                                    acc['call_id'] = tc['id']
+                                if not acc['added']:
+                                    acc['added'] = True
+                                    yield emit({
+                                        'type': 'response.output_item.added', 'sequence_number': next_seq(),
+                                        'output_index': acc['output_index'],
+                                        'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
+                                                 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
+                                    })
+                                if fn.get('name'):
+                                    # P0-3: never emit the NAME as an arguments delta.
+                                    acc['name'] += fn['name']
+                                if fn.get('arguments'):
+                                    acc['args'] += fn['arguments']
+                                    yield emit({
+                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
+                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
+                                        'delta': fn['arguments'],
+                                    })
+                                has_tool = True
             except Exception as e:
                 stream_error = e
                 import logging
