@@ -108,12 +108,17 @@ class Registry:
     def _save_cache_file(self):
         try:
             os.makedirs(os.path.dirname(CACHE_FILE), exist_ok=True)
-            with open(CACHE_FILE, 'w') as f:
+            # B-34.2: atomic write (tmp + rename) — a crash/kill mid-write used
+            # to leave a truncated cache, forfeiting the last-good NGC map on
+            # the NEXT boot (same class as the manifest-loader atomicity fix).
+            tmp = CACHE_FILE + '.tmp'
+            with open(tmp, 'w') as f:
                 json.dump({
                     'source': 'live',
                     'syncedAt': time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime()),
                     'map': self._map,
                 }, f, indent=2)
+            os.replace(tmp, CACHE_FILE)
         except Exception as e:
             logger.warning(f'[registry] cache write failed: {e}')
 

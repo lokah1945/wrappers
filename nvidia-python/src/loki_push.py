@@ -74,7 +74,31 @@ async def _get_session():
     return _session
 
 
+# B-34.1: at most one push_chunk may snapshot/slice _batch at a time.
+_inflight_push = False
+
+
 async def push_chunk() -> None:
+    global _batch, _last_flush, _auth_failures, _disabled, _inflight_push
+    # B-34.1: this function MUST be serialized. Every line past BATCH_SIZE used
+    # to fire ANOTHER fire-and-forget push while the previous one was still
+    # awaiting Loki: two concurrent tasks snapshotted the SAME _batch[:50]
+    # (DUPLICATE records pushed) and each then sliced _batch[50:] on success —
+    # the second slice silently DELETED records that had never been pushed
+    # (loss). One in-flight push at a time now; skipped triggers are
+    # redundant (the next >= BATCH_SIZE line or the FLUSH_INTERVAL tick
+    # drains the remainder). The flag is set synchronously at task start
+    # (event-loop atomic) and cleared in finally.
+    if _inflight_push:
+        return
+    _inflight_push = True
+    try:
+        await _push_chunk_impl()
+    finally:
+        _inflight_push = False
+
+
+async def _push_chunk_impl() -> None:
     global _batch, _last_flush, _auth_failures, _disabled
     if _disabled:
         _batch = []
@@ -187,6 +211,12 @@ async def daemon() -> None:
         await asyncio.sleep(0.5)
         try:
             stat = os.stat(SOURCE)
+            if stat.st_size < pos:
+                # B-34.3: the source file was truncated/rotated since our last
+                # read — resume from the beginning instead of stalling until
+                # the new file grows past the OLD offset (which silently
+                # skipped every record written in the downtime).
+                pos = 0
             if stat.st_size <= pos:
                 if time.time() - _last_flush >= FLUSH_INTERVAL and _batch:
                     await push_chunk()

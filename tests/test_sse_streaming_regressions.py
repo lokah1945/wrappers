@@ -1948,3 +1948,128 @@ def test_b33_1_responses_compat_tail_parity_structure():
     for needle in ("chunk.get('usage')", "chunk.get('error') is not None",
                    "delta.get('tool_calls') or []", 'input_json_delta'):
         assert needle in atail, needle
+
+
+# ── R34: loki_push serialization + registry atomic cache ────────────────────
+
+def _load_loki_push():
+    import importlib.util
+    if 'loki_push_mod' in sys.modules:
+        return sys.modules['loki_push_mod']
+    spec = importlib.util.spec_from_file_location('loki_push_mod', ROOT / 'nvidia-python' / 'src' / 'loki_push.py')
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules['loki_push_mod'] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class _FakeLokiResp:
+    def __init__(self, delay=0.02, status=200):
+        self._delay = delay
+        self.status = status
+
+    async def __aenter__(self):
+        await asyncio.sleep(self._delay)  # slow Loki → real overlap window
+        return self
+
+    async def __aexit__(self, *a):
+        return False
+
+
+class _FakeLokiSession:
+    def __init__(self, rec):
+        self.rec = rec
+        self.closed = False
+
+    def post(self, url, data=None, headers=None, ssl=None):
+        payload = json.loads(data)
+        # record pushed lines atomically at push start (task interleaves later)
+        self.rec.append([v[1] for s in payload['streams'] for v in s['values']])
+        return _FakeLokiResp()
+
+
+def _reset_loki_state(mod):
+    mod._batch = []
+    mod._disabled = False
+    mod._auth_failures = 0
+    mod._inflight_push = False
+    mod._session = None
+
+
+def test_b34_1_loki_push_serialized_no_dup_no_loss():
+    """B-34.1: concurrent push_chunk tasks must never duplicate a record nor
+    slice away unpushed lines (pre-fix: same snapshot pushed twice + loss)."""
+    mod = _load_loki_push()
+    _reset_loki_state(mod)
+    rec = []
+    mod._get_session = lambda: asyncio.sleep(0, result=_FakeLokiSession(rec))
+
+    async def drive():
+        # 120 lines, two tasks fired back-to-back past BATCH_SIZE (the old storm)
+        for i in range(120):
+            mod._batch.append(f'line-{i}')
+        t1 = asyncio.create_task(mod.push_chunk())
+        t2 = asyncio.create_task(mod.push_chunk())  # redundant under the guard
+        await asyncio.gather(t1, t2)
+        # drain whatever remains (as next lines / flush ticks would do)
+        while mod._batch:
+            await mod.push_chunk()
+        t3 = asyncio.create_task(mod.push_chunk())  # empty-batch no-op
+        await t3
+    asyncio.run(drive())
+
+    pushed = [ln for batch in rec for ln in batch]
+    assert len(pushed) == len(set(pushed)), f'duplicate pushes: {len(pushed)-len(set(pushed))}'
+    assert sorted(pushed) == sorted(f'line-{i}' for i in range(120)), (
+        'lost records: ' + str(sorted(set(f'line-{i}' for i in range(120)) - set(pushed))[:5]))
+    assert mod._batch == []
+
+
+def test_b34_1_process_line_trigger_path_clean():
+    """B-34.1: the process_line fire path (>= BATCH_SIZE) also stays dup/loss-free."""
+    mod = _load_loki_push()
+    _reset_loki_state(mod)
+    rec = []
+    mod._get_session = lambda: asyncio.sleep(0, result=_FakeLokiSession(rec))
+
+    async def drive():
+        for i in range(137):
+            mod.process_line(f'ev-{i}')
+            if i % 17 == 0:
+                await asyncio.sleep(0.001)  # let fired tasks run mid-burst
+        await asyncio.gather(*list(mod._BG_TASKS), return_exceptions=True)
+        while mod._batch:
+            await mod.push_chunk()
+    asyncio.run(drive())
+
+    pushed = [ln for batch in rec for ln in batch]
+    assert len(pushed) == len(set(pushed)), 'duplicates via process_line path'
+    assert sorted(pushed) == sorted(f'ev-{i}' for i in range(137))
+
+
+def test_b34_3_daemon_rotation_resume_source_lock():
+    """B-34.3: daemon must resume at 0 when the watched file shrinks (rotation)."""
+    src = (ROOT / 'nvidia-python' / 'src' / 'loki_push.py').read_text()
+    assert 'stat.st_size < pos' in src and 'pos = 0' in src
+    assert src.count('_inflight_push') >= 5  # guard wired through impl+wrapper
+
+
+def test_b34_2_registry_cache_write_is_atomic():
+    """B-34.2: cache writes go through tmp+os.replace (no torn cache files)."""
+    import importlib.util, os
+    spec = importlib.util.spec_from_file_location(
+        'nv_registry_mod', ROOT / 'nvidia-python' / 'src' / 'registry.py')
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    tmpdir = '/tmp/b34_2_registry'
+    mod.CACHE_FILE = tmpdir + '/cache.json'
+    r = mod.Registry()
+    r._map = {'m/x': {'context': 1000, 'maxOutput': 100}}
+    r._save_cache_file()
+    with open(mod.CACHE_FILE) as f:
+        got = json.load(f)
+    assert got['map'] == r._map and got['source'] == 'live'
+    assert not os.path.exists(mod.CACHE_FILE + '.tmp'), 'tmp file must not linger'
+    assert 'os.replace(' in (ROOT / 'nvidia-python' / 'src' / 'registry.py').read_text()
+    import shutil
+    shutil.rmtree(tmpdir, ignore_errors=True)
