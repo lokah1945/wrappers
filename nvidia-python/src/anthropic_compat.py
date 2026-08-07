@@ -84,6 +84,44 @@ except ImportError:  # pragma: no cover - standalone fallback
         return v if v > 0 else 0
 
 
+# B-36.1: shared upstream-payload sanitizer — NaN/±Infinity literals (accepted
+# by json.loads) are replaced with None at the ingest boundary so the
+# response render (allow_nan=False) can never 500 on a successful turn.
+try:
+    from common.model.sanitize import sanitize_nonfinite_numbers as _sanitize_nonfinite
+except ImportError:  # pragma: no cover - standalone fallback
+    import math as _math_nonfinite
+
+    def _sanitize_nonfinite(payload):  # type: ignore[misc]
+        # B-36.1: twin of common.model.sanitize.sanitize_nonfinite_numbers (verbatim).
+        if isinstance(payload, float):
+            return payload if _math_nonfinite.isfinite(payload) else None
+        if isinstance(payload, (dict, list)):
+            # Single stack, typed nodes: dict mutates by key, list by index.
+            # (The first version popped list frames through dict.items() — the
+            # unit test caught it: mixed containers are the norm.)
+            stack = [payload]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, child in node.items():
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[key] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+                else:
+                    for idx, child in enumerate(node):
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[idx] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+            return payload
+        return payload
+
+
+
 def _env_flag(name: str, default: str = '0') -> bool:
     return os.environ.get(name, default).strip().lower() in ('1', 'true', 'yes', 'on')
 
@@ -602,7 +640,7 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     for tc in (msg.get('tool_calls') or []):
         fn = tc.get('function', {})
         try:
-            args = json.loads(fn.get('arguments') or '{}')
+            args = _sanitize_nonfinite(json.loads(fn.get('arguments') or '{}'))
             if not isinstance(args, dict):
                 args = {'value': args}
         except Exception:

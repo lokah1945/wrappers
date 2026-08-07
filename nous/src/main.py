@@ -65,6 +65,44 @@ except ImportError:  # noqa: E722 - fallback defined below
         return _re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
 
 
+# B-36.1: shared upstream-payload sanitizer — NaN/±Infinity literals (accepted
+# by json.loads) are replaced with None at the ingest boundary so the
+# response render (allow_nan=False) can never 500 on a successful turn.
+try:
+    from common.model.sanitize import sanitize_nonfinite_numbers as _sanitize_nonfinite
+except ImportError:  # pragma: no cover - standalone fallback
+    import math as _math_nonfinite
+
+    def _sanitize_nonfinite(payload):  # type: ignore[misc]
+        # B-36.1: twin of common.model.sanitize.sanitize_nonfinite_numbers (verbatim).
+        if isinstance(payload, float):
+            return payload if _math_nonfinite.isfinite(payload) else None
+        if isinstance(payload, (dict, list)):
+            # Single stack, typed nodes: dict mutates by key, list by index.
+            # (The first version popped list frames through dict.items() — the
+            # unit test caught it: mixed containers are the norm.)
+            stack = [payload]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, child in node.items():
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[key] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+                else:
+                    for idx, child in enumerate(node):
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[idx] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+            return payload
+        return payload
+
+
+
 # Shared translation utilities from common/translations (deduplication).
 # Note: Nous uses a dict-based AnthropicStreamState (for stream_with_heartbeat),
 # so we only import the string-agnostic utilities here.
@@ -902,7 +940,7 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
                 retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else 0
                 resp.release()
                 try:
-                    data = json.loads(text) if text else text
+                    data = _sanitize_nonfinite(json.loads(text)) if text else text
                 except Exception:
                     data = text
                 err = _normalize_upstream_error(resp.status, data)
@@ -916,7 +954,7 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
                 if resp.status != 200:
                     # Parse Retry-After header for 429 cooldown (anti rate-limit).
                     try:
-                        body_data = json.loads(text) if text else text
+                        body_data = _sanitize_nonfinite(json.loads(text)) if text else text
                     except Exception:
                         body_data = text
                     retry_after = _parse_retry_after(resp.headers, body_data if isinstance(body_data, dict) else None) if resp.status == 429 else 0
@@ -925,7 +963,7 @@ async def post_nous(payload: dict, token: str, stream: bool = False, extra_heade
                         err.setdefault('error', {})['retry_after'] = retry_after
                     return resp.status, err
                 try:
-                    data = json.loads(text) if text else {}
+                    data = _sanitize_nonfinite(json.loads(text)) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 return resp.status, data
@@ -1064,7 +1102,7 @@ async def get_nous_json_with_retries(path: str) -> tuple:
             async with sess.get(url, headers={"Authorization": f"Bearer {oauth_token}"}) as r:
                 text = await r.text()
                 try:
-                    data = json.loads(text) if text else {}
+                    data = _sanitize_nonfinite(json.loads(text)) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 if r.status == 200:
@@ -1085,7 +1123,7 @@ async def get_nous_json_with_retries(path: str) -> tuple:
             async with sess.get(url, headers={"Authorization": f"Bearer {entry.api_key}"}) as r:
                 text = await r.text()
                 try:
-                    data = json.loads(text) if text else {}
+                    data = _sanitize_nonfinite(json.loads(text)) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 if r.status == 200:
@@ -1516,7 +1554,7 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     for tc in tool_calls:
         fn = tc.get("function", {}) or {}
         try:
-            inp = json.loads(fn.get("arguments", "") or "{}")
+            inp = _sanitize_nonfinite(json.loads(fn.get("arguments", "") or "{}"))
         except Exception:
             inp = {"raw": fn.get("arguments", "")}
         content.append({

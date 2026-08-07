@@ -128,6 +128,43 @@ except ImportError:
         sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
         return sanitized.strip()
 
+
+# B-36.1: shared upstream-payload sanitizer — NaN/±Infinity literals (accepted
+# by json.loads) are replaced with None at the ingest boundary so the
+# response render (allow_nan=False) can never 500 on a successful turn.
+try:
+    from common.model.sanitize import sanitize_nonfinite_numbers as _sanitize_nonfinite
+except ImportError:  # pragma: no cover - standalone fallback
+    import math as _math_nonfinite
+
+    def _sanitize_nonfinite(payload):  # type: ignore[misc]
+        # B-36.1: twin of common.model.sanitize.sanitize_nonfinite_numbers (verbatim).
+        if isinstance(payload, float):
+            return payload if _math_nonfinite.isfinite(payload) else None
+        if isinstance(payload, (dict, list)):
+            # Single stack, typed nodes: dict mutates by key, list by index.
+            # (The first version popped list frames through dict.items() — the
+            # unit test caught it: mixed containers are the norm.)
+            stack = [payload]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, child in node.items():
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[key] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+                else:
+                    for idx, child in enumerate(node):
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[idx] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+            return payload
+        return payload
+
 # B-08 fix: shared sentinel-task idle iterator + CRLF normalisation.
 from common.sse import (  # noqa: E402
     IDLE as _IDLE,
@@ -560,7 +597,7 @@ async def _refresh_models(force: bool = False) -> list:
             if resp.status != 200:
                 logger.warning(f"[openrouter] Failed to fetch models: {resp.status}")
                 return []
-            data = await resp.json()
+            data = _sanitize_nonfinite(await resp.json())
             models = [m["id"] for m in data.get("data", [])]
             return models
     except Exception as e:
@@ -1019,7 +1056,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                           'model-state')
                     last_status = resp.status
                     try:
-                        last_data = json.loads(error_text)
+                        last_data = _sanitize_nonfinite(json.loads(error_text))
                     except Exception:
                         last_data = {"error": {"message": error_text[:2000], "type": "upstream_error",
                                                  "status": resp.status}}
@@ -1170,7 +1207,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 if resp.status >= 400:
                     # Parse Retry-After header for 429 cooldown (anti rate-limit).
                     try:
-                        body_data = json.loads(text) if text else {}
+                        body_data = _sanitize_nonfinite(json.loads(text)) if text else {}
                     except Exception:
                         body_data = {"error": {"message": text[:2000], "type": "upstream_error",
                                            "status": resp.status}}
@@ -1188,7 +1225,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 if hasattr(pool, 'mark_success'):
                     pool.mark_success(key_obj, available_keys=pool.available_keys)
                 try:
-                    data = json.loads(text) if text else {}
+                    data = _sanitize_nonfinite(json.loads(text)) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
                 return JSONResponse(content=data, status_code=resp.status)
@@ -1974,7 +2011,7 @@ async def list_models(request: Request):
             pool.release(key_obj)
             if resp.status != 200:
                 return JSONResponse({"data": []}, status_code=resp.status)
-            data = await resp.json()
+            data = _sanitize_nonfinite(await resp.json())
             models = data.get("data", [])
 
             # Filter FREE_ONLY
@@ -2685,7 +2722,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
         for tc in message["tool_calls"]:
             fn = tc.get("function", {})
             try:
-                input_obj = json.loads(fn.get("arguments", "{}"))
+                input_obj = _sanitize_nonfinite(json.loads(fn.get("arguments", "{}")))
             except Exception:
                 input_obj = {"raw": fn.get("arguments", "")}
             content_blocks.append({
@@ -3304,7 +3341,7 @@ async def _mgmt_request(method: str, path: str = "", json_body: dict | None = No
             kwargs["params"] = params
 
         async with agent.request(method, url, **kwargs) as resp:
-            data = await resp.json()
+            data = _sanitize_nonfinite(await resp.json())
             return JSONResponse(data, status_code=resp.status)
     except Exception as e:
         logger.error(f"[openrouter] Management API error: {e}")

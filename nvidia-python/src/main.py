@@ -83,6 +83,43 @@ except ImportError:
         sanitized = value.replace('\r', '').replace('\n', '')
         sanitized = _re.sub(r'[\x00-\x1f\x7f]', '', sanitized)
         return sanitized.strip()
+
+
+# B-36.1: shared upstream-payload sanitizer — NaN/±Infinity literals (accepted
+# by json.loads) are replaced with None at the ingest boundary so the
+# response render (allow_nan=False) can never 500 on a successful turn.
+try:
+    from common.model.sanitize import sanitize_nonfinite_numbers as _sanitize_nonfinite
+except ImportError:  # pragma: no cover - standalone fallback
+    import math as _math_nonfinite
+
+    def _sanitize_nonfinite(payload):  # type: ignore[misc]
+        # B-36.1: twin of common.model.sanitize.sanitize_nonfinite_numbers (verbatim).
+        if isinstance(payload, float):
+            return payload if _math_nonfinite.isfinite(payload) else None
+        if isinstance(payload, (dict, list)):
+            # Single stack, typed nodes: dict mutates by key, list by index.
+            # (The first version popped list frames through dict.items() — the
+            # unit test caught it: mixed containers are the norm.)
+            stack = [payload]
+            while stack:
+                node = stack.pop()
+                if isinstance(node, dict):
+                    for key, child in node.items():
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[key] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+                else:
+                    for idx, child in enumerate(node):
+                        if isinstance(child, float):
+                            if not _math_nonfinite.isfinite(child):
+                                node[idx] = None
+                        elif isinstance(child, (dict, list)):
+                            stack.append(child)
+            return payload
+        return payload
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
@@ -1613,7 +1650,7 @@ def _fire_and_forget(coro, label: str = 'bg') -> None:
 async def _safe_response_body(resp) -> dict:
     """Parse upstream body as JSON; fall back to text envelope (NIM sometimes returns text/plain errors)."""
     try:
-        data = await resp.json(content_type=None)
+        data = _sanitize_nonfinite(await resp.json(content_type=None))
         if isinstance(data, dict):
             return data
         return {'error': {'message': str(data)[:2000], 'type': 'api_error'}}

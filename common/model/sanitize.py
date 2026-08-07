@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 import re
 from typing import Any
 
@@ -68,3 +69,43 @@ def sanitize_error_detail(payload: Any, max_chars: int = 4000) -> str:
         return json.dumps(scrubbed, ensure_ascii=False, default=str)[:max_chars]
     except Exception:
         return str(scrubbed)[:max_chars]
+
+
+def sanitize_nonfinite_numbers(payload: Any) -> Any:
+    """Replace NaN/±Infinity floats with None, iteratively, in place.
+
+    B-36.1: Python's json.loads ACCEPTS the literals ``NaN``/``Infinity``/
+    ``-Infinity``. An upstream response body carrying one parsed fine, then
+    crashed the Starlette render (``allow_nan=False`` → ValueError → an
+    unhandled 500 on an otherwise-successful turn — CONTRACT §3.3 inversion),
+    or was re-serialized with the RFC-invalid ``NaN`` literal that strict
+    client SDKs reject mid-stream. Apply at the upstream-ingest boundary so
+    every downstream surface stays RFC-valid. The walk is iterative
+    (stack-free) — immune to pathological nesting depth, and dicts/lists are
+    only visited exactly once (parsed JSON is acyclic).
+    """
+    if isinstance(payload, float):
+        return payload if math.isfinite(payload) else None
+    if isinstance(payload, (dict, list)):
+        # Single stack, typed nodes: dict mutates by key, list by index.
+        # (The first version popped list frames through dict.items() — the
+        # unit test caught it: mixed containers are the norm.)
+        stack = [payload]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                for key, child in node.items():
+                    if isinstance(child, float):
+                        if not math.isfinite(child):
+                            node[key] = None
+                    elif isinstance(child, (dict, list)):
+                        stack.append(child)
+            else:
+                for idx, child in enumerate(node):
+                    if isinstance(child, float):
+                        if not math.isfinite(child):
+                            node[idx] = None
+                    elif isinstance(child, (dict, list)):
+                        stack.append(child)
+        return payload
+    return payload

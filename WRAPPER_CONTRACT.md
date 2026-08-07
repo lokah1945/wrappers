@@ -392,7 +392,7 @@ Round-12 deep audit: a new hostile-body fuzz gate was built and run against all 
 - **§9.1 routing fix (B-12.1):** nvidia-python's generation base (`BASE_GENAI` — embeddings / ranking / images) ignored an operator-provided custom `NVIDIA_BASE_URL` and leaked those calls to the public NVIDIA cloud endpoint. It now falls back to the explicit LLM base URL before the cloud default; the official-cloud default is unchanged.
 - **§10 parity fix (B-12.2):** nous, opencode and blackbox `/metrics` JSON lacked the `pool` (live per-key stats from `KEY_POOL.all_stats()`) and `in_flight` fields that nvidia and openrouter already reported, breaking cross-wrapper observability parity. All five `/metrics` payloads now carry both fields.
 - **§2/§9.2 translation fix (B-12.3):** the shared OpenAI→Anthropic request converter (COMPATIBILITY_LAYER=2) silently ignored `max_completion_tokens` — the alias newer OpenAI SDKs send instead of `max_tokens` — dropping the client's output cap entirely. It now coalesces the alias (`max_tokens` still wins when both are set; no cap is injected when neither is).
-- **Verification:** 359 unit · 990 runtime E2E · 240 full-matrix · 55 agent-loop · multi-agent storm · official-SDK compat · COMPATIBILITY_LAYER E2E · soak · **1132 fuzz checks** — **9/9 gates green, 0 failures**.
+- **Verification:** 362 unit · 990 runtime E2E · 240 full-matrix · 55 agent-loop · multi-agent storm · official-SDK compat · COMPATIBILITY_LAYER E2E · soak · **1132 fuzz checks** — **9/9 gates green, 0 failures**.
 
 ### v3.1 → v3.2 (2026-08-04)
 
@@ -461,4 +461,4 @@ Three deep-audit rounds (2026-08-03…04) hardened the five wrappers without add
 ---
 
 **Version:** 3.3 · **Last updated:** 2026-08-04
-**Verification at this version:** 359 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · 1132 hostile-body fuzz checks · soak; **9/9 gates green, 0 failures**
+**Verification at this version:** 362 unit/regression tests · 990 live runtime E2E checks (5 wrappers × 3 surfaces × 22 modes) · official-SDK compat (openai + anthropic) · 240 full-matrix checks · 55 real-SDK agent-loop checks · multi-agent concurrency storm (12 agents × 5 wrappers, zero cross-talk) · 1132 hostile-body fuzz checks · soak; **9/9 gates green, 0 failures**

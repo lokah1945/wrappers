@@ -2135,3 +2135,90 @@ def test_b35_1_cap_env_override_source_lock():
     assert "os.environ.get('BODY_MAX_DEPTH', '256')" in src
     assert '_structure_too_deep(raw, BODY_MAX_DEPTH)' in src
     assert 'except RecursionError:' in src  # interpreter-limit net retained
+
+
+# ── R36: upstream-ingest non-finite float sanitizer (B-36.1) ────────────────
+
+def test_b36_1_sanitizer_semantics():
+    """B-36.1: NaN/±Inf → None everywhere; finite floats/bools/ints untouched;
+    stack-free on pathological depth; RFC-strict dumps of the result."""
+    from common.model.sanitize import sanitize_nonfinite_numbers as s
+    nan, inf, ninf = float('nan'), float('inf'), float('-inf')
+    assert s(None) is None and s(5) == 5 and s('x') == 'x'
+    assert s(1.5) == 1.5
+    assert s(nan) is None and s(inf) is None and s(ninf) is None
+    assert s(True) is True  # bool must NOT be treated as a number-to-clean
+    deep = {'a': [{'b': nan}, [inf, 1.25, {'c': [ninf]}]], 'ok': 2.5, 'flag': False}
+    out = s(deep)
+    assert out == {'a': [{'b': None}, [None, 1.25, {'c': [None]}]], 'ok': 2.5, 'flag': False}
+    json.dumps(out, allow_nan=False)  # RFC-strict render must succeed
+    # pathological depth: iterative walk must not recurse (a body deeper than
+    # anything the interpreter could parse must not explode in the walker)
+    nest7k = {}
+    cur = nest7k
+    for _ in range(7000):
+        cur['x'] = {}
+        cur = cur['x']
+    cur['v'] = nan
+    out = s(nest7k)
+    cur = out
+    for _ in range(7000):
+        cur = cur['x']
+    assert cur['v'] is None
+    # realistic max depth (parse-admitted range) stays RFC-renderable
+    nest300 = nan
+    for _ in range(300):
+        nest300 = [nest300]
+    json.dumps(s(nest300), allow_nan=False)
+    assert nest300[0][0][0] is not None  # structure preserved (list, [])
+
+
+def test_b36_1_fallback_twins_byte_parity():
+    """B-36.1/§7: every wrapper's embedded fallback twin is byte-identical to
+    the shared implementation body (no drift), and behaves identically."""
+    import ast, textwrap
+
+    def extract(path):
+        """Fallback twin, AST-located (indentation- and layout-proof)."""
+        s = (ROOT / path).read_text()
+        tree = ast.parse(s)
+        for node in ast.walk(tree):
+            if isinstance(node, ast.FunctionDef) and node.name == '_sanitize_nonfinite':
+                return textwrap.dedent(ast.get_source_segment(s, node))
+        raise AssertionError(f'no _sanitize_nonfinite twin in {path}')
+
+    files = ['nous/src/main.py', 'opencode/src/main.py', 'blackbox/src/main.py',
+             'openrouter/src/main.py', 'nvidia-python/src/main.py',
+             'nvidia-python/src/anthropic_compat.py']
+    bodies = {extract(f) for f in files}
+    assert len(bodies) == 1, 'fallback twin bodies drifted across files'
+    body = bodies.pop()
+    assert 'isfinite' in body and body.rstrip().endswith('return payload')
+
+    # behavior parity: exec one twin and compare outputs with the shared one
+    import math as _math_nonfinite  # noqa: F401 (twin's import alias)
+    ns = {'_math_nonfinite': _math_nonfinite}
+    exec(body, ns)
+    from common.model.sanitize import sanitize_nonfinite_numbers as shared_fn
+    nan, inf = float('nan'), float('inf')
+    for payload in (nan, 2.5, {'u': {'p': nan, 'q': [inf, 1]}}, [nan, {'z': inf}], 's', 7, True):
+        a = shared_fn(payload)
+        b = ns['_sanitize_nonfinite'](payload)
+        assert json.dumps(a) == json.dumps(b), (payload, a, b)
+
+
+def test_b36_1_all_ingest_sites_wired_source_lock():
+    """B-36.1: source-scan lock — every known non-stream upstream ingest is
+    wrapped (protects against future unwrap-by-edit)."""
+    expect = {
+        'nous/src/main.py': 6,
+        'opencode/src/main.py': 3,
+        'blackbox/src/main.py': 3,
+        'openrouter/src/main.py': 7,
+        'nvidia-python/src/main.py': 1,
+        'nvidia-python/src/anthropic_compat.py': 1,
+    }
+    for f, want in expect.items():
+        s = (ROOT / f).read_text()
+        got = s.count('_sanitize_nonfinite(json.loads') + s.count('_sanitize_nonfinite(await resp')
+        assert got == want, f'{f}: wrapped sites={got} want {want}'
