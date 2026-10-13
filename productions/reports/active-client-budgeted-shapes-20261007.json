@@ -1,0 +1,119 @@
+{
+  "completed_at_utc": "2026-10-07T14:51:06.331414+00:00",
+  "execution": "Actual Claude/Codex commands against latest wrapper with isolated credential-free fake upstream, temporary client working folders, tools disabled; HOME unchanged.",
+  "selected_model": "liquid/lfm-2.5-2.6b:free",
+  "inference_against_real_provider": false,
+  "credentials_used": "synthetic only",
+  "checks": [
+    {
+      "client": "claude",
+      "exit_code": 0,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": false,
+      "visible_characters": 17,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 0.988,
+      "frontend_requests": [
+        {
+          "path": "/v1/messages",
+          "model": "liquid/lfm-2.5-2.6b:free",
+          "root_fields": [
+            "context_management",
+            "max_tokens",
+            "messages",
+            "metadata",
+            "model",
+            "output_config",
+            "stream",
+            "system",
+            "thinking",
+            "tools"
+          ],
+          "header_names": [
+            "accept",
+            "accept-encoding",
+            "anthropic-beta",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-version",
+            "authorization",
+            "connection",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-api-key",
+            "x-app",
+            "x-claude-code-session-id",
+            "x-stainless-arch",
+            "x-stainless-lang",
+            "x-stainless-os",
+            "x-stainless-package-version",
+            "x-stainless-retry-count",
+            "x-stainless-runtime",
+            "x-stainless-runtime-version",
+            "x-stainless-timeout"
+          ],
+          "max_tokens": 256,
+          "max_output_tokens": null,
+          "max_completion_tokens": null,
+          "stream": true,
+          "tool_count": 0,
+          "message_count": 1,
+          "input_shape": "NoneType",
+          "thinking": {
+            "type": "adaptive"
+          },
+          "system_or_instructions_serialized_length": 338,
+          "body_serialized_length": 1300
+        }
+      ],
+      "upstream_requests": [
+        {
+          "path": "/v1/chat/completions",
+          "model": "liquid/lfm-2.5-2.6b:free",
+          "root_fields": [
+            "max_tokens",
+            "messages",
+            "metadata",
+            "model",
+            "stream"
+          ],
+          "header_names": [
+            "accept",
+            "accept-encoding",
+            "anthropic-beta",
+            "anthropic-dangerous-direct-browser-access",
+            "anthropic-version",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent",
+            "x-stainless-arch",
+            "x-stainless-lang",
+            "x-stainless-os",
+            "x-stainless-package-version",
+            "x-stainless-retry-count",
+            "x-stainless-runtime",
+            "x-stainless-runtime-version"
+          ],
+          "max_tokens": 256,
+          "max_output_tokens": null,
+          "max_completion_tokens": null,
+          "stream": true,
+          "tool_count": 0,
+          "message_count": 2,
+          "input_shape": "NoneType",
+          "body_serialized_length": 868
+        }
+      ],
+      "all_forwarded_models_exact": true
+    }
+  ]
+}

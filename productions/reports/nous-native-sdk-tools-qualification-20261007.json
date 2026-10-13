@@ -1,0 +1,29 @@
+{
+  "recorded_at_utc": "2026-10-07T15:42:06.159244+00:00",
+  "wrapper": "nous",
+  "execution": "Latest source staged with private state and first configured static key only; native passthrough mode; production service and state unchanged.",
+  "private_oauth_clone": true,
+  "calls": 1,
+  "checks": [
+    {
+      "case": "native_responses_sdk_stream",
+      "model": "poolside/laguna-xs-2.1:free",
+      "sdk": "openai responses.stream context manager",
+      "max_output_tokens": 256,
+      "reasoning_effort": "none",
+      "status": 429,
+      "exception": "RateLimitError",
+      "sanitized_error": "Error code: 429 - {'status': 429, 'message': \"The requested model is temporarily at capacity upstream. This is not your API key's rate limit \u2014 please retry shortly.\"}",
+      "passed": false,
+      "latency_sec": 1.144
+    }
+  ],
+  "source_sha256": {
+    "nous/src/main.py": "8d5366a6c630668396f9d77b1aa1bf3ff38e5caa35cde2158dd5d5d8937735af"
+  },
+  "official_sources": [
+    "https://portal.nousresearch.com/api/openapi",
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/agent/portal_tags.py",
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/hermes_cli/proxy/adapters/nous_portal.py"
+  ]
+}

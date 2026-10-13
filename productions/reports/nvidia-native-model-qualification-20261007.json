@@ -1,0 +1,40 @@
+{
+  "recorded_at_utc": "2026-10-07T15:39:08.111674+00:00",
+  "wrapper": "nvidia-python",
+  "execution": "Latest source isolated staging on port19611; production state untouched; native Responses passthrough only. Explicit qualification model choices, no runtime model substitution.",
+  "sdk_version": "2.31.0",
+  "native_mode": "native",
+  "calls": 1,
+  "source_sha256": {
+    "nvidia-python/src/main.py": "0edb2b7f6063a51fba8dfec28b8fc21dfe86927a951ad41696b426cd8a4ab9d3"
+  },
+  "checks": [
+    {
+      "model": "openai/gpt-oss-20b",
+      "stream": true,
+      "max_output_tokens": 256,
+      "reasoning": {
+        "effort": "low"
+      },
+      "passed": false,
+      "http_status": null,
+      "exception": "IndexError",
+      "sanitized_error": "list index out of range",
+      "event_types": [
+        "response.content_part.added",
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.reasoning_part.added",
+        "response.reasoning_part.done",
+        "response.reasoning_text.delta",
+        "response.reasoning_text.done"
+      ],
+      "visible_delta_characters_before_error": 0,
+      "latency_sec": 1.826
+    }
+  ],
+  "passed": 0,
+  "failed": 1
+}

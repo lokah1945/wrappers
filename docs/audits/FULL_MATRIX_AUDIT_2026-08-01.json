@@ -1,7 +1,7 @@
 {
  "total": 240,
- "passed": 240,
- "failed": 0,
+ "passed": 196,
+ "failed": 44,
  "blocked": 0,
  "results": [
   {
@@ -325,7 +325,7 @@
    "component": "openai-responses",
    "test": "prev-response-id",
    "status": "PASS",
-   "evidence": "resp_zhzhipd1smeb9.. -> turn two ok",
+   "evidence": "resp_jxrd3r8yby85f.. -> turn two ok",
    "detail": ""
   },
   {
@@ -513,8 +513,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-nonstream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -522,8 +522,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-stream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -531,8 +531,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "tools-tool_use",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -540,8 +540,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "thinking-block",
-   "status": "PASS",
-   "evidence": "1 thinking blocks",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -549,8 +549,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "reasoning-only",
-   "status": "PASS",
-   "evidence": "stop=end_turn blocks=2",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -558,8 +558,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "system-prompt",
-   "status": "PASS",
-   "evidence": "system->messages[0]=yes",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -567,8 +567,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "multimodal-image",
-   "status": "PASS",
-   "evidence": "image translated to image_url",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -577,7 +577,7 @@
    "component": "anthropic-messages",
    "test": "upstream-500-shaped",
    "status": "PASS",
-   "evidence": "HTTP 429 shaped=True",
+   "evidence": "HTTP 500 shaped=True",
    "detail": ""
   },
   {
@@ -846,8 +846,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-nonstream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -855,8 +855,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-stream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -864,8 +864,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "tools-tool_use",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -873,8 +873,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "thinking-block",
-   "status": "PASS",
-   "evidence": "1 thinking blocks",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -882,8 +882,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "reasoning-only",
-   "status": "PASS",
-   "evidence": "stop=end_turn blocks=2",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -891,8 +891,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "system-prompt",
-   "status": "PASS",
-   "evidence": "system->messages[0]=yes",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -900,8 +900,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "multimodal-image",
-   "status": "PASS",
-   "evidence": "image translated to image_url",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1179,8 +1179,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-nonstream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1188,8 +1188,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-stream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1197,8 +1197,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "tools-tool_use",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1206,8 +1206,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "thinking-block",
-   "status": "PASS",
-   "evidence": "1 thinking blocks",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1215,8 +1215,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "reasoning-only",
-   "status": "PASS",
-   "evidence": "stop=end_turn blocks=2",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1224,8 +1224,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "system-prompt",
-   "status": "PASS",
-   "evidence": "system->messages[0]=yes",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1233,8 +1233,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "multimodal-image",
-   "status": "PASS",
-   "evidence": "image translated to image_url",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1512,8 +1512,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-nonstream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1521,8 +1521,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "sdk-stream-text",
-   "status": "PASS",
-   "evidence": "text='Hello from mock upstream.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1530,8 +1530,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "tools-tool_use",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1539,8 +1539,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "thinking-block",
-   "status": "PASS",
-   "evidence": "1 thinking blocks",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1548,8 +1548,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "reasoning-only",
-   "status": "PASS",
-   "evidence": "stop=end_turn blocks=1",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1557,8 +1557,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "system-prompt",
-   "status": "PASS",
-   "evidence": "system->messages[0]=yes",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1566,8 +1566,8 @@
    "layer": 1,
    "component": "anthropic-messages",
    "test": "multimodal-image",
-   "status": "PASS",
-   "evidence": "image translated to image_url",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -1800,8 +1800,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough",
-   "status": "PASS",
-   "evidence": "text='Hello from anthropic mock.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1809,8 +1809,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough-stream",
-   "status": "PASS",
-   "evidence": "anthropic stream ok",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1818,8 +1818,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-tools-passthrough",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1827,8 +1827,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-thinking-passthrough",
-   "status": "PASS",
-   "evidence": "1 thinking",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1899,8 +1899,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough",
-   "status": "PASS",
-   "evidence": "text='Hello from anthropic mock.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1908,8 +1908,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough-stream",
-   "status": "PASS",
-   "evidence": "anthropic stream ok",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1917,8 +1917,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-tools-passthrough",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1926,8 +1926,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-thinking-passthrough",
-   "status": "PASS",
-   "evidence": "1 thinking",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -1998,8 +1998,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough",
-   "status": "PASS",
-   "evidence": "text='Hello from anthropic mock.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -2007,8 +2007,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough-stream",
-   "status": "PASS",
-   "evidence": "anthropic stream ok",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -2016,8 +2016,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-tools-passthrough",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -2025,8 +2025,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-thinking-passthrough",
-   "status": "PASS",
-   "evidence": "1 thinking",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'type': 'authentication_error', 'message': 'Unauthorized'}}",
    "detail": ""
   },
   {
@@ -2097,8 +2097,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough",
-   "status": "PASS",
-   "evidence": "text='Hello from anthropic mock.'",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -2106,8 +2106,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-passthrough-stream",
-   "status": "PASS",
-   "evidence": "anthropic stream ok",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -2115,8 +2115,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-tools-passthrough",
-   "status": "PASS",
-   "evidence": "2 tool_use stop=tool_use",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {
@@ -2124,8 +2124,8 @@
    "layer": 2,
    "component": "anthropic-upstream",
    "test": "messages-thinking-passthrough",
-   "status": "PASS",
-   "evidence": "1 thinking",
+   "status": "FAIL",
+   "evidence": "AuthenticationError: Error code: 401 - {'error': {'message': 'Unauthorized', 'type': 'authentication_error'}}",
    "detail": ""
   },
   {

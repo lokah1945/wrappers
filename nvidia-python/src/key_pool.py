@@ -435,14 +435,17 @@ class KeyPool:
             self._lock.release()
 
     # ── Selection & Pacing Queue ─────────────────────────────────────────
-    async def acquire(self, model: str = '', signal=None) -> Optional[dict]:
-        chosen, waited_s = await self._acquire_slot(model, signal)
+    async def acquire(self, model: str = '', signal=None, exclude=None) -> Optional[dict]:
+        chosen, waited_s = await self._acquire_slot(model, signal, exclude)
         if chosen is None:
             return None
         return {'key': chosen, 'waited_ms': round(waited_s * 1000)}
 
-    async def _acquire_slot(self, model: str = '', signal=None) -> Tuple[Optional[KeyEntry], float]:
+    async def _acquire_slot(self, model: str = '', signal=None, exclude=None) -> Tuple[Optional[KeyEntry], float]:
         start = time.time()
+        excluded = set(exclude or ())
+        if self.keys and all(key.api_key in excluded for key in self.keys):
+            return (None, 0.0)
         soft = self.soft_limit
         hard = self.hard_limit
         interval = self._admit_interval
@@ -496,7 +499,12 @@ class KeyPool:
                     # is_model_blocked()/is_hard_blocked() stay predicates.
                     for _key in self.keys:
                         _key.expire_model_blocks()
-                    avail = [s for s in self.keys if not s.is_hard_blocked() and not s.is_model_blocked(model)]
+                    avail = [s for s in self.keys if s.api_key not in excluded and not s.is_hard_blocked() and not s.is_model_blocked(model)]
+                    if not avail:
+                        # No eligible credential can serve this request now.
+                        # Return to the HTTP layer for an actionable 429 instead
+                        # of waiting up to PACING_MAX_WAIT on blocked keys.
+                        return (None, time.time() - start)
 
                     # Saturation checks
                     model_saturated = False
@@ -511,6 +519,12 @@ class KeyPool:
                                 break
                         if all_saturated:
                             model_saturated = True
+
+                    if model_saturated:
+                        # Every key is already at its observed model quota.
+                        # Let clients back off rather than queueing a request
+                        # that cannot use any available credential now.
+                        return (None, time.time() - start)
 
                     chosen = None
                     wait = None
@@ -852,6 +866,7 @@ class KeyPool:
 
     # ── Model Discovery ───────────────────────────────────────────────────
     async def _fetch_models(self) -> List[str]:
+        from common.model.metadata import annotate_catalog
         base_url = os.environ.get('NVIDIA_BASE_URL', NVIDIA_BASE_URL).rstrip('/')
 
         # Keyless-first discovery
@@ -865,13 +880,14 @@ class KeyPool:
                         models_raw = body.get('data', body.get('models', []))
                         parsed = []
                         for m in models_raw:
-                            mid = m if isinstance(m, str) else m.get('id', '')
-                            if not mid:
+                            mid = m if isinstance(m, str) else m.get('id', '') if isinstance(m, dict) else ''
+                            if not isinstance(mid, str) or not mid:
                                 continue
-                            clean_id = mid.replace('stg/', '').replace('dev/', '').replace('test/', '')
+                            clean_id = mid  # Exact upstream identity; prefixes can distinguish deployments.
                             parsed.append(clean_id)
                             if isinstance(m, dict):
-                                self._models_metadata[clean_id] = m
+                                self._models_metadata[clean_id] = annotate_catalog(
+                                    m, f'{base_url}/v1/models', ttl_sec=max(60, int(os.environ.get('MODEL_REFRESH_SEC', '600'))))
                         if parsed:
                             parsed.sort()
                             if not self._keyless_discovery_logged:
@@ -898,13 +914,14 @@ class KeyPool:
                     models_raw = body.get('data', body.get('models', []))
                     parsed = []
                     for m in models_raw:
-                        mid = m if isinstance(m, str) else m.get('id', '')
-                        if not mid:
+                        mid = m if isinstance(m, str) else m.get('id', '') if isinstance(m, dict) else ''
+                        if not isinstance(mid, str) or not mid:
                             continue
-                        clean_id = mid.replace('stg/', '').replace('dev/', '').replace('test/', '')
+                        clean_id = mid
                         parsed.append(clean_id)
                         if isinstance(m, dict):
-                            self._models_metadata[clean_id] = m
+                            self._models_metadata[clean_id] = annotate_catalog(
+                                    m, f'{base_url}/v1/models', ttl_sec=max(60, int(os.environ.get('MODEL_REFRESH_SEC', '600'))))
                     parsed.sort()
                     return parsed
         except Exception:
@@ -918,6 +935,9 @@ class KeyPool:
         if models:
             self._models_cache = models
             self._models_cache_ts = time.time()
+            callback = getattr(self, 'on_models_refresh', None)
+            if callback is not None:
+                callback()
         return self._models_cache
 
     @property
@@ -967,4 +987,4 @@ class KeyPool:
                 except Exception as e:
                     logger.error(f'[key_pool] Model refresh loop error: {e}')
 
-        asyncio.create_task(_refresh_loop())
+        return asyncio.create_task(_refresh_loop())

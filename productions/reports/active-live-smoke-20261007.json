@@ -1,0 +1,158 @@
+{
+  "recorded_at_utc": "2026-10-07T02:19:00.414496+00:00",
+  "scope": [
+    "nvidia-python",
+    "nous",
+    "openrouter"
+  ],
+  "verification_scope": "Existing live services before source cutover; direct configured upstream validation probes.",
+  "latest_source_distinction": "Inference checks used the already-running services stamped with runtime.commit 1825f876d30feca307ae1198be8e832073b78015. They do not verify deployment of the latest working-tree patches. The latest source and production cutover require separate release-gate and post-cutover evidence.",
+  "inference_checks": [
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "surface": "openai_chat",
+      "stream": false,
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "http_status": 200,
+      "has_visible_content": false,
+      "visible_content_length": 0,
+      "has_reasoning": true,
+      "finish_reason": "length",
+      "returned_model": "openai/gpt-oss-20b",
+      "latency_sec": 11.876,
+      "phase": "initial_live_service_smoke",
+      "max_tokens": 32,
+      "diagnosis": "token_budget_exhausted_before_visible_answer"
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "surface": "openai_chat",
+      "stream": false,
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "http_status": 400,
+      "latency_sec": 0.991,
+      "phase": "initial_live_service_smoke",
+      "max_tokens": 32,
+      "diagnosis": "required_provider_tags_absent"
+    },
+    {
+      "wrapper": "openrouter",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "surface": "openai_chat",
+      "stream": false,
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "http_status": 200,
+      "has_visible_content": true,
+      "visible_content_length": 3,
+      "has_reasoning": true,
+      "finish_reason": "stop",
+      "returned_model": "liquid/lfm-2.5-2.6b:free",
+      "latency_sec": 2.587,
+      "phase": "initial_live_service_smoke",
+      "max_tokens": 32
+    },
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "max_tokens": 256,
+      "http_status": 200,
+      "has_visible_content": true,
+      "visible_content_length": 2,
+      "has_reasoning": true,
+      "finish_reason": "stop",
+      "returned_model": "openai/gpt-oss-20b",
+      "latency_sec": 2.683,
+      "phase": "same_model_live_diagnostic",
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015"
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "max_tokens": 32,
+      "http_status": 400,
+      "latency_sec": 0.944,
+      "phase": "same_model_live_diagnostic",
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "diagnosis": "required_provider_tags_absent"
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "http_status": 200,
+      "has_visible_content": true,
+      "visible_content_length": 2,
+      "has_reasoning": false,
+      "finish_reason": "stop",
+      "returned_model": "upstage/solar-mini4:free",
+      "latency_sec": 2.295,
+      "phase": "same_model_required_metadata_verification",
+      "max_tokens": 32,
+      "runtime_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "required_metadata_tags": [
+        "product=wrapper-nous",
+        "client=wrapper-nous",
+        "user=wrapper-nous"
+      ]
+    }
+  ],
+  "native_responses_empty_json_probes": [
+    {
+      "wrapper": "nvidia-python",
+      "path": "/v1/responses",
+      "http_status": 400,
+      "endpoint_classification": "native_validation",
+      "latency_sec": 0.381
+    },
+    {
+      "wrapper": "nous",
+      "path": "/v1/responses",
+      "http_status": 400,
+      "endpoint_classification": "native_validation",
+      "latency_sec": 0.303
+    },
+    {
+      "wrapper": "openrouter",
+      "path": "/responses",
+      "http_status": 400,
+      "endpoint_classification": "native_validation",
+      "latency_sec": 0.382
+    }
+  ],
+  "native_responses_probe_limit": "Each probe sent empty JSON with the configured credential directly to the selected provider. HTTP 400 validation confirms a routed endpoint, without issuing an inference. It does not prove all models or every Responses feature are supported.",
+  "nous_required_metadata_policy": {
+    "default_tags": [
+      "product=wrapper-nous",
+      "client=wrapper-nous",
+      "user=wrapper-nous"
+    ],
+    "when_added": "Only when the client omits the tags field. Explicit values, including empty or invalid values, remain unchanged.",
+    "operator_override": "NOUS_REQUEST_TAGS comma-separated list",
+    "purpose": "Mandatory provider attribution; no change to model identity, input content or protocol.",
+    "primary_reference": "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/agent/portal_tags.py"
+  },
+  "successful_exact_model_verifications": [
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "max_tokens": 256
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "max_tokens": 32,
+      "provider_tags_required": true
+    },
+    {
+      "wrapper": "openrouter",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "max_tokens": 32
+    }
+  ],
+  "limitations": [
+    "Client/agent compatibility is verified against particular API and SDK contracts; universal future-client compatibility is not proven.",
+    "Catalog availability and readiness alone did not demonstrate inference: the Nous mandatory tags issue was exposed by the real inference smoke.",
+    "No alias or model fallback was used in these checks."
+  ]
+}

@@ -5,7 +5,7 @@
   "adapters": {
     "openai_chat": "nous.chat.v1",
     "anthropic_messages": "anthropic-to-nous-chat.v1",
-    "openai_responses": "responses-to-nous-chat.v1"
+    "openai_responses": "nous.responses.native.v1"
   },
   "policy": {
     "transparent": true,

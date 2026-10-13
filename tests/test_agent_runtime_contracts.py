@@ -172,7 +172,7 @@ def test_nous_retries_next_key_on_rate_limit_before_returning_error():
     old_post = wn.post_nous
     old_auth = wn._read_token_from_auth_path
 
-    async def fake_post(payload, token, stream=False, extra_headers=None, path="v1/chat/completions"):
+    async def fake_post(payload, token, stream=False, extra_headers=None, path="v1/chat/completions", context_state=None):
         calls.append(token)
         if token == "bad-token":
             return 429, {"error": {"message": "rate limited", "type": "rate_limit_error"}}
@@ -397,9 +397,13 @@ def test_nvidia_transient_unavailable_probe_does_not_block_explicit_model():
         nv._retired_models.discard("moonshotai/kimi-k2.6")
 
 
-def test_nvidia_kimi_clamps_max_tokens_to_build_nvidia_cap():
+def test_nvidia_output_cap_is_only_an_explicit_operator_override(monkeypatch):
     nv = _load_nvidia_main()
+    monkeypatch.delenv('MODEL_MAX_TOKENS_CAPS', raising=False)
     body = {"model": "moonshotai/kimi-k2.6", "max_tokens": 200000, "max_completion_tokens": 200000}
+    nv.clamp_max_tokens_for_model(body, "moonshotai/kimi-k2.6")
+    assert body['max_tokens'] == body['max_completion_tokens'] == 200000
+    monkeypatch.setenv('MODEL_MAX_TOKENS_CAPS', 'moonshotai/kimi-k2.6:16384')
     nv.clamp_max_tokens_for_model(body, "moonshotai/kimi-k2.6")
     assert body["max_tokens"] == 16384
     assert body["max_completion_tokens"] == 16384

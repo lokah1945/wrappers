@@ -40,6 +40,7 @@ _DEFAULT = LAYER_OPENAI
 _probe_cache: dict[str, tuple[float, str]] = {}
 _probe_lock = asyncio.Lock()
 _PROBE_TTL_SEC = float(os.environ.get('COMPATIBILITY_PROBE_TTL_SEC', '300'))
+_resolved_auto_layer = LAYER_OPENAI
 
 
 def compat_layer_raw() -> str:
@@ -53,6 +54,7 @@ def validate_compat_layer() -> str:
     Called from each wrapper's validate_config() so an invalid
     COMPATIBILITY_LAYER fails fast at startup instead of misbehaving silently.
     """
+    responses_upstream_mode()
     raw = compat_layer_raw()
     if not raw:
         return _DEFAULT
@@ -62,6 +64,47 @@ def validate_compat_layer() -> str:
             f"got {raw!r}. Set it explicitly or remove it (defaults to 1)."
         )
     return raw
+
+
+def responses_upstream_mode() -> str:
+    """Prefer native Responses; auto permits a confirmed unavailable route adapter."""
+    mode = (os.environ.get('RESPONSES_UPSTREAM_MODE') or 'auto').strip().lower()
+    if mode not in ('auto', 'native', 'chat'):
+        raise ValueError(
+            f"RESPONSES_UPSTREAM_MODE must be auto, native or chat, got {mode!r}. "
+            "Auto prefers native Responses and permits Chat only for an unsupported endpoint."
+        )
+    return mode
+
+
+def responses_use_native_upstream() -> bool:
+    """Native OpenAI Responses keeps its wire API; Anthropic remains cross-dialect."""
+    return responses_upstream_mode() in ('auto', 'native') and is_openai_upstream()
+
+
+def responses_chat_fallback_allowed(status: int, payload: Any = None) -> bool:
+    """Allow the owner's fallback only for a confirmed unsupported native route."""
+    if responses_upstream_mode() != 'auto' or not is_openai_upstream():
+        return False
+    if status in (405, 501):
+        return True
+    if status != 404:
+        return False
+    from common.model import classify_upstream_error
+    classification = classify_upstream_error(status, payload)
+    if classification.account_scoped:
+        return False
+    if getattr(classification.state, 'value', classification.state) == 'wrong_route':
+        return True
+    if isinstance(payload, dict):
+        error = payload.get('error') or {}
+        if isinstance(error, dict) and str(error.get('code', '')).lower() in (
+                'endpoint_not_found', 'route_not_found', 'path_not_allowed'):
+            return True
+        # FastAPI/Starlette's default missing-route envelope is unambiguous;
+        # a provider error named model_not_found must remain a model error.
+        return str(payload.get('detail', '')).strip().lower() == 'not found'
+    return isinstance(payload, str) and payload.strip().lower() in ('not found', '404 not found')
 
 
 def compat_layer() -> str:
@@ -75,15 +118,41 @@ def compat_layer() -> str:
 
 
 def is_openai_upstream() -> bool:
-    return compat_layer() == LAYER_OPENAI
+    layer = compat_layer()
+    return (_resolved_auto_layer if layer == LAYER_AUTO else layer) == LAYER_OPENAI
 
 
 def is_anthropic_upstream() -> bool:
-    return compat_layer() == LAYER_ANTHROPIC
+    layer = compat_layer()
+    return (_resolved_auto_layer if layer == LAYER_AUTO else layer) == LAYER_ANTHROPIC
 
 
 def is_auto_discovery() -> bool:
     return compat_layer() == LAYER_AUTO
+
+
+async def initialize_upstream_compatibility(base_url: str) -> str:
+    """Resolve auto mode before serving requests without changing configuration.
+
+    Probe with a separate credential-free session so provider key rotation,
+    OAuth files and inherited proxy authentication cannot enter discovery.
+    Explicit layer 1/2 never opens a probe session.
+    """
+    global _resolved_auto_layer
+    _resolved_auto_layer = LAYER_OPENAI
+    configured = validate_compat_layer()
+    if configured != LAYER_AUTO:
+        return configured
+    try:
+        import aiohttp
+        async with aiohttp.ClientSession(trust_env=False,
+                                         timeout=aiohttp.ClientTimeout(total=5)) as session:
+            layer = await probe_upstream_compatibility(session, base_url)
+        if layer in (LAYER_OPENAI, LAYER_ANTHROPIC):
+            _resolved_auto_layer = layer
+    except Exception as exc:
+        logger.warning('[compat] auto discovery unavailable (%s); using OpenAI', type(exc).__name__)
+    return _resolved_auto_layer
 
 
 async def probe_upstream_compatibility(session: Any, base_url: str) -> str:
@@ -118,10 +187,14 @@ async def probe_upstream_compatibility(session: Any, base_url: str) -> str:
 
 
 async def _probe(session: Any, base: str) -> str:
+    # Wrapper bases may already include /v1 (OpenRouter/OpenCode/BLACKBOX).
+    # Preserve an operator's path prefix without probing /v1/v1 endpoints.
+    base = base.rstrip('/')
+    api_base = base if base.endswith('/v1') else f'{base}/v1'
     # 1. model listing -> OpenAI
-    for models_path in ('/v1/models', '/models'):
+    for models_url in dict.fromkeys((f'{api_base}/models', f'{base}/models')):
         try:
-            async with session.get(f'{base}{models_path}', timeout=5) as resp:
+            async with session.get(models_url, timeout=5) as resp:
                 if resp.status == 200:
                     try:
                         body = await resp.json()
@@ -135,7 +208,7 @@ async def _probe(session: Any, base: str) -> str:
     # 2. Anthropic messages endpoint
     try:
         async with session.post(
-            f'{base}/v1/messages',
+            f'{api_base}/messages',
             json={'model': 'probe', 'max_tokens': 1,
                   'messages': [{'role': 'user', 'content': 'hi'}]},
             timeout=5,
@@ -148,7 +221,7 @@ async def _probe(session: Any, base: str) -> str:
     # 3. OpenAI chat completions endpoint
     try:
         async with session.post(
-            f'{base}/v1/chat/completions',
+            f'{api_base}/chat/completions',
             json={'model': 'probe',
                   'messages': [{'role': 'user', 'content': 'hi'}]},
             timeout=5,
@@ -197,22 +270,41 @@ async def _chunks_with_heartbeat(src, hb_interval: float):
     """
     from common.sse import IDLE, iter_chunks_with_idle
     last = time.time()
-    async for raw in iter_chunks_with_idle(src, hb_interval):
-        if raw is IDLE:
-            now = time.time()
-            if now - last >= hb_interval:
-                yield b': heartbeat\n\n'
-                last = now
-            continue
-        last = time.time()
-        yield raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode()
+    # Comments are safe only between complete SSE events. A chunk may stop in
+    # a data line, after one newline, or halfway through a CRLF delimiter.
+    # Inserting a heartbeat there can alter the next event's type/data.
+    at_event_boundary = True
+    framing_tail = b''
+    chunks = iter_chunks_with_idle(src, hb_interval)
+    try:
+        async for raw in chunks:
+            if raw is IDLE:
+                now = time.time()
+                if at_event_boundary and now - last >= hb_interval:
+                    yield b': heartbeat\n\n'
+                    last = now
+                continue
+            last = time.time()
+            chunk = raw if isinstance(raw, (bytes, bytearray)) else str(raw).encode()
+            if chunk:
+                framing_tail = (framing_tail + bytes(chunk))[-4:]
+                at_event_boundary = framing_tail.endswith((b'\n\n', b'\r\n\r\n'))
+            yield chunk
+    finally:
+        from common.sse import close_stream
+        await close_stream(chunks)
 
 
 async def passthrough_anthropic_sse(src, hb_interval: float):
     """Forward Anthropic Messages SSE verbatim (no [DONE] appended) with
     heartbeats — used by the layer-2 `/v1/messages` surface."""
-    async for chunk in _chunks_with_heartbeat(src, hb_interval):
-        yield chunk
+    chunks = _chunks_with_heartbeat(src, hb_interval)
+    try:
+        async for chunk in chunks:
+            yield chunk
+    finally:
+        from common.sse import close_stream
+        await close_stream(chunks)
 
 
 async def translate_anthropic_stream_to_openai_chat(src, model: str, hb_interval: float):
@@ -220,9 +312,17 @@ async def translate_anthropic_stream_to_openai_chat(src, model: str, hb_interval
     frames — used by the layer-2 `/v1/chat/completions` and `/v1/responses`
     surfaces. Comments/heartbeats pass through harmlessly."""
     from common.translations.shared import stream_anthropic_to_openai
-    async for frame in stream_anthropic_to_openai(
-            _chunks_with_heartbeat(src, hb_interval), model):
-        yield frame
+    chunks = _chunks_with_heartbeat(src, hb_interval)
+    frames = stream_anthropic_to_openai(chunks, model)
+    try:
+        async for frame in frames:
+            yield frame
+    finally:
+        from common.sse import close_stream
+        try:
+            await close_stream(frames)
+        finally:
+            await close_stream(chunks)
 
 
 async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
@@ -336,17 +436,15 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
                     continue
                 fn = tc.get('function') or {}
                 acc = _get_tool_acc(tc)
+                if isinstance(fn.get('name'), str) and fn['name']:
+                    acc['name'] += fn['name']
                 if not acc['added']:
                     acc['added'] = True
                     yield _sse('response.output_item.added', {
                         'output_index': acc['output_index'],
                         'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
                                  'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''}})
-                if isinstance(fn.get('name'), str) and fn['name']:
-                    acc['name'] += fn['name']
-                    yield _sse('response.function_call_arguments.delta', {
-                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                        'delta': fn['name'], 'name': acc['name']})
+                # Function names are item metadata, never JSON argument deltas.
                 if isinstance(fn.get('arguments'), str) and fn['arguments']:
                     acc['args'] += fn['arguments']
                     yield _sse('response.function_call_arguments.delta', {
@@ -364,7 +462,11 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
                 async for out in _process_frame(str(frame)):
                     yield out
     finally:
-        pass  # upstream cleanup owned by caller
+        # The caller owns release in its generator's finally; explicitly
+        # close that generator when clients stop at response.completed.
+        close = getattr(chat_sse_gen, 'aclose', None)
+        if close is not None:
+            await close()
 
     if reasoning_started:
         yield _sse('response.reasoning_text.done', {

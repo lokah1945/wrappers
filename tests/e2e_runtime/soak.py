@@ -9,7 +9,7 @@ duration, and asserts:
   * no tracebacks in the server log
   * p95 latency does not degrade between the first and last quarter
 
-Usage: python tests/e2e_runtime/soak.py --wrapper blackbox --seconds 45 --concurrency 8
+Usage: python tests/e2e_runtime/soak.py --wrapper openrouter --seconds 45 --concurrency 8
 """
 
 from __future__ import annotations
@@ -26,7 +26,8 @@ from pathlib import Path
 import aiohttp
 
 ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / 'tests' / 'runtime'))
+sys.path.insert(0, str(ROOT / 'tests' / 'e2e_runtime'))
+from process_isolation import assert_ports_free
 from run_runtime_e2e import (  # noqa: E402
     BASE_FOR, MOCK_PORT, TOKEN, WRAPPERS, free_port_wait, health_wait,
     scan_log, start_wrapper,
@@ -198,6 +199,15 @@ def main():
     ap.add_argument('--seconds', type=int, default=30)
     ap.add_argument('--concurrency', type=int, default=8)
     args = ap.parse_args()
+    if args.wrapper:
+        from common.wrapper_scope import require_production, WrapperScopeError
+        try:
+            targets = [require_production(args.wrapper, ROOT)]
+        except WrapperScopeError as exc:
+            ap.error(str(exc))
+    else:
+        targets = list(WRAPPERS)
+    assert_ports_free(MOCK_PORT, *(WRAPPERS[name][1] for name in targets))
 
     mock = subprocess.Popen(
         [sys.executable, str(ROOT / 'tests/e2e_runtime/mock_upstream.py'), str(MOCK_PORT)],
@@ -208,7 +218,6 @@ def main():
         return 2
     rc = 0
     try:
-        targets = [args.wrapper] if args.wrapper else list(WRAPPERS)
         for w in targets:
             rc |= asyncio.run(run(w, args.seconds, args.concurrency))
     finally:

@@ -1,0 +1,99 @@
+{
+  "recorded_at_utc": "2026-10-07T15:40:45.572783+00:00",
+  "wrapper": "nous",
+  "execution": "Latest source staged with private state and first configured static key only; native passthrough mode; production service and state unchanged.",
+  "private_oauth_clone": true,
+  "calls": 3,
+  "checks": [
+    {
+      "case": "native_responses_minimal",
+      "path": "/v1/responses",
+      "model": "upstage/solar-mini4:free",
+      "request_fields": [
+        "model",
+        "input",
+        "max_output_tokens",
+        "tags"
+      ],
+      "credential_selection": "first configured static API key only; OAuth clone has no usable token",
+      "status": 400,
+      "response_fields": [
+        "status",
+        "message"
+      ],
+      "response_object": null,
+      "response_status": 400,
+      "sanitized_error": "{'status': 400, 'message': 'This request is not valid. Check the model name and other parameters. Additional info: missing tags'}",
+      "latency_sec": 0.968
+    },
+    {
+      "case": "native_chat_baseline",
+      "path": "/v1/chat/completions",
+      "model": "upstage/solar-mini4:free",
+      "request_fields": [
+        "model",
+        "messages",
+        "max_tokens",
+        "tags"
+      ],
+      "credential_selection": "first configured static API key only; OAuth clone has no usable token",
+      "status": 200,
+      "response_fields": [
+        "id",
+        "object",
+        "created",
+        "model",
+        "system_fingerprint",
+        "service_tier",
+        "choices",
+        "usage"
+      ],
+      "response_object": "chat.completion",
+      "response_status": null,
+      "visible_text_length": 3,
+      "finish_reasons": [
+        "stop"
+      ],
+      "latency_sec": 1.956
+    },
+    {
+      "case": "native_responses_free_alternate",
+      "path": "/v1/responses",
+      "model": "poolside/laguna-xs-2.1:free",
+      "request_fields": [
+        "model",
+        "input",
+        "max_output_tokens",
+        "tags"
+      ],
+      "credential_selection": "first configured static API key only; OAuth clone has no usable token",
+      "status": 200,
+      "response_fields": [
+        "id",
+        "object",
+        "created_at",
+        "status",
+        "incomplete_details",
+        "error",
+        "model",
+        "output",
+        "usage"
+      ],
+      "response_object": "response",
+      "response_status": "incomplete",
+      "output_types": [
+        "reasoning"
+      ],
+      "visible_text_length": 0,
+      "latency_sec": 0.981
+    }
+  ],
+  "source_sha256": {
+    "nous/src/main.py": "8d5366a6c630668396f9d77b1aa1bf3ff38e5caa35cde2158dd5d5d8937735af"
+  },
+  "official_sources": [
+    "https://portal.nousresearch.com/api/openapi",
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/agent/portal_tags.py",
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/main/hermes_cli/proxy/adapters/nous_portal.py"
+  ]
+}

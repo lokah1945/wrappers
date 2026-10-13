@@ -1,0 +1,71 @@
+{
+  "completed_at_utc": "2026-10-07T15:10:09.239004+00:00",
+  "upstream": "openrouter",
+  "exact_model": "liquid/lfm-2.5-2.6b:free",
+  "scope": "Live OpenRouter service on9106 after controlled rollout; actual CLI clients with bounded prompts and small-model budgets; no persistent client config changes.",
+  "versions": {
+    "claude": "2.1.202",
+    "codex": "0.160.1",
+    "opencode": "1.17.20"
+  },
+  "source_combined_sha256": "fdd670ff0e99eacd768b0555b33ce09fcda8b00ee5884de00c6d8c1c8b1cb09d",
+  "source_sha256": {
+    "openrouter/src/main.py": "77a4428fbf74a0ff268ecb82dc285c5238fb5ba9e4e4a930223b153441aa2d14",
+    "common/compat.py": "effd430618e1f273503fea58487913431cb79ba80dab35f89cf6b925fde5601e",
+    "common/body_guard.py": "804a4229cf7bacf73bf89f0b48d1482180a9e85e140f3d8a5ce3032f5942097f"
+  },
+  "checks": [
+    {
+      "client": "claude",
+      "exit_code": 0,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 2.429
+    },
+    {
+      "client": "codex",
+      "exit_code": 0,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 3.024
+    },
+    {
+      "client": "opencode",
+      "exit_code": 0,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text"
+      ],
+      "latency_sec": 10.639
+    }
+  ],
+  "passed": 3,
+  "failed": 0
+}

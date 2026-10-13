@@ -1,0 +1,61 @@
+{
+  "started_at_utc": "2026-10-11T03:51:29.891132+00:00",
+  "execution": "one read-tool task per selected client and backend on live endpoints; no model substitution",
+  "limits": "Claude/OpenCode output budget 1024. Codex context 8192 with minimal instructions; its CLI does not guarantee a request output cap. Process timeout bounds each task.",
+  "fixture": "Fresh random nonsecret nonce in a temporary read-only file; absent from prompts and reports",
+  "source_fingerprints": {
+    "files": {
+      "wrappers.json": "2e9bbfd58bad239a3e87650ca61f8466f1868d9e13262234f2905c99c51520eb",
+      "common/compat.py": "635fff2088b66ac13042a035b38b20c75930134762309a795fd9a5542a9ee2ef",
+      "common/body_guard.py": "44909029175cf66a0a7503f683cb8e6dab8ef8b7c7b4248370139177862185bd",
+      "nvidia-python/src/main.py": "218836a75b6321d0424163e0a08b412259ef15f27210bd2329026c6f40a49178"
+    },
+    "combined_sha256": "d7f307862068b78d2fb4823cf1a2cde88669f56619c9266f2e10f1960160f165",
+    "meaning": "working-tree files at qualification time; service deployment requires a separate rollout record"
+  },
+  "helper_sha256": "42b3e5652dc5b1ed8bc04e7726dffd5edd235e8fbdbe86c58174f195380c55c6",
+  "client_versions": {
+    "opencode": {
+      "available": true,
+      "version": "1.17.20"
+    }
+  },
+  "checks": [
+    {
+      "kind": "agent_read_tool",
+      "client": "opencode",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "exit_code": 0,
+      "timed_out": false,
+      "terminal_event_observed": true,
+      "client_error_observed": false,
+      "has_visible_answer": true,
+      "answer_nonce_matches": true,
+      "answer_exact": true,
+      "visible_characters": 62,
+      "successful_read_tool_events": 1,
+      "tool_execution_observed": true,
+      "forbidden_tool_events": 0,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text",
+        "tool_use"
+      ],
+      "unknown_event_type_count": 0,
+      "latency_sec": 8.375,
+      "passed": true,
+      "fixture_unchanged": true,
+      "wrapper": "nvidia-python"
+    }
+  ],
+  "references": [
+    "https://learn.chatgpt.com/docs/cli/reference",
+    "https://learn.chatgpt.com/docs/agent-approvals-security",
+    "https://opencode.ai/docs/permissions/",
+    "https://code.claude.com/docs/en/permissions"
+  ],
+  "completed_at_utc": "2026-10-11T03:51:39.713916+00:00",
+  "passed": 1,
+  "failed": 0
+}

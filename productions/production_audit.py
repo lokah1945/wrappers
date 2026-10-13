@@ -16,9 +16,16 @@ import shutil
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from common.wrapper_scope import (
+    WrapperScopeError, frozen_wrappers, load_wrappers, production_wrappers, select_wrappers,
+)
 
 REDACT = re.compile(r"(?i)(bearer\s+|(?:nvapi|sk|ghp|github_pat)-)[A-Za-z0-9_\-.]+")
 FORBIDDEN_RUNTIME_MARKERS = (
@@ -28,6 +35,62 @@ FORBIDDEN_RUNTIME_MARKERS = (
     "select_fallback_model",
     "select_alternative_model",
 )
+
+
+def service_targets(repo: Path | None = None) -> dict[str, int]:
+    entries = load_wrappers(repo)
+    return {name: entries[name]["port"] for name in production_wrappers(repo)}
+
+
+def reject_frozen_service_url(url: str | None, repo: Path | None = None) -> None:
+    if not url:
+        return
+    target = urlparse(url)
+    if target.hostname not in ("127.0.0.1", "localhost", "::1"):
+        return
+    entries = load_wrappers(repo)
+    for name, config in entries.items():
+        if config["status"] != "production" and target.port == config.get("port"):
+            raise WrapperScopeError(f"{name}: pending wrapper is frozen; direct endpoint selection is excluded")
+
+
+# Public default contract retained for tests and callers; main reloads metadata
+# from --repo-dir so status changes cannot be bypassed by an imported snapshot.
+SERVICE_TARGETS = service_targets()
+
+
+def canonical_wrapper(name: str) -> str:
+    return "nvidia-python" if name == "nvidia" else name
+
+
+def isolated_test_environment(state: Path) -> dict[str, str]:
+    env = {key: value for key, value in os.environ.items()
+           if key in {"PATH", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "VIRTUAL_ENV"}}
+    env.update({
+        "WRAPPER_SKIP_DOTENV": "true", "PYTHONDONTWRITEBYTECODE": "1",
+        "VERIFY_ON_BOOT": "false", "BEARER_TOKEN": "", "FREE_ONLY": "no",
+        "VERIFY_PERIODIC_ENABLED": "false",
+        "AUTH_PATH": str(state / "missing-auth.json"),
+        "MODEL_REGISTRY_URL": "", "MODEL_REGISTRY_ADMIN_TOKEN": "",
+        "MODEL_REGISTRY_STRICT": "false",
+        "MODEL_STATE_DB": str(state / "model-state.db"),
+        "MODEL_REGISTRY_DB": str(state / "registry.db"),
+        "METRICS_DB": str(state / "metrics.db"),
+        "METRICS_SNAPSHOT_FILE": str(state / "metrics-snapshot.json"),
+        "CATALOG_DB": str(state / "missing-catalog.db"),
+        "LOG_FILE": str(state / "test.log"), "EVENTS_FILE": str(state / "events.jsonl"),
+        "ALERT_OUTPUT": str(state / "alert-history.jsonl"),
+        "LOKI_PUSH_URL": "http://127.0.0.1:0/disabled-loki",
+        "NGC_CONTEXT_CACHE_FILE": str(state / "ngc-context.json"),
+        "NGC_FEATURED_MODELS_URL": "http://127.0.0.1:0/disabled-ngc",
+        "NVIDIA_BUILD_CONTEXT_ENABLED": "false",
+    })
+    return env
+
+
+def readiness_ok(status: int, body: dict | None) -> bool:
+    # Several wrappers deliberately return HTTP 200 with ready=false.
+    return 200 <= status < 300 and isinstance(body, dict) and body.get("ready") is True
 
 
 class Audit:
@@ -50,18 +113,9 @@ class Audit:
             self.blocked += 1
 
     def command(self, cmd: list[str], timeout: int = 120, isolated: bool = False) -> tuple[int, str]:
-        env = {**os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
-        if isolated:
-            # Production credentials and registry configuration must never leak
-            # into unit/contract tests. Fixtures own their fake credentials.
-            for key in list(env):
-                if key.startswith(("NVIDIA_API_KEY", "NOUS_API_KEY", "OPENCODE_API_KEY", "BLACKBOX_API_KEY")):
-                    env.pop(key, None)
-            for key in ("AUTH_PATH", "BEARER_TOKEN", "MODEL_REGISTRY_URL", "MODEL_REGISTRY_ADMIN_TOKEN", "MODEL_STATE_DB"):
-                env.pop(key, None)
-            # H-03: prevent wrapper source from reloading .env at import time so
-            # production keys cannot re-enter an isolated test process.
-            env["WRAPPER_SKIP_DOTENV"] = "true"
+        state = tempfile.TemporaryDirectory(prefix="wrapper-audit-tests-") if isolated else None
+        env = isolated_test_environment(Path(state.name)) if state else {
+            **os.environ, "PYTHONDONTWRITEBYTECODE": "1"}
         try:
             proc = subprocess.run(
                 cmd,
@@ -77,6 +131,9 @@ class Audit:
             return 127, f"command not found: {cmd[0]}"
         except subprocess.TimeoutExpired:
             return 124, "command timed out"
+        finally:
+            if state:
+                state.cleanup()
 
     def http(self, url: str, method: str = "GET", payload: dict | None = None,
              api_key: str | None = None, timeout: int = 10) -> tuple[int, float, dict | None, str]:
@@ -116,17 +173,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--surface", action="append", choices=["chat", "responses", "messages"],
                         help="Surface to smoke (repeatable): chat=/v1/chat/completions, responses=/v1/responses, messages=/v1/messages")
     parser.add_argument("--run-tests", action="store_true")
+    parser.add_argument("--report-dir", type=Path, default=None, help="Report output directory")
     parser.add_argument("--run-smoke", action="store_true")
     parser.add_argument("--smoke-all", action="store_true",
-                        help="Smoke every required wrapper with a known-good exact model (M-01)")
+                        help="Smoke every required inference wrapper with the explicit --model")
     parser.add_argument("--run-load", action="store_true")
     parser.add_argument("--requests", type=int, default=50)
     parser.add_argument("--concurrency", type=int, default=5)
-    parser.add_argument("--required-wrapper", action="append",
-                        default=["model-registry", "nvidia", "nous", "opencode", "blackbox"],
-                        help="Wrapper name required to be ready; repeatable (default: all 5)")
+    parser.add_argument("--required-wrapper", action="append", type=canonical_wrapper,
+                        default=None,
+                        help="Production wrapper required to be ready; repeatable (default: enabled services and registry). Pending selections are rejected.")
     parser.add_argument("--require-registry", action="store_true")
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        args.required_wrapper = list(select_wrappers(args.required_wrapper, args.repo_dir))
+        reject_frozen_service_url(args.wrapper_url, args.repo_dir)
+        reject_frozen_service_url(args.registry_url, args.repo_dir)
+    except WrapperScopeError as exc:
+        parser.error(str(exc))
+    if args.requests < 1 or args.concurrency < 1:
+        parser.error("--requests and --concurrency must be positive")
+    if args.smoke_all and not (args.run_smoke or args.run_load):
+        parser.error("--smoke-all requires --run-smoke or --run-load")
+    return args
 
 
 def error_summary(body: dict | None) -> str:
@@ -142,7 +211,9 @@ def error_summary(body: dict | None) -> str:
 
 def _run_load(audit, repo, base_url, model, api_key, requests, concurrency) -> None:
     """Bounded load test against one wrapper; records p50/p95/p99/TTFT to report."""
-    env = {**os.environ, "API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"}
+    env = {key: value for key, value in os.environ.items()
+           if key in {"PATH", "LANG", "LC_ALL", "LD_LIBRARY_PATH", "VIRTUAL_ENV"}}
+    env.update({"API_KEY": api_key, "PYTHONDONTWRITEBYTECODE": "1"})
     cmd = [
         sys.executable, "tests/perf/load_agent_sim.py",
         "--base-url", base_url,
@@ -166,18 +237,20 @@ def _run_load(audit, repo, base_url, model, api_key, requests, concurrency) -> N
         if cm:
             cls = cm.group(1)
         # SLA thresholds (M-04 / agent finding #4)
-        MAX_ERROR_RATE = 0.0  # load is PASS only if zero errors
-        if total and err_count == 0:
+        # Publish metrics only, never the simulator's sample response body.
+        metrics = "\n".join(line for line in out.splitlines()
+                            if line.startswith(("ok=", "latency_ms ", "ttft_ms ")))
+        if proc.returncode == 0 and total == requests and ok_count == total and err_count == 0:
             level = "PASS"
-            detail = out[-6000:]
+            detail = metrics
         elif cls == "external_outage":
             # upstream 503/502 majority => external, not wrapper defect
             level = "BLOCKED"
-            detail = f"external provider outage ({err_count}/{total} errored): {out[-4000:]}"
+            detail = f"external provider outage ({err_count}/{total} errored): {metrics}"
         else:
             # provider/runtime reliability error => real FAIL
             level = "FAIL"
-            detail = f"load reliability error ({err_count}/{total}): {out[-4000:]}"
+            detail = f"load reliability error ({err_count}/{total}), exit={proc.returncode}: {metrics}"
         audit.log(level, f"bounded load [{base_url} {model}]", detail)
     except subprocess.TimeoutExpired:
         audit.log("FAIL", f"bounded load [{base_url} {model}]", "timed out")
@@ -188,6 +261,14 @@ def main() -> int:
     repo = (args.repo_dir or Path(__file__).resolve().parents[1]).resolve()
     audit = Audit(repo)
     timestamp = dt.datetime.now().astimezone().isoformat()
+    try:
+        targets_by_service = service_targets(repo)
+        args.required_wrapper = list(select_wrappers(args.required_wrapper, repo))
+        reject_frozen_service_url(args.wrapper_url, repo)
+        reject_frozen_service_url(args.registry_url, repo)
+    except WrapperScopeError as exc:
+        print(f"[audit][ERROR] {exc}", file=sys.stderr)
+        return 2
 
     audit.lines.extend([
         "# Production audit report",
@@ -198,48 +279,22 @@ def main() -> int:
         "",
         "## Results",
     ])
+    for name in frozen_wrappers(repo):
+        audit.log("PENDING", f"provider {name}",
+                  "frozen by wrappers.json; implementation, configuration, service, logs and endpoints excluded")
 
     if not (repo / "wrappers.json").is_file():
         audit.log("FAIL", "repository layout", "wrappers.json is missing")
     else:
         audit.log("PASS", "repository layout", "wrappers.json present")
 
-    # H-04: compare runtime against the per-service deployed commit marker,
-    # not HEAD. systemd ExecStartPre writes <repo>/runtime/<svc>.commit at start
-    # time, so each process is tracked independently (no global race).
-    svc_map = {
-        "model-registry": "model-registry",
-        "nvidia": "nvidia-python",
-        "nous": "nous",
-        "opencode": "opencode",
-        "blackbox": "blackbox",
-    }
-    for name, port in [("model-registry", 9200), ("nvidia", 9101), ("nous", 9102), ("opencode", 9103), ("blackbox", 9104)]:
-        if name not in args.required_wrapper and name != "model-registry":
-            continue
-        svc = svc_map[name]
-        marker = repo / "runtime" / f"{svc}.commit"
-        repo_commit = marker.read_text().strip() if marker.is_file() else ""
-        if not repo_commit:
-            rc, out = audit.command(["git", "rev-parse", "HEAD"])
-            repo_commit = out.strip()
-        # runtime commit from health endpoint
-        rc, out = audit.command(
-            ["curl", "-sS", "-m", "5", f"http://127.0.0.1:{port}/health"]
-        )
-        runtime_commit = ""
-        if rc == 0 and out.strip():
-            try:
-                import json as _json
-                runtime_commit = _json.loads(out).get("git_commit", "")
-            except Exception:
-                runtime_commit = ""
-        if runtime_commit and repo_commit and runtime_commit[:12] != repo_commit[:12]:
-            audit.log("FAIL", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
-        elif not runtime_commit and name in args.required_wrapper:
-            audit.log("BLOCKED", f"runtime commit {name}", "health response has no git_commit/build identity")
-        else:
-            audit.log("PASS", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
+    rc, out = audit.command(["git", "rev-parse", "HEAD"])
+    checkout_commit = out.strip() if rc == 0 else ""
+    audit.log("PASS" if checkout_commit else "BLOCKED", "checkout commit", checkout_commit or "unknown")
+    expected_commits = {}
+    for name in targets_by_service:
+        marker = repo / "runtime" / f"{name}.commit"
+        expected_commits[name] = marker.read_text().strip() if marker.is_file() else checkout_commit
     rc, branch = audit.command(["git", "branch", "--show-current"])
     audit.log("PASS" if rc == 0 and branch.strip() else "BLOCKED", "git branch", branch.strip() or "unknown")
     rc, origin = audit.command(["git", "remote", "get-url", "origin"])
@@ -256,12 +311,12 @@ def main() -> int:
     audit.log("PASS" if install.is_file() and os.access(install, os.X_OK) else "FAIL",
               "installer executable", str(install))
 
-    for directory in ("common", "model-registry", "nvidia-python", "nous", "opencode", "blackbox"):
+    for directory in ("common", *targets_by_service):
         path = repo / directory
         audit.log("PASS" if path.is_dir() else "FAIL", f"directory {directory}", str(path))
 
     runtime_files = []
-    for directory in ("common", "model-registry", "nvidia-python", "nous", "opencode", "blackbox"):
+    for directory in ("common", *targets_by_service):
         runtime_files.extend((repo / directory).rglob("*.py"))
     forbidden = []
     for path in runtime_files:
@@ -274,176 +329,103 @@ def main() -> int:
                 forbidden.append(f"{path.relative_to(repo)}:{marker}")
     audit.log("PASS" if not forbidden else "FAIL", "no model substitution markers", "; ".join(forbidden) or "none")
 
-    config_names = [
-        "nvidia-python/.env", "nous/.env", "opencode/.env", "blackbox/.env", "model-registry/.env"
-    ]
+    config_names = [f"{name}/.env" for name in targets_by_service]
     for name in config_names:
         path = repo / name
         audit.log("PASS" if path.is_file() else "BLOCKED", f"config presence {name}", "present" if path.is_file() else "missing")
 
     unit_states = {}
     if shutil.which("systemctl"):
-        units = [
-            "wrapper-model-registry.service",
-            "wrapper-nvidia-python.service",
-            "wrapper-nous.service",
-            "wrapper-opencode.service",
-            "wrapper-blackbox.service",
-        ]
+        units = [f"wrapper-{name}.service" for name in targets_by_service]
         for unit in units:
             rc, out = audit.command(["systemctl", "--user", "is-active", unit], timeout=15)
             state = out.strip() or "inactive"
             unit_states[unit.removesuffix(".service").removeprefix("wrapper-")] = state
-            required = unit.removesuffix(".service").removeprefix("wrapper-") in args.required_wrapper
+            service = unit.removesuffix(".service").removeprefix("wrapper-")
+            required = service in args.required_wrapper or (service == "model-registry" and args.require_registry)
             level = "PASS" if rc == 0 and state == "active" else ("FAIL" if required else "BLOCKED")
             audit.log(level, f"systemd {unit}", state)
     else:
         audit.log("FAIL" if args.required_wrapper or args.require_registry else "BLOCKED", "systemd availability", "systemctl is not available")
 
-    endpoints = {
-        "registry": f"{args.registry_url.rstrip('/')}/health",
-        "nvidia": "http://127.0.0.1:9101/health",
-        "nous": "http://127.0.0.1:9102/health",
-        "opencode": "http://127.0.0.1:9103/health",
-        "blackbox": "http://127.0.0.1:9104/health",
-    }
-    for name, url in endpoints.items():
-        status, ms, body, error = audit.http(url)
-        ok = 200 <= status < 300
-        detail = f"HTTP {status}, {ms:.1f} ms"
+    for name, port in targets_by_service.items():
+        base = args.registry_url.rstrip("/") if name == "model-registry" else f"http://127.0.0.1:{port}"
+        required = name in args.required_wrapper or (name == "model-registry" and args.require_registry)
+        status, ms, body, error = audit.http(f"{base}/health")
+        healthy = 200 <= status < 300 and isinstance(body, dict) and body.get("status") == "ok"
+        detail = f"HTTP {status}, {ms:.1f} ms, status={body.get('status', 'unknown') if body else 'unknown'}"
         if error:
             detail += f", {error}"
-        elif isinstance(body, dict):
-            detail += f", status={body.get('status', body.get('ok', 'unknown'))}"
-        required = name in args.required_wrapper or (name == "registry" and args.require_registry)
-        endpoint_level = "PASS" if ok else ("FAIL" if required else "BLOCKED")
-        audit.log(endpoint_level, f"endpoint {name}", detail)
-        unit_name = "model-registry" if name == "registry" else name
-        if ok and unit_name in unit_states and unit_states[unit_name] != "active":
+        audit.log("PASS" if healthy else ("FAIL" if required else "BLOCKED"), f"endpoint {name}", detail)
+        if healthy and unit_states.get(name) not in (None, "active"):
             audit.log("FAIL", f"orphan runtime {name}", "endpoint is healthy but its systemd unit is not active")
-        if isinstance(body, dict):
-            runtime_commit = body.get("git_commit") or body.get("commit")
-            if runtime_commit and repo_commit and runtime_commit != repo_commit:
-                audit.log("FAIL", f"runtime commit {name}", f"runtime={runtime_commit} repository={repo_commit}")
-            elif not runtime_commit and name in args.required_wrapper:
-                audit.log("BLOCKED", f"runtime commit {name}", "health response has no git_commit/build identity")
+        runtime_commit = body.get("git_commit") if isinstance(body, dict) else None
+        expected_commit = expected_commits[name]
+        if runtime_commit and expected_commit and runtime_commit != expected_commit:
+            audit.log("FAIL", f"runtime commit {name}", f"runtime={runtime_commit} deployed={expected_commit}")
+        elif runtime_commit and expected_commit:
+            audit.log("PASS", f"runtime commit {name}", f"runtime={runtime_commit} deployed={expected_commit}")
+        elif required:
+            audit.log("BLOCKED", f"runtime commit {name}", "health response or deployment marker has no build identity")
+        if runtime_commit and checkout_commit and runtime_commit != checkout_commit:
+            audit.log("BLOCKED", f"checkout revision {name}", "running service differs from checkout; review deployed revision before release")
+        if name != "model-registry":
+            api_key = os.environ.get(args.api_key_env) or None
+            ready_status, ready_ms, ready_body, ready_error = audit.http(f"{base}/ready", api_key=api_key)
+            ready = readiness_ok(ready_status, ready_body)
+            level = "PASS" if ready else ("FAIL" if required else "BLOCKED")
+            if ready_status in (401, 403) and not api_key:
+                level = "BLOCKED"
+            detail = f"HTTP {ready_status}, {ready_ms:.1f} ms, ready={ready}"
+            if ready_status in (401, 403):
+                detail += f", local bearer authentication required via --api-key-env {args.api_key_env}"
+            if ready_error:
+                detail += f", {ready_error}"
+            audit.log(level, f"readiness {name}", detail)
 
     if args.run_tests:
         rc, out = audit.command([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"], timeout=1800, isolated=True)
         audit.log("PASS" if rc == 0 else "FAIL", "repository tests", out)
-        rc, out = audit.command([sys.executable, "tests/run_transparency_check.py"], timeout=300)
+        rc, out = audit.command([sys.executable, "tests/run_transparency_check.py"], timeout=300, isolated=True)
         audit.log("PASS" if rc == 0 else "FAIL", "cross-wrapper transparency", out)
 
     if args.run_smoke or args.run_load:
-        if args.smoke_all:
-            # M-01: smoke every required wrapper with a known-good exact model.
-            smoke_targets = [
-                ("http://127.0.0.1:9101/v1", "nvidia/llama-3.3-nemotron-super-49b-v1", ["chat", "responses"]),
-                ("http://127.0.0.1:9102/v1", "poolside/laguna-s-2.1:free", ["chat", "messages"]),
-                ("http://127.0.0.1:9103/v1", "deepseek-v4-flash-free", ["chat", "messages"]),
-                ("http://127.0.0.1:9104/v1", "blackboxai/nvidia/nemotron-nano-12b-v2-vl", ["chat", "messages"]),
-            ]
-            api_key = os.environ.get(args.api_key_env, "")
-            if not api_key:
-                audit.log("BLOCKED", "explicit model test", "--api-key-env missing or empty")
-            for url, model, surfaces in smoke_targets:
-                for surface in surfaces:
-                    if args.run_smoke:
+        api_key = os.environ.get(args.api_key_env, "")
+        if not args.model:
+            audit.log("BLOCKED", "explicit model test", "--model is required; no default model will be selected")
+        elif not api_key:
+            audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")
+        elif not args.smoke_all and not args.wrapper_url:
+            audit.log("BLOCKED", "explicit model test", "--wrapper-url is required")
+        else:
+            targets = ([f"http://127.0.0.1:{targets_by_service[name]}/v1"
+                        for name in args.required_wrapper if name != "model-registry"]
+                       if args.smoke_all else [args.wrapper_url])
+            if not targets:
+                audit.log("BLOCKED", "explicit model test", "no inference wrapper selected")
+            for base in targets:
+                if args.run_smoke:
+                    for surface in args.surface or ["chat"]:
                         if surface == "chat":
-                            path, payload = "/chat/completions", {"model": model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
+                            path, payload = "/chat/completions", {"model": args.model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
                         elif surface == "responses":
-                            path, payload = "/responses", {"model": model, "input": "Reply exactly OK.", "max_output_tokens": 8}
-                        elif surface == "messages":
-                            path, payload = "/messages", {"model": model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
+                            path, payload = "/responses", {"model": args.model, "input": "Reply exactly OK.", "max_output_tokens": 8}
                         else:
-                            continue
-                        # Retry transient upstream errors (429/503) with backoff
-                        # — opencode.ai free tier is flaky but recovers quickly.
-                        last_status = 0
-                        status, ms, body, error = 0, 0.0, {}, None
-                        for attempt in range(3):
-                            status, ms, body, error = audit.http(
-                                f"{url.rstrip('/')}{path}",
-                                method="POST",
-                                payload=payload,
-                                api_key=api_key, timeout=180,
-                            )
-                            last_status = status
-                            if 200 <= status < 300:
-                                break
-                            if status in (429, 503):
-                                import time as _time
-                                _time.sleep(2 + attempt * 3)
-                                continue
-                            break
+                            path, payload = "/messages", {"model": args.model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
+                        status, ms, body, error = audit.http(
+                            f"{base.rstrip('/')}{path}", method="POST", payload=payload,
+                            api_key=api_key, timeout=180)
                         returned_model = body.get("model") if isinstance(body, dict) else None
-                        detail = (
-                            f"wrapper={url}, model={model}, surface={surface}, "
-                            f"api_key_env={args.api_key_env}, HTTP {last_status}, {ms:.1f} ms, "
-                            f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                        )
+                        ok = 200 <= status < 300 and isinstance(body, dict) and returned_model in (None, args.model)
+                        detail = (f"wrapper={base}, model={args.model}, surface={surface}, "
+                                  f"HTTP {status}, {ms:.1f} ms, returned_model={returned_model or 'not-present'}, "
+                                  f"{error_summary(body)}")
                         if error:
                             detail += f", transport_error={error}"
-                        # M-02: upstream 503 (service unavailable) is an external outage,
-                        # not a wrapper defect -- treat as BLOCKED (external) not FAIL.
-                        # opencode.ai "No capacity" and any 503 from the provider both mean
-                        # the upstream is currently down/overloaded; the wrapper routed
-                        # and authenticated correctly.
-                        external_down = (
-                            last_status == 503
-                            or (
-                                last_status in (502,)
-                                and isinstance(body, dict)
-                                and "no capacity" in str(body.get("error", {}).get("message", "")).lower()
-                            )
-                        )
-                        ok = 200 <= last_status < 300 and returned_model in (None, model)
-                        if external_down:
-                            audit.log("BLOCKED", f"exact-model smoke [{surface}]", detail + ", external_outage=opencode.ai")
-                        else:
-                            audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
-                    # Per-wrapper bounded load (uses THIS wrapper's url/model, not defaults)
-                    if args.run_load:
-                        _run_load(audit, repo, url, model, api_key, args.requests, args.concurrency)
-                    elif not args.wrapper_url or not args.model:
-                        audit.log("BLOCKED", "explicit model test", "--wrapper-url and --model are required")
-                    elif not args.api_key_env or not os.environ.get(args.api_key_env):
-                        audit.log("BLOCKED", "explicit model test", "--api-key-env is missing or empty")
-                    else:
-                        api_key = os.environ[args.api_key_env]
-                        surfaces = args.surface or ["chat"]
-                        for surface in surfaces:
-                            if surface == "chat":
-                                path, payload = "/chat/completions", {"model": args.model, "messages": [{"role": "user", "content": "Reply exactly OK."}], "max_tokens": 8, "stream": False}
-                            elif surface == "responses":
-                                path, payload = "/responses", {"model": args.model, "input": "Reply exactly OK.", "max_output_tokens": 8}
-                            elif surface == "messages":
-                                path, payload = "/messages", {"model": args.model, "max_tokens": 8, "messages": [{"role": "user", "content": "Reply exactly OK."}]}
-                            else:
-                                audit.log("BLOCKED", "explicit model test", f"unknown surface: {surface}")
-                                continue
-                            if args.run_smoke:
-                                status, ms, body, error = audit.http(
-                                    f"{args.wrapper_url.rstrip('/')}{path}",
-                                    method="POST",
-                                    payload=payload,
-                                    api_key=api_key,
-                                    timeout=180,
-                                )
-                                returned_model = body.get("model") if isinstance(body, dict) else None
-                                identity_ok = returned_model in (None, args.model)
-                                ok = 200 <= status < 300 and identity_ok
-                                detail = (
-                                    f"wrapper_url={args.wrapper_url}, model={args.model}, surface={surface}, "
-                                    f"api_key_env={args.api_key_env}, HTTP {status}, {ms:.1f} ms, "
-                                    f"returned_model={returned_model or 'not-present'}, {error_summary(body)}"
-                                )
-                                if error:
-                                    detail += f", transport_error={error}"
-                                audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
-                        if args.run_load:
-                            _run_load(audit, repo, args.wrapper_url, args.model, api_key,
-                                      args.requests, args.concurrency)
+                        audit.log("PASS" if ok else "FAIL", f"exact-model smoke [{surface}]", detail)
+                if args.run_load:
+                    _run_load(audit, repo, base, args.model, api_key,
+                              args.requests, args.concurrency)
 
     audit.lines.extend([
         "",
@@ -453,6 +435,7 @@ def main() -> int:
         f"- BLOCKED: `{audit.blocked}`",
         "",
         "## Interpretation",
+        "- PENDING providers are frozen and excluded from production judgment; they are never inspected or probed.",
         "- BLOCKED means the VPS did not provide the required service/configuration or an explicit test flag was not supplied.",
         "- FAIL means an available component violated an acceptance criterion.",
         "- A production-ready decision requires zero FAIL and no unreviewed BLOCKED result.",
@@ -460,7 +443,7 @@ def main() -> int:
         "- The report intentionally does not include secrets or response bodies.",
     ])
 
-    reports = repo / "productions" / "reports"
+    reports = args.report_dir or repo / "productions" / "reports"
     reports.mkdir(parents=True, exist_ok=True)
     filename = reports / f"production-audit-{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.md"
     filename.write_text("\n".join(audit.lines) + "\n")

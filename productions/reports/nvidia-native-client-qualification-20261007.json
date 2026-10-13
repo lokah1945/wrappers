@@ -1,0 +1,69 @@
+{
+  "completed_at_utc": "2026-10-07T15:40:45.818183+00:00",
+  "upstream": "nvidia-python",
+  "exact_model": "nvidia/nemotron-3-super-120b-a12b",
+  "scope": "latest source on isolated port19611, real CLI clients, tools disabled, no production restart/state access",
+  "versions": {
+    "claude": "2.1.202",
+    "codex": "0.160.1",
+    "opencode": "1.17.20"
+  },
+  "source_sha256": {
+    "nvidia-python/src/main.py": "0edb2b7f6063a51fba8dfec28b8fc21dfe86927a951ad41696b426cd8a4ab9d3",
+    "common/compat.py": "effd430618e1f273503fea58487913431cb79ba80dab35f89cf6b925fde5601e"
+  },
+  "checks": [
+    {
+      "client": "codex",
+      "exit_code": 0,
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "native_upstream_policy": "native (no Chat fallback)",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 3.552
+    },
+    {
+      "client": "claude",
+      "exit_code": 0,
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "native_upstream_policy": "native (no Chat fallback)",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 1.724
+    },
+    {
+      "client": "opencode",
+      "exit_code": 0,
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "native_upstream_policy": "native (no Chat fallback)",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text"
+      ],
+      "latency_sec": 8.623
+    }
+  ],
+  "passed": 3,
+  "failed": 0
+}

@@ -1,0 +1,91 @@
+{
+  "completed_at_utc": "2026-10-07T15:03:20.506599+00:00",
+  "scope": [
+    "nvidia-python",
+    "nous",
+    "openrouter",
+    "model-registry"
+  ],
+  "operation": "Fresh-install pip resolver dry-run with --ignore-installed for selected active service requirements; no global package or service changes.",
+  "pre_fix_failures": {
+    "nvidia-python": "ResolutionImpossible: fastapi==0.115.0 conflicts with verified fastapi==0.142.2",
+    "nous": "ResolutionImpossible: fastapi==0.115.0 conflicts with verified fastapi==0.142.2",
+    "openrouter": "ResolutionImpossible: sse-starlette>=2.2,<3 conflicts with verified sse-starlette==3.5.0"
+  },
+  "post_fix_fresh_resolution": {
+    "passed": true,
+    "package_count": 46,
+    "packages": {
+      "fastapi": "0.142.2",
+      "aiohttp": "3.14.4",
+      "aiosqlite": "0.22.1",
+      "python-dotenv": "1.2.4",
+      "httpx": "0.28.1",
+      "httpcore": "1.0.9",
+      "pydantic": "2.13.5",
+      "pydantic_core": "2.46.5",
+      "mcp": "1.30.0",
+      "sse-starlette": "3.5.0",
+      "watchdog": "6.0.0",
+      "aiohappyeyeballs": "2.7.1",
+      "aiosignal": "1.4.0",
+      "annotated-doc": "0.0.5",
+      "annotated-types": "0.8.0",
+      "anyio": "4.15.1",
+      "attrs": "26.1.0",
+      "click": "8.5.0",
+      "frozenlist": "1.8.0",
+      "h11": "0.16.0",
+      "httptools": "0.8.0",
+      "httpx-sse": "0.4.3",
+      "idna": "3.20",
+      "jsonschema": "4.26.0",
+      "multidict": "6.9.1",
+      "opentelemetry-api": "1.45.1",
+      "propcache": "0.5.4",
+      "pydantic-settings": "2.15.0",
+      "python-multipart": "0.0.32",
+      "PyYAML": "6.0.3",
+      "starlette": "1.7.0",
+      "typing_extensions": "4.16.0",
+      "typing-inspection": "0.4.4",
+      "uvicorn": "0.54.0",
+      "uvloop": "0.23.0",
+      "watchfiles": "1.3.0",
+      "websockets": "17.2",
+      "yarl": "1.25.1",
+      "certifi": "2026.7.22",
+      "cryptography": "50.0.2",
+      "jsonschema-specifications": "2025.9.1",
+      "referencing": "0.37.0",
+      "rpds-py": "2026.9.1",
+      "PyJWT": "2.15.1",
+      "cffi": "2.1.1",
+      "pycparser": "3.0"
+    },
+    "verified_constraint_mismatches": []
+  },
+  "isolated_environment_install": {
+    "path": "/tmp/wrapper-production-verify-20261007",
+    "added_packages": {
+      "watchdog": "6.0.0"
+    },
+    "core_packages_unchanged": true,
+    "pip_check_passed": true
+  },
+  "tests": {
+    "pinned_environment": "50 passed: installer transaction5 +scope18 +request guard/cleanup27",
+    "production_python": "32 passed: installer transaction5 +request guard/cleanup27",
+    "shell_syntax": "install.sh passed bash -n"
+  },
+  "source_sha256": {
+    "requirements-runtime.txt": "68a768db4cf3595f623f127305dfe6bbd22d6b2c9e050680df7b02c83af04d33",
+    "tests/constraints-verified.txt": "886186eec845e731c80f39d8e0cc0ab506a23e24c1a5fb1fa61514283823529c",
+    "install.sh": "98fc33cb56749eb4d9476f66c016f38c1ea9de799e0b7217800c0bba387a746c",
+    "nvidia-python/requirements.txt": "4124136a5ac0de3ed08ea4801a54c220435e0ad23a8035e3219a9f9b3a1804e1",
+    "nous/requirements.txt": "4124136a5ac0de3ed08ea4801a54c220435e0ad23a8035e3219a9f9b3a1804e1",
+    "openrouter/requirements.txt": "4124136a5ac0de3ed08ea4801a54c220435e0ad23a8035e3219a9f9b3a1804e1",
+    "model-registry/requirements.txt": "ff111be454a639448aad6d0da9e943fcc7b214231cf28e99360071632a2cf0a1"
+  },
+  "installer_behavior": "One selected-only, release-constrained pip transaction and pip check before environment/unit changes; --skip-deps bypass preserved."
+}

@@ -36,6 +36,7 @@ from dataclasses import dataclass, field
 # Add project root to path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import load_wrappers, production_wrappers
 
 # Try to import real SDKs, fall back to mock if not available
 try:
@@ -73,12 +74,10 @@ class WrapperConfig:
         return f"http://127.0.0.1:{self.port}"
 
 
-WRAPPERS = [
-    WrapperConfig("nvidia-python", "http://127.0.0.1:9101", 9101, "nvidia-nim"),
-    WrapperConfig("nous", "http://127.0.0.1:9102", 9102, "nous-research"),
-    WrapperConfig("opencode", "http://127.0.0.1:9103", 9103, "opencode-zen"),
-    WrapperConfig("blackbox", "http://127.0.0.1:9104", 9104, "blackbox-ai"),
-]
+_metadata = load_wrappers(ROOT)
+WRAPPERS = [WrapperConfig(name, f"http://127.0.0.1:{_metadata[name]['port']}",
+                          _metadata[name]["port"], _metadata[name]["upstream"])
+            for name in production_wrappers(ROOT, include_registry=False)]
 
 
 @dataclass

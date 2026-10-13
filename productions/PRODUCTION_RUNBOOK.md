@@ -6,6 +6,13 @@ Use this runbook after syncing the repository to the VPS. It validates the
 runtime, workflow, central model registry, exact-model transparency, key
 rotation behavior, and bounded performance without silently changing models.
 
+The current qualified production release is documented in
+[readiness 2026-10-11](PRODUCTION_READINESS_2026-10-11.md): eight controlled gates,
+954 unit tests on each Python environment, 27 live client checks, 31 rollout
+checks and 14 final active-service checks pass. Use [client setup](CLIENT_BACKEND_SETUP.md)
+for the tested model IDs and client versions. Other models and new client
+features require qualification separately.
+
 ## Important contract
 
 ```text
@@ -16,9 +23,15 @@ No test may use or enable model fallback.
 
 ## 0. Safety and preparation
 
+Lifecycle scope is mandatory: read root `AGENTS.md` and `wrappers.json`.
+BLACKBOX and the OpenCode provider are pending and frozen. Never read, analyze,
+edit, test, probe, stop, restart, install or deploy them. This runbook covers
+NVIDIA, Nous, OpenRouter and model-registry only. OpenCode clients may use these
+active backends.
+
 1. Work from the actual deployed repository directory.
 2. Confirm the current Git commit before and after deployment.
-3. Take a backup of wrapper `.env` files and all `*.db`/`*.db-wal` files using the
+3. Take a backup of eligible active-wrapper `.env`, `*.db` and `*.db-wal` files using the
    organization's approved secret-safe backup process.
 4. Do not print `.env` contents, API keys, OAuth tokens, Authorization headers,
    request bodies, or provider response bodies.
@@ -36,7 +49,7 @@ The agent should verify:
 
 - repository is clean or changes are explicitly documented;
 - expected branch and commit are deployed;
-- all wrapper directories exist;
+- active wrapper directories exist;
 - `model-registry/` exists;
 - `install.sh` is executable;
 - Python imports succeed;
@@ -53,8 +66,7 @@ Check presence, not values, of:
 ```text
 nvidia-python/.env
 nous/.env
-opencode/.env
-blackbox/.env
+openrouter/.env
 model-registry/.env
 ```
 
@@ -66,20 +78,34 @@ Required production concepts:
 - `MODEL_REGISTRY_ADMIN_TOKEN` is set on the central registry and all wrappers
   that publish to it;
 - `VERIFY_ON_BOOT` is explicitly configured;
+- `RESPONSES_UPSTREAM_MODE=auto` is the default production policy: native
+  first, with the owner-approved Chat adapter only for a confirmed unsupported
+  native route; never force `chat` while the native endpoint is supported;
 - `FREE_ONLY` is explicit, not accidental;
 - no deprecated `DEFAULT_MODEL`, `REASONING_MODEL`, or model fallback variable is
   used for inference routing.
 
 ## 3. Service and endpoint gate
 
+Current port allocation is the existing external catalog/MCP service 9100,
+NVIDIA 9101, Nous 9102, reserved pending providers 9103–9104, unified
+dashboard 9105, and OpenRouter 9106. The internal model-registry remains
+on 9200. Port 9105 is the lowest free dashboard slot: preserve the unrelated
+service on 9100 and never probe or move the reserved pending services.
+Existing inference client URLs stay the same.
+
+Open the unified dashboard at `http://127.0.0.1:9105/`. Home shows the
+global status, and the top dropdown selects each active wrapper's existing
+dashboard. Pending entries are metadata-only and never trigger requests.
+
 Check all services:
 
 ```bash
-systemctl is-active wrapper-model-registry.service
-systemctl is-active wrapper-nvidia-python.service
-systemctl is-active wrapper-nous.service
-systemctl is-active wrapper-opencode.service
-systemctl is-active wrapper-blackbox.service
+systemctl --user is-active wrapper-model-registry.service
+systemctl --user is-active wrapper-nvidia-python.service
+systemctl --user is-active wrapper-nous.service
+systemctl --user is-active wrapper-openrouter.service
+systemctl --user is-active wrapper-dashboard.service
 ```
 
 Then check:
@@ -98,6 +124,9 @@ GET http://127.0.0.1:9200/health
 ```
 
 A healthy process with zero configured keys is not a ready inference backend.
+Require the `/ready` JSON field to be `true`; HTTP 200 alone does not prove
+readiness. Use the local bearer token for protected readiness endpoints, and
+keep tokens and upstream error bodies out of logs.
 
 ## 4. Catalog and model registry gate
 
@@ -189,11 +218,27 @@ PYTHONDONTWRITEBYTECODE=1 python3 tests/run_transparency_check.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m pytest -q -p no:cacheprovider
 ```
 
+Run the complete release gate using the verified dependency environment:
+
+```bash
+PYTHON_BIN=/path/to/verified/venv/bin/python \
+  bash tests/run_production_gates.sh --output-dir /tmp/wrapper-release-evidence
+```
+
+The release gate uses fake credentials, isolated temporary databases and
+dedicated test ports. It checks runtime protocols, official SDK parsing, the
+full matrix, both compatibility layers, bounded soak and the unit suite. It
+does not call live provider inference or overwrite historical audit JSON.
+
 For a live staging model, verify:
 
 - Chat stream ends with `[DONE]` where appropriate;
 - Anthropic stream ends with `message_stop`;
-- Responses stream sends `response.completed` before `[DONE]`;
+- native Responses preserves upstream SSE events and termination; require a
+  successful terminal event such as `response.completed` and client parsing,
+  without requiring or injecting `[DONE]` into a native stream;
+- the approved Responses-to-Chat adapter emits its documented Responses
+  terminal events; native errors must not become successful completion;
 - tool calls remain structured;
 - no in-flight leak remains after client cancellation/EOF;
 - `previous_response_id` tool loops continue correctly.

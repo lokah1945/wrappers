@@ -1,0 +1,205 @@
+{
+  "completed_at_utc": "2026-10-07T16:03:06.059084+00:00",
+  "selected_rollout": [
+    "nvidia-python",
+    "nous"
+  ],
+  "pending_excluded": [
+    "blackbox",
+    "opencode"
+  ],
+  "source_combined_sha256": "6ab07899b94d7ed5978e0889db3f2b8a5dcf66d2a935dc65fac3d5aa0e1c9ee5",
+  "git_head": "1825f876d30feca307ae1198be8e832073b78015",
+  "working_tree_release": true,
+  "checks": [
+    {
+      "wrapper": "nvidia-python",
+      "check": "health",
+      "route": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "readiness",
+      "route": "ready",
+      "http_status": 200,
+      "passed": true,
+      "ready": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "unauthorized",
+      "route": "v1/chat/completions",
+      "http_status": 401,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null-body",
+      "route": "v1/chat/completions",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null-body",
+      "route": "v1/responses",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null-body",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "malformed-tools",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "malformed-text",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "malformed-image",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "malformed-model",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "unsupported-effort",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "models",
+      "route": "v1/models",
+      "http_status": 200,
+      "passed": true,
+      "model_count": 93,
+      "selected_model": "nvidia/nemotron-3-super-120b-a12b",
+      "selected_model_listed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "health",
+      "route": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "readiness",
+      "route": "ready",
+      "http_status": 200,
+      "passed": true,
+      "ready": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "unauthorized",
+      "route": "v1/chat/completions",
+      "http_status": 401,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "null-body",
+      "route": "v1/chat/completions",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "null-body",
+      "route": "v1/responses",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "null-body",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "malformed-tools",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "malformed-text",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "malformed-image",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "malformed-model",
+      "route": "v1/messages",
+      "http_status": 400,
+      "passed": true,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "wrapper": "nous",
+      "check": "models",
+      "route": "v1/models",
+      "http_status": 200,
+      "passed": true,
+      "model_count": 8,
+      "selected_model": "poolside/laguna-xs-2.1:free",
+      "selected_model_listed": true
+    }
+  ],
+  "passed": 23,
+  "failed": 0,
+  "service_metadata": "MainPID=3825050\nId=wrapper-nvidia-python.service\nActiveState=active\nActiveEnterTimestamp=Wed 2026-10-07 23:02:30 WIB\n\nMainPID=3825099\nId=wrapper-nous.service\nActiveState=active\nActiveEnterTimestamp=Wed 2026-10-07 23:02:42 WIB\n",
+  "environment_and_unit_files_preserved": true,
+  "notes": "Only NVIDIA/Nous restarted after complete active gates. Native-first policy and explicitly requested models retained; no model fallback. Private online SQLite, source, configuration and unit backups created before restart. Frozen provider services not touched or probed."
+}

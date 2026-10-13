@@ -29,6 +29,67 @@ from common.translations import openai_chat_to_anthropic_request  # noqa: E402
 @pytest.fixture(autouse=True)
 def _clear_env(monkeypatch):
     monkeypatch.delenv('COMPATIBILITY_LAYER', raising=False)
+    import common.compat as compatibility
+    monkeypatch.setattr(compatibility, '_resolved_auto_layer', '1')
+
+
+@pytest.mark.parametrize('resolved', ['1', '2'])
+async def test_auto_initialization_routes_to_the_resolved_dialect(monkeypatch, resolved):
+    import aiohttp
+    import common.compat as compatibility
+    monkeypatch.setenv('COMPATIBILITY_LAYER', '3')
+    created = []
+
+    class ProbeSession:
+        def __init__(self, **kwargs):
+            created.append(kwargs)
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            pass
+
+    async def probe(session, base):
+        assert isinstance(session, ProbeSession)
+        assert base == 'http://mock.example/prefix/v1'
+        return resolved
+
+    monkeypatch.setattr(aiohttp, 'ClientSession', ProbeSession)
+    monkeypatch.setattr(compatibility, 'probe_upstream_compatibility', probe)
+    assert await compatibility.initialize_upstream_compatibility('http://mock.example/prefix/v1') == resolved
+    assert compat_layer() == '3' and is_auto_discovery()
+    assert is_anthropic_upstream() == (resolved == '2')
+    assert is_openai_upstream() == (resolved == '1')
+    assert created[0]['trust_env'] is False
+    assert 'headers' not in created[0] and 'auth' not in created[0]
+
+
+@pytest.mark.parametrize('configured', ['1', '2'])
+async def test_explicit_dialect_never_probes(monkeypatch, configured):
+    import aiohttp
+    import common.compat as compatibility
+    monkeypatch.setenv('COMPATIBILITY_LAYER', configured)
+
+    def forbidden_session(**kwargs):
+        raise AssertionError('an explicit dialect must not probe upstream')
+
+    monkeypatch.setattr(aiohttp, 'ClientSession', forbidden_session)
+    assert await compatibility.initialize_upstream_compatibility('http://unused') == configured
+
+
+async def test_auto_unavailable_upstream_recovers_to_openai(monkeypatch):
+    import common.compat as compatibility
+    monkeypatch.setenv('COMPATIBILITY_LAYER', '3')
+    monkeypatch.setattr(compatibility, '_resolved_auto_layer', '2')
+
+    async def unavailable(*args):
+        raise OSError('unavailable')
+
+    monkeypatch.setattr(compatibility, 'probe_upstream_compatibility', unavailable)
+    assert await compatibility.initialize_upstream_compatibility('http://unused') == '1'
+    assert compat_layer() == '3'
+    assert is_openai_upstream() and not is_anthropic_upstream()
 
 
 def test_default_layer_is_openai():

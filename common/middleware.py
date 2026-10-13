@@ -19,20 +19,13 @@ logger = logging.getLogger('wrapper-middleware')
 MAX_REQUEST_BYTES = int(os.environ.get('MAX_REQUEST_BYTES', str(10 * 1024 * 1024)))  # 10MB default
 
 
-class _RequestTooLarge(BaseException):
-    """Internal sentinel: chunked request exceeded the size cap (CM-3).
-
-    NB-5 fix: derives from BaseException so endpoint-level `except
-    Exception` handlers cannot swallow it and emit a second response
-    after the middleware already sent the 413.
-    """
-
-
 class RequestSizeLimiter:
     """Pure ASGI middleware for request size limiting.
 
-    Checks Content-Length header without reading the body, so it's safe
-    for streaming endpoints. Rejects oversized requests with 413.
+    Rejects an oversized Content-Length immediately and checks received bytes
+    independently of transport headers. Buffers at most the configured limit
+    before dispatch, so malformed or understated lengths cannot bypass it.
+    Response streaming and genuine client disconnects are preserved.
 
     Usage:
         app.add_middleware(RequestSizeLimiter)
@@ -43,51 +36,49 @@ class RequestSizeLimiter:
         self.max_bytes = max_bytes
 
     async def __call__(self, scope: dict, receive: Any, send: Any) -> None:
-        if scope['type'] == 'http':
-            headers = dict(scope.get('headers', []))
-            content_length = headers.get(b'content-length')
-            if content_length:
+        if scope['type'] != 'http':
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get('headers', []):
+            if name.lower() == b'content-length':
                 try:
-                    size = int(content_length)
+                    size = int(value)
                     if size > self.max_bytes:
                         await self._reject(send)
                         return
                 except (ValueError, TypeError):
                     pass
-            else:
-                # CM-3 fix: requests using Transfer-Encoding: chunked send
-                # no Content-Length, bypassing the cap above. Count actual
-                # received bytes and abort past the limit.
-                te = headers.get(b'transfer-encoding', b'').lower()
-                if b'chunked' in te:
-                    counter = {'total': 0}
-                    state = {'response_started': False}
-                    limit = self.max_bytes
 
-                    async def counting_receive():
-                        message = await receive()
-                        if message['type'] == 'http.request':
-                            counter['total'] += len(message.get('body', b''))
-                            if counter['total'] > limit:
-                                # NB-5 fix: do NOT send from inside receive().
-                                # Raise only; the middleware except-arm sends
-                                # the 413 exactly once, and only if the app
-                                # has not already started a response.
-                                raise _RequestTooLarge()
-                        return message
+        chunks: list[bytes] = []
+        total = 0
+        while True:
+            message = await receive()
+            if message['type'] == 'http.disconnect':
+                return
+            chunk = message.get('body', b'')
+            total += len(chunk)
+            if total > self.max_bytes:
+                await self._reject(send)
+                return
+            chunks.append(chunk)
+            if not message.get('more_body', False):
+                break
 
-                    async def tracking_send(message):
-                        if message.get('type') == 'http.response.start':
-                            state['response_started'] = True
-                        await send(message)
+        body = b''.join(chunks)
+        chunks.clear()
+        sent_body = False
 
-                    try:
-                        await self.app(scope, counting_receive, tracking_send)
-                    except _RequestTooLarge:
-                        if not state['response_started']:
-                            await self._reject(send)
-                    return
-        await self.app(scope, receive, send)
+        async def replay_receive():
+            nonlocal sent_body
+            if not sent_body:
+                sent_body = True
+                return {'type': 'http.request', 'body': body, 'more_body': False}
+            # Never synthesize disconnect: response generators use receive()
+            # to detect real disconnections after the request has been read.
+            return await receive()
+
+        await self.app(scope, replay_receive, send)
 
     async def _reject(self, send: Any) -> None:
         import json

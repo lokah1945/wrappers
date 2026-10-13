@@ -56,7 +56,7 @@ from typing import Optional, Any, Set
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -79,6 +79,10 @@ except ImportError:
         if not isinstance(value, str):
             value = str(value)
         return re_module.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', value).strip()
+
+# Stream cleanup is a required production contract, independent of the
+# optional request-size middleware fallback above.
+from common.sse import ClosingStreamingResponse as StreamingResponse
 from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 
@@ -175,7 +179,7 @@ async def verify_models(pool):
     if not ids:
         return
 
-    if _model_state_store:
+    if _model_state_store and not getattr(pool, "on_models_refresh", None):
         metadata = getattr(pool, "models_metadata", {}) or {}
         catalog_entries = [metadata.get(mid) or {"id": mid} for mid in ids]
         _model_state_store.upsert_catalog(catalog_entries, source="nvidia:/v1/models")
@@ -260,6 +264,11 @@ async def verify_models(pool):
     )
 
 async def verify_loop(pool):
+    if not _env_flag('VERIFY_PERIODIC_ENABLED', 'true') or VERIFY_INTERVAL <= 0:
+        return
+    # Startup verification is controlled solely by VERIFY_ON_BOOT. The
+    # periodic task must not trigger a second, unconditional startup sweep.
+    await asyncio.sleep(VERIFY_INTERVAL / 1000)
     while True:
         try:
             # F7 fix: never compete with live traffic — skip the sweep while
@@ -333,6 +342,8 @@ def start_env_watcher():
     _ENV_RELOAD_CALLBACKS so the key pool can pick up new keys without
     a process restart.
     """
+    if os.environ.get('WRAPPER_SKIP_DOTENV', '').lower() in ('1', 'true', 'yes', 'on'):
+        return
     if not HAS_WATCHDOG:
         logger.warning('[env] watchdog not available; hot reload disabled')
         return
@@ -427,6 +438,7 @@ except ImportError:
 
 from .anthropic_compat import (
     anthropic_to_openai,
+    validate_anthropic_request,
     openai_to_anthropic as _openai_to_anthropic_impl,
     stream_openai_to_anthropic,
     estimate_input_tokens,
@@ -690,10 +702,9 @@ else:
 #                                   /v1/chat/completions streams too. By default the
 #                                   wrapper injects it only on translated /v1/messages
 #                                   and /v1/responses paths (it needs usage there).
-#   WRAPPER_AUTO_TRUNCATE=0|1       (default 0) V19: when 1, /v1/messages histories that
-#                                   exceed the estimated context window are silently
-#                                   truncated (oldest first). Default OFF: forward as-is
-#                                   and let upstream decide.
+#   WRAPPER_AUTO_TRUNCATE          retired: history is preserved, including tool
+#                                   call/result pairs. Explicit upstream context
+#                                   errors permit one bounded output-budget retry.
 #   WRAPPER_SYNTHETIC_THINKING=0|1  (default 0) V25: when 1, emit the synthetic
 #                                   "[Reasoning not supported...]" thinking block when a
 #                                   client requested thinking but the model produced
@@ -704,7 +715,7 @@ else:
 #   LOKI_MAX_BUFFER / LOKI_AUTH_FAILURE_LIMIT  V-04: see loki_push.py.
 #   WRAPPER_EVENTS_MAX_MB           (default 64) V-11: rotate wrapper-events.jsonl when
 #                                   it exceeds this size.
-#   RESPONSES_STORE_MAX_BYTES       (default 64MiB) V-22: byte cap for the /v1/responses
+#   RESPONSES_STORE_MAX_BYTES       (default 32MiB) V-22: byte cap for the /v1/responses
 #                                   previous_response_id history store.
 #   VERIFY_INTERVAL                 (default now 1800s, was 600) F7: verify sweeps also
 #                                   skip while live requests are queued on the key pool.
@@ -884,7 +895,60 @@ def find_reasoning_config(model_id: str) -> Optional[dict]:
     return best
 
 
-def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking: Any) -> None:
+def _translate_nemotron_super_controls(oai_body: dict, thinking: Any, output_config: Any = None) -> None:
+    """Map Messages controls to the qualified Super model's cloud contract.
+
+    NVIDIA documents only none/low/high and a reasoning budget up to 32768.
+    Explicit Anthropic controls win conflicting provider controls; unrelated
+    template extensions and caller force_nonempty_content remain intact.
+    https://docs.api.nvidia.com/nim/re/reference/nvidia-nemotron-3-super-120b-a12b-infer
+    """
+    effort = output_config.get('effort') if isinstance(output_config, dict) else None
+    if thinking is None and effort is None:
+        return
+    if thinking is not None and not isinstance(thinking, dict):
+        raise ValueError('thinking must be an object for Nemotron Super')
+    mode = thinking.get('type') if isinstance(thinking, dict) else None
+    if thinking is not None and mode not in ('disabled', 'enabled', 'adaptive'):
+        raise ValueError('Nemotron Super supports thinking types disabled, enabled or adaptive')
+    if mode == 'disabled':
+        mapped_effort = 'none'
+    elif effort is not None:
+        if effort not in ('low', 'high'):
+            raise ValueError('Nemotron Super supports output_config.effort low or high; '
+                             'use thinking.type disabled to disable reasoning')
+        mapped_effort = effort
+    else:
+        mapped_effort = 'high'  # Documented provider default for enabled reasoning.
+
+    template = oai_body.get('chat_template_kwargs', {})
+    if not isinstance(template, dict):
+        raise ValueError('chat_template_kwargs must be an object')
+    template = dict(template)
+    template.setdefault('force_nonempty_content', True)
+    template['enable_thinking'] = mapped_effort != 'none'
+    template['low_effort'] = mapped_effort == 'low'
+    oai_body['reasoning_effort'] = mapped_effort
+    if mode != 'disabled' and isinstance(thinking, dict) and 'budget_tokens' in thinking:
+        budget = thinking['budget_tokens']
+        if (not isinstance(budget, int) or isinstance(budget, bool)
+                or not 1 <= budget <= 32768):
+            raise ValueError('Nemotron Super thinking.budget_tokens must be an integer from 1 to 32768')
+        maximum = oai_body.get('max_tokens')
+        if isinstance(maximum, int) and budget >= maximum:
+            raise ValueError('thinking.budget_tokens must be smaller than max_tokens to leave room for the answer')
+        oai_body['reasoning_budget'] = budget
+        # NVIDIA gives this legacy option precedence over the top-level field.
+        if 'reasoning_budget' in template:
+            template['reasoning_budget'] = budget
+    oai_body['chat_template_kwargs'] = template
+
+
+def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking: Any,
+                              anthropic_output_config: Any = None) -> None:
+    if (nim_model or '').lower() == 'nvidia/nemotron-3-super-120b-a12b':
+        _translate_nemotron_super_controls(oai_body, anthropic_thinking, anthropic_output_config)
+        return
     if anthropic_thinking is None:
         return
     enabled = anthropic_thinking is True or (isinstance(anthropic_thinking, dict) and anthropic_thinking.get('type') != 'disabled')
@@ -1196,12 +1260,9 @@ def _model_output_cap(model_id: str) -> Optional[int]:
     """Provider-specific max output cap to avoid upstream max_tokens errors.
 
     Format override: MODEL_MAX_TOKENS_CAPS='pattern:cap,other-pattern:cap'.
-    Defaults include known NVIDIA build example caps.
+    Only explicit operator overrides apply before a provider rejects a request.
     """
-    caps = {
-        'moonshotai/kimi-k2.6': 16384,
-        'kimi-k2.6': 16384,
-    }
+    caps = {}
     raw = os.environ.get('MODEL_MAX_TOKENS_CAPS', '') or ''
     for item in raw.split(','):
         if ':' not in item:
@@ -1270,12 +1331,10 @@ def model_from_path(path: str) -> str:
 
 
 def forward_headers(request: Request) -> dict:
-    """Transparent proxy: forward ALL client headers via shared build_forward_headers.
+    """Preserve native extension headers after removing local transport/auth.
 
-    Per project principle #1: wrappers must NOT drop client headers. Only
-    swap Authorization (done by caller) and set Content-Type. Everything
-    else (user-agent, x-stainless-*, anthropic-*, openai-*, x-request-id,
-    x-correlation-id, accept, accept-language, etc.) is forwarded verbatim.
+    The caller supplies provider Authorization and Content-Type. The shared
+    filter also removes Connection-nominated fields and local proxy identity.
     """
     headers = _build_forward_headers(request.headers)
     # Generate a request ID if the client didn't provide one
@@ -1448,6 +1507,41 @@ class Server:
         self._start_time = time.time()
         self._bg_tasks: list = []  # V-17 fix: retained background task handles
 
+    def _context_catalog_entry(self, model_id):
+        from common.model.metadata import annotate_catalog, merge_context_metadata, discovery_limits
+        raw = dict((getattr(self.pool, 'models_metadata', {}) or {}).get(model_id) or {'id': model_id})
+        source = BASE_LLM + '/v1/models'
+        endpoint = raw.get('endpoint_context_metadata') or raw.get('context_metadata') or {}
+        # A hydrated merged record must not promote a published fallback to an
+        # endpoint observation, or keep it above a newly refreshed publication.
+        if endpoint.get('source') != source or endpoint.get('field_provenance'):
+            endpoint = annotate_catalog({'id': model_id}, source, checked_at=0)['context_metadata']
+        raw['endpoint_context_metadata'] = dict(endpoint)
+        official = (self.registry.get_official_context(model_id)
+                    if self.registry and BASE_LLM == 'https://integrate.api.nvidia.com' else None)
+        raw['context_metadata'] = merge_context_metadata({'context_metadata': endpoint}, official)
+        # Remove normalized fields from a prior merged cache before reapplying
+        # verified limits. Unknown capacity must not retain an old guessed cap.
+        for field in ('context_window', 'context_length', 'max_context_window',
+                      'max_input_tokens', 'max_output_tokens'):
+            raw.pop(field, None)
+        raw.update(discovery_limits(raw))
+        return raw
+
+    def _sync_context_catalog(self):
+        entries = [self._context_catalog_entry(mid) for mid in (self.pool.models_cached or [])]
+        if entries:
+            self.model_state.upsert_catalog(entries, source='nvidia:cached-upstream-metadata')
+            MODEL_REGISTRY.register_catalog(entries, revision='runtime-catalog')
+            MODEL_REGISTRY_CLIENT.schedule_catalog('nvidia', entries, 'runtime-catalog')
+
+    def _enrich_model_metadata(self, model_id, desc, status):
+        from common.model.metadata import discovery_limits
+        raw = self._context_catalog_entry(model_id)
+        result = enrich_model_metadata(model_id, {**desc, **raw}, status)
+        result.update(discovery_limits(raw))
+        return result
+
     async def init(self):
         await MODEL_REGISTRY_CLIENT.start()
         self.pool.load_from_env()
@@ -1494,16 +1588,19 @@ class Server:
         self._bg_tasks.append(asyncio.create_task(alert_history.mode_daemon()))
         self._bg_tasks.append(asyncio.create_task(loki_push.daemon()))
 
-        self.registry = Registry()
+        self.registry = Registry(enabled=BASE_LLM == 'https://integrate.api.nvidia.com')
         self.registry.set_external_agent(self._session)
+        self.registry.set_model_ids(lambda: self.pool.models_cached)
+        self.registry.on_refresh = self._sync_context_catalog
+        self.pool.on_models_refresh = self._sync_context_catalog
         await self.registry.refresh(force=True)
-        self.registry.start()
 
         # Hydrate the last good persistent catalog first.  This keeps model
         # discovery available during an upstream outage or process restart.
         try:
             cached_ids = self.model_state.get_ids(fresh_only=False)
             if cached_ids and not self.pool.models_cached:
+                self.pool._models_metadata = {m['id']: m for m in self.model_state.get_catalog(fresh_only=False)}
                 self.pool._models_cache = cached_ids
                 self.pool._models_cache_ts = time.time()
                 logger.info(f'[init] hydrated {len(cached_ids)} models from persistent catalog')
@@ -1512,17 +1609,12 @@ class Server:
 
         # Warm NIM model catalog before resolving Claude Code aliases.
         try:
-            ids = await self.pool.refresh_models(force=True)
-            if ids:
-                metadata = getattr(self.pool, 'models_metadata', {}) or {}
-                self.model_state.upsert_catalog(
-                    [metadata.get(mid) or {"id": mid} for mid in ids],
-                    source='nvidia:/v1/models',
-                )
-                MODEL_REGISTRY.register_catalog([metadata.get(mid) or {"id": mid} for mid in ids], revision='runtime-catalog')
-                MODEL_REGISTRY_CLIENT.schedule_catalog('nvidia', [metadata.get(mid) or {"id": mid} for mid in ids], 'runtime-catalog')
+            await self.pool.refresh_models(force=True)
+            self._sync_context_catalog()
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
+
+        self.registry.start()
 
         load_alias_config(self.pool)
 
@@ -1541,7 +1633,9 @@ class Server:
             'extract_internal_reasoning': extract_internal_reasoning,
         })
 
-        self.pool.start_model_refresh()
+        model_refresh_task = self.pool.start_model_refresh()
+        if model_refresh_task is not None:
+            self._bg_tasks.append(model_refresh_task)
 
         # Full model verification + env watcher (Node audit parity, production)
         if VERIFY_ON_BOOT:
@@ -1953,10 +2047,10 @@ class Server:
                 if ad_hoc:
                     d['source'] = 'heuristic-adhoc'
                 status_cap = self._model_status_view(await self.metrics.get_model_status())
-                return enrich_model_metadata(model_id, d, status_cap)
+                return self._enrich_model_metadata(model_id, d, status_cap)
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
-            enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
+            enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             return {
                 'object': 'list', 'models': enriched,
                 'summary': summarize(catalog),
@@ -1978,7 +2072,7 @@ class Server:
         async def models_route(request: Request):
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
-            enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
+            enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             # Dynamic aliases: expose short names bound to current concrete target (if any)
             tgt = get_dynamic_alias_target()
             if tgt:
@@ -1996,13 +2090,13 @@ class Server:
             model_id = model_id.replace('%2F', '/').replace('%2f', '/')
             d = describe(model_id, BASE_LLM, BASE_GENAI)
             status_cap = self._model_status_view(await self.metrics.get_model_status())
-            return enrich_model_metadata(model_id, d, status_cap)
+            return self._enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/v1/engines')
         async def engines_route():
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
-            enriched = [enrich_model_metadata(d['id'], d, status_list) for d in catalog]
+            enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
             return {'object': 'list', 'data': enriched}
 
         @app.get('/v1/engines/{model_id:path}')
@@ -2010,7 +2104,7 @@ class Server:
             model_id = model_id.replace('%2F', '/').replace('%2f', '/')
             d = describe(model_id, BASE_LLM, BASE_GENAI)
             status_cap = self._model_status_view(await self.metrics.get_model_status())
-            return enrich_model_metadata(model_id, d, status_cap)
+            return self._enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/api/tags')
         async def api_tags():
@@ -2084,7 +2178,7 @@ class Server:
                 return JSONResponse(status_code=400, content={'error': {'message': 'max_tokens must be a positive integer', 'type': 'invalid_request_error'}})
 
             # BUG-SEC3 fix: cap max_tokens to prevent integer overflow / abuse.
-            # 1M tokens is far beyond any model's context window.
+            # Operational output ceiling, independent of model context capacity.
             _MAX_TOKENS_LIMIT = 1_000_000
             for _mt_key in ('max_tokens', 'max_completion_tokens'):
                 _mt_val = body.get(_mt_key)
@@ -2095,7 +2189,7 @@ class Server:
                     }})
 
             for m in body.get('messages', []) or []:
-                if isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
+                if _is_anthropic_upstream() and isinstance(m, dict) and m.get('role') not in (None, 'system', 'user', 'assistant', 'tool', 'developer', 'function'):
                     return JSONResponse(status_code=400, content={'error': {'message': f"Invalid role: {m.get('role')!r} (must be one of: system, user, assistant, tool, developer, function)", 'type': 'invalid_request_error'}})
                 if isinstance(m, dict) and m.get('role') == 'tool' and not m.get('tool_call_id'):
                     return JSONResponse(status_code=400, content={'error': {'message': "tool role requires tool_call_id", 'type': 'invalid_request_error'}})
@@ -2140,6 +2234,29 @@ class Server:
                 if body.get('model'):
                     body['model'] = resolve_target_model(body.get('model', ''))
                 return await self._compat2_responses(body, request)
+            from common.compat import responses_use_native_upstream, responses_chat_fallback_allowed
+            if responses_use_native_upstream():
+                # Responses and Chat are distinct wire APIs. Keep native input,
+                # previous_response_id, tools and future fields intact.
+                native_result = await self._handle_catch_all(request, '/v1/responses')
+                if not isinstance(native_result, JSONResponse):
+                    return native_result
+                try:
+                    native_error = json.loads(native_result.body)
+                except (TypeError, ValueError):
+                    native_error = {}
+                if not responses_chat_fallback_allowed(native_result.status_code, native_error):
+                    return native_result
+                # The owner permits the Chat adapter only when this native
+                # endpoint is definitively unsupported. Retain the model.
+                previous = _rb.get('previous_response_id')
+                if previous:
+                    from .responses_compat import _extract_principal, _get_stored_conversation
+                    if _get_stored_conversation(_extract_principal(request), previous) is None:
+                        return JSONResponse(status_code=400, content={'error': {
+                            'type': 'invalid_request_error', 'code': 'previous_response_not_found',
+                            'message': 'Native response history is unavailable to the Chat adapter. Send the complete conversation input without previous_response_id.',
+                        }})
             # V-14 fix: the recursive debug walk only runs when DEBUG logging is
             # actually enabled — no O(body) CPU on the Codex hot path otherwise.
             if logger.isEnabledFor(logging.DEBUG):
@@ -2291,127 +2408,216 @@ class Server:
         the caller owns resp + key (release in finally); otherwise resp is the
         parsed JSON error/success and key is None (already released).
         """
+        from common.context_recovery import context_request, ContextRecoveryState, context_response_headers, ContextJSON
+        from common.http_headers import upstream_response_headers
+        context_state = ContextRecoveryState()
         model_id = body.get('model', '')
         attempts = max(1, self.pool.total_keys)
         last_status = 429
         last_data = {'error': {'message': 'All keys exhausted or rate-limited', 'type': 'rate_limit_error'}}
+        attempted_keys = set()
         for _attempt in range(attempts):
-            key_result = await self.pool.acquire(model_id)
+            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             if not key_result:
                 break
             key = key_result['key']
             self._in_flight += 1
+            attempted_keys.add(key.api_key)
+            resp = None
+            transferred = False
+            released_attempt = False
+
+            def release_attempt():
+                nonlocal released_attempt
+                if not released_attempt:
+                    released_attempt = True
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+
             try:
                 target = f"{BASE_LLM}/v1/messages"
                 fwd = {'Authorization': f'Bearer {key.api_key}',
                        **forward_headers(request), 'Content-Type': 'application/json'}
                 if body.get('stream'):
                     fwd['Accept'] = 'text/event-stream'
-                resp = await self._session.post(target, json=body, headers=fwd,
-                                                timeout=self._client_timeout(bool(body.get('stream')), '/v1/messages'))
+                resp = await context_request(
+                    lambda payload: self._session.post(target, json=payload, headers=fwd,
+                        timeout=self._client_timeout(bool(body.get('stream')), '/v1/messages')),
+                    body, state=context_state, store=getattr(self, 'model_state', None),
+                    credential=key.api_key, endpoint=target)
                 if resp.status == 429:
                     ra = _parse_retry_after(resp.headers.get('retry-after'))
-                    self._in_flight = max(0, self._in_flight - 1)
-                    key.decrement_in_flight()
+                    release_attempt()
                     await self._record_model_response(model_id, key, resp.status, await resp.text(), '/v1/messages')
                     await self.pool.register_rate_limit(key, model_id, ra, None, None)
                     last_status = resp.status
                     last_data = {'error': {'message': 'rate limited', 'type': 'rate_limit_error'}}
                     continue
                 if body.get('stream') and resp.status < 400:
-                    return 200, resp, key
+                    transferred = True
+                    return resp.status, resp, key
                 data = await resp.read()
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 try:
                     parsed = json.loads(data)
                 except (json.JSONDecodeError, ValueError):
                     parsed = {'error': {'message': data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
+                if isinstance(parsed, dict):
+                    parsed = ContextJSON(parsed, resp)
+                    parsed.upstream_headers = upstream_response_headers(resp)
                 if resp.status >= 400:
                     await self._record_model_response(model_id, key, resp.status, parsed, '/v1/messages')
                     last_status = resp.status
                     last_data = parsed
-                    if resp.status in (408, 409, 429) or resp.status >= 500:
+                    if resp.status in (401, 402, 403, 408, 409, 429) or resp.status >= 500:
                         continue
                     return resp.status, parsed, None
                 return resp.status, parsed, None
             except Exception as e:
                 logger.error(f'[compat2] upstream error: {e}')
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 last_status = 502
                 last_data = {'error': {'message': f'upstream error: {e}', 'type': 'api_error'}}
                 continue
+            finally:
+                if not transferred:
+                    if resp is not None:
+                        resp.release()
+                    release_attempt()
+
         return last_status, last_data, None
 
     async def _compat2_chat(self, body: dict, request: Request):
+        from common.context_recovery import context_response_headers
+        from common.http_headers import upstream_response_headers
         from common.translations import anthropic_to_openai_response as _a2o
         anthro = openai_chat_to_anthropic_request(body)
         anthro['stream'] = bool(body.get('stream', False))
         status, result, key = await self._compat2_proxy(anthro, request)
-        if status != 200:
-            return JSONResponse(status_code=status, content=result)
+        if status >= 400:
+            return JSONResponse(status_code=status, content=result, headers=upstream_response_headers(result))
         if anthro['stream']:
-            async def gen():
+            released = False
+
+            def close_upstream():
+                nonlocal released
+                if released:
+                    return
+                released = True
                 try:
-                    async for frame in _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
-                        yield frame
+                    result.release()
                 finally:
-                    try:
-                        result.release()
-                    except Exception:
-                        pass
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
-            return StreamingResponse(gen(), media_type='text/event-stream',
-                                     headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
-        return JSONResponse(status_code=200, content=_a2o(result, body.get('model', '')))
+
+            async def gen():
+                source = _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0)
+                try:
+                    async for frame in source:
+                        yield frame
+                finally:
+                    from common.sse import close_stream
+                    await close_stream(source, close_upstream)
+            return StreamingResponse(gen(), status_code=status, media_type='text/event-stream',
+                                     on_close=close_upstream,
+                                     headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(result)})
+        return JSONResponse(status_code=status, content=_a2o(result, body.get('model', '')), headers=upstream_response_headers(result))
 
     async def _compat2_messages(self, body: dict, request: Request):
+        from common.context_recovery import context_response_headers
+        from common.http_headers import upstream_response_headers
         status, result, key = await self._compat2_proxy(body, request)
-        if status != 200:
-            return JSONResponse(status_code=status, content=result)
+        if status >= 400:
+            return JSONResponse(status_code=status, content=result, headers=upstream_response_headers(result))
         if bool(body.get('stream', False)):
-            async def gen():
+            released = False
+
+            def close_upstream():
+                nonlocal released
+                if released:
+                    return
+                released = True
                 try:
-                    async for frame in _passthrough_anthropic_sse(result, float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
-                        yield frame
+                    result.release()
                 finally:
-                    try:
-                        result.release()
-                    except Exception:
-                        pass
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
-            return StreamingResponse(gen(), media_type='text/event-stream',
-                                     headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
-        return JSONResponse(status_code=200, content=result)
+
+            async def gen():
+                source = _passthrough_anthropic_sse(result, float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0)
+                try:
+                    async for frame in source:
+                        yield frame
+                finally:
+                    from common.sse import close_stream
+                    await close_stream(source, close_upstream)
+            return StreamingResponse(gen(), status_code=status, media_type='text/event-stream',
+                                     on_close=close_upstream,
+                                     headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(result)})
+        return JSONResponse(status_code=status, content=result, headers=upstream_response_headers(result))
 
     async def _compat2_responses(self, body: dict, request: Request):
-        from .responses_compat import respond_non_streaming
-        anthro = openai_chat_to_anthropic_request(body)
+        from common.context_recovery import context_response_headers
+        from common.http_headers import upstream_response_headers
+        from .responses_compat import (respond_non_streaming, build_chat_body,
+                                       _extract_principal, _get_stored_conversation, _bounded_store)
+        from common.translations import remember_responses_stream, responses_output_to_assistant_message
+        principal = _extract_principal(request)
+        model = body.get('model', '')
+        chat_body = build_chat_body(body, model, None)
+        previous = body.get('previous_response_id')
+        if previous:
+            history = _get_stored_conversation(principal, previous)
+            if history:
+                # Re-convert the combined input so current tool results retain
+                # the preceding assistant call rather than becoming orphans.
+                replay_body = dict(body)
+                current = body.get('input')
+                replay_body['input'] = history + (current if isinstance(current, list)
+                    else [{'role': 'user', 'content': current}] if isinstance(current, str) else [])
+                chat_body = build_chat_body(replay_body, model, None)
+        anthro = openai_chat_to_anthropic_request(chat_body)
         anthro['stream'] = bool(body.get('stream', False))
+
+        def save(response):
+            _bounded_store(principal, response['id'], chat_body.get('messages', [])
+                           + [responses_output_to_assistant_message(response)])
+
         status, result, key = await self._compat2_proxy(anthro, request)
-        if status != 200:
-            return JSONResponse(status_code=status, content=result)
+        if status >= 400:
+            return JSONResponse(status_code=status, content=result, headers=upstream_response_headers(result))
         if anthro['stream']:
-            async def gen():
+            released = False
+
+            def close_upstream():
+                nonlocal released
+                if released:
+                    return
+                released = True
                 try:
-                    async for frame in _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0):
-                        yield frame
+                    result.release()
                 finally:
-                    try:
-                        result.release()
-                    except Exception:
-                        pass
                     self._in_flight = max(0, self._in_flight - 1)
                     key.decrement_in_flight()
+
+            async def gen():
+                source = _translate_anthropic_stream_to_openai_chat(result, body.get('model', ''), float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0)
+                try:
+                    async for frame in source:
+                        yield frame
+                finally:
+                    from common.sse import close_stream
+                    await close_stream(source, close_upstream)
             return StreamingResponse(
-                _translate_openai_chat_sse_to_responses(gen(), body.get('model', '')),
-                media_type='text/event-stream',
-                headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'})
+                remember_responses_stream(
+                    _translate_openai_chat_sse_to_responses(gen(), model), save),
+                media_type='text/event-stream', status_code=status,
+                on_close=close_upstream,
+                headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(result)})
         oai_chat = anthropic_to_openai_response(result, body.get('model', ''))
-        return JSONResponse(status_code=200, content=respond_non_streaming(oai_chat, body.get('model', '')))
+        response = respond_non_streaming(oai_chat, model)
+        save(response)
+        return JSONResponse(status_code=status, content=response, headers=upstream_response_headers(result))
 
     async def _handle_chat_completions(self, body: dict, request: Request, raw: bytes):
         model_id = body.get('model', '')
@@ -2421,14 +2627,6 @@ class Server:
             return await self._compat2_chat(body, request)
         if is_model_unavailable(model_id):
             return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
-
-        # Cast numeric params that SDKs (Codex/OpenAI) may send as strings
-        for _k in ('temperature', 'top_p', 'top_k', 'presence_penalty', 'frequency_penalty', 'min_p'):
-            if body.get(_k) is not None:
-                try:
-                    body[_k] = float(body[_k])
-                except (TypeError, ValueError):
-                    pass
 
         stream_guard = guard_stream_unsupported(body, model_id)
         if stream_guard:
@@ -2440,79 +2638,26 @@ class Server:
         if result.get('stream'):
             return StreamingResponse(
                 self._stream_chat(result, body, request),
-                media_type='text/event-stream',
-                headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+                status_code=result.get('status', 200), media_type='text/event-stream',
+                on_close=result.get('on_close'),
+                headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **result.get('headers', {})},
             )
 
         status_code = result.get('status', 200)
         data = result.get('data', {})
         if status_code != 200 and data.get('error'):
-            return JSONResponse(status_code=status_code, content=data)
-        if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
-            data = anthropic_to_openai_response(data, model_id)
-        ensure_nonempty_content(data)
-        return JSONResponse(status_code=200, content=data)
+            return JSONResponse(status_code=status_code, content=data, headers=result.get('headers', {}))
+        return JSONResponse(status_code=status_code, content=data, headers=result.get('headers', {}))
 
     async def _stream_chat(self, result: dict, body: dict, request: Request):
+        """Forward native SSE bytes, including future fields and events."""
         stream = result.get('stream')
-        max_buffer = int(os.environ.get('MAX_STREAM_BUFFER_KB', '512')) * 1024
-        generated_chars = 0
-        has_content = False
-        stream_buffer = ''
-        saw_done = False
-        stream_error = None
-
         try:
             async for chunk in stream:
-                chunk_str = chunk.decode('utf-8', errors='replace') if isinstance(chunk, bytes) else chunk
-                if not has_content:
-                    for line in chunk_str.split('\n'):
-                        t = line.strip()
-                        if t.startswith('data:') and t != 'data:[DONE]' and t != 'data: [DONE]':
-                            try:
-                                c = json.loads(t[5:].strip())
-                                d = c.get('choices', [{}])[0].get('delta', {}).get('content')
-                                if isinstance(d, str):
-                                    generated_chars += len(d)
-                                    if d:
-                                        has_content = True
-                            except (json.JSONDecodeError, ValueError):
-                                pass
-
-                if re_module.search(r'data:\s*\[DONE\]', chunk_str):
-                    saw_done = True
-
-                stream_buffer += chunk_str
-                if len(stream_buffer) > max_buffer:
-                    stream_buffer = stream_buffer[-max_buffer:]
-
-                # B-12 fix: this is an OpenAI-SSE surface. If the upstream (or
-                # a relay) emits Anthropic-style frames, forwarding them
-                # verbatim leaks protocol text into the client's rendered
-                # output (same failure class as the nous B-10 leak). Detect and
-                # drop foreign frames rather than passing them through.
-                if 'event:' in chunk_str and '"type"' in chunk_str and 'chat.completion' not in chunk_str:
-                    logger.warning(
-                        '[stream] dropping non-OpenAI SSE frame on chat surface: %r',
-                        chunk_str[:200])
-                    continue
-
-                yield chunk_str
-        except Exception as e:
-            stream_error = e
-            logger.error(f'[stream error] _stream_chat: {e}')
-
-        if not saw_done and not re_module.search(r'data:\s*\[DONE\]', stream_buffer):
-            if not has_content:
-                friendly = f"The context/history for model '{body.get('model', '')}' is too large and exceeds the model's limit (or the upstream connection closed immediately). Please exit the current session and start a clean one."
-                if stream_error:
-                    friendly = f'{friendly} Upstream stream error: {stream_error}'
-                yield f'data: {json.dumps({"error": {"message": friendly, "type": "invalid_request_error"}})}\n\n'
-            elif stream_error:
-                yield f'data: {json.dumps({"error": {"message": f"Upstream stream interrupted: {stream_error}", "type": "api_error"}})}\n\n'
-            # Always terminate OpenAI Chat SSE explicitly. Several agents wait
-            # for [DONE] and otherwise stop mid-run on upstream EOF.
-            yield 'data: [DONE]\n\n'
+                yield chunk
+        finally:
+            if hasattr(stream, 'aclose'):
+                await stream.aclose()
 
     async def _handle_anthropic_messages(self, raw: bytes, request: Request):
         try:
@@ -2525,6 +2670,10 @@ class Server:
             if body.get('model'):
                 body['model'] = resolve_target_model(body.get('model', ''))
             return await self._compat2_messages(body, request)
+        try:
+            validate_anthropic_request(body)
+        except ValueError as e:
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', str(e)))
         anthro_version = (request.headers.get('anthropic-version') or '').strip()
         # Claude Code always sends this; default for other Anthropic-compatible clients
         if not anthro_version:
@@ -2534,7 +2683,8 @@ class Server:
             body = json.loads(raw)
         except (json.JSONDecodeError, ValueError) as e:
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', f'Invalid JSON: {e}'))
-        if not isinstance(body.get('max_tokens'), int) or body['max_tokens'] <= 0:
+        if (not isinstance(body.get('max_tokens'), int) or isinstance(body['max_tokens'], bool)
+                or body['max_tokens'] <= 0):
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'max_tokens is required and must be a positive integer'))
 
         # BUG-SEC3 fix: cap max_tokens to prevent integer overflow / abuse
@@ -2544,10 +2694,6 @@ class Server:
         sys_field = body.get('system')
         if sys_field is not None and not isinstance(sys_field, (str, list)):
             return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', '"system" must be a string or array of content blocks'))
-
-        for t in body.get('tools', []) or []:
-            if not isinstance(t.get('input_schema'), dict):
-                return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', 'tool.input_schema must be an object'))
 
         # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages rejected.
         for _m in body.get('messages', []) or []:
@@ -2582,8 +2728,10 @@ class Server:
         apply_default_reasoning(openai_body, model_id)
         openai_body['model'] = model_id
 
-        if body.get('thinking') and isinstance(body['thinking'], dict):
-            translate_thinking_to_nim(openai_body, model_id, body['thinking'])
+        try:
+            translate_thinking_to_nim(openai_body, model_id, body.get('thinking'), body.get('output_config'))
+        except ValueError as e:
+            return JSONResponse(status_code=400, content=anthropic_error('invalid_request_error', str(e)))
 
         clamp_max_tokens_for_model(openai_body, model_id)
         result = await self.proxy_openai(openai_body, forward_headers(request), model_id, request, metric_path='/v1/messages')
@@ -2615,10 +2763,15 @@ class Server:
                         yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
                     except Exception:
                         pass
+                finally:
+                    from common.sse import close_stream
+                    await close_stream(result['stream'], result.get('on_close'))
             return StreamingResponse(
                 anthropic_stream(),
                 media_type='text/event-stream',
+                on_close=result.get('on_close'),
                 headers={
+                    **result.get('headers', {}),
                     'Cache-Control': 'no-cache',
                     'Connection': 'keep-alive',
                     'X-Accel-Buffering': 'no',
@@ -2629,13 +2782,13 @@ class Server:
         data = result.get('data', {})
         if status_code != 200 and data.get('error'):
             err = data['error']
-            return JSONResponse(status_code=status_code, content=anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error')))
+            return JSONResponse(status_code=status_code, content=anthropic_error(err.get('type', 'api_error'), err.get('message', 'Unknown error')), headers=result.get('headers', {}))
 
         if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
             anthropic_resp = data
         else:
             anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
-        return JSONResponse(status_code=200, content=anthropic_resp)
+        return JSONResponse(status_code=200, content=anthropic_resp, headers=result.get('headers', {}))
 
     def _select_timeout(self, is_streaming: bool, metric_path: str) -> int:
         """Select timeout based on request type (P2: extracted from proxy_openai)."""
@@ -2676,6 +2829,8 @@ class Server:
     async def _prepare_proxy_body(self, body: dict, model_id: str, metric_path: str = '/v1/chat/completions') -> dict:
         """Prepare request body for upstream (P2: extracted from proxy_openai)."""
         body = json.loads(json.dumps(body))  # deep copy
+        if metric_path == '/v1/chat/completions':
+            return body
         # V6: map max_completion_tokens -> max_tokens only when max_tokens is
         # absent (NIM needs max_tokens); never delete it when max_tokens exists.
         if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
@@ -2692,7 +2847,11 @@ class Server:
         return body
 
     async def proxy_openai(self, body: dict, req_headers: dict, model: str, req: Request = None, metric_path: str = '/v1/chat/completions'):
-        sanitize_nvidia_payload(body)
+        from common.context_recovery import context_request, ContextRecoveryState, context_response_headers
+        from common.http_headers import upstream_response_headers
+        context_state = ContextRecoveryState()
+        if metric_path != '/v1/chat/completions':
+            sanitize_nvidia_payload(body)
         model_id = body.get('model') or model or ''
         if is_model_unavailable(model_id):
             return {'status': 404, 'data': {'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}}}
@@ -2724,34 +2883,6 @@ class Server:
                 num = float(v)
                 body[p] = num if num == int(num) else v
 
-        preserved = {}
-        for p in ['chat_template_kwargs', 'reasoning_effort', 'extra_body', 'nvext']:
-            if body.get(p) is not None:
-                preserved[p] = body[p]
-
-        if isinstance(body.get('extra_body'), dict) and body['extra_body'].get('nvext'):
-            preserved['nvext'] = {**(preserved.get('nvext') or {}), **body['extra_body']['nvext']}
-
-        if isinstance(preserved.get('nvext'), dict) and 'stream' in preserved['nvext']:
-            del preserved['nvext']['stream']
-
-        if isinstance(preserved.get('extra_body'), dict) and isinstance(preserved['extra_body'].get('nvext'), dict):
-            if 'stream' in preserved['extra_body']['nvext']:
-                del preserved['extra_body']['nvext']['stream']
-            if not preserved['extra_body']['nvext']:
-                del preserved['extra_body']['nvext']
-
-        for p in PROACTIVE_DROP:
-            if p not in PROTECTED_PARAMS:
-                body.pop(p, None)
-
-        reasoning_mechanism = (find_reasoning_config(model_id) or {}).get('mechanism')
-        if reasoning_mechanism in ('reasoning_effort', 'nemotron_chat_template') and body.get('chat_template_kwargs'):
-            del body['chat_template_kwargs']
-
-        for p, v in preserved.items():
-            body[p] = v
-
         # BUG-ROUTE1 fix: route by endpoint path, not model_id. A model_id
         # never starts with '/v1/images' or '/v1/ranking', so the old code
         # always returned BASE_LLM. Using the call_plan.path correctly routes
@@ -2762,8 +2893,9 @@ class Server:
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
+        attempted_keys = set()
         while attempt < max_attempts:
-            key_result = await self.pool.acquire(model_id)
+            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             if not key_result:
                 # Return 429 (not 503) so client SDKs (Anthropic/OpenAI) auto-retry with backoff.
                 # 503 is treated as non-retryable fatal server error by most SDKs.
@@ -2771,6 +2903,18 @@ class Server:
 
             key = key_result['key']
             self._in_flight += 1
+            attempted_keys.add(key.api_key)
+            resp = None
+            transferred = False
+            released_attempt = False
+
+            def release_attempt():
+                nonlocal released_attempt
+                if not released_attempt:
+                    released_attempt = True
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+
 
             try:
                 fwd_headers = {
@@ -2782,14 +2926,14 @@ class Server:
                 req_timeout = self._client_timeout(is_streaming, metric_path)  # V-09 fix
 
                 if body.get('stream'):
-                    resp = await self._session.post(
-                        target_url, json=body, headers=fwd_headers,
-                        timeout=req_timeout,
-                    )
+                    resp = await context_request(
+                        lambda payload: self._session.post(target_url, json=payload,
+                            headers=fwd_headers, timeout=req_timeout), body,
+                        state=context_state, store=getattr(self, 'model_state', None),
+                        credential=key.api_key, endpoint=target_url)
                     if resp.status == 429:
                         ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
-                        self._in_flight = max(0, self._in_flight - 1)
-                        key.decrement_in_flight()
+                        release_attempt()
                         body_text = await resp.text()
                         await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
@@ -2802,9 +2946,10 @@ class Server:
                         resp_body = await _safe_response_body(resp)
                         await self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
                         classification = classify_upstream_error(resp.status, resp_body)
-                        norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
-                        self._in_flight = max(0, self._in_flight - 1)
-                        key.decrement_in_flight()
+                        norm_status = resp.status
+                        if metric_path != '/v1/chat/completions':
+                            norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
+                        release_attempt()
                         # Retry only failures that may change with time/key.
                         # Account-scoped deployment, capability and route
                         # errors must not be retried across identical keys.
@@ -2812,75 +2957,46 @@ class Server:
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
-                        return {'status': norm_status, 'data': resp_body}
+                        return {'status': norm_status, 'data': resp_body, 'headers': upstream_response_headers(resp)}
 
                     # Keep in-flight until the stream consumer finishes. The wrapper
                     # owns release/decrement so every streaming surface (/chat,
                     # /messages, /responses) closes capacity exactly once.
                     released = False
 
-                    async def stream_wrapper(resp=resp, key=key):
+                    def close_upstream():
                         nonlocal released
-                        # Idle-aware heartbeat: uses sentinel-task pattern so
-                        # heartbeat fires EVEN when upstream is silent (reasoning
-                        # models thinking 30+ sec). Without this, client/LB idle
-                        # timeouts kill the stream mid-turn → "response berhenti".
-                        last_hb = time.time()
-                        at_line_boundary = True
-                        saw_done = False
-                        hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+                        if released:
+                            return
+                        released = True
                         try:
-                            # B-08 fix: sentinel-task idle detection replaces
-                            # asyncio.wait_for, which cancels the pending read
-                            # and cannot distinguish an idle upstream from a
-                            # dead one (a failed stream was heartbeated
-                            # forever). Also fixes the dead `last_hb`.
-                            async for chunk in _iter_chunks_with_idle(resp, hb_interval):
-                                if chunk is _IDLE:
-                                    _now = time.time()
-                                    if at_line_boundary and (_now - last_hb) > hb_interval:
-                                        yield b': heartbeat\n\n'
-                                        last_hb = _now
-                                    continue
-                                # Check for [DONE] marker
-                                if isinstance(chunk, (bytes, bytearray)):
-                                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
-                                        saw_done = True
-                                else:
-                                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
-                                        saw_done = True
-                                yield chunk
-                                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                                    at_line_boundary = chunk.endswith(b'\n')
-                                elif chunk:
-                                    at_line_boundary = str(chunk).endswith('\n')
-                            # Synthesize [DONE] if upstream EOF'd without one
-                            if not saw_done:
-                                yield b'data: [DONE]\n\n'
+                            resp.release()
                         finally:
-                            if not released:
-                                released = True
-                                try:
-                                    resp.release()
-                                except Exception:
-                                    pass
-                                self._in_flight = max(0, self._in_flight - 1)
-                                try:
-                                    key.decrement_in_flight()
-                                except Exception:
-                                    pass
+                            release_attempt()
 
-                    return {'stream': stream_wrapper(), 'key': key, 'start_ms': start_ms, 'status': 200}
+                    async def stream_wrapper(resp=resp, key=key):
+                        hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+                        source = _passthrough_anthropic_sse(resp, hb_interval)
+                        try:
+                            async for chunk in source:
+                                yield chunk
+                        finally:
+                            from common.sse import close_stream
+                            await close_stream(source, close_upstream)
+
+                    transferred = True
+                    return {'stream': stream_wrapper(), 'on_close': close_upstream,
+                            'key': key, 'start_ms': start_ms, 'status': resp.status, 'headers': upstream_response_headers(resp)}
                 else:
-                    resp = await self._session.post(
-                        target_url, json=body, headers=fwd_headers,
-                        timeout=req_timeout,
-                    )
+                    resp = await context_request(
+                        lambda payload: self._session.post(target_url, json=payload,
+                            headers=fwd_headers, timeout=req_timeout), body,
+                        state=context_state, store=getattr(self, 'model_state', None),
+                        credential=key.api_key, endpoint=target_url)
 
                     if resp.status == 429:
                         ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
-                        self._in_flight = max(0, self._in_flight - 1)
-                        key.decrement_in_flight()
+                        release_attempt()
                         body_text = await resp.text()
                         await self._record_model_response(model_id, key, resp.status, body_text, metric_path)
                         await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
@@ -2894,16 +3010,17 @@ class Server:
                     classification = classify_upstream_error(resp.status, resp_data)
                     if resp.status >= 400:
                         await self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
-                    norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
-                    self._in_flight = max(0, self._in_flight - 1)
-                    key.decrement_in_flight()
+                    norm_status = resp.status
+                    if metric_path != '/v1/chat/completions':
+                        norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
+                    release_attempt()
 
                     if norm_status >= 400:
                         retryable = self._classify_retry(resp.status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
-                        return {'status': norm_status, 'data': resp_data}
+                        return {'status': norm_status, 'data': resp_data, 'headers': upstream_response_headers(resp)}
 
                     if self.metrics:
                         # F2 fix: DB write off the hot path
@@ -2914,19 +3031,23 @@ class Server:
                             completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
                             path=metric_path,
                         ), 'metrics')
-                    return {'status': resp.status, 'data': resp_data}
+                    return {'status': resp.status, 'data': resp_data, 'headers': upstream_response_headers(resp)}
 
             except asyncio.TimeoutError:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 attempt += 1
                 continue
             except Exception as e:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 logger.error(f'[proxy_openai] error: {e}')
                 attempt += 1
                 continue
+
+            finally:
+                if not transferred:
+                    if resp is not None:
+                        resp.release()
+                    release_attempt()
 
         return {'status': 429, 'headers': {'Retry-After': '30'}, 'data': {'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}}}
 
@@ -2938,17 +3059,33 @@ class Server:
         return route_upstream(model_id)
 
     async def _proxy_post(self, request: Request, body: dict, raw: bytes, model_id: str, path: str, get_target_url):
+        from common.context_recovery import context_request, ContextRecoveryState, context_response_headers
+        from common.http_headers import upstream_response_headers
+        context_state = ContextRecoveryState()
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
         is_streaming = bool(body.get('stream'))
 
+        attempted_keys = set()
         while attempt < max_attempts:
-            key_result = await self.pool.acquire(model_id)
+            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             if not key_result:
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
             key = key_result['key']
             self._in_flight += 1
+            attempted_keys.add(key.api_key)
+            resp = None
+            transferred = False
+            released_attempt = False
+
+            def release_attempt():
+                nonlocal released_attempt
+                if not released_attempt:
+                    released_attempt = True
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+
             start_ms = time.time() * 1000
 
             try:
@@ -2962,15 +3099,15 @@ class Server:
                 # P2/V-09: streaming uses read-idle timeout instead of total
                 req_timeout = self._client_timeout(is_streaming, path)
 
-                resp = await self._session.post(
-                    target_url, json=body, headers=fwd_headers,
-                    timeout=req_timeout,
-                )
+                resp = await context_request(
+                    lambda payload: self._session.post(target_url, json=payload,
+                        headers=fwd_headers, timeout=req_timeout), body,
+                    state=context_state, store=getattr(self, 'model_state', None),
+                    credential=key.api_key, endpoint=target_url)
 
                 if resp.status == 429:
                     ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
-                    self._in_flight = max(0, self._in_flight - 1)
-                    key.decrement_in_flight()
+                    release_attempt()
                     body_text = await resp.text()
                     await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
@@ -2988,15 +3125,29 @@ class Server:
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                             path=path,
                         ), 'metrics')
+                    transferred = True
+                    released = False
+
+                    def close_upstream():
+                        nonlocal released
+                        if released:
+                            return
+                        released = True
+                        try:
+                            resp.release()
+                        finally:
+                            self.pool.release_success(key)
+                            self._in_flight = max(0, self._in_flight - 1)
+
                     return StreamingResponse(
-                        self._stream_proxy(resp, key),
-                        media_type='text/event-stream',
-                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+                        self._stream_proxy(resp, key, close_upstream),
+                        status_code=resp.status, media_type='text/event-stream',
+                        on_close=close_upstream,
+                        headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(resp)},
                     )
 
                 resp_data = await resp.read()
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
 
                 if resp.status >= 400:
                     try:
@@ -3009,7 +3160,7 @@ class Server:
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
-                    return JSONResponse(status_code=resp.status, content=err_data)
+                    return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
                 if self.metrics:
                     # F2 fix: DB write off the hot path
@@ -3019,60 +3170,48 @@ class Server:
                         path=path,
                     ), 'metrics')
 
-                return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
+                return JSONResponse(status_code=resp.status, content=json.loads(resp_data), headers=upstream_response_headers(resp))
 
             except asyncio.TimeoutError:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 attempt += 1
                 continue
             except Exception as e:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 logger.error(f'[_proxy_post] error: {e}')
                 attempt += 1
                 continue
 
+            finally:
+                if not transferred:
+                    if resp is not None:
+                        resp.release()
+                    release_attempt()
+
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
-    async def _stream_proxy(self, resp, key):
-        # Idle-aware heartbeat: fires even when upstream is silent.
-        last_hb = time.time()
-        at_line_boundary = True
-        saw_done = False
+    async def _stream_proxy(self, resp, key, on_close=None):
+        """Forward native event bytes with boundary-safe idle heartbeats."""
         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+        source = _passthrough_anthropic_sse(resp, hb_interval)
         try:
-            # B-08 fix: sentinel-task idle detection (see common/sse.py).
-            async for chunk in _iter_chunks_with_idle(resp, hb_interval):
-                if chunk is _IDLE:
-                    _now = time.time()
-                    if at_line_boundary and (_now - last_hb) > hb_interval:
-                        yield b': heartbeat\n\n'
-                        last_hb = _now
-                    continue
-                if isinstance(chunk, (bytes, bytearray)):
-                    if b'data: [DONE]' in chunk or b'data:[DONE]' in chunk:
-                        saw_done = True
-                else:
-                    if 'data: [DONE]' in str(chunk) or 'data:[DONE]' in str(chunk):
-                        saw_done = True
+            async for chunk in source:
                 yield chunk
-                if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                    at_line_boundary = chunk.endswith(b'\n')
-                elif chunk:
-                    at_line_boundary = str(chunk).endswith('\n')
-                last_hb = time.time()
-            if not saw_done:
-                yield b'data: [DONE]\n\n'
         finally:
             try:
-                resp.release()
-            except Exception:
-                pass
-            self.pool.release_success(key)
-            self._in_flight = max(0, self._in_flight - 1)
+                await source.aclose()
+            finally:
+                if on_close is not None:
+                    on_close()
+                else:
+                    resp.release()
+                    self.pool.release_success(key)
+                    self._in_flight = max(0, self._in_flight - 1)
 
     async def _handle_catch_all(self, request: Request, path: str):
+        from common.context_recovery import context_request, ContextRecoveryState, context_response_headers
+        from common.http_headers import upstream_response_headers
+        context_state = ContextRecoveryState()
         path = self._normalize_path(path)
         method = request.method
         is_post = method in ('POST', 'PUT', 'PATCH')
@@ -3121,13 +3260,26 @@ class Server:
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
+        attempted_keys = set()
         while attempt < max_attempts:
-            key_result = await self.pool.acquire(model_id)
+            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             if not key_result:
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
             key = key_result['key']
             self._in_flight += 1
+            attempted_keys.add(key.api_key)
+            resp = None
+            transferred = False
+            released_attempt = False
+
+            def release_attempt():
+                nonlocal released_attempt
+                if not released_attempt:
+                    released_attempt = True
+                    self._in_flight = max(0, self._in_flight - 1)
+                    key.decrement_in_flight()
+
             start_ms = time.time() * 1000
 
             try:
@@ -3141,17 +3293,16 @@ class Server:
                 # P2/V-09: streaming uses read-idle timeout instead of total
                 req_timeout = self._client_timeout(is_streaming, path)
 
-                resp = await self._session.request(
-                    method, target_url,
-                    json=body if is_post else None,
-                    headers=fwd_headers,
-                    timeout=req_timeout,
-                )
+                resp = await context_request(
+                    lambda payload: self._session.request(method, target_url,
+                        json=payload, headers=fwd_headers, timeout=req_timeout),
+                    body if is_post else None, state=context_state,
+                    store=getattr(self, 'model_state', None), credential=key.api_key,
+                    endpoint=target_url)
 
                 if resp.status == 429:
                     ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
-                    self._in_flight = max(0, self._in_flight - 1)
-                    key.decrement_in_flight()
+                    release_attempt()
                     body_text = await resp.text()
                     await self._record_model_response(model_id, key, resp.status, body_text, path)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
@@ -3170,15 +3321,29 @@ class Server:
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
                             path=path,
                         ), 'metrics')
+                    transferred = True
+                    released = False
+
+                    def close_upstream():
+                        nonlocal released
+                        if released:
+                            return
+                        released = True
+                        try:
+                            resp.release()
+                        finally:
+                            self.pool.release_success(key)
+                            self._in_flight = max(0, self._in_flight - 1)
+
                     return StreamingResponse(
-                        self._stream_proxy(resp, key),
-                        media_type='text/event-stream',
-                        headers={'Cache-Control': 'no-cache', 'Connection': 'keep-alive', 'X-Accel-Buffering': 'no'},
+                        self._stream_proxy(resp, key, close_upstream),
+                        status_code=resp.status, media_type='text/event-stream',
+                        on_close=close_upstream,
+                        headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(resp)},
                     )
 
                 resp_data = await resp.read()
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
 
                 if resp.status >= 400:
                     # V-07 fix: classify the failure like the other proxy paths —
@@ -3187,12 +3352,16 @@ class Server:
                         err_data = json.loads(resp_data)
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
+                    if path == '/v1/responses':
+                        from common.compat import responses_chat_fallback_allowed
+                        if responses_chat_fallback_allowed(resp.status, err_data):
+                            return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
                     classification = classify_upstream_error(resp.status, err_data)
                     retryable = self._classify_retry(resp.status, classification)
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
-                    return JSONResponse(status_code=resp.status, content=err_data)
+                    return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
                 if self.metrics:
                     # F2 fix: DB write off the hot path
@@ -3203,21 +3372,26 @@ class Server:
                     ), 'metrics')
 
                 try:
-                    return JSONResponse(status_code=resp.status, content=json.loads(resp_data))
+                    return JSONResponse(status_code=resp.status, content=json.loads(resp_data), headers=upstream_response_headers(resp))
                 except (json.JSONDecodeError, ValueError):
-                    return Response(content=resp_data, status_code=resp.status, media_type=content_type)
+                    return Response(content=resp_data, status_code=resp.status,
+                                    headers=upstream_response_headers(resp))
 
             except asyncio.TimeoutError:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 attempt += 1
                 continue
             except Exception as e:
-                self._in_flight = max(0, self._in_flight - 1)
-                key.decrement_in_flight()
+                release_attempt()
                 logger.error(f'[_handle_catch_all] error: {e}')
                 attempt += 1
                 continue
+
+            finally:
+                if not transferred:
+                    if resp is not None:
+                        resp.release()
+                    release_attempt()
 
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
@@ -3280,9 +3454,6 @@ def create_app() -> FastAPI:
         allow_credentials=True,
     )
 
-    if _HAS_SIZE_LIMITER:
-        app.add_middleware(RequestSizeLimiter)
-
     # R-01 fix: reject non-object JSON bodies with a shaped 400 instead of
     # letting `body.get(...)` raise AttributeError -> HTTP 500.
     try:
@@ -3290,6 +3461,11 @@ def create_app() -> FastAPI:
         app.add_middleware(_JSONBodyGuard)
     except ImportError:  # pragma: no cover
         pass
+
+    # Register after the JSON guard so the limiter runs first and rejects
+    # oversized bodies before the guard can buffer them (ASGI wraps in reverse).
+    if _HAS_SIZE_LIMITER:
+        app.add_middleware(RequestSizeLimiter)
 
     # ── Catalog + MCP Integration (MUST BE BEFORE server routes with catch-all) ──────────────────────
     try:
@@ -3309,6 +3485,8 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         validate_config()
+        from common.compat import initialize_upstream_compatibility
+        await initialize_upstream_compatibility(BASE_LLM)
         logger.info(f'[lifecycle] wrapper-nvidia starting (v{VERSION}, commit={GIT_COMMIT})')
         await server.init()
         try:
@@ -3338,14 +3516,14 @@ def create_app() -> FastAPI:
                     _task.cancel()
                 if server._bg_tasks:
                     await asyncio.gather(*server._bg_tasks, return_exceptions=True)
+                if server.registry:
+                    await server.registry.close()
                 if server._session:
                     await server._session.close()
                 if server._agent:
                     await server._agent.close()
                 if server.metrics:
                     await server.metrics.close()
-                if server.registry:
-                    server.registry.stop()
                 await MODEL_REGISTRY_CLIENT.stop()
 
     app.router.lifespan_context = lifespan

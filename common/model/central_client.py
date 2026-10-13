@@ -34,6 +34,9 @@ class ModelRegistryClient:
         self._worker: asyncio.Task | None = None
         self._start_task: asyncio.Task | None = None
         self._queue: asyncio.Queue[tuple[str, dict[str, Any]]] = asyncio.Queue(maxsize=self.queue_limit)
+        self._stopping = False
+        self._closed = False
+        self.drain_timeout_sec = max(0.0, float(os.environ.get("MODEL_REGISTRY_DRAIN_TIMEOUT_SEC", "5")))
         self.dropped_observations = 0
         self.failed_posts = 0
         self.consecutive_failures = 0
@@ -52,7 +55,7 @@ class ModelRegistryClient:
         return headers
 
     async def _ensure_session(self) -> aiohttp.ClientSession | None:
-        if not self.enabled:
+        if not self.enabled or self._closed:
             return None
         loop = asyncio.get_running_loop()
         if self._session is not None:
@@ -76,32 +79,48 @@ class ModelRegistryClient:
     async def start(self) -> None:
         if not self.enabled:
             return
+        self._stopping = False
+        self._closed = False
         await self._ensure_session()
         if self._worker is None or self._worker.done():
             self._worker = asyncio.create_task(self._observation_worker())
 
     async def stop(self) -> None:
+        """Drain queued writes within a fixed window, then close owned resources."""
+        self._stopping = True
         if self._start_task is not None and not self._start_task.done():
             self._start_task.cancel()
             with suppress(asyncio.CancelledError):
                 await self._start_task
         self._start_task = None
+        # schedule_* can be called immediately before shutdown, before its
+        # scheduled start task ever runs. Still process that queue on stop.
+        if not self._queue.empty() and (self._worker is None or self._worker.done()):
+            self._worker = asyncio.create_task(self._observation_worker())
+        if self._worker is not None and self.drain_timeout_sec:
+            with suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._queue.join(), timeout=self.drain_timeout_sec)
         if self._worker is not None:
             self._worker.cancel()
             with suppress(asyncio.CancelledError):
                 await self._worker
             self._worker = None
+        while not self._queue.empty():
+            self._queue.get_nowait()
+            self._queue.task_done()
+            self.dropped_observations += 1
         if self._session is not None and not self._session.closed:
             await self._session.close()
         self._session = None
+        self._closed = True
 
     async def _post(self, path: str, payload: dict[str, Any]) -> bool:
         if time.time() < self.circuit_open_until:
             return False
-        session = await self._ensure_session()
-        if session is None:
-            return False
         try:
+            session = await self._ensure_session()
+            if session is None:
+                return False
             async with session.post(
                 f"{self.base_url}{path}", json=payload, headers=self._headers()
             ) as response:
@@ -139,6 +158,9 @@ class ModelRegistryClient:
             path, payload = await self._queue.get()
             try:
                 await self._post(path, payload)
+            except asyncio.CancelledError:
+                self.dropped_observations += 1
+                raise
             finally:
                 self._queue.task_done()
 
@@ -179,6 +201,9 @@ class ModelRegistryClient:
 
     def _schedule(self, path: str, payload: dict[str, Any]) -> None:
         if not self.enabled:
+            return
+        if self._stopping or self._closed:
+            self.dropped_observations += 1
             return
         try:
             loop = asyncio.get_running_loop()

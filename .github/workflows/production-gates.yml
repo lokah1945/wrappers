@@ -1,0 +1,36 @@
+name: Production gates
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  isolated-release-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: |
+            requirements-runtime.txt
+            tests/requirements.txt
+            tests/constraints-verified.txt
+      - run: python -m pip install -r requirements-runtime.txt -r tests/requirements.txt -c tests/constraints-verified.txt
+      - name: Verify authoritative production scope
+        run: python common/wrapper_scope.py --format json
+      - run: bash tests/run_production_gates.sh --output-dir /tmp/wrapper-gate-evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: production-gate-evidence
+          path: /tmp/wrapper-gate-evidence
+          retention-days: 14

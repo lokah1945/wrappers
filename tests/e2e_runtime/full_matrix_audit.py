@@ -8,22 +8,26 @@ openai SDK for Codex / generic OpenAI SDK) plus raw protocol checks for the
 remaining agents (OpenClaw/Hermes/OpenHands via OpenAI chat, OpenCode via all
 three, Ollama via discovery).
 
-Every check records PASS/FAIL/BLOCKED with evidence. Results are written to
-docs/audits/FULL_MATRIX_AUDIT_2026-08-01.json and the markdown report is
-rendered by render_full_matrix_report.py.
+Every check records PASS/FAIL/BLOCKED with evidence. Results go to a temporary
+directory by default; --output selects an explicit evidence file. Historical
+tracked audit evidence is preserved unless that path is explicitly requested.
 
-Usage:  python tests/e2e_runtime/full_matrix_audit.py
+Usage:  python tests/e2e_runtime/full_matrix_audit.py --output /tmp/full-matrix.json
 """
 import asyncio
+import argparse
 import json
 import os
 import subprocess
 import sys
 import time
+import tempfile
 from pathlib import Path
+from process_isolation import isolated_environment, assert_ports_free, stop_process
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import production_wrappers, require_production
 
 OPENAI_MOCK_PORT = 19997
 ANTHRO_MOCK_PORT = 19996
@@ -36,6 +40,8 @@ WRAPPERS = {
     'blackbox':      (19204, 'BLACKBOX', 'v1'),
     'openrouter':    (19206, 'OPENROUTER', 'v1'),
 }
+WRAPPERS = {name: config for name, config in WRAPPERS.items()
+            if name in production_wrappers(ROOT, include_registry=False)}
 
 RESULTS = []   # list of dicts
 CHECK = [0]
@@ -58,7 +64,8 @@ def log(msg):
 # ── process management ────────────────────────────────────────────────────
 
 def start_mock(port, mode):
-    env = os.environ.copy()
+    assert_ports_free(port)
+    env = isolated_environment()
     env['PYTHONUNBUFFERED'] = '1'
     return subprocess.Popen(
         [sys.executable, str(ROOT / 'tests/e2e_runtime/mock_upstream.py'), str(port), mode],
@@ -66,11 +73,13 @@ def start_mock(port, mode):
 
 
 def start_wrapper(name, port, pfx, base_style, layer):
+    require_production(name, ROOT)
     if base_style == 'root':
         base = f'http://127.0.0.1:{ANTHRO_MOCK_PORT}' if layer == 2 else f'http://127.0.0.1:{OPENAI_MOCK_PORT}'
     else:
         base = f'http://127.0.0.1:{ANTHRO_MOCK_PORT}/v1' if layer == 2 else f'http://127.0.0.1:{OPENAI_MOCK_PORT}/v1'
-    env = os.environ.copy()
+    assert_ports_free(port)
+    env = isolated_environment()
     env.update({
         'WRAPPER_SKIP_DOTENV': 'true',
         'BEARER_TOKEN': TOKEN,
@@ -82,6 +91,7 @@ def start_wrapper(name, port, pfx, base_style, layer):
         'PYTHONPATH': f'{ROOT}:{ROOT / name}',
         'PYTHONUNBUFFERED': '1',
         'FREE_ONLY': 'no',
+        'RESPONSES_UPSTREAM_MODE': 'chat',  # explicit historical adapter fixture
         'SOFT_LIMIT_RPM': '100000',
         'HARD_LIMIT_RPM': '100000',
         f'{pfx}_API_KEY_1': 'mock-key-0000000001',
@@ -337,11 +347,14 @@ async def audit_layer1_chat(port, wrapper):
                              {'model': 'mock/http429once', 'messages': [{'role': 'user', 'content': 'hi'}]})
     rec(wrapper, 1, c, 'retry-after-429', 'PASS' if st == 200 else 'FAIL', f'HTTP {st}')
 
-    # slow stream with heartbeat (timeout behavior)
+    # Matching OpenAI streams retain upstream data and EOF. Operational idle
+    # heartbeat comments are allowed only as complete frames between events.
     st, body, _ = await post(port, '/v1/chat/completions',
                              {'model': 'mock/slow', 'stream': True,
                               'messages': [{'role': 'user', 'content': 'hi'}]}, timeout=30)
-    rec(wrapper, 1, c, 'slow-heartbeat', 'PASS' if st == 200 and ': heartbeat' in body and '[DONE]' in body else 'FAIL',
+    heartbeat_frames = sum(frame == ': heartbeat' for frame in body.split('\n\n'))
+    boundary_safe = body.count(': heartbeat') == heartbeat_frames
+    rec(wrapper, 1, c, 'slow-native-stream', 'PASS' if st == 200 and 'after a long think' in body and boundary_safe and '[DONE]' in body else 'FAIL',
         f'HTTP {st} hb={": heartbeat" in body} done={"[DONE]" in body}')
 
     # metadata propagation
@@ -618,7 +631,9 @@ async def audit_layer2(port, wrapper):
         f'HTTP {st} shaped={"error" in body}')
 
 
-async def main():
+async def main(output: Path | None = None):
+    assert_ports_free(OPENAI_MOCK_PORT, ANTHRO_MOCK_PORT,
+                      *(config[0] for config in WRAPPERS.values()))
     openai_mock = start_mock(OPENAI_MOCK_PORT, 'openai')
     anthro_mock = start_mock(ANTHRO_MOCK_PORT, 'anthropic')
     time.sleep(1.5)
@@ -637,7 +652,7 @@ async def main():
             await audit_layer1_chat(port, name)
             await audit_layer1_messages(port, name)
             await audit_layer1_responses(port, name)
-            p.terminate()
+            stop_process(p)
 
         # ── layer 2 (Anthropic upstream) ──
         log('═══ COMPATIBILITY_LAYER=2 (Anthropic upstream) ═══')
@@ -649,12 +664,12 @@ async def main():
                 rec(name, 2, 'boot', 'health', 'FAIL', 'server not healthy')
                 continue
             await audit_layer2(port, name)
-            p.terminate()
+            stop_process(p)
 
         # wait for all to die
         for (p, lf) in procs.values():
             try:
-                p.terminate()
+                stop_process(p)
             except Exception:
                 pass
 
@@ -669,7 +684,7 @@ async def main():
             for r in RESULTS:
                 if r['status'] == 'FAIL':
                     log(f"  ✗ [{r['wrapper']} L{r['layer']}] {r['component']}::{r['test']} — {r['evidence']}")
-        out = ROOT / 'docs/audits/FULL_MATRIX_AUDIT_2026-08-01.json'
+        out = output or Path(tempfile.mkdtemp(prefix='wrapper-matrix-')) / 'audit.json'
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({'total': len(RESULTS), 'passed': passed,
                                    'failed': failed, 'blocked': blocked,
@@ -679,12 +694,15 @@ async def main():
     finally:
         for (p, lf) in procs.values():
             try:
-                p.terminate()
+                stop_process(p)
+                lf.close()
             except Exception:
                 pass
-        openai_mock.terminate()
-        anthro_mock.terminate()
+        stop_process(openai_mock)
+        stop_process(anthro_mock)
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--output', type=Path, help='Evidence path (default: a temporary directory)')
+    asyncio.run(main(parser.parse_args().output))

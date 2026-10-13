@@ -1,10 +1,16 @@
 # Wrapper Monorepo Contract
 
-**Version:** 3.1 (2026-08-01)
-**Supersedes:** 3.0 (2026-08-01)
+**Version:** 3.2 (2026-10-07)
+**Supersedes:** 3.1 (2026-08-01)
 **Status:** Normative. This document is the specification every wrapper is held to.
 
-This monorepo contains provider-specific wrappers that must behave as **one coherent product**. Upstreams differ (NVIDIA NIM, Nous Research, OpenCode Zen, BLACKBOX AI, OpenRouter), but the client-facing contract is intentionally identical across all wrappers.
+The active production provider scope is NVIDIA NIM, Nous Research and OpenRouter, with the shared model registry. `wrappers.json` and [AGENTS.md](AGENTS.md) govern lifecycle scope. BLACKBOX and the OpenCode provider wrapper are **pending and frozen**: do not read, analyze, edit, test, probe or deploy them until explicit owner reactivation. Historical clauses mentioning all five providers do not override this freeze. OpenCode client applications remain consumers of the active backends.
+
+### Native protocol forwarding
+
+Matching native protocols MUST preserve request and response fields, unknown extensions, and upstream SSE events: OpenAI Chat → OpenAI Chat, native Responses → native Responses, and Anthropic Messages → Anthropic Messages. Local authentication, required provider routing metadata, explicit aliases, credential rotation and documented operational limits still apply. Nous product/client tags are required metadata; inject honest wrapper defaults only when caller tags are absent, preserving explicit tags. Native paths MUST NOT rewrite null content, remove unknown tool types or roles, guess another protocol from a response shape, or manufacture a successful completion after an upstream failure. Heartbeats may be inserted only at complete SSE frame boundaries; all other upstream bytes remain unchanged. The upstream owns native stream terminators.
+
+Cross-protocol paths translate OpenAI ↔ Anthropic and validate fields needed by that translation. OpenAI Responses and Chat are different wire APIs; a Chat adapter for Responses requires an explicit compatibility policy. Future vendor updates are supported by native opaque forwarding and by updating cross-protocol adapters and regression tests; existing test results cannot guarantee compatibility with unpublished APIs.
 
 > **How to read this document.** Requirements use RFC-2119 keywords: **MUST**, **MUST NOT**, **SHOULD**, **MAY**. Every clause here was verified against the code at the version stamped above; where a wrapper legitimately deviates, the deviation is stated explicitly rather than hidden.
 
@@ -99,7 +105,7 @@ Provider-specific extras (nvidia's `/v1/ranking`, `/v1/images/*`, `/v1/engines`,
 2. **All-key retry before client error.** For retriable statuses (`401`, `402`, `403`, `408`, `409`, `429`, `5xx`) every available credential **MUST** be tried before returning an error.
 3. **Per-key cooldown.** A failing key is cooled down and skipped; other keys keep serving. A cooldown decision **MUST** come from the shared `common.translations.should_cooldown_key` — a model-capacity error **MUST NOT** cool the credential.
 4. **Exactly-once in-flight accounting.** A key is reserved exactly once on selection and released exactly once on non-stream completion, stream completion, stream exception, upstream EOF, **or client disconnect**.
-5. **Terminally complete streams.** OpenAI ends with exactly one `data: [DONE]`; Anthropic ends with `message_delta` + `message_stop`; Responses ends with `response.completed` **or** `response.failed`, then `data: [DONE]`.
+5. **Terminally complete translated streams.** Chat adapters emit exactly one `data: [DONE]`; Anthropic adapters emit `message_delta` + `message_stop`; Responses adapters emit `response.completed` **or** `response.failed`. Native streams forward upstream framing and terminators without inventing success.
 6. **No unstructured tool leakage.** Clients receive structured tool calls, never raw DSML or provider-specific markup.
 7. **Conversation continuity.** `previous_response_id` retains enough assistant `tool_calls` context that the next tool result is never orphaned. The store **MUST** be tenant-namespaced and bounded (§6.3).
 8. **Transparent model choice.** Wrappers do not silently substitute client-selected models. Aliases (`sonnet`, `haiku`, `opus`, `claude-*`) are dynamic/operator-bound, not hardcoded provider choices.
@@ -110,7 +116,7 @@ Provider-specific extras (nvidia's `/v1/ranking`, `/v1/images/*`, `/v1/engines`,
 
 ## 3. Streaming contract (normative)
 
-This section is new in v3.0. Every clause below corresponds to a defect found in live testing; the tag in brackets is the finding ID, and each is enforced by a regression test.
+The parsing and emission rules below apply to cross-protocol adapters. Native paths forward SSE bytes and unknown event types transparently. Historical finding tags refer to earlier audit regressions.
 
 ### 3.1 Parsing upstream SSE
 
@@ -163,7 +169,7 @@ This section is new in v3.0. Every clause below corresponds to a defect found in
 - **A malformed or non-object JSON body MUST yield a shaped `4xx`, never a `5xx`.** A valid-but-non-object body (`[1,2,3]`, `"str"`, `42`) reaches `body.get(...)`, and `list.get` raises `AttributeError` → HTTP 500. A 500 tells the SDK the *server* is broken and many SDKs then retry, amplifying load. Enforced centrally by `common.body_guard.JSONBodyGuard`, registered on all five wrappers. `[R-01]`
 - `max_tokens` **MUST** be a positive integer and is capped at `1_000_000`.
 - Request size is capped by `common.middleware.RequestSizeLimiter` (default 10 MB, `MAX_REQUEST_BYTES`). All five wrappers **MUST** use the same default.
-- Unknown `role` values and orphan `tool` messages are repaired or rejected with a shaped 400.
+- Cross-protocol adapters reject unsupported roles and orphan tool messages with shaped errors. Native paths preserve unknown roles for upstream validation; known orphan tool messages may be rejected locally.
 
 ---
 

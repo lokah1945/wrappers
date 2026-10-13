@@ -117,6 +117,14 @@ Invalid values fail fast at startup (`validate_config`). Full design:
 
 ## Configuration (.env)
 
+Nous Portal requires attribution metadata in inference requests. The wrapper
+supplies `tags=["product=wrapper-nous", "client=wrapper-nous", "user=wrapper-nous"]`
+when the caller omits `tags`; this prevents the provider's `400 missing tags`
+error for ordinary SDK and agent clients. Explicit caller tags pass through
+unchanged, including an empty or invalid value. Set `NOUS_REQUEST_TAGS` to a
+comma-separated list to override the defaults. This provider metadata does not
+change the selected model, message content, or protocol.
+
 ```ini
 NOUS_BASE_URL=https://inference-api.nousresearch.com
 AUTH_PATH=/root/.hermes/profiles/ilma/auth.json

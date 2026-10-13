@@ -1,0 +1,315 @@
+{
+  "started_at_utc": "2026-10-10T19:45:49.114695+00:00",
+  "git_head": "1825f876d30feca307ae1198be8e832073b78015",
+  "working_tree_release": true,
+  "source_combined_sha256": "d7c359bb4d125a26c8ec940f31263f315f64294edba0722734b83d9e71cfcd68",
+  "selected_services": [
+    "nvidia-python",
+    "nous",
+    "openrouter",
+    "model-registry",
+    "dashboard"
+  ],
+  "pending_excluded": [
+    "opencode",
+    "blackbox"
+  ],
+  "private_backup_created": true,
+  "before": {
+    "nvidia-python": {
+      "MainPID": "814",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:23:43 WIB"
+    },
+    "nous": {
+      "MainPID": "813",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:23:43 WIB"
+    },
+    "openrouter": {
+      "MainPID": "816",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:23:43 WIB"
+    },
+    "model-registry": {
+      "MainPID": "812",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:23:43 WIB"
+    },
+    "dashboard": {
+      "MainPID": "0",
+      "NRestarts": "0",
+      "ActiveState": "inactive",
+      "SubState": "dead",
+      "ActiveEnterTimestamp": ""
+    }
+  },
+  "checks": [
+    {
+      "wrapper": "nvidia-python",
+      "check": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "ready",
+      "http_status": 200,
+      "ready": true,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "native_first_configuration",
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "unauthorized",
+      "http_status": 401,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null_body_wrong_content_type/chat/completions",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null_body_wrong_content_type/responses",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "null_body_wrong_content_type/messages",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "qualified_model_catalog",
+      "http_status": 200,
+      "selected_model": "nvidia/nemotron-3-super-120b-a12b",
+      "model_count": 93,
+      "selected_model_listed": true,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "ready",
+      "http_status": 200,
+      "ready": true,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "native_first_configuration",
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "unauthorized",
+      "http_status": 401,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "null_body_wrong_content_type/chat/completions",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "null_body_wrong_content_type/responses",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "null_body_wrong_content_type/messages",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "qualified_model_catalog",
+      "http_status": 200,
+      "selected_model": "poolside/laguna-xs-2.1:free",
+      "model_count": 9,
+      "selected_model_listed": true,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "ready",
+      "http_status": 200,
+      "ready": true,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "native_first_configuration",
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "unauthorized",
+      "http_status": 401,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "null_body_wrong_content_type/chat/completions",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "null_body_wrong_content_type/responses",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "null_body_wrong_content_type/messages",
+      "http_status": 400,
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "qualified_model_catalog",
+      "http_status": 200,
+      "selected_model": "liquid/lfm-2.5-2.6b:free",
+      "model_count": 15,
+      "selected_model_listed": true,
+      "passed": true
+    },
+    {
+      "wrapper": "model-registry",
+      "check": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "dashboard",
+      "check": "health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "wrapper": "dashboard",
+      "check": "ready",
+      "http_status": 200,
+      "ready": true,
+      "passed": true
+    },
+    {
+      "check": "existing_environment_and_units_preserved",
+      "passed": true
+    },
+    {
+      "wrapper": "nvidia-python",
+      "check": "runtime_native_first_policy",
+      "passed": true
+    },
+    {
+      "wrapper": "nous",
+      "check": "runtime_native_first_policy",
+      "passed": true
+    },
+    {
+      "wrapper": "openrouter",
+      "check": "runtime_native_first_policy",
+      "passed": true
+    }
+  ],
+  "environment_policy": {
+    "nvidia-python": {
+      "responses_upstream_mode": "auto",
+      "local_auth_configured": true,
+      "systemd_inherited_responses_mode": null
+    },
+    "nous": {
+      "responses_upstream_mode": "auto",
+      "local_auth_configured": true,
+      "systemd_inherited_responses_mode": null
+    },
+    "openrouter": {
+      "responses_upstream_mode": "auto",
+      "local_auth_configured": true,
+      "systemd_inherited_responses_mode": null
+    }
+  },
+  "runtime_packages": {
+    "fastapi": "0.136.1",
+    "starlette": "1.0.0",
+    "aiohttp": "3.13.5",
+    "uvicorn": "0.46.0",
+    "openai": "2.31.0",
+    "anthropic": "0.95.0"
+  },
+  "notes": "Active services only. Provider ports unchanged; dashboard9105 added. Existing provider environments and installed units preserved. Private source/configuration/online SQLite backups taken. No commit or push.",
+  "after": {
+    "nvidia-python": {
+      "MainPID": "8876",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:45:52 WIB"
+    },
+    "nous": {
+      "MainPID": "8899",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:45:54 WIB"
+    },
+    "openrouter": {
+      "MainPID": "8924",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:45:57 WIB"
+    },
+    "model-registry": {
+      "MainPID": "8862",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:45:50 WIB"
+    },
+    "dashboard": {
+      "MainPID": "8850",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running",
+      "ActiveEnterTimestamp": "Sun 2026-10-11 02:45:49 WIB"
+    }
+  },
+  "existing_environment_and_units_preserved": true,
+  "passed": 31,
+  "failed": 0,
+  "completed_at_utc": "2026-10-10T19:46:00.331366+00:00"
+}

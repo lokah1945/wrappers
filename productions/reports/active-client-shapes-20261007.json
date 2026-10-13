@@ -1,0 +1,134 @@
+{
+  "completed_at_utc": "2026-10-07T14:46:26.929187+00:00",
+  "execution": "Actual Claude/Codex commands against latest wrapper with isolated credential-free fake upstream, temporary client working folders, tools disabled; HOME unchanged.",
+  "selected_model": "liquid/lfm-2.5-2.6b:free",
+  "inference_against_real_provider": false,
+  "credentials_used": "synthetic only",
+  "checks": [
+    {
+      "client": "claude",
+      "exit_code": 1,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": false,
+      "has_visible_answer": true,
+      "answer_matches_OK": false,
+      "visible_characters": 78,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 1.418,
+      "frontend_requests": [],
+      "upstream_requests": [],
+      "all_forwarded_models_exact": true
+    },
+    {
+      "client": "codex",
+      "exit_code": 0,
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": false,
+      "visible_characters": 17,
+      "terminal_event_observed": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 1.491,
+      "frontend_requests": [
+        {
+          "path": "/v1/responses",
+          "model": "liquid/lfm-2.5-2.6b:free",
+          "root_fields": [
+            "client_metadata",
+            "include",
+            "input",
+            "instructions",
+            "model",
+            "parallel_tool_calls",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tool_choice",
+            "tools"
+          ],
+          "header_names": [
+            "accept",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "originator",
+            "session-id",
+            "thread-id",
+            "user-agent",
+            "x-client-request-id",
+            "x-codex-beta-features",
+            "x-codex-turn-metadata",
+            "x-codex-window-id"
+          ],
+          "max_tokens": null,
+          "max_output_tokens": null,
+          "max_completion_tokens": null,
+          "stream": true,
+          "tool_count": 5,
+          "message_count": 0,
+          "input_shape": "list",
+          "reasoning": {
+            "summary": "auto"
+          },
+          "system_or_instructions_serialized_length": 17203,
+          "body_serialized_length": 27366
+        }
+      ],
+      "upstream_requests": [
+        {
+          "path": "/v1/responses",
+          "model": "liquid/lfm-2.5-2.6b:free",
+          "root_fields": [
+            "client_metadata",
+            "include",
+            "input",
+            "instructions",
+            "model",
+            "parallel_tool_calls",
+            "prompt_cache_key",
+            "reasoning",
+            "store",
+            "stream",
+            "tool_choice",
+            "tools"
+          ],
+          "header_names": [
+            "accept",
+            "accept-encoding",
+            "authorization",
+            "content-length",
+            "content-type",
+            "host",
+            "user-agent"
+          ],
+          "max_tokens": null,
+          "max_output_tokens": null,
+          "max_completion_tokens": null,
+          "stream": true,
+          "tool_count": 5,
+          "message_count": 0,
+          "input_shape": "list",
+          "body_serialized_length": 27366,
+          "reasoning": {
+            "summary": "auto"
+          },
+          "system_or_instructions_serialized_length": 17203
+        }
+      ],
+      "all_forwarded_models_exact": true
+    }
+  ]
+}

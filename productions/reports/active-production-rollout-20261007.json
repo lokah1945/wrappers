@@ -1,0 +1,71 @@
+{
+  "completed_at_utc": "2026-10-07T15:14:42.922841+00:00",
+  "selected_rollout": [
+    "model-registry",
+    "openrouter"
+  ],
+  "held_for_native_qualification": [
+    "nvidia-python",
+    "nous"
+  ],
+  "pending_excluded": [
+    "blackbox",
+    "opencode"
+  ],
+  "source_combined_sha256": "fdd670ff0e99eacd768b0555b33ce09fcda8b00ee5884de00c6d8c1c8b1cb09d",
+  "git_head": "1825f876d30feca307ae1198be8e832073b78015",
+  "working_tree_release": true,
+  "checks": [
+    {
+      "check": "registry/health",
+      "http_status": 200,
+      "status": "ok",
+      "git_commit": "1825f876d30feca307ae1198be8e832073b78015"
+    },
+    {
+      "check": "openrouter/health",
+      "http_status": 200,
+      "status": "ok",
+      "git_commit": "1825f876d30feca307ae1198be8e832073b78015",
+      "version": "1.0.0"
+    },
+    {
+      "check": "openrouter/readiness",
+      "http_status": 200,
+      "ready": true
+    },
+    {
+      "check": "openrouter/unauthorized",
+      "http_status": 401
+    },
+    {
+      "check": "openrouter/chat/completions/null-body",
+      "http_status": 400,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "check": "openrouter/responses/null-body",
+      "http_status": 400,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "check": "openrouter/messages/null-body",
+      "http_status": 400,
+      "error_type": "invalid_request_error"
+    },
+    {
+      "check": "openrouter/models",
+      "http_status": 200,
+      "model_count": 16,
+      "selected_model_listed": true,
+      "selected_model": "liquid/lfm-2.5-2.6b:free",
+      "selected_model_context_length": 65536,
+      "selected_model_tools_supported": true
+    }
+  ],
+  "passed": 8,
+  "failed": 0,
+  "service_metadata": "MainPID=3815360\nId=wrapper-openrouter.service\nActiveState=active\nActiveEnterTimestamp=Wed 2026-10-07 22:09:40 WIB\n\nMainPID=3815330\nId=wrapper-model-registry.service\nActiveState=active\nActiveEnterTimestamp=Wed 2026-10-07 22:09:32 WIB\n\nMainPID=827\nId=wrapper-nvidia-python.service\nActiveState=active\nActiveEnterTimestamp=Thu 2026-08-06 10:16:30 WIB\n\nMainPID=826\nId=wrapper-nous.service\nActiveState=active\nActiveEnterTimestamp=Thu 2026-08-06 10:16:30 WIB\n",
+  "environment_and_unit_files_preserved": true,
+  "notes": "Pending endpoints/services not probed or restarted. NVIDIA/Nous PIDs preserved. Native passthrough retained; no new unsupported-native exception. Private SQLite/source backups created before restart."
+}

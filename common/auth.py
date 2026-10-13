@@ -56,12 +56,17 @@ def require_auth() -> bool:
 
 
 def extract_client_token(headers) -> str:
-    """Pull the caller's credential from either SDK's header.
+    """Return the first credential, preserving the single-token helper API.
 
-    OpenAI SDKs send `Authorization: Bearer <t>`; Anthropic SDKs send
-    `x-api-key: <t>`. A malformed Authorization header must not mask a valid
-    x-api-key, so both are considered independently.
+    Authentication uses extract_client_tokens so a stale Authorization
+    header cannot mask a valid x-api-key.
     """
+    candidates = extract_client_tokens(headers)
+    return candidates[0] if candidates else ''
+
+
+def extract_client_tokens(headers) -> tuple[str, ...]:
+    """Read both SDK credentials independently, including mixed headers."""
     try:
         auth = (headers.get('authorization') or '').strip()
     except Exception:
@@ -71,11 +76,15 @@ def extract_client_token(headers) -> str:
     except Exception:
         api_key = ''
 
+    candidates = []
     if auth:
         if auth.lower().startswith('bearer '):
-            return auth[7:].strip()
-        return auth
-    return api_key
+            candidates.append(auth[7:].strip())
+        else:
+            candidates.append(auth)
+    if api_key:
+        candidates.append(api_key)
+    return tuple(candidates)
 
 
 def tokens_match(client_token: str, server_token: str) -> bool:
@@ -94,6 +103,20 @@ def tokens_match(client_token: str, server_token: str) -> bool:
         )
     except (UnicodeError, TypeError, AttributeError):
         return False
+
+
+def authenticated_client_token(headers) -> str:
+    """Use the accepted credential to namespace continuation history.
+
+    A stale secondary header must not change the principal between turns.
+    Open deployments retain the first supplied token as their namespace.
+    """
+    candidates = extract_client_tokens(headers)
+    configured = bearer_token()
+    for candidate in candidates:
+        if tokens_match(candidate, configured):
+            return candidate
+    return candidates[0] if candidates else ''
 
 
 class AuthResult:
@@ -145,9 +168,10 @@ def check_auth(headers, *, env_var: str = 'BEARER_TOKEN',
         )
         return _OK
 
-    client_token = extract_client_token(headers)
-    if tokens_match(client_token, server_token):
-        return _OK
+    client_tokens = extract_client_tokens(headers)
+    for client_token in client_tokens:
+        if tokens_match(client_token, server_token):
+            return _OK
     return AuthResult(False, 401, 'Unauthorized')
 
 

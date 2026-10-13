@@ -76,6 +76,67 @@ def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     return "".join(clean_parts).strip(), tools
 
 
+def responses_output_to_assistant_message(response: dict) -> dict:
+    """Reconstruct one assistant turn, retaining structured calls for replay."""
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = []
+    for item in response.get('output') or []:
+        if not isinstance(item, dict):
+            continue
+        kind = item.get('type')
+        if kind in ('message', 'reasoning'):
+            parts = text_parts if kind == 'message' else reasoning_parts
+            expected = 'output_text' if kind == 'message' else 'reasoning_text'
+            parts.extend(part['text'] for part in item.get('content') or []
+                         if isinstance(part, dict) and part.get('type') == expected
+                         and isinstance(part.get('text'), str))
+        elif kind == 'function_call':
+            tool_calls.append({'id': item.get('call_id') or item.get('id'), 'type': 'function',
+                               'function': {'name': item.get('name', ''),
+                                            'arguments': item.get('arguments', '')}})
+    message = {'role': 'assistant', 'content': ''.join(text_parts) or (None if tool_calls else '')}
+    if tool_calls:
+        message['tool_calls'] = tool_calls
+    if reasoning_parts:
+        message['reasoning_content'] = ''.join(reasoning_parts)
+    return message
+
+
+async def remember_responses_stream(generator, on_completed):
+    """Persist complete translated turns before clients can close at terminal.
+
+    Input consists of complete Responses SSE frames emitted by our adapters.
+    The callback may be synchronous or async. Failed/interrupted turns never
+    invoke it, and closing this wrapper deterministically closes the adapter.
+    """
+    import inspect
+    try:
+        async for frame in generator:
+            text = frame.decode('utf-8') if isinstance(frame, bytes) else frame
+            for line in text.splitlines():
+                if not line.startswith('data:'):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == '[DONE]':
+                    continue
+                try:
+                    event = json.loads(payload)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get('type') == 'response.completed':
+                    response = event.get('response') or {}
+                    if response.get('status') == 'completed' and response.get('id'):
+                        result = on_completed(response)
+                        if inspect.isawaitable(result):
+                            await result
+            yield frame
+    finally:
+        close = getattr(generator, 'aclose', None)
+        if close is not None:
+            await close()
+
+
 def repair_orphan_tool_messages(messages: list[dict]) -> list[dict]:
     """Convert orphan role=tool messages into user text.
 
@@ -330,25 +391,28 @@ def should_cooldown_key(status: int, body: Any) -> bool:
 
 
 # ── Transparent header forwarding ─────────────────────────────────────────
-# Per project principle #1 (TRANSPARENT PROXY): wrappers must NOT drop client
-# headers. The wrapper only swaps Authorization (to use a pool key) and strips
-# hop-by-hop headers. Everything else is forwarded verbatim.
+# Native protocol extensions must survive newer SDK versions. Only transport
+# framing, local credentials, and local proxy identity belong to this hop.
 
 # Hop-by-hop headers (RFC 7230) — must NOT be forwarded by proxies.
 HOP_BY_HOP_HEADERS = frozenset({
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
-    'te', 'trailers', 'transfer-encoding', 'upgrade',
+    'te', 'trailer', 'trailers', 'transfer-encoding', 'upgrade',
 })
 
 # Headers that the wrapper sets itself (must not be overwritten by client).
 WRAPPER_OWNED_HEADERS = frozenset({
-    'authorization', 'content-length', 'content-type', 'host',
+    'authorization', 'content-length', 'content-type', 'content-encoding', 'host',
     'accept-encoding',  # wrapper handles decompression
 })
 
-# Client headers that should ALWAYS be forwarded upstream (transparent proxy).
-# This is a broad allowlist covering all standard OpenAI/Anthropic SDK headers
-# plus common agent/client identity headers.
+LOCAL_CLIENT_HEADERS = frozenset({
+    'x-api-key', 'api-key', 'cookie',  # alternate local authentication/session
+    'forwarded', 'x-real-ip', 'via',  # inbound proxy chain is not the uplink's
+})
+
+# Compatibility export for older consumers. This documents familiar headers;
+# it is not an allowlist controlling native forwarding.
 FORWARD_HEADER_ALLOWLIST = (
     # OpenAI / Anthropic SDK identity
     'user-agent', 'x-stainless-lang', 'x-stainless-package-version',
@@ -370,38 +434,36 @@ FORWARD_HEADER_ALLOWLIST = (
 
 
 def build_forward_headers(client_headers, extra: dict | None = None) -> dict:
-    """Build the upstream header dict from client headers (transparent proxy).
+    """Forward end-to-end fields, including unknown SDK/protocol extensions.
 
-    Forwards:
-      - All headers in FORWARD_HEADER_ALLOWLIST (if present in client_headers).
-      - Any additional headers from `extra` (wrapper-specific overrides).
-
-    Strips:
-      - Hop-by-hop headers (RFC 7230).
-      - Wrapper-owned headers (authorization, content-length, content-type, host,
-        accept-encoding) — these are set by the wrapper itself.
-
-    Case-insensitive lookup on client_headers (works with Starlette/aiohttp
-    headers objects that use case-insensitive .get()).
-
-    Args:
-        client_headers: dict-like with case-insensitive .get() (e.g.
-            starlette.datastructures.Headers, dict, aiohttp.ClientResponse.headers).
-        extra: optional dict of wrapper-specific headers to add/override.
-
-    Returns:
-        dict of headers to send upstream (all values sanitized to str).
+    Local authentication, proxy identity and body/framing headers are replaced
+    at the wrapper boundary. Every Connection-nominated field also belongs to
+    this hop. ``extra`` is trusted wrapper configuration, so it may supply the
+    provider credential or content type; it never revives hop-by-hop fields.
+    Names are normalized to avoid duplicate keys with different capitalization.
     """
     out = {}
-    if client_headers and hasattr(client_headers, 'get'):
-        for h in FORWARD_HEADER_ALLOWLIST:
-            v = client_headers.get(h)
-            if v is not None:
-                out[h] = str(v)
-    if extra:
-        for k, v in extra.items():
-            if v is not None and k.lower() not in HOP_BY_HOP_HEADERS:
-                out[k] = str(v)
+    client_items = list(client_headers.items()) if client_headers is not None else []
+    extra_items = list(extra.items()) if extra else []
+    excluded = set(HOP_BY_HOP_HEADERS)
+    for key, value in [*client_items, *extra_items]:
+        if str(key).lower() == 'connection' and value is not None:
+            excluded.update(token.strip().lower() for token in str(value).split(','))
+    for items, trusted in ((client_items, False), (extra_items, True)):
+        for key, value in items:
+            name = str(key).lower()
+            if value is None or name in excluded:
+                continue
+            if not trusted and (name in WRAPPER_OWNED_HEADERS or name in LOCAL_CLIENT_HEADERS
+                                or name.startswith('x-forwarded-')):
+                continue
+            # Valid HTTP field names are tokens. Reject malformed names instead
+            # of sending CR/LF or whitespace into another HTTP request.
+            if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9a-z-]+", name):
+                continue
+            text = str(value)
+            # Preserve valid values exactly, including long opaque extensions.
+            out[name] = sanitize_header_value(text, max_len=len(text))
     return out
 
 
@@ -754,6 +816,9 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
     if not isinstance(chat_body, dict):
         return {'model': '', 'messages': []}
 
+    from copy import deepcopy
+    chat_body = deepcopy(chat_body)
+
     model = chat_body.get('model', '')
     system_parts: list[str] = []
     msgs: list = []
@@ -855,6 +920,7 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
             'name': name,
             'description': fn.get('description', '') or '',
             'input_schema': fn.get('parameters') or {'type': 'object', 'properties': {}},
+            **({'strict': fn['strict']} if 'strict' in fn else {}),
         })
     if tools:
         out['tools'] = tools

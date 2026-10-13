@@ -19,9 +19,11 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from process_isolation import isolated_environment, assert_ports_free, stop_process
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import production_wrappers, require_production
 
 MOCK_PORT = 19999
 TOKEN = 'sdk-e2e-token'
@@ -32,7 +34,9 @@ BASE_FOR = {
     'blackbox':   f'http://127.0.0.1:{MOCK_PORT}/v1',
     'openrouter': f'http://127.0.0.1:{MOCK_PORT}/v1',
 }
-PORT = {'nvidia-python': 19101, 'nous': 9102, 'opencode': 9103, 'blackbox': 9104, 'openrouter': 9106}
+PORT = {'nvidia-python': 19101, 'nous': 19102, 'opencode': 19103, 'blackbox': 19104, 'openrouter': 19106}
+PORT = {name: port for name, port in PORT.items()
+        if name in production_wrappers(ROOT, include_registry=False)}
 FAILURES = []
 
 
@@ -41,7 +45,7 @@ def log(msg):
 
 
 def start_mock():
-    env = os.environ.copy()
+    env = isolated_environment()
     env['PYTHONUNBUFFERED'] = '1'
     p = subprocess.Popen([sys.executable, str(ROOT / 'tests/e2e_runtime/mock_upstream.py'), str(MOCK_PORT)],
                          env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -49,7 +53,9 @@ def start_mock():
 
 
 def start_wrapper(name: str, wdir: str, port: int, upstream_var: str):
-    env = os.environ.copy()
+    require_production(name, ROOT)
+    assert_ports_free(port)
+    env = isolated_environment()
     env.update({
         'WRAPPER_SKIP_DOTENV': 'true',
         'BEARER_TOKEN': TOKEN,
@@ -61,6 +67,7 @@ def start_wrapper(name: str, wdir: str, port: int, upstream_var: str):
         'PYTHONPATH': f'{ROOT}:{ROOT / wdir}',
         'PYTHONUNBUFFERED': '1',
         'FREE_ONLY': 'no',
+        'RESPONSES_UPSTREAM_MODE': 'chat',  # explicit historical adapter fixture
         'SOFT_LIMIT_RPM': '100000',
         'HARD_LIMIT_RPM': '100000',
         f'{name.upper()}_HARD_LIMIT_RPM'.replace('NOUS', 'NOUS').replace('OPENCODE', 'OPENCODE'): '100000',
@@ -141,12 +148,13 @@ async def sdk_parse_nonstream(body: str, label: str):
 
 
 async def main():
+    assert_ports_free(MOCK_PORT, *PORT.values())
     log('starting mock upstream...')
     mock = start_mock()
     time.sleep(1.5)
     wrappers = {}
     try:
-        for name in ('nvidia-python', 'nous', 'opencode', 'blackbox', 'openrouter'):
+        for name in PORT:
             log(f'starting {name}...')
             p, lf = start_wrapper(name, name, PORT[name], f'{name.upper()}_BASE_URL'.replace('NVIDIA-PYTHON', 'NVIDIA'))
             wrappers[name] = (p, lf)
@@ -189,7 +197,7 @@ async def main():
                     if not dones:
                         FAILURES.append(f'{name} [tools]: no function_call_arguments.done events: {names}')
                         log(f'    classes: {names}')
-                if deltas and dones:
+                if mode == 'tools' and deltas and dones:
                     log(f'    tool args streamed via {len(deltas)} deltas + {len(dones)} done events')
             # non-streaming Responses must also parse with the SDK's strict
             # Response model (client.responses.create path)
@@ -217,8 +225,9 @@ async def main():
         log('✅ ALL WRAPPERS × MODES PARSE CLEANLY WITH THE OPENAI SDK (CODEX-RESP-02 FIXED)')
     finally:
         for p, lf in wrappers.values():
-            p.terminate()
-        mock.terminate()
+            stop_process(p)
+            lf.close()
+        stop_process(mock)
 
 
 if __name__ == '__main__':

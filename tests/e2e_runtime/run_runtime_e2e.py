@@ -23,8 +23,11 @@ import time
 from pathlib import Path
 
 import aiohttp
+from process_isolation import isolated_environment, assert_ports_free
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import production_wrappers, require_production, WrapperScopeError
 MOCK_PORT = 19999
 TOKEN = 'runtime-e2e-token'
 
@@ -36,6 +39,8 @@ WRAPPERS = {
     'blackbox':      ('blackbox',      19104, 'BLACKBOX_BASE_URL', {}),
     'openrouter':    ('openrouter',    19106, 'OPENROUTER_BASE_URL', {}),
 }
+WRAPPERS = {name: config for name, config in WRAPPERS.items()
+            if name in production_wrappers(ROOT, include_registry=False)}
 
 # nvidia-python and nous append '/v1' to the configured base themselves;
 # opencode/blackbox/openrouter expect the base to already include it.
@@ -265,15 +270,30 @@ def check_anthropic_stream(evs, mode) -> list[str]:
     return errs
 
 
-def check_openai_stream(evs, mode) -> list[str]:
+def check_openai_stream(evs, mode, raw=None) -> list[str]:
     errs = []
     if not evs:
         return ['no events emitted']
     payloads = [d for _e, d in evs]
-    if '[DONE]' not in payloads:
+    if mode in ('nofinish', 'midstream_error'):
+        # The native upstream deliberately closes at EOF without [DONE].
+        # Transparent forwarding must preserve that framing; the client drive
+        # has already verified EOF completes within its bounded timeout.
+        if '[DONE]' in payloads:
+            errs.append('native stream synthesized data: [DONE] absent from upstream')
+    elif '[DONE]' not in payloads:
         errs.append('missing terminal data: [DONE] (client hangs)')
     elif payloads[-1] != '[DONE]':
         errs.append('data: [DONE] is not the final frame')
+    if mode == 'noterminator' and raw is not None and not raw.endswith('data: [DONE]'):
+        errs.append('native stream changed the upstream unterminated data: [DONE] EOF')
+    if mode == 'nofinish':
+        choices = [choice for payload in payloads if isinstance(payload, dict)
+                   for choice in payload.get('choices', [])]
+        if any(choice.get('finish_reason') is not None for choice in choices):
+            errs.append('native stream synthesized finish_reason absent from upstream')
+        if not choices or (choices[-1].get('delta') or {}).get('content') != 'from mock upstream.':
+            errs.append('native EOF lost the final upstream content chunk')
     for d in payloads:
         if d == '[DONE]':
             continue
@@ -448,7 +468,7 @@ async def exercise(wrapper: str, port: int) -> None:
             except ValueError as e:
                 fail(wrapper, '/v1/chat/completions', mode, f'unparsable SSE: {e}')
                 continue
-            errs = check_openai_stream(evs, mode)
+            errs = check_openai_stream(evs, mode, raw)
             if errs:
                 for e in errs:
                     fail(wrapper, '/v1/chat/completions', mode, e)
@@ -496,40 +516,6 @@ async def exercise(wrapper: str, port: int) -> None:
                     fail(wrapper, '/v1/responses', mode, e)
             else:
                 ok(wrapper, '/v1/responses', mode, f'{len(evs)} events')
-
-        # ── upstream HTTP errors must surface as shaped errors, not hangs ──
-        for mode in ERROR_MODES:
-            for path, payload in (
-                ('/v1/chat/completions',
-                 {'model': f'mock/{mode}', 'stream': True,
-                  'messages': [{'role': 'user', 'content': 'hi'}]}),
-                ('/v1/messages',
-                 {'model': f'mock/{mode}', 'max_tokens': 64, 'stream': True,
-                  'messages': [{'role': 'user', 'content': 'hi'}]}),
-            ):
-                st, raw, err = await drive_stream(s, base + path, payload, headers)
-                if err:
-                    fail(wrapper, path, mode, f'transport: {err}')
-                    continue
-                if st == 200:
-                    # A 200 is only acceptable if the body carries a terminal
-                    # error event; otherwise the client sees a silent empty turn.
-                    if 'error' not in raw and 'message_stop' not in raw and '[DONE]' not in raw:
-                        fail(wrapper, path, mode,
-                             'HTTP 200 with no error and no terminator (client hangs)')
-                    else:
-                        ok(wrapper, path, mode, '200+terminal')
-                elif 400 <= st < 600:
-                    try:
-                        d = json.loads(raw)
-                        if not isinstance(d, dict) or 'error' not in d:
-                            fail(wrapper, path, mode, f'HTTP {st} body is not a shaped error: {raw[:150]}')
-                        else:
-                            ok(wrapper, path, mode, f'{st} shaped')
-                    except json.JSONDecodeError:
-                        fail(wrapper, path, mode, f'HTTP {st} body is not JSON: {raw[:150]}')
-                else:
-                    fail(wrapper, path, mode, f'unexpected status {st}')
 
         # ── non-streaming JSON on all three surfaces ──
         for path, payload, shape in (
@@ -690,10 +676,49 @@ async def exercise(wrapper: str, port: int) -> None:
                     fail(wrapper, path, name, f'{type(e).__name__}: {e}')
 
 
+
+async def exercise_upstream_rejections(wrapper: str, port: int) -> None:
+    """Quota rejection checks run with a fresh server after positive scenarios."""
+    base = f'http://127.0.0.1:{port}'
+    headers = {'Authorization': f'Bearer {TOKEN}'}
+    async with aiohttp.ClientSession() as s:
+        # ── upstream HTTP errors must surface as shaped errors, not hangs ──
+        for mode in ERROR_MODES:
+            for path, payload in (
+                ('/v1/chat/completions',
+                 {'model': f'mock/{mode}', 'stream': True,
+                  'messages': [{'role': 'user', 'content': 'hi'}]}),
+                ('/v1/messages',
+                 {'model': f'mock/{mode}', 'max_tokens': 64, 'stream': True,
+                  'messages': [{'role': 'user', 'content': 'hi'}]}),
+            ):
+                st, raw, err = await drive_stream(s, base + path, payload, headers)
+                if err:
+                    fail(wrapper, path, mode, f'transport: {err}')
+                    continue
+                if st == 200:
+                    fail(wrapper, path, mode,
+                         'upstream rejected before streaming; wrapper returned HTTP 200 instead of an error/exhaustion status')
+                elif 400 <= st < 600:
+                    try:
+                        d = json.loads(raw)
+                        if not isinstance(d, dict) or 'error' not in d:
+                            fail(wrapper, path, mode, f'HTTP {st} body is not a shaped error: {raw[:150]}')
+                        else:
+                            ok(wrapper, path, mode, f'{st} shaped')
+                    except json.JSONDecodeError:
+                        fail(wrapper, path, mode, f'HTTP {st} body is not JSON: {raw[:150]}')
+                else:
+                    fail(wrapper, path, mode, f'unexpected status {st}')
+
+
+
 # ── process management ─────────────────────────────────────────────────────
 
 def start_wrapper(name: str, wdir: str, port: int, upstream_var: str, extra: dict):
-    env = os.environ.copy()
+    require_production(name, ROOT)
+    assert_ports_free(port)
+    env = isolated_environment()
     env.update({
         'WRAPPER_SKIP_DOTENV': 'true',
         'BEARER_TOKEN': TOKEN,
@@ -706,6 +731,9 @@ def start_wrapper(name: str, wdir: str, port: int, upstream_var: str, extra: dic
         'PYTHONUNBUFFERED': '1',
         'FREE_ONLY': 'no',
         'MODEL_REGISTRY_STRICT': 'false',
+        # Historical adapter tests opt in explicitly; native Responses are
+        # covered separately by active_production_acceptance.py.
+        'RESPONSES_UPSTREAM_MODE': 'chat',
         # HARNESS NOTE: this suite fires ~55 requests in well under a minute.
         # nvidia's key pool defaults to SOFT_LIMIT_RPM=30 and deliberately
         # PACES admission above that — correct production behaviour, but it
@@ -763,11 +791,20 @@ def main():
     global VERBOSE
     ap = argparse.ArgumentParser()
     ap.add_argument('--wrapper')
+    ap.add_argument('--errors-only', action='store_true', help='Run pre-stream quota/status regressions on fresh wrapper processes')
     ap.add_argument('-v', '--verbose', action='store_true')
     args = ap.parse_args()
     VERBOSE = args.verbose
 
-    targets = ({args.wrapper: WRAPPERS[args.wrapper]} if args.wrapper else WRAPPERS)
+    if args.wrapper:
+        try:
+            name = require_production(args.wrapper, ROOT)
+        except WrapperScopeError as exc:
+            ap.error(str(exc))
+        targets = {name: WRAPPERS[name]}
+    else:
+        targets = WRAPPERS
+    assert_ports_free(MOCK_PORT, *(item[1] for item in targets.values()))
 
     mock = subprocess.Popen(
         [sys.executable, str(ROOT / 'tests/e2e_runtime/mock_upstream.py'), str(MOCK_PORT)],
@@ -779,22 +816,29 @@ def main():
     try:
         for name, (wdir, port, upstream_var, extra) in targets.items():
             print(f'── {name} ' + '─' * (58 - len(name)))
-            proc, logf = start_wrapper(name, wdir, port, upstream_var, extra)
-            try:
-                if not free_port_wait(port) or not health_wait(port):
-                    tail = open(f'/tmp/rt-{name}.log', errors='replace').read()[-1500:]
-                    fail(name, 'boot', '-', f'did not become healthy.\n{tail}')
-                    continue
-                asyncio.run(exercise(name, port))
-            finally:
-                proc.terminate()
+            phases = [exercise_upstream_rejections] if args.errors_only else [exercise, exercise_upstream_rejections]
+            for exercise_phase in phases:
+                # Deliberate exhausted-account failures belong to their own
+                # process pool, so they cannot poison positive protocol tests.
+                # Both error surfaces still share the rejected pool, verifying
+                # that exhausted clients get a prompt error on their next turn.
+                proc, logf = start_wrapper(name, wdir, port, upstream_var, extra)
                 try:
-                    proc.wait(timeout=15)
-                except subprocess.TimeoutExpired:
-                    proc.kill()
-                logf.close()
-            for hit in scan_log(name):
-                fail(name, 'server-log', '-', hit)
+                    if not free_port_wait(port) or not health_wait(port):
+                        tail = open(f'/tmp/rt-{name}.log', errors='replace').read()[-1500:]
+                        fail(name, 'boot', '-', f'did not become healthy.\n{tail}')
+                        continue
+                    asyncio.run(exercise_phase(name, port))
+                finally:
+                    proc.terminate()
+                    try:
+                        proc.wait(timeout=15)
+                    except subprocess.TimeoutExpired:
+                        proc.kill()
+                        proc.wait(timeout=15)
+                    logf.close()
+                for hit in scan_log(name):
+                    fail(name, 'server-log', '-', hit)
             print()
     finally:
         mock.terminate()

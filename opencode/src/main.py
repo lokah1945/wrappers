@@ -330,17 +330,10 @@ def _bearer_token() -> str:
     return (os.environ.get('BEARER_TOKEN') or '').strip()
 
 def _client_ip(request: Request) -> str:
-    """OC-8 / DR-7: key rate limiting by the real peer, not a client-supplied
-    X-Forwarded-For value (which is trivially spoofable and lets an attacker
-    rotate values to bypass the limiter and grow the store unbounded). XFF is
-    only trusted as a fallback when no direct peer host is available."""
+    """Use the ASGI peer; forwarded headers require server-level trust."""
     host = getattr(request.client, 'host', None) if request.client else None
-    if host:
-        return host
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return 'unknown'
+    return host or 'unknown'
+
 
 # ── Per-IP Rate Limiting ──
 from collections import defaultdict
@@ -900,9 +893,24 @@ def openai_to_anthropic(model: str, data: dict) -> dict:
 
 # G11 fix: previous_response_id store for codex multi-turn server-side history
 _RESPONSE_STORE: dict = {}  # namespaced key -> {"ts": float, "data": list}
-_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSE_STORE_TTL_SEC', '3600'))
+_RESPONSE_STORE_TTL_SEC = int(os.environ.get('RESPONSES_STORE_TTL_SEC', os.environ.get('RESPONSE_STORE_TTL_SEC', '3600')))
+_RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_RESPONSE_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
 _RESPONSE_STORE_MAX_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_CHARS', '4000000'))
 _RESPONSE_STORE_MAX_ENTRY_CHARS = int(os.environ.get('RESPONSE_STORE_MAX_ENTRY_CHARS', '500000'))
+
+
+def _prune_response_store() -> None:
+    now = time.time()
+    if _RESPONSE_STORE_TTL_SEC > 0:
+        for key in [key for key, entry in _RESPONSE_STORE.items()
+                    if now - entry['ts'] > _RESPONSE_STORE_TTL_SEC]:
+            _RESPONSE_STORE.pop(key, None)
+    total = sum(entry['size'] for entry in _RESPONSE_STORE.values())
+    while _RESPONSE_STORE and (len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES
+                              or total > _RESPONSE_STORE_MAX_BYTES):
+        key = next(iter(_RESPONSE_STORE))
+        total -= _RESPONSE_STORE.pop(key)['size']
 
 
 def _store_response(principal: str, key: str, data) -> None:
@@ -937,25 +945,24 @@ def _store_response(principal: str, key: str, data) -> None:
             start += 1
         data = entries[start:]
     store_key = f"{principal}\x00{key}"
-    _RESPONSE_STORE[store_key] = {"ts": time.time(), "data": data}
-    # Evict expired entries and bound total size to 200.
-    if len(_RESPONSE_STORE) > 200:
-        now = time.time()
-        for k in [k for k, v in _RESPONSE_STORE.items() if now - v["ts"] > _RESPONSE_STORE_TTL_SEC]:
-            _RESPONSE_STORE.pop(k, None)
-        if len(_RESPONSE_STORE) > 200:
-            for k in sorted(_RESPONSE_STORE, key=lambda k: _RESPONSE_STORE[k]["ts"])[:len(_RESPONSE_STORE) - 200]:
-                _RESPONSE_STORE.pop(k, None)
+    try:
+        serialized = json.dumps(data, ensure_ascii=False)
+        size = len(serialized.encode('utf-8'))
+        data = json.loads(serialized)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return
+    _RESPONSE_STORE.pop(store_key, None)
+    if size <= _RESPONSE_STORE_MAX_BYTES:
+        _RESPONSE_STORE[store_key] = {"ts": time.time(), "size": size, "data": data}
+    _prune_response_store()
 
 
 def _load_response(principal: str, key: str):
+    _prune_response_store()
     entry = _RESPONSE_STORE.get(f"{principal}\x00{key}")
     if not entry:
         return None
-    if time.time() - entry["ts"] > _RESPONSE_STORE_TTL_SEC:
-        _RESPONSE_STORE.pop(f"{principal}\x00{key}", None)
-        return None
-    return entry["data"]
+    return json.loads(json.dumps(entry['data'], ensure_ascii=False))
 
 
 
@@ -1225,6 +1232,8 @@ async def model_catalog_refresh_loop():
 async def lifespan(app: FastAPI):
     # B-22: `_session` dropped from this global stmt — never rebound here.
     global _MODEL_REFRESH_TASK, _METRICS_PERSIST_TASK, _env_observer
+    from common.compat import initialize_upstream_compatibility
+    await initialize_upstream_compatibility(OPENCODE_BASE)
     pool.load_from_env()
     start_env_watcher()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
@@ -1819,12 +1828,12 @@ async def responses(request: Request):
                     for tc in d.get("tool_calls") or []:
                         acc = get_tool_acc(tc)
                         fn = tc.get("function") or {}
+                        if fn.get("name"):
+                            acc["name"] += fn["name"]
                         if not acc["added"]:
                             acc["added"] = True
                             yield emit("response.output_item.added", {"output_index": acc["output_index"], "item": {"id": acc["call_id"], "type": "function_call", "status": "in_progress", "call_id": acc["call_id"], "name": acc["name"], "arguments": ""}})
-                        if fn.get("name"):
-                            acc["name"] += fn["name"]
-                            yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["name"], "name": acc["name"]})
+                        # Function names are item metadata, never JSON argument deltas.
                         if fn.get("arguments"):
                             acc["args"] += fn["arguments"]
                             yield emit("response.function_call_arguments.delta", {"item_id": acc["call_id"], "output_index": acc["output_index"], "delta": fn["arguments"]})
@@ -1866,6 +1875,7 @@ async def responses(request: Request):
                     # output (Codex would persist it as a successful answer). Emit
                     # a proper failure event and stop.
                     yield emit("response.failed", {"response": {"id": rid, "model": model, "status": "failed", "error": {"type": "api_error", "message": f"Upstream stream error: {e}"}}})
+                    yield "data: [DONE]\n\n"
                     return
                 finally:
                     try:
@@ -1889,9 +1899,9 @@ async def responses(request: Request):
                 yield emit("response.output_text.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "text": acc_text})
                 yield emit("response.content_part.done", {"item_id": "msg-1", "output_index": 0, "content_index": 0, "part": {"type": "output_text", "text": acc_text, "annotations": []}})
                 yield emit("response.output_item.done", {"output_index": 0, "item": msg_item})
-                outputs = [msg_item]
+                outputs_by_index = {0: msg_item}
                 if rsn_started:
-                    outputs.append({"id": rsn_id, "type": "reasoning", "status": "completed", "summary": [], "content": [{"type": "reasoning_text", "text": acc_reason}]})
+                    outputs_by_index[rsn_index] = {"id": rsn_id, "type": "reasoning", "status": "completed", "summary": [], "content": [{"type": "reasoning_text", "text": acc_reason}]}
                 completed_tools = [a for a in tool_accs if a]
                 for acc in completed_tools:
                     fc_item = {"id": acc["call_id"], "type": "function_call", "status": "completed", "call_id": acc["call_id"], "name": acc["name"], "arguments": acc["args"]}
@@ -1899,9 +1909,12 @@ async def responses(request: Request):
                     # tool arguments before the item is closed.
                     yield emit("response.function_call_arguments.done", {"item_id": acc["call_id"], "output_index": acc["output_index"], "name": acc["name"], "arguments": acc["args"]})
                     yield emit("response.output_item.done", {"output_index": acc["output_index"], "item": fc_item})
-                    outputs.append(fc_item)
-                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj(), "parallel_tool_calls": True, "tool_choice": "auto", "tools": []}})
+                    outputs_by_index[acc["output_index"]] = fc_item
+                outputs = [outputs_by_index[index] for index in sorted(outputs_by_index)]
+                # Persist before the client observes completion or closes here.
                 _store_response(principal, rid, list(chat_body.get("messages", [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+                yield emit("response.completed", {"response": {"id": rid, "object": "response", "created_at": int(time.time()), "model": model, "status": "completed", "output": outputs, "usage": usage_obj(), "parallel_tool_calls": True, "tool_choice": "auto", "tools": []}})
+                yield "data: [DONE]\n\n"
             return StreamingResponse(gen(), media_type="text/event-stream",
                                      headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
 

@@ -1,0 +1,598 @@
+{
+  "recorded_at_utc": "2026-10-07T02:24:38.237561+00:00",
+  "execution": "Latest source staged on isolated ports; direct Responses raw SDK iterator; actual provider content discarded and only structural metadata saved.",
+  "private_oauth_copy": true,
+  "checks": [
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "surface": "native_responses",
+      "stream": true,
+      "max_output_tokens": 256,
+      "http_status": 200,
+      "event_count": 34,
+      "completed_count": 1,
+      "visible_delta_length": 2,
+      "passed_raw_iterator": true,
+      "structural_events": [
+        {
+          "type": "response.created",
+          "sequence_number": 0,
+          "field_names": [
+            "response",
+            "sequence_number",
+            "type"
+          ],
+          "response_status": "in_progress",
+          "response_output_count": 0,
+          "response_output_types": []
+        },
+        {
+          "type": "response.in_progress",
+          "sequence_number": 1,
+          "field_names": [
+            "response",
+            "sequence_number",
+            "type"
+          ],
+          "response_status": "in_progress",
+          "response_output_count": 0,
+          "response_output_types": []
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 0,
+          "sequence_number": 2,
+          "field_names": [
+            "item",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "item_type": "reasoning",
+          "item_status": "in_progress",
+          "item_content_count": null
+        },
+        {
+          "type": "response.reasoning_part.added",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 3,
+          "field_names": [
+            "sequence_number",
+            "type",
+            "content_index",
+            "item_id",
+            "output_index",
+            "part"
+          ]
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 4,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 3
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 5,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 6,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 9
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 7,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 1
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 8,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 2
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 9,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 10,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 11,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 4
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 12,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 7
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 13,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 14,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 3
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 15,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 2
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 16,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 3
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 17,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 2
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 18,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 19,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 6
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 20,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 21,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 5
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 22,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 3
+        },
+        {
+          "type": "response.reasoning_text.delta",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 23,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 1
+        },
+        {
+          "type": "response.reasoning_text.done",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 24,
+          "field_names": [
+            "content_index",
+            "item_id",
+            "output_index",
+            "sequence_number",
+            "text",
+            "type"
+          ]
+        },
+        {
+          "type": "response.reasoning_part.done",
+          "output_index": 0,
+          "content_index": 0,
+          "sequence_number": 25,
+          "field_names": [
+            "sequence_number",
+            "type",
+            "content_index",
+            "item_id",
+            "output_index",
+            "part"
+          ]
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 0,
+          "sequence_number": 26,
+          "field_names": [
+            "item",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "item_type": "reasoning",
+          "item_status": "completed",
+          "item_content_count": 1
+        },
+        {
+          "type": "response.output_item.added",
+          "output_index": 1,
+          "sequence_number": 27,
+          "field_names": [
+            "item",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "item_type": "message",
+          "item_status": "in_progress",
+          "item_content_count": 0
+        },
+        {
+          "type": "response.content_part.added",
+          "output_index": 1,
+          "content_index": 1,
+          "sequence_number": 28,
+          "field_names": [
+            "content_index",
+            "item_id",
+            "output_index",
+            "part",
+            "sequence_number",
+            "type"
+          ]
+        },
+        {
+          "type": "response.output_text.delta",
+          "output_index": 1,
+          "content_index": 1,
+          "sequence_number": 29,
+          "field_names": [
+            "content_index",
+            "delta",
+            "item_id",
+            "logprobs",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "delta_length": 2
+        },
+        {
+          "type": "response.output_text.done",
+          "output_index": 1,
+          "content_index": 1,
+          "sequence_number": 30,
+          "field_names": [
+            "content_index",
+            "item_id",
+            "logprobs",
+            "output_index",
+            "sequence_number",
+            "text",
+            "type"
+          ]
+        },
+        {
+          "type": "response.content_part.done",
+          "output_index": 1,
+          "content_index": 1,
+          "sequence_number": 31,
+          "field_names": [
+            "content_index",
+            "item_id",
+            "output_index",
+            "part",
+            "sequence_number",
+            "type"
+          ]
+        },
+        {
+          "type": "response.output_item.done",
+          "output_index": 1,
+          "sequence_number": 32,
+          "field_names": [
+            "item",
+            "output_index",
+            "sequence_number",
+            "type"
+          ],
+          "item_type": "message",
+          "item_status": "completed",
+          "item_content_count": 1
+        },
+        {
+          "type": "response.completed",
+          "sequence_number": 33,
+          "field_names": [
+            "response",
+            "sequence_number",
+            "type"
+          ],
+          "response_status": "completed",
+          "response_output_count": 2,
+          "response_output_types": [
+            "reasoning",
+            "message"
+          ]
+        }
+      ],
+      "latency_sec": 2.697,
+      "synthetic_replay_event_count": 34
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "surface": "native_responses",
+      "stream": true,
+      "max_output_tokens": 256,
+      "input_shape": "message_array",
+      "explicit_top_level_tags_count": 3,
+      "http_status": 400,
+      "exception": "BadRequestError",
+      "sanitized_error": "Error code: 400 - {'status': 400, 'message': 'This request is not valid. Check the model name and other parameters. Additional info: missing tags'}",
+      "passed_raw_iterator": false,
+      "latency_sec": 0.881
+    }
+  ],
+  "sdk_snapshot_synthetic_replay": [
+    {
+      "sdk_version": "2.31.0",
+      "fixture": "synthetic content redacted; preserves captured vendor event structure",
+      "events_before_error": 29,
+      "passed": false,
+      "exception": "IndexError",
+      "error": "list index out of range",
+      "traceback_frames": [
+        {
+          "file": "_responses.py",
+          "line": 49,
+          "function": "__iter__"
+        },
+        {
+          "file": "_responses.py",
+          "line": 57,
+          "function": "__stream__"
+        },
+        {
+          "file": "_responses.py",
+          "line": 248,
+          "function": "handle_event"
+        },
+        {
+          "file": "_responses.py",
+          "line": 352,
+          "function": "accumulate_event"
+        }
+      ]
+    },
+    {
+      "sdk_version": "2.54.0",
+      "fixture": "synthetic content redacted; preserves captured vendor event structure",
+      "events_before_error": 29,
+      "passed": false,
+      "exception": "IndexError",
+      "error": "list index out of range",
+      "traceback_frames": [
+        {
+          "file": "_responses.py",
+          "line": 49,
+          "function": "__iter__"
+        },
+        {
+          "file": "_responses.py",
+          "line": 57,
+          "function": "__stream__"
+        },
+        {
+          "file": "_responses.py",
+          "line": 248,
+          "function": "handle_event"
+        },
+        {
+          "file": "_responses.py",
+          "line": 352,
+          "function": "accumulate_event"
+        }
+      ]
+    }
+  ],
+  "nvidia_vendor_index_diagnosis": "The native message at output_index=1 begins with zero content parts. Its only content_part.added and output_text.delta events use content_index=1, while the completed message contains one part. Both installed SDK 2.31.0 and isolated SDK 2.54.0 append that part at index 0 and fail when the delta accesses index 1. Raw event iteration still receives a completed response and visible text.",
+  "nous_vendor_tags_diagnosis": "The native Responses request with input array and explicit top-level honest tags is rejected with missing tags, despite the wrapper transport adding/preserving those same tags and the same model succeeding via Chat/cross Messages. No alternative metadata nesting or Chat fallback was silently applied.",
+  "protocol_policy": "No native SSE indices, provider payload schema, model or API family were rewritten during diagnostics. Provider-side/native endpoint failures are distinguished from wrapper-local conversion issues."
+}

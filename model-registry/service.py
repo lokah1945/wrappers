@@ -8,6 +8,7 @@ It never selects a fallback model or provider.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 from pathlib import Path
@@ -62,7 +63,9 @@ from fastapi.responses import JSONResponse  # noqa: E402
 
 from common.model import AliasBinding, LocalModelRegistry  # noqa: E402
 from common.model_state import ModelStateStore  # noqa: E402
-from common.model.validation import validate_catalog_entries, validate_observation, validate_provider_name  # noqa: E402
+from common.middleware import RequestSizeLimiter  # noqa: E402
+from common.model.identity import normalize_model_syntax  # noqa: E402
+from common.model.validation import validate_catalog_entries, validate_model_id, validate_observation, validate_provider_name  # noqa: E402
 
 MODEL_REGISTRY_DB = os.environ.get(
     "MODEL_REGISTRY_DB", str(Path(__file__).resolve().parent / "registry-state.db")
@@ -110,12 +113,28 @@ class CentralRegistry:
         registry = self.registry(provider)
         with self._guard:
             ids = registry.register_catalog(models, revision=revision or "catalog")
-        self.state(provider).upsert_catalog(models, source=f"central:{provider}")
+            self.state(provider).upsert_catalog(models, source=f"central:{provider}")
         return ids
+
+    def resolve(self, provider: str, requested: str, scopes: list[tuple[str, str]]):
+        with self._guard:
+            return self.registry(provider).resolve(requested, scopes)
+
+    def call_plan(self, provider: str, requested: str, surface: str,
+                  scopes: list[tuple[str, str]]):
+        with self._guard:
+            return self.registry(provider).call_plan(requested, surface, scopes)
+
+    def bind_aliases(self, provider: str, bindings: list[AliasBinding]) -> None:
+        with self._guard:
+            registry = self.registry(provider)
+            for binding in bindings:
+                registry.bind_alias(binding)
 
 
 central = CentralRegistry()
 app = FastAPI(title="model-registry", version="0.1.0", docs_url=None, redoc_url=None)
+app.add_middleware(RequestSizeLimiter)
 
 
 def _require_internal(request: Request) -> None:
@@ -150,6 +169,33 @@ def _provider(body: dict[str, Any]) -> str:
         return validate_provider_name(body.get("provider"))
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+def _requested_model(body: dict[str, Any]) -> str:
+    requested = body.get("requested_model") or body.get("model")
+    if not isinstance(requested, str):
+        raise HTTPException(status_code=400, detail="requested_model must be a non-empty string")
+    try:
+        validate_model_id(normalize_model_syntax(requested))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return requested.strip()
+
+
+def _scope_chain(body: dict[str, Any]) -> list[tuple[str, str]]:
+    scopes = body.get("scope_chain")
+    if scopes is None:
+        return []
+    if not isinstance(scopes, list) or len(scopes) > 100:
+        raise HTTPException(status_code=400, detail="scope_chain must be a list of at most 100 scopes")
+    result = []
+    for scope in scopes:
+        if (not isinstance(scope, (list, tuple)) or len(scope) != 2
+                or any(not isinstance(value, str) or not value.strip() or len(value) > 256
+                       for value in scope)):
+            raise HTTPException(status_code=400, detail="scope entries must contain string type and id")
+        result.append((scope[0], scope[1]))
+    return result
 
 
 @app.get("/health")
@@ -201,11 +247,12 @@ def model_info(canonical_id: str) -> dict[str, Any]:
 async def resolve(request: Request) -> dict[str, Any]:
     body = await _read_json_body(request)
     provider = _provider(body)
-    requested = str(body.get("requested_model") or body.get("model") or "").strip()
-    if not requested:
-        raise HTTPException(status_code=400, detail="requested_model is required")
-    scope_chain = body.get("scope_chain") or []
-    ref = central.registry(provider).resolve(requested, scope_chain)
+    requested = _requested_model(body)
+    scope_chain = _scope_chain(body)
+    try:
+        ref = await asyncio.to_thread(central.resolve, provider, requested, scope_chain)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
         "requested_model": requested,
         "resolved": ref.to_dict(),
@@ -219,12 +266,13 @@ async def resolve(request: Request) -> dict[str, Any]:
 async def call_plan(request: Request) -> dict[str, Any]:
     body = await _read_json_body(request)
     provider = _provider(body)
-    requested = str(body.get("requested_model") or body.get("model") or "").strip()
-    surface = str(body.get("client_surface") or "").strip()
-    if not requested or not surface:
-        raise HTTPException(status_code=400, detail="requested_model and client_surface are required")
+    requested = _requested_model(body)
+    surface = body.get("client_surface")
+    if not isinstance(surface, str) or not surface.strip():
+        raise HTTPException(status_code=400, detail="client_surface must be a non-empty string")
+    scope_chain = _scope_chain(body)
     try:
-        plan = central.registry(provider).call_plan(requested, surface, body.get("scope_chain") or [])
+        plan = await asyncio.to_thread(central.call_plan, provider, requested, surface.strip(), scope_chain)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return {
@@ -239,7 +287,7 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
     _require_internal(request)
     body = await _read_json_body(request)
     provider = _provider(body)
-    models_data = body.get("models") or body.get("data") or []
+    models_data = body.get("models", body.get("data", []))
     if not isinstance(models_data, list):
         raise HTTPException(status_code=400, detail="models must be a list")
     try:
@@ -247,8 +295,7 @@ async def ingest_catalog(request: Request) -> dict[str, Any]:
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     # MR-2 fix: run sync SQLite work off the event loop.
-    import asyncio as _asyncio
-    ids = await _asyncio.to_thread(
+    ids = await asyncio.to_thread(
         central.register_catalog, provider, models_data,
         str(body.get("revision") or "catalog"))
     return {"provider": provider, "registered": len(ids), "ids": ids}
@@ -259,10 +306,10 @@ async def ingest_aliases(request: Request) -> dict[str, Any]:
     _require_internal(request)
     body = await _read_json_body(request)
     provider = _provider(body)
-    bindings = body.get("bindings") or []
+    bindings = body.get("bindings", [])
     if not isinstance(bindings, list) or len(bindings) > 1000:
         raise HTTPException(status_code=400, detail="bindings must be a list of at most 1000 items")
-    registered = []
+    validated = []
     try:
         for item in bindings:
             if not isinstance(item, dict):
@@ -275,10 +322,16 @@ async def ingest_aliases(request: Request) -> dict[str, Any]:
                 revision=str(item.get("revision") or ""),
                 source=str(item.get("source") or "central"),
             )
-            central.registry(provider).bind_alias(binding)
-            registered.append(binding.to_dict())
+            validate_model_id(normalize_model_syntax(binding.alias))
+            validate_model_id(binding.canonical_target)
+            if (not binding.canonical_target.startswith(f"{provider}/")
+                    or not binding.canonical_target[len(provider) + 1:]):
+                raise ValueError("alias target must belong to the registry provider and include a model id")
+            validated.append(binding)
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    await asyncio.to_thread(central.bind_aliases, provider, validated)
+    registered = [binding.to_dict() for binding in validated]
     return {"provider": provider, "registered": len(registered), "bindings": registered}
 
 
@@ -303,18 +356,27 @@ async def observation(request: Request) -> dict[str, Any]:
         )
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    raw_status = body.get("http_status")
+    try:
+        if isinstance(raw_status, (bool, float, dict, list)):
+            raise ValueError
+        http_status = int(raw_status or 0)
+        if http_status != 0 and not 100 <= http_status <= 599:
+            raise ValueError
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise HTTPException(status_code=400, detail="http_status must be 0 or an integer from 100 to 599") from exc
     # MR-2 fix: run sync SQLite work off the event loop.
-    import asyncio as _asyncio
-    result = await _asyncio.to_thread(
-        central.state(provider).record_status,
-        model_id=validated["model_id"],
-        account_scope=validated["account_scope"],
-        state=validated["state"],
-        status_code=int(body.get("http_status") or 0),
-        reason_code=validated["reason_code"],
-        reason_detail=validated["reason_detail"],
-        endpoint=validated["endpoint"],
-    )
+    def record_observation():
+        return central.state(provider).record_status(
+            model_id=validated["model_id"],
+            account_scope=validated["account_scope"],
+            state=validated["state"],
+            status_code=http_status,
+            reason_code=validated["reason_code"],
+            reason_detail=validated["reason_detail"],
+            endpoint=validated["endpoint"],
+        )
+    result = await asyncio.to_thread(record_observation)
     return {"provider": provider, "model": model_id, "observation": result}
 
 
@@ -343,7 +405,7 @@ def main() -> None:
 
     uvicorn.run(
         app,
-        host=os.environ.get("MODEL_REGISTRY_HOST", "0.0.0.0"),
+        host=os.environ.get("MODEL_REGISTRY_HOST", "127.0.0.1"),
         port=int(os.environ.get("MODEL_REGISTRY_PORT", "9200")),
         log_level="info",
     )

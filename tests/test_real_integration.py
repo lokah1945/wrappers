@@ -41,6 +41,7 @@ from typing import Any, Dict, List, Optional
 # Add project root to path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import load_wrappers, production_wrappers, select_wrappers, WrapperScopeError
 
 # Try to import real SDKs
 try:
@@ -81,12 +82,10 @@ class WrapperEndpoint:
 
 
 # Default wrapper endpoints
-DEFAULT_WRAPPERS = [
-    WrapperEndpoint("nvidia-python", 9101, "http://127.0.0.1:9101"),
-    WrapperEndpoint("nous", 9102, "http://127.0.0.1:9102"),
-    WrapperEndpoint("opencode", 9103, "http://127.0.0.1:9103"),
-    WrapperEndpoint("blackbox", 9104, "http://127.0.0.1:9104"),
-]
+_metadata = load_wrappers(ROOT)
+DEFAULT_WRAPPERS = [WrapperEndpoint(name, _metadata[name]["port"],
+                                    f"http://127.0.0.1:{_metadata[name]['port']}")
+                    for name in production_wrappers(ROOT, include_registry=False)]
 
 
 # ============================================================================
@@ -508,7 +507,7 @@ class RealIntegrationTestSuite:
 def parse_args():
     """Parse command line arguments."""
     parser = argparse.ArgumentParser(description="Real Integration Test Suite")
-    parser.add_argument("--ports", type=str, default="9101,9102,9103,9104",
+    parser.add_argument("--ports", type=str, default=",".join(str(w.port) for w in DEFAULT_WRAPPERS),
                        help="Comma-separated list of wrapper ports")
     parser.add_argument("--wrappers", type=str, default=None,
                        help="Comma-separated list of wrapper names to test")
@@ -516,7 +515,19 @@ def parse_args():
                        help="Skip wrappers that are not running")
     parser.add_argument("--auth-token", type=str, default="test-token",
                        help="Auth token for wrapper access")
-    return parser.parse_args()
+    args = parser.parse_args()
+    try:
+        if args.wrappers:
+            args.wrappers = ",".join(select_wrappers([w.strip() for w in args.wrappers.split(",")], ROOT, include_registry=False))
+        frozen_ports = {config["port"]: name for name, config in load_wrappers(ROOT).items()
+                        if config["status"] != "production"}
+        for raw in args.ports.split(","):
+            port = int(raw.strip())
+            if port in frozen_ports:
+                raise WrapperScopeError(f"{frozen_ports[port]}: pending wrapper is frozen; endpoint selection is excluded")
+    except (WrapperScopeError, ValueError) as exc:
+        parser.error(str(exc))
+    return args
 
 
 async def main():

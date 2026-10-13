@@ -1,0 +1,46 @@
+{
+  "completed_at_utc": "2026-10-07T15:14:03.114797+00:00",
+  "scope": "actual live OpenRouter endpoint9106; controlled synthetic echo tool, no shell/files/network tool execution",
+  "exact_model": "liquid/lfm-2.5-2.6b:free",
+  "source_combined_sha256": "fdd670ff0e99eacd768b0555b33ce09fcda8b00ee5884de00c6d8c1c8b1cb09d",
+  "checks": [
+    {
+      "surface": "chat",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "execution": "live production, two-turn structured tool loop, bounded max256, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "stop",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    },
+    {
+      "surface": "responses",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "execution": "live production, two-turn structured tool loop, bounded max256, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "completed",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    },
+    {
+      "surface": "messages",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "execution": "live production, two-turn structured tool loop, bounded max256, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "end_turn",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    }
+  ],
+  "passed": 3,
+  "failed": 0
+}

@@ -23,8 +23,9 @@ def test_local_registry_loads_provider_manifest_and_registers_catalog():
     assert plan.key_rotation_allowed is True
     assert registry.profiles["nvidia/provider/model-a"].capabilities.input_modalities == ()
     responses_plan = registry.call_plan("provider/model-a", "openai_responses")
-    assert responses_plan.upstream_surface == "openai_chat"
-    assert responses_plan.path == "/v1/chat/completions"
+    assert responses_plan.upstream_surface == "openai_responses"
+    assert responses_plan.path == "/v1/responses"
+    assert responses_plan.adapter_name == "nvidia.responses.native.v1"
 
 
 def test_local_registry_alias_is_explicit_and_scoped():

@@ -1,0 +1,24 @@
+{
+  "execution": "bounded native Chat check on already-running service; required-value schema; final strict cross patch not yet deployed",
+  "check": {
+    "kind": "tool_loop",
+    "surface": "chat",
+    "model": "liquid/lfm-2.5-2.6b:free",
+    "request_count": 2,
+    "argument_schema": "required value:string enum[OK]; additionalProperties=false; strict=true",
+    "history": "full explicit history; no claim of server-side credential-affinity continuation",
+    "first_reported_model": "liquid/lfm-2.5-2.6b:free",
+    "tool_name_correct": true,
+    "arguments_valid": true,
+    "first_terminal": "tool_calls",
+    "final_reported_model": "liquid/lfm-2.5-2.6b:free",
+    "terminal": "stop",
+    "has_visible_answer": true,
+    "answer_matches_OK": true,
+    "visible_characters": 2,
+    "passed": true,
+    "latency_sec": 5.938,
+    "reported_model_matches_request": true,
+    "reported_model_observed": true
+  }
+}

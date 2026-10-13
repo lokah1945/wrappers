@@ -203,16 +203,10 @@ def _raw_upstream_errors() -> bool:
 
 
 def _client_ip(request: Request) -> str:
-    """BB-11/DR-7: key rate limiting by the real peer, not the client-supplied
-    X-Forwarded-For header (spoofable → limiter bypass + unbounded store
-    growth). XFF is only a fallback when no direct peer host is available."""
+    """Use the ASGI peer; forwarded headers require server-level trust."""
     host = getattr(request.client, 'host', None) if request.client else None
-    if host:
-        return host
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return 'unknown'
+    return host or 'unknown'
+
 
 
 # ── Per-IP Rate Limiting ──
@@ -815,9 +809,8 @@ def _extract_principal(request) -> str:
     import hashlib
     token = ''
     try:
-        auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
-        if auth:
-            token = auth.replace('Bearer ', '', 1).strip() if auth.lower().startswith('bearer ') else auth.strip()
+        from common.auth import authenticated_client_token
+        token = authenticated_client_token(request.headers)
         if not token and request.client:
             token = request.client.host or ''
     except Exception:
@@ -1074,6 +1067,8 @@ async def model_catalog_refresh_loop():
 async def lifespan(app: FastAPI):
     # B-22: `global _session` removed — never assigned in this scope.
     global _MODEL_REFRESH_TASK
+    from common.compat import initialize_upstream_compatibility
+    await initialize_upstream_compatibility(BLACKBOX_BASE)
     pool.load_from_env()
     seed = (os.environ.get('DYNAMIC_ALIAS_TARGET') or '').strip()
     if seed and not is_alias_name(seed):
@@ -1622,12 +1617,12 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         for tc in d.get('tool_calls') or []:
             acc = get_tool_acc(tc)
             fn = tc.get('function') or {}
+            if fn.get('name'):
+                acc['name'] += fn['name']
             if not acc['added']:
                 acc['added'] = True
                 yield emit('response.output_item.added', {'output_index': acc['output_index'], 'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress', 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''}})
-            if fn.get('name'):
-                acc['name'] += fn['name']
-                yield emit('response.function_call_arguments.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name']})
+            # Function names are item metadata, never JSON argument deltas.
             if fn.get('arguments'):
                 acc['args'] += fn['arguments']
                 yield emit('response.function_call_arguments.delta', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'delta': fn['arguments']})
@@ -1698,9 +1693,9 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
     yield emit('response.output_text.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'text': acc_text})
     yield emit('response.content_part.done', {'item_id': msg_id, 'output_index': 0, 'content_index': 0, 'part': {'type': 'output_text', 'text': acc_text, 'annotations': []}})
     yield emit('response.output_item.done', {'output_index': 0, 'item': msg_item})
-    outputs = [msg_item]
+    outputs_by_index = {0: msg_item}
     if rsn_started:
-        outputs.append({'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]})
+        outputs_by_index[rsn_index] = {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [], 'content': [{'type': 'reasoning_text', 'text': acc_reason}]}
     completed_tools = [a for a in tool_accs if a]
     for acc in completed_tools:
         fc_item = {'id': acc['call_id'], 'type': 'function_call', 'status': 'completed', 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': acc['args']}
@@ -1708,9 +1703,12 @@ async def _responses_stream(resp, key, rid: str, model: str, chat_body: dict, pr
         # arguments before the item is closed.
         yield emit('response.function_call_arguments.done', {'item_id': acc['call_id'], 'output_index': acc['output_index'], 'name': acc['name'], 'arguments': acc['args']})
         yield emit('response.output_item.done', {'output_index': acc['output_index'], 'item': fc_item})
-        outputs.append(fc_item)
-    yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj(), 'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': []}})
+        outputs_by_index[acc['output_index']] = fc_item
+    outputs = [outputs_by_index[index] for index in sorted(outputs_by_index)]
+    # The client may close or start its next tool turn at the terminal event.
     _store_response(principal, rid, list(chat_body.get('messages', [])) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+    yield emit('response.completed', {'response': {'id': rid, 'object': 'response', 'created_at': int(time.time()), 'model': model, 'status': 'completed', 'output': outputs, 'usage': usage_obj(), 'parallel_tool_calls': True, 'tool_choice': 'auto', 'tools': []}})
+    yield 'data: [DONE]\n\n'
 
 
 _RESPONSE_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
@@ -1729,12 +1727,15 @@ def _store_response(principal: str, rid: str, messages: list):
         return
     key = _response_store_key(principal, rid)
     try:
-        size = len(json.dumps(messages, ensure_ascii=False))
-    except (TypeError, ValueError):
-        size = 0
+        serialized = json.dumps(messages, ensure_ascii=False)
+        size = len(serialized.encode('utf-8'))
+        messages = json.loads(serialized)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return
     if size > _RESPONSE_STORE_MAX_BYTES:
         logger.warning(f'[responses] history for {rid} too large ({size}B); not stored')
         return
+    _RESPONSE_STORE.pop(key, None)
     _RESPONSE_STORE[key] = (time.time(), size, messages)
     _prune_response_store()
 
@@ -1749,14 +1750,16 @@ def _prune_response_store():
     while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
         _RESPONSE_STORE.pop(next(iter(_RESPONSE_STORE)))
     total = sum(v[1] for v in _RESPONSE_STORE.values() if isinstance(v, tuple))
-    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
-        _k, v = _RESPONSE_STORE.popitem()
+    while total > _RESPONSE_STORE_MAX_BYTES and _RESPONSE_STORE:
+        _k = next(iter(_RESPONSE_STORE))
+        v = _RESPONSE_STORE.pop(_k)
         if isinstance(v, tuple):
             total -= v[1]
 
 
 def _get_stored_conversation(principal: str, rid: str) -> list:
     """TTL-aware read from the bounded store (B-33)."""
+    _prune_response_store()
     entry = _RESPONSE_STORE.get(_response_store_key(principal, rid))
     if not entry or not isinstance(entry, tuple):
         return []
@@ -1764,7 +1767,7 @@ def _get_stored_conversation(principal: str, rid: str) -> list:
     if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
         _RESPONSE_STORE.pop(_response_store_key(principal, rid), None)
         return []
-    return list(msgs)
+    return json.loads(json.dumps(msgs, ensure_ascii=False))
 
 
 @app.post('/v1/messages')

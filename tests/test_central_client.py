@@ -8,6 +8,11 @@ def test_observation_queue_is_bounded_and_drops_without_blocking(monkeypatch):
 
     async def run():
         client = ModelRegistryClient("http://registry.test")
+
+        async def accepted_post(path, payload):
+            return True
+
+        monkeypatch.setattr(client, "_post", accepted_post)
         client.schedule_observation("nvidia", "provider/model-a", "scope", "available", 200, "OK", "", "chat")
         client.schedule_observation("nvidia", "provider/model-b", "scope", "available", 200, "OK", "", "chat")
         assert client._queue.qsize() == 1

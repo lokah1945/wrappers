@@ -8,6 +8,8 @@ from .anthropic_stream import AnthropicStreamState
 from .shared import (
     parse_dsml_from_text,
     repair_orphan_tool_messages,
+    responses_output_to_assistant_message,
+    remember_responses_stream,
     strip_cache_control,
     normalize_upstream_error,
     parse_retry_after,
@@ -27,6 +29,8 @@ __all__ = [
     "AnthropicStreamState",
     "parse_dsml_from_text",
     "repair_orphan_tool_messages",
+    "responses_output_to_assistant_message",
+    "remember_responses_stream",
     "strip_cache_control",
     "normalize_upstream_error",
     "parse_retry_after",

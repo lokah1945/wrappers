@@ -1,0 +1,127 @@
+{
+  "started_at_utc": "2026-10-07T02:20:54.378606+00:00",
+  "completed_at_utc": "2026-10-07T02:21:00.515529+00:00",
+  "scope": [
+    "nvidia-python",
+    "nous",
+    "openrouter"
+  ],
+  "execution": "Latest frozen working-tree source on isolated staging listeners with real configured upstream credentials; no production service restart or state writes.",
+  "interpreter": "/usr/bin/python3",
+  "sdk_versions": {
+    "openai": "2.31.0",
+    "anthropic": "0.95.0"
+  },
+  "state_isolation": {
+    "directories_mode": "0700",
+    "private_logs_mode": "0600",
+    "production_model_metrics_catalog_databases_used": false,
+    "central_registry_client_disabled": true,
+    "operator_credentials_logged": false,
+    "credential_source": "Active wrapper .env settings and read-only configured Nous OAuth auth path."
+  },
+  "native_responses_policy": "RESPONSES_UPSTREAM_MODE=native explicitly; no downgrade to Chat.",
+  "source_sha256": {
+    "nvidia-python/src/main.py": "248c75b9827de3d398383311ea7dce220de4e5babdc6e0301ca807f56c624ddb",
+    "nous/src/main.py": "4094c3aed1666d193a8113e7c495620984cd893afd6e6c78ee6c30d41358d048",
+    "openrouter/src/main.py": "f1afff5f39224dc7257c36a780bb7e6073b1bc2762c2ca883fa7df9190dcaa97",
+    "common/compat.py": "695bbb932555f1931a60896d868c8d7378d435fe44ab51097bce9069d40f458a",
+    "common/translations/__init__.py": "49d461ca7e69492541b25c11085a398c5bac5db5f839e1b13f91291a9549e2fd",
+    "common/model/errors.py": "af77abe5ef7418bb6f3041d9d8e5fbeb142d1dffb713c52dcf96c4167c4b22d1"
+  },
+  "checks": [
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "surface": "native_responses",
+      "stream": true,
+      "store": false,
+      "max_output_tokens": 256,
+      "passed": false,
+      "exception": "IndexError",
+      "http_status": null,
+      "sanitized_error": "list index out of range",
+      "latency_sec": 2.615
+    },
+    {
+      "wrapper": "nvidia-python",
+      "model": "openai/gpt-oss-20b",
+      "surface": "cross_anthropic_messages",
+      "stream": true,
+      "max_tokens": 256,
+      "http_status": 200,
+      "stop_reason": "end_turn",
+      "terminal_message_stop_count": 1,
+      "has_visible_content": true,
+      "visible_content_length": 2,
+      "returned_model": "openai/gpt-oss-20b",
+      "event_count": 65,
+      "passed": true,
+      "latency_sec": 2.166
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "surface": "native_responses",
+      "stream": true,
+      "store": false,
+      "max_output_tokens": 256,
+      "passed": false,
+      "exception": "BadRequestError",
+      "http_status": 400,
+      "sanitized_error": "Error code: 400 - {'status': 400, 'message': 'This request is not valid. Check the model name and other parameters. Additional info: missing tags'}",
+      "latency_sec": 2.098
+    },
+    {
+      "wrapper": "nous",
+      "model": "upstage/solar-mini4:free",
+      "surface": "cross_anthropic_messages",
+      "stream": true,
+      "max_tokens": 256,
+      "http_status": 200,
+      "stop_reason": "end_turn",
+      "terminal_message_stop_count": 1,
+      "has_visible_content": true,
+      "visible_content_length": 2,
+      "returned_model": "upstage/solar-mini4:free",
+      "event_count": 7,
+      "passed": true,
+      "latency_sec": 2.153
+    },
+    {
+      "wrapper": "openrouter",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "surface": "native_responses",
+      "stream": true,
+      "store": false,
+      "max_output_tokens": 256,
+      "http_status": 200,
+      "terminal_status": "completed",
+      "terminal_completed_count": 1,
+      "has_visible_content": true,
+      "visible_content_length": 3,
+      "returned_model": "liquid/lfm-2.5-2.6b:free",
+      "event_count": 25,
+      "passed": true,
+      "latency_sec": 1.948
+    },
+    {
+      "wrapper": "openrouter",
+      "model": "liquid/lfm-2.5-2.6b:free",
+      "surface": "cross_anthropic_messages",
+      "stream": true,
+      "max_tokens": 256,
+      "http_status": 200,
+      "stop_reason": "end_turn",
+      "terminal_message_stop_count": 1,
+      "has_visible_content": true,
+      "visible_content_length": 2,
+      "returned_model": "liquid/lfm-2.5-2.6b:free",
+      "event_count": 33,
+      "passed": true,
+      "latency_sec": 1.874
+    }
+  ],
+  "passed": 4,
+  "failed": 2
+}

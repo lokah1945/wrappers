@@ -1,32 +1,35 @@
 #!/usr/bin/env bash
 # install.sh — canonical installer for the wrappers monorepo.
 #
-# Installs one or all Python wrapper services using the same layout/contract:
+# Installs production services enabled in wrappers.json; pending providers are
+# frozen and cannot be selected by --wrapper. model-registry is a dependency.
+# Production services use the same layout/contract:
 #   nvidia-python  -> port 9101
 #   nous           -> port 9102
-#   opencode       -> port 9103
-#   blackbox       -> port 9104
 #   openrouter     -> port 9106
 #   model-registry -> port 9200
 #
 # Usage:
-#   sudo ./install.sh                         # install all wrappers
-#   sudo ./install.sh --wrapper blackbox      # install one wrapper
+#   sudo ./install.sh                         # install production wrappers
+#   sudo ./install.sh --wrapper openrouter    # install wrapper + registry
 #   sudo ./install.sh --status                # status for all wrappers
 #   sudo ./install.sh --wrapper nous --status # status for one wrapper
 #   sudo ./install.sh --no-restart            # copy units/install deps only
+#   ./install.sh --skip-deps                  # use already-verified dependencies
 
 set -euo pipefail
 
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MODE="install"
 WRAPPER="all"
+SKIP_DEPS=false
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --wrapper) WRAPPER="${2:-}"; shift 2 ;;
     --status|status) MODE="status"; shift ;;
     --no-restart) MODE="no-restart"; shift ;;
+    --skip-deps) SKIP_DEPS=true; shift ;;
     *) echo "[install][ERROR] unknown argument: $1" >&2; exit 1 ;;
   esac
 done
@@ -34,23 +37,15 @@ done
 log() { printf '[install] %s\n' "$*"; }
 fail() { printf '[install][ERROR] %s\n' "$*" >&2; exit 1; }
 
-# name|dir|unit|health
-WRAPPERS=(
-  "nvidia-python|nvidia-python|wrapper-nvidia-python.service|http://127.0.0.1:9101/health"
-  "nous|nous|wrapper-nous.service|http://127.0.0.1:9102/health"
-  "opencode|opencode|wrapper-opencode.service|http://127.0.0.1:9103/health"
-  "blackbox|blackbox|wrapper-blackbox.service|http://127.0.0.1:9104/health"
-  "openrouter|openrouter|wrapper-openrouter.service|http://127.0.0.1:9106/health"
-  "model-registry|model-registry|wrapper-model-registry.service|http://127.0.0.1:9200/health"
-)
+# Validate metadata before inspecting any provider path or changing systemd.
+scope_args=(--repo-dir "$PROJECT_DIR" --format install --include-dashboard)
+if [ "$WRAPPER" != "all" ]; then
+  scope_args+=(--wrapper "$WRAPPER")
+fi
+SELECTED_ITEMS="$("${PYTHON_BIN:-python3}" "${PROJECT_DIR}/common/wrapper_scope.py" "${scope_args[@]}")" || exit $?
 
 selected_wrappers() {
-  for item in "${WRAPPERS[@]}"; do
-    IFS='|' read -r name dir unit health <<<"$item"
-    if [ "$WRAPPER" = "all" ] || [ "$WRAPPER" = "$name" ] || [ "$WRAPPER" = "$dir" ]; then
-      printf '%s\n' "$item"
-    fi
-  done
+  printf '%s\n' "$SELECTED_ITEMS"
 }
 
 if [ -z "$(selected_wrappers)" ]; then
@@ -69,6 +64,26 @@ fi
 
 if [ "$(id -u)" -eq 0 ] && [ "${HOME:-}" = "/root" ]; then
   log "INFO: running as root — units install to /root/.config/systemd/user (user-level systemd for root)"
+fi
+
+# Resolve the selected services together before modifying environments or
+# units. Sequential installs could silently downgrade another active service's
+# verified dependencies. Pending requirements are never visited.
+if [ "$SKIP_DEPS" = false ]; then
+  dependency_args=()
+  while IFS='|' read -r name dir unit health; do
+    requirement_file="${PROJECT_DIR}/${dir}/requirements.txt"
+    if [ -f "$requirement_file" ]; then
+      dependency_args+=(-r "$requirement_file")
+    fi
+  done < <(selected_wrappers)
+  if [ "${#dependency_args[@]}" -gt 0 ]; then
+    constraint_file="${PROJECT_DIR}/tests/constraints-verified.txt"
+    [ -f "$constraint_file" ] || fail "missing release dependency constraints: $constraint_file"
+    log "installing selected Python dependencies in one release-constrained transaction"
+    python3 -m pip install -c "$constraint_file" "${dependency_args[@]}"
+    python3 -m pip check
+  fi
 fi
 
 # Deployment model: USER-LEVEL systemd (per wrapper runtime reality).
@@ -95,9 +110,8 @@ while IFS='|' read -r name dir unit health; do
     log "WARN: ${dir}/.env missing and no .env.example available — service may fail to boot"
   fi
 
-  if [ -f "${src_dir}/requirements.txt" ]; then
-    log "installing Python deps for ${name}"
-    python3 -m pip install -r "${src_dir}/requirements.txt"
+  if [ -f "${src_dir}/.env" ]; then
+    chmod 600 "${src_dir}/.env"
   fi
 
   # Unit files are kept portable in git. Render the repository path used by
@@ -130,16 +144,19 @@ FAILED_UNITS=""
 while IFS='|' read -r name dir unit health; do
   log "restarting ${unit}"
   systemctl --user reset-failed "$unit" 2>&1 || true
-  systemctl --user restart "$unit"
-  sleep 2
-  if curl -sS -m 5 "$health" > "/tmp/${unit}.health.json" 2>/dev/null; then
-    log "✅ ${name} healthy"
-    cat "/tmp/${unit}.health.json"
-    printf '\n'
+  if ! systemctl --user restart "$unit"; then
+    log "❌ ${name} restart failed"
+    FAILED_UNITS="${FAILED_UNITS} ${unit}"
+    continue
+  fi
+  probe_args=(--base-url "${health%/health}" --env-file "${PROJECT_DIR}/${dir}/.env")
+  if [ "$name" = "model-registry" ]; then
+    probe_args+=(--registry)
+  fi
+  if python3 "${PROJECT_DIR}/productions/check_service_ready.py" "${probe_args[@]}"; then
+    log "✅ ${name} ready"
   else
-    log "❌ ${name} health failed"
-    tail -30 "/tmp/${unit}.health.json" || true
-    journalctl --user -u "$unit" --since "30 seconds ago" --no-pager | tail -20 || true
+    log "❌ ${name} health/readiness failed"
     FAILED_UNITS="${FAILED_UNITS} ${unit}"
   fi
 done < <(selected_wrappers)

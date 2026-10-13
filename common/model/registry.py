@@ -24,6 +24,7 @@ from .contracts import (
 from .identity import AliasResolver
 from .profile_store import ModelProfileStore
 from .validation import validate_provider_name
+from .metadata import context_metadata
 
 
 class LocalModelRegistry:
@@ -148,6 +149,11 @@ class LocalModelRegistry:
             canonical = provider_model_id if provider_model_id.startswith(prefix) else prefix + provider_model_id
             raw_id = provider_model_id[len(prefix):] if provider_model_id.startswith(prefix) else provider_model_id
             existing = self.profiles.get(canonical)
+            observed = context_metadata(metadata)
+            observed_limits = {key: observed[key] for key in
+                               ('context_window', 'max_input_tokens', 'max_output_tokens')
+                               if isinstance(observed.get(key), int) and not isinstance(observed[key], bool)
+                               and observed[key] > 0}
             if existing is not None:
                 # Catalog refresh is observational. It may update provenance
                 # and revision, but must never erase an authoritative/manual
@@ -157,10 +163,20 @@ class LocalModelRegistry:
                     "source": "provider_catalog",
                     "metadata": metadata,
                 }
+                limits = existing.limits.to_dict()
+                previous = dict(provenance.get('catalog_limits', {}))
+                for key, value in observed_limits.items():
+                    # Refresh catalog-owned fields; preserve explicit/manual
+                    # profiles. Absence is not evidence of a new limit.
+                    if limits.get(key) is None or key in previous:
+                        limits[key] = value
+                        previous[key] = dict(observed)
+                provenance['catalog_limits'] = previous
                 profile = replace(
                     existing,
                     catalog_revision=revision,
                     provenance=provenance,
+                    limits=LimitProfile(**limits),
                 )
             else:
                 profile = ModelProfile(
@@ -169,10 +185,11 @@ class LocalModelRegistry:
                     provider_model_id=raw_id,
                     profile_revision=revision,
                     catalog_revision=revision,
-                capabilities=CapabilityProfile(),
-                    limits=LimitProfile(),
+                    capabilities=CapabilityProfile(),
+                    limits=LimitProfile(**observed_limits),
                     protocols=self._default_protocols(),
-                    provenance={"source": "provider_catalog", "metadata": metadata},
+                    provenance={"source": "provider_catalog", "metadata": metadata,
+                                "catalog_limits": {key: dict(observed) for key in observed_limits}},
                 )
             self.register_profile(profile, persist=False)
             profiles_to_persist.append(profile)

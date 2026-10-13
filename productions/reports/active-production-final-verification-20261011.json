@@ -1,0 +1,133 @@
+{
+  "at_utc": "2026-10-11T03:56:22.238181+00:00",
+  "tested_deployed_source_sha256": "db1a89e77a89d32510644ee1f4178cd15b1cd25cbed9d528a3a40cc7620fa6b8",
+  "post_verification_metadata_update": {
+    "at_utc": "2026-10-11T03:55:55.710654+00:00",
+    "changed_files": [
+      "wrappers.json"
+    ],
+    "purpose": "Qualification evidence/date/status only after live tests; provider lifecycle/ports/pending entries unchanged. Executable source and deployed unit files unchanged.",
+    "final_wrappers_json_sha256": "78705b1e3ec7d405f9466ffbf9aefc73ba26b0e933ba26e73d7840a892287c41",
+    "effective_release_combined_sha256": "7f9ea19bd251a05211aff86df357c9f96e25069299ff208d34e3113e728116db"
+  },
+  "services": {
+    "nvidia-python": {
+      "MainPID": "83035",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running"
+    },
+    "nous": {
+      "MainPID": "83063",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running"
+    },
+    "openrouter": {
+      "MainPID": "83112",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running"
+    },
+    "model-registry": {
+      "MainPID": "83016",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running"
+    },
+    "dashboard": {
+      "MainPID": "83000",
+      "NRestarts": "0",
+      "ActiveState": "active",
+      "SubState": "running"
+    }
+  },
+  "checks": [
+    {
+      "service": "nvidia-python",
+      "check": "running_stable",
+      "passed": true
+    },
+    {
+      "service": "nvidia-python",
+      "check": "/health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "nvidia-python",
+      "check": "/ready",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "nous",
+      "check": "running_stable",
+      "passed": true
+    },
+    {
+      "service": "nous",
+      "check": "/health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "nous",
+      "check": "/ready",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "openrouter",
+      "check": "running_stable",
+      "passed": true
+    },
+    {
+      "service": "openrouter",
+      "check": "/health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "openrouter",
+      "check": "/ready",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "model-registry",
+      "check": "running_stable",
+      "passed": true
+    },
+    {
+      "service": "model-registry",
+      "check": "/health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "dashboard",
+      "check": "running_stable",
+      "passed": true
+    },
+    {
+      "service": "dashboard",
+      "check": "/health",
+      "http_status": 200,
+      "passed": true
+    },
+    {
+      "service": "dashboard",
+      "check": "/ready",
+      "http_status": 200,
+      "passed": true
+    }
+  ],
+  "passed": 14,
+  "failed": 0,
+  "pending_metadata_only_excluded": [
+    "opencode",
+    "blackbox"
+  ],
+  "runtime_source_changed": false
+}

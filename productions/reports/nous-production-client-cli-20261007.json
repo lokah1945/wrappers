@@ -1,0 +1,71 @@
+{
+  "completed_at_utc": "2026-10-07T16:03:07.754621+00:00",
+  "upstream": "nous",
+  "exact_model": "poolside/laguna-xs-2.1:free",
+  "scope": "Live nous service on9102 after controlled rollout; actual CLI clients with bounded prompts; no persistent client config changes.",
+  "versions": {
+    "claude": "2.1.202",
+    "codex": "0.160.1",
+    "opencode": "1.17.20"
+  },
+  "source_combined_sha256": "6ab07899b94d7ed5978e0889db3f2b8a5dcf66d2a935dc65fac3d5aa0e1c9ee5",
+  "source_sha256": {
+    "nous/src/main.py": "f91d6caf98f1855bfb7e1eae98a593fbca69dc79856897af530f333711ce26a9",
+    "common/compat.py": "effd430618e1f273503fea58487913431cb79ba80dab35f89cf6b925fde5601e",
+    "common/body_guard.py": "804a4229cf7bacf73bf89f0b48d1482180a9e85e140f3d8a5ce3032f5942097f"
+  },
+  "checks": [
+    {
+      "client": "claude",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 3.54
+    },
+    {
+      "client": "codex",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 2.036
+    },
+    {
+      "client": "opencode",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "auto/native-first",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text"
+      ],
+      "latency_sec": 8.948
+    }
+  ],
+  "passed": 3,
+  "failed": 0
+}

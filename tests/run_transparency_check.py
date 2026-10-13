@@ -10,6 +10,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+from common.wrapper_scope import production_wrappers
 LOGDIR = Path("/tmp/wrapper-audit-logs")
 LOGDIR.mkdir(parents=True, exist_ok=True)
 
@@ -264,6 +266,10 @@ def main() -> None:
     print("NOUS OK")
 
     # ---------- OPENCODE ----------
+    if "opencode" not in production_wrappers(ROOT, include_registry=False):
+        print("OPENCODE provider pending: frozen checks excluded by wrappers.json")
+        print("ACTIVE WRAPPER TRANSPARENCY CHECKS PASS")
+        return
     for k in list(sys.modules):
         if k == "src" or k.startswith("src."):
             del sys.modules[k]

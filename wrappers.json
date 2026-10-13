@@ -9,7 +9,58 @@
       "structure": "standardized",
       "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9101",
       "env_prefix": "NVIDIA_",
-      "supports": ["openai_chat", "openai_responses", "anthropic_messages", "embeddings", "rerank", "images"]
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages",
+        "embeddings",
+        "rerank",
+        "images"
+      ],
+      "client_qualification": {
+        "status": "qualified_for_tested_model_and_clients",
+        "verification_stage": "live_production",
+        "rollout_status": "completed",
+        "verified_model": "nvidia/nemotron-3-super-120b-a12b",
+        "verified_clients": {
+          "Claude Code": "2.1.202",
+          "Codex": "0.160.1",
+          "OpenCode client": "1.17.20"
+        },
+        "verified_surfaces": [
+          "openai_chat",
+          "openai_responses",
+          "anthropic_messages"
+        ],
+        "verified_native_features": [
+          "responses_sdk_stream_accumulation_openai_2_31_and_2_54",
+          "responses_function_call_and_full_history_function_result"
+        ],
+        "limitations": "Live checks qualify the recorded models/client versions with bounded CLI replies and strict required-value echo tool loops. They do not prove every model, workload, future protocol update, native previous_response_id continuity across credential changes, or model-side strict schema enforcement. Native fields/SSE stay transparent; explicit model selection only, no model fallback.",
+        "known_model_limitations": [
+          {
+            "model": "openai/gpt-oss-20b",
+            "native_responses": "Native Responses SSE used an invalid content index for OpenAI SDK stream accumulation in the recorded check. Native payloads remain transparent; this model is not qualified for Responses.",
+            "evidence": "productions/reports/active-native-response-diagnosis-20261007.json"
+          }
+        ],
+        "evidence": "productions/reports/live-client-qualification-20261011.json",
+        "additional_evidence": [
+          "productions/reports/live-agent-read-qualification-20261011.json",
+          "productions/reports/active-production-rollout-20261011.json",
+          "artifacts/production-final-20261011/production-gates-summary.json"
+        ],
+        "verified_date": "2026-10-11",
+        "verified_agent_features": [
+          "Claude Code Read tool plus final nonce answer",
+          "Codex read-only cat tool plus final nonce answer",
+          "OpenCode client read tool plus final nonce answer"
+        ],
+        "verified_responses_features": [
+          "responses_sdk_stream_accumulation_openai_2_54",
+          "responses_function_call_and_full_explicit_history_function_result"
+        ]
+      }
     },
     "nous": {
       "port": 9102,
@@ -20,29 +71,92 @@
       "structure": "standardized",
       "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9102",
       "env_prefix": "NOUS_",
-      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ],
+      "client_qualification": {
+        "status": "qualified_for_tested_model_and_clients",
+        "verification_stage": "live_production",
+        "rollout_status": "completed",
+        "verified_model": "poolside/laguna-xs-2.1:free",
+        "verified_clients": {
+          "Claude Code": "2.1.202",
+          "Codex": "0.160.1",
+          "OpenCode client": "1.17.20"
+        },
+        "verified_surfaces": [
+          "openai_chat",
+          "openai_responses",
+          "anthropic_messages"
+        ],
+        "verified_native_features": [
+          "responses_sdk_stream_accumulation_openai_2_31_and_2_54",
+          "responses_function_call_and_full_history_function_result"
+        ],
+        "limitations": "Live checks qualify the recorded models/client versions with bounded CLI replies and strict required-value echo tool loops. They do not prove every model, workload, future protocol update, native previous_response_id continuity across credential changes, or model-side strict schema enforcement. Native fields/SSE stay transparent; explicit model selection only, no model fallback. Messages-to-Chat adaptive/effort/budget controls are not qualified as equivalent to Anthropic controls. The selected model can add punctuation to short replies; the recorded strict CLI smoke requires explicit two-character ASCII instructions.",
+        "known_model_limitations": [
+          {
+            "model": "upstage/solar-mini4:free",
+            "native_responses": "Native Responses returned 400 missing tags despite honest valid top-level metadata reaching transport. Chat/Messages passed; this model is not qualified for Responses.",
+            "evidence": "productions/reports/active-native-response-diagnosis-20261007.json"
+          }
+        ],
+        "evidence": "productions/reports/live-client-qualification-20261011.json",
+        "additional_evidence": [
+          "productions/reports/live-agent-read-qualification-20261011.json",
+          "productions/reports/active-production-rollout-20261011.json",
+          "artifacts/production-final-20261011/production-gates-summary.json",
+          "productions/reports/nous-cli-explicit-ascii-qualification-20261011.json"
+        ],
+        "verified_date": "2026-10-11",
+        "verified_agent_features": [
+          "Claude Code Read tool plus final nonce answer",
+          "Codex read-only cat tool plus final nonce answer",
+          "OpenCode client read tool plus final nonce answer"
+        ],
+        "verified_responses_features": [
+          "responses_sdk_stream_accumulation_openai_2_54",
+          "responses_function_call_and_full_explicit_history_function_result"
+        ]
+      }
     },
     "opencode": {
       "port": 9103,
       "module": "src.main",
       "entry_point": "src.main:app",
       "upstream": "OpenCode",
-      "status": "production",
+      "status": "pending",
+      "maintenance": "frozen",
+      "pending_since": "2026-10-07",
+      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it. OpenCode clients remain supported by active wrappers.",
       "structure": "standardized",
       "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9103",
       "env_prefix": "OPENCODE_",
-      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ]
     },
     "blackbox": {
       "port": 9104,
       "module": "src.main",
       "entry_point": "src.main:app",
       "upstream": "BLACKBOX AI",
-      "status": "production",
+      "status": "pending",
+      "maintenance": "frozen",
+      "pending_since": "2026-10-07",
+      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it.",
       "structure": "standardized",
       "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9104",
       "env_prefix": "BLACKBOX_",
-      "supports": ["openai_chat", "openai_responses", "anthropic_messages"]
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ]
     },
     "openrouter": {
       "port": 9106,
@@ -55,7 +169,53 @@
       "management_api": true,
       "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9106",
       "env_prefix": "OPENROUTER_",
-      "supports": ["openai_chat", "openai_responses", "anthropic_messages", "embeddings", "images"]
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages",
+        "embeddings",
+        "images"
+      ],
+      "client_qualification": {
+        "status": "qualified_for_tested_model_and_clients",
+        "verified_model": "liquid/lfm-2.5-2.6b:free",
+        "verified_clients": {
+          "Claude Code": "2.1.202",
+          "Codex": "0.160.1",
+          "OpenCode client": "1.17.20"
+        },
+        "verified_surfaces": [
+          "openai_chat",
+          "openai_responses",
+          "anthropic_messages"
+        ],
+        "limitations": "Live checks qualify the recorded models/client versions with bounded CLI replies and strict required-value echo tool loops. They do not prove every model, workload, future protocol update, native previous_response_id continuity across credential changes, or model-side strict schema enforcement. Native fields/SSE stay transparent; explicit model selection only, no model fallback.",
+        "evidence": "productions/reports/live-client-qualification-20261011.json",
+        "verified_date": "2026-10-11",
+        "verification_stage": "live_production",
+        "rollout_status": "completed",
+        "additional_evidence": [
+          "productions/reports/live-agent-read-qualification-20261011.json",
+          "productions/reports/active-production-rollout-20261011.json",
+          "artifacts/production-final-20261011/production-gates-summary.json"
+        ],
+        "verified_agent_features": [
+          "Claude Code Read tool plus final nonce answer",
+          "Codex read-only cat tool plus final nonce answer",
+          "OpenCode client read tool plus final nonce answer"
+        ],
+        "verified_responses_features": [
+          "responses_sdk_stream_accumulation_openai_2_54",
+          "responses_function_call_and_full_explicit_history_function_result"
+        ],
+        "known_model_limitations": [
+          {
+            "model": "liquid/lfm-2.5-2.6b:free",
+            "native_tool_arguments": "The recorded empty-object tool schema produced malformed native JSON arguments. Native data remains transparent; this fixture is not qualified. Required-value echo tools passed on all three surfaces.",
+            "evidence": "productions/reports/live-client-qualification-attempt1-20261011.json"
+          }
+        ]
+      }
     },
     "model-registry": {
       "port": 9200,
@@ -66,7 +226,11 @@
       "structure": "service",
       "run_command": "python3 service.py",
       "env_prefix": "MODEL_REGISTRY_",
-      "supports": ["model_registry", "call_plan", "catalog_sync"]
+      "supports": [
+        "model_registry",
+        "call_plan",
+        "catalog_sync"
+      ]
     }
   },
   "metadata": {
@@ -78,8 +242,33 @@
     "all_keys_exhausted_returns": 429,
     "load_shedding_default": "off",
     "rate_limit_per_ip_rpm_default": 600,
-    "agent_compatibility": "universal (Claude Code, Codex, OpenCode, Hermes, OpenClaw, Cursor, Windsurf, Cline, Continue, Roo Code, Aider, Goose, Gemini CLI, generic OpenAI/Anthropic SDKs)",
+    "agent_compatibility": "OpenAI and Anthropic compatible clients, including Claude Code, Codex and OpenCode clients; validate the selected endpoint and current client version before release",
+    "production_scope": [
+      "nvidia-python",
+      "nous",
+      "openrouter",
+      "model-registry"
+    ],
+    "pending_wrappers": [
+      "blackbox",
+      "opencode"
+    ],
+    "scope_policy": "Only status=production is eligible for analysis, tests, installation, audit and deployment. Pending provider wrappers are frozen, including explicit selection, until owner reactivation.",
     "catalog_integration_version": "1.0",
-    "management_api_providers": ["openrouter"]
+    "management_api_providers": [
+      "openrouter"
+    ],
+    "qualification_policy": "Lifecycle production selects eligible maintenance scope; it is not proof of every model/client feature. Check per-wrapper client_qualification and current real upstream evidence before rollout.",
+    "dashboard_url": "http://127.0.0.1:9105",
+    "port_allocation": "9100 external catalog MCP, 9101 NVIDIA, 9102 Nous, 9103-9104 frozen reserved providers, 9105 unified dashboard, 9106 OpenRouter; model-registry internal9200"
+  },
+  "dashboard": {
+    "status": "production",
+    "port": 9105,
+    "module": "app",
+    "entry_point": "app:app",
+    "structure": "control_service",
+    "run_command": "uvicorn dashboard.app:app --host 127.0.0.1 --port 9105",
+    "lowest_available_port_reason": "9100 is occupied by an unrelated AI catalog MCP service; 9101-9104 belong to active or frozen provider slots. No unrelated or frozen service is changed."
   }
 }

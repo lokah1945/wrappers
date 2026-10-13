@@ -2,10 +2,10 @@
 """
 responses_compat.py — OpenAI Responses API support for wrapper-nvidia (Python).
 
-Codex and other agent clients use the OpenAI Responses wire format. NVIDIA NIM
-only exposes OpenAI-style chat/completions for the models handled by this
-wrapper, so this module translates Responses⇄Chat and, critically, guarantees
-that streamed Responses always emit a complete event lifecycle:
+Codex and other agent clients use the OpenAI Responses wire format. The main
+route tries the native Responses endpoint first. This module provides the
+owner-approved Responses⇄Chat adapter only when that endpoint is definitively
+unsupported, and emits the Responses streaming lifecycle:
 
   response.created → response.in_progress → output_item/content_part added
   → deltas → done events → response.completed → data: [DONE]
@@ -24,7 +24,35 @@ import random
 import string
 from typing import Dict, List, Optional, Any, Tuple, AsyncGenerator
 
+from common.sse import close_stream
 from .anthropic_compat import extract_internal_reasoning
+
+
+class _OwnedStream:
+    """Keep pre-acquired upstream ownership visible before iteration starts."""
+
+    def __init__(self, stream, on_close):
+        self.stream = stream
+        self.on_close = on_close
+        self.closed = False
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.closed:
+            raise StopAsyncIteration
+        try:
+            return await self.stream.__anext__()
+        except BaseException:
+            await self.aclose()
+            raise
+
+    async def aclose(self):
+        if self.closed:
+            return
+        self.closed = True
+        await close_stream(self.stream, self.on_close)
 
 # previous_response_id store for Codex multi-turn server-side history.
 # Values are OpenAI chat messages, including the assistant message that contained
@@ -37,8 +65,11 @@ from .anthropic_compat import extract_internal_reasoning
 # includes the caller's own principal so the store is per-tenant isolated.
 _RESPONSE_STORE: Dict[str, list] = {}
 _RESPONSE_STORE_SIZES: Dict[str, int] = {}
+_RESPONSE_STORE_TIMESTAMPS: Dict[str, float] = {}
 # V-22 fix: also bound the store by total bytes, not just entry count.
-_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(64 * 1024 * 1024)))
+_STORE_MAX_BYTES = int(os.environ.get('RESPONSES_STORE_MAX_BYTES', str(32 * 1024 * 1024)))
+_STORE_MAX_ENTRIES = int(os.environ.get('RESPONSES_STORE_MAX_ENTRIES', '200'))
+_STORE_TTL_SEC = float(os.environ.get('RESPONSES_STORE_TTL_SEC', '3600'))
 
 
 def _rand(suffix: str) -> str:
@@ -55,19 +86,17 @@ def _zero_usage() -> dict:
 def _extract_principal(request: Any) -> str:
     """Extract a stable tenant identifier from the request for store namespacing.
 
-    Priority: Bearer token > x-api-key > client IP > 'anonymous'.
+    Priority: authenticated credential > client IP > 'anonymous'.
     Uses a SHA-256 fingerprint (first 24 chars) to avoid storing raw credentials
     as dictionary keys. This matches the opencode wrapper's OC-11 pattern.
     """
     import hashlib
+    from common.auth import authenticated_client_token
     token = ''
     try:
         # FastAPI/Starlette Request object
-        auth = ''
         if hasattr(request, 'headers'):
-            auth = request.headers.get('authorization', '') or request.headers.get('x-api-key', '')
-        if auth:
-            token = auth.replace('Bearer ', '', 1).strip() if auth.lower().startswith('bearer ') else auth.strip()
+            token = authenticated_client_token(request.headers)
         if not token and hasattr(request, 'client') and request.client:
             token = getattr(request.client, 'host', '') or ''
     except Exception:
@@ -82,23 +111,51 @@ def _store_key(principal: str, resp_id: str) -> str:
     return f"{principal}\x00{resp_id}"
 
 
-def _bounded_store(principal: str, resp_id: str, messages: list) -> None:
-    """Store conversation history namespaced by principal (BUG-SEC-RESPONSE-STORE fix)."""
-    if not resp_id:
-        return
-    key = _store_key(principal, resp_id)
-    try:
-        size = len(json.dumps(messages, ensure_ascii=False))
-    except Exception:
-        size = 0
-    _RESPONSE_STORE[key] = messages
-    _RESPONSE_STORE_SIZES[key] = size
-    # V-22 fix: evict oldest entries by count (200) AND by total byte budget.
-    while len(_RESPONSE_STORE) > 200 or (
-            len(_RESPONSE_STORE) > 1 and sum(_RESPONSE_STORE_SIZES.values()) > _STORE_MAX_BYTES):
+def _prune_response_store() -> None:
+    """Expire and evict whole snapshots; all operations run on the event loop."""
+    now = time.time()
+    if _STORE_TTL_SEC > 0:
+        for key in list(_RESPONSE_STORE):
+            if now - _RESPONSE_STORE_TIMESTAMPS.get(key, 0) > _STORE_TTL_SEC:
+                _RESPONSE_STORE.pop(key, None)
+                _RESPONSE_STORE_SIZES.pop(key, None)
+                _RESPONSE_STORE_TIMESTAMPS.pop(key, None)
+    total = sum(_RESPONSE_STORE_SIZES.values())
+    while _RESPONSE_STORE and (len(_RESPONSE_STORE) > _STORE_MAX_ENTRIES
+                              or total > _STORE_MAX_BYTES):
         oldest = next(iter(_RESPONSE_STORE))
         _RESPONSE_STORE.pop(oldest, None)
-        _RESPONSE_STORE_SIZES.pop(oldest, None)
+        total -= _RESPONSE_STORE_SIZES.pop(oldest, 0)
+        _RESPONSE_STORE_TIMESTAMPS.pop(oldest, None)
+
+
+def _bounded_store(principal: str, resp_id: str, messages: list) -> None:
+    """Save an immutable, tenant-scoped snapshot within every store bound."""
+    if not resp_id:
+        return
+    try:
+        serialized = json.dumps(messages, ensure_ascii=False)
+        size = len(serialized.encode('utf-8'))
+        snapshot = json.loads(serialized)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return
+    key = _store_key(principal, resp_id)
+    _RESPONSE_STORE.pop(key, None)
+    _RESPONSE_STORE_SIZES.pop(key, None)
+    _RESPONSE_STORE_TIMESTAMPS.pop(key, None)
+    if size <= _STORE_MAX_BYTES:
+        _RESPONSE_STORE[key] = snapshot
+        _RESPONSE_STORE_SIZES[key] = size
+        _RESPONSE_STORE_TIMESTAMPS[key] = time.time()
+    _prune_response_store()
+
+
+def _get_stored_conversation(principal: str, resp_id: str) -> Optional[list]:
+    """Prune on reads and detach replay messages from the retained snapshot."""
+    import copy
+    _prune_response_store()
+    messages = _RESPONSE_STORE.get(_store_key(principal, resp_id))
+    return copy.deepcopy(messages) if messages is not None else None
 
 
 def http_status_from_error(err: dict) -> int:
@@ -285,6 +342,8 @@ def convert_tools(tools: Optional[list]) -> Optional[list]:
     """
     if not tools or not isinstance(tools, list):
         return None
+    from copy import deepcopy
+    tools = deepcopy(tools)
     out = []
     for t in tools:
         if not t or not isinstance(t, dict):
@@ -304,6 +363,7 @@ def convert_tools(tools: Optional[list]) -> Optional[list]:
                 'name': name,
                 'description': fn.get('description', '') or '',
                 'parameters': fn.get('parameters') or fn.get('input_schema') or {},
+                **({'strict': fn['strict']} if 'strict' in fn else {}),
             },
         })
     return out if out else None
@@ -520,7 +580,7 @@ class ResponsesHandler:
             _bounded_store(principal, resp_obj.get('id'), chat_body.get('messages', []) + [_assistant_message_from_chat(data)])
             return resp_obj, None
 
-        async def stream_gen() -> AsyncGenerator[str, None]:
+        async def stream_events() -> AsyncGenerator[str, None]:
             resp_id = _rand('resp')
             msg_id = _rand('msg')
             seq = 0
@@ -534,7 +594,7 @@ class ResponsesHandler:
             tool_accs: List[Optional[dict]] = []
             has_tool = False
             usage = _zero_usage()
-            buffer = ''
+            buffer = b''
             stream_error = None
 
             def next_seq() -> int:
@@ -572,6 +632,104 @@ class ResponsesHandler:
                 'part': {'type': 'output_text', 'text': '', 'annotations': []},
             })
 
+            stream_terminated = False
+            finished = False
+            dropped_after_finish = 0
+
+            async def process_line(line):
+                nonlocal acc_text, acc_reason, usage, rsn_started, rsn_index, next_extra_index
+                nonlocal has_tool, stream_error, stream_terminated, finished, dropped_after_finish
+                t = line.decode('utf-8', errors='replace').strip()
+                if not t.startswith('data:'):
+                    return
+                payload = t[5:].strip()
+                if not payload:
+                    return
+                if payload in ('[DONE]', '"[DONE]"'):
+                    stream_terminated = True
+                    return
+                try:
+                    c = json.loads(payload)
+                except (json.JSONDecodeError, ValueError):
+                    return
+                if not isinstance(c, dict):
+                    return
+                if c.get('usage'):
+                    usage = convert_usage(c['usage'])
+                # R-03: surface upstream error frames instead of
+                # dropping them and emitting response.completed.
+                if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
+                    _e = c['error']
+                    stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                    stream_terminated = True
+                    return
+                # R-08: empty choices array is legal.
+                _cl = c.get('choices') or []
+                if not _cl:
+                    return
+                ch = _cl[0] or {}
+                d = ch.get('delta') or {}
+                if finished:
+                    if any(d.get(k) for k in ('content', 'reasoning_content', 'reasoning', 'tool_calls')):
+                        dropped_after_finish += 1
+                        import logging
+                        logging.getLogger('responses').warning('Dropped post-finish content (model=%s, count=%d)', model, dropped_after_finish)
+                    return
+                if isinstance(d.get('content'), str) and d['content']:
+                    acc_text += d['content']
+                    yield emit({
+                        'type': 'response.output_text.delta', 'sequence_number': next_seq(),
+                        'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
+                        'content_index': 0, 'delta': d['content'],
+                    })
+                reason_delta = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
+                if reason_delta:
+                    if not rsn_started:
+                        rsn_started = True
+                        rsn_index = next_extra_index
+                        next_extra_index += 1
+                        yield emit({
+                            'type': 'response.output_item.added', 'sequence_number': next_seq(),
+                            'output_index': rsn_index,
+                            'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': [], 'content': []},
+                        })
+                    acc_reason += reason_delta
+                    yield emit({
+                        'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
+                        'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
+                        'delta': reason_delta,
+                    })
+                for tc in d.get('tool_calls') or []:
+                    idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
+                    acc = tool_accs[idx] if idx < len(tool_accs) else None
+                    if acc is None:
+                        acc = make_tool_acc(idx, tc)
+                    fn = tc.get('function') or {}
+                    if tc.get('id') and (not acc.get('call_id') or acc['call_id'].startswith('call_')):
+                        acc['call_id'] = tc['id']
+                    if fn.get('name'):
+                        acc['name'] += fn['name']
+                    if not acc['added']:
+                        acc['added'] = True
+                        yield emit({
+                            'type': 'response.output_item.added', 'sequence_number': next_seq(),
+                            'output_index': acc['output_index'],
+                            'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
+                                     'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
+                        })
+                    # Argument deltas contain JSON only; function
+                    # names belong to the function_call item.
+                    if fn.get('arguments'):
+                        acc['args'] += fn['arguments']
+                        yield emit({
+                            'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
+                            'item_id': acc['call_id'], 'output_index': acc['output_index'],
+                            'delta': fn['arguments'],
+                        })
+                    has_tool = True
+                if ch.get('finish_reason'):
+                    finished = True
+
             stream = result.get('stream')
             try:
                 if stream is not None:
@@ -586,121 +744,22 @@ class ResponsesHandler:
                     # a free slot: the wrapper stops responding entirely while
                     # the key pool still reports "available".
                     async for raw in stream:
-                        chunk = raw.decode('utf-8', errors='replace') if isinstance(raw, (bytes, bytearray)) else str(raw)
+                        # Buffer bytes until a complete line is available;
+                        # decoding each network chunk corrupts split UTF-8.
+                        chunk = bytes(raw) if isinstance(raw, (bytes, bytearray)) else str(raw).encode('utf-8')
                         buffer += chunk
-                        lines = buffer.split('\n')
-                        buffer = lines.pop() if lines else ''
-                        for line in lines:
-                            t = line.strip()
-                            if not t.startswith('data:'):
-                                continue
-                            payload = t[5:].strip()
-                            if payload in ('[DONE]', '"[DONE]"', ''):
-                                continue
-                            try:
-                                c = json.loads(payload)
-                            except (json.JSONDecodeError, ValueError):
-                                continue
-                            if c.get('usage'):
-                                usage = convert_usage(c['usage'])
-                            # R-03: surface upstream error frames instead of
-                            # dropping them and emitting response.completed.
-                            if isinstance(c, dict) and c.get('error') is not None and 'choices' not in c:
-                                _e = c['error']
-                                stream_error = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                        while b'\n' in buffer:
+                            line, buffer = buffer.split(b'\n', 1)
+                            async for event in process_line(line):
+                                yield event
+                            if stream_terminated:
                                 break
-                            # R-08: empty choices array is legal.
-                            _cl = c.get('choices') or []
-                            if not _cl:
-                                continue
-                            ch = _cl[0] or {}
-                            d = ch.get('delta') or {}
-                            if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
-                            reason_delta = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
-                            if reason_delta:
-                                if not rsn_started:
-                                    rsn_started = True
-                                    rsn_index = next_extra_index
-                                    next_extra_index += 1
-                                    yield emit({
-                                        'type': 'response.output_item.added', 'sequence_number': next_seq(),
-                                        'output_index': rsn_index,
-                                        'item': {'id': rsn_id, 'type': 'reasoning', 'status': 'in_progress', 'summary': [], 'content': []},
-                                    })
-                                acc_reason += reason_delta
-                                yield emit({
-                                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
-                                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
-                                    'delta': reason_delta,
-                                })
-                            for tc in d.get('tool_calls') or []:
-                                idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
-                                acc = tool_accs[idx] if idx < len(tool_accs) else None
-                                if acc is None:
-                                    acc = make_tool_acc(idx, tc)
-                                fn = tc.get('function') or {}
-                                if tc.get('id') and (not acc.get('call_id') or acc['call_id'].startswith('call_')):
-                                    acc['call_id'] = tc['id']
-                                if not acc['added']:
-                                    acc['added'] = True
-                                    yield emit({
-                                        'type': 'response.output_item.added', 'sequence_number': next_seq(),
-                                        'output_index': acc['output_index'],
-                                        'item': {'id': acc['call_id'], 'type': 'function_call', 'status': 'in_progress',
-                                                 'call_id': acc['call_id'], 'name': acc['name'], 'arguments': ''},
-                                    })
-                                if fn.get('name'):
-                                    acc['name'] += fn['name']
-                                    yield emit({
-                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
-                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                                        'delta': fn['name'], 'name': acc['name'],
-                                    })
-                                if fn.get('arguments'):
-                                    acc['args'] += fn['arguments']
-                                    yield emit({
-                                        'type': 'response.function_call_arguments.delta', 'sequence_number': next_seq(),
-                                        'item_id': acc['call_id'], 'output_index': acc['output_index'],
-                                        'delta': fn['arguments'],
-                                    })
-                                has_tool = True
-                # V-16 fix: parse a final single-line data payload (upstream closed
-                # without a trailing newline) like a normal line — the common case
-                # is a last usage chunk or terminal text delta.
-                tail = buffer.strip()
-                if tail.startswith('data:'):
-                    payload = tail[5:].strip()
-                    if payload not in ('[DONE]', '"[DONE]"', ''):
-                        try:
-                            c = json.loads(payload)
-                        except (json.JSONDecodeError, ValueError):
-                            c = None
-                        if isinstance(c, dict):
-                            if c.get('usage'):
-                                usage = convert_usage(c['usage'])
-                            ch = (c.get('choices') or [{}])[0]
-                            d = ch.get('delta') or {}
-                            if isinstance(d.get('content'), str) and d['content']:
-                                acc_text += d['content']
-                                yield emit({
-                                    'type': 'response.output_text.delta', 'sequence_number': next_seq(),
-                                    'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
-                                    'content_index': 0, 'delta': d['content'],
-                                })
-                            reason_tail = d.get('reasoning_content') if isinstance(d.get('reasoning_content'), str) else d.get('reasoning') if isinstance(d.get('reasoning'), str) else ''
-                            if reason_tail and rsn_started:
-                                acc_reason += reason_tail
-                                yield emit({
-                                    'type': 'response.reasoning_text.delta', 'sequence_number': next_seq(),
-                                    'item_id': rsn_id, 'output_index': rsn_index, 'content_index': 0,
-                                    'delta': reason_tail,
-                                })
+                        if stream_terminated:
+                            break
+                # EOF tails use the same parser, including errors and tools.
+                if buffer.strip() and not stream_terminated:
+                    async for event in process_line(buffer):
+                        yield event
             except Exception as e:
                 stream_error = e
                 import logging
@@ -756,7 +815,7 @@ class ResponsesHandler:
                 rsn_item = {'id': rsn_id, 'type': 'reasoning', 'status': 'completed', 'summary': [],
                            'content': [{'type': 'reasoning_text', 'text': acc_reason}]}
                 yield emit({'type': 'response.output_item.done', 'sequence_number': next_seq(), 'output_index': rsn_index, 'item': rsn_item})
-                outputs_by_index[rsn_index] = make_reasoning_item(acc_reason)
+                outputs_by_index[rsn_index] = rsn_item
 
             yield emit({'type': 'response.output_text.done', 'sequence_number': next_seq(),
                         'response_id': resp_id, 'item_id': msg_id, 'output_index': msg_index,
@@ -781,13 +840,27 @@ class ResponsesHandler:
                 outputs_by_index[acc['output_index']] = fc_item
 
             outputs = [outputs_by_index[i] for i in sorted(outputs_by_index)]
+            # A client may stop reading at response.completed or [DONE].
+            # Persist before the first terminal event makes the turn visible.
+            _bounded_store(principal, resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
             yield emit({'type': 'response.completed', 'sequence_number': next_seq(),
                         'response': base_response(resp_id, model, 'completed', outputs, usage)})
             yield 'data: [DONE]\n\n'
 
-            _bounded_store(principal, resp_id, chat_body.get('messages', []) + [_assistant_message_from_chat({}, acc_text, completed_tools)])
+        async def close_upstream():
+            await close_stream(result.get('stream'), result.get('on_close'))
 
-        return None, stream_gen()
+        async def stream_gen():
+            # The synthetic initial events belong to this cleanup scope too.
+            # A client may disconnect before stream_events reaches its read loop.
+            events = stream_events()
+            try:
+                async for event in events:
+                    yield event
+            finally:
+                await close_stream(events, close_upstream)
+
+        return None, _OwnedStream(stream_gen(), close_upstream)
 
     async def handle_responses_api(self, request: Any, raw_body: bytes) -> Tuple[Optional[dict], Optional[AsyncGenerator[str, None]], Optional[int]]:
         try:
@@ -806,9 +879,8 @@ class ResponsesHandler:
         # across tenants — a cross-tenant data leak.
         principal = _extract_principal(request)
         prev = body.get('previous_response_id')
-        prev_key = _store_key(principal, prev) if prev else None
-        if prev_key and prev_key in _RESPONSE_STORE:
-            stored = _RESPONSE_STORE[prev_key]
+        stored = _get_stored_conversation(principal, prev) if prev else None
+        if stored is not None:
             cur = body.get('input')
             if isinstance(cur, list):
                 body['input'] = stored + cur

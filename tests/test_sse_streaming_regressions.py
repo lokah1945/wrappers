@@ -589,14 +589,19 @@ def test_r04_no_loop_variable_shadows_a_function_parameter():
 def test_r05_openrouter_translates_non_streaming_responses():
     """openrouter returned the RAW OpenAI ChatCompletion body on the Anthropic
     and Responses surfaces — `return response` fired before the translation."""
+    import ast
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
-    i = src.index('async def messages(')
-    block = src[i:i + 4500]
-    assert '_openai_to_anthropic_response(payload, body)' in block, \
+    functions = {node.name: node for node in ast.parse(src).body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    message_calls = [node for node in ast.walk(functions['messages'])
+                     if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    assert any(node.func.id == '_openai_to_anthropic_response'
+               and [ast.unparse(argument) for argument in node.args] == ['payload', 'body']
+               for node in message_calls), \
         'openrouter /v1/messages does not translate non-streaming replies'
-    j = src.index('async def responses(')
-    rblock = src[j:j + 4500]
-    assert 'chat_to_responses(' in rblock, \
+    response_calls = [node for node in ast.walk(functions['responses'])
+                      if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)]
+    assert any(node.func.id == 'chat_to_responses' for node in response_calls), \
         'openrouter /v1/responses does not translate non-streaming replies'
 
 

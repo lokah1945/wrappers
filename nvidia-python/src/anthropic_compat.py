@@ -102,7 +102,7 @@ def is_anthropic_message_order_valid(messages: list) -> bool:
     return True
 
 
-def get_compat_context_window(model_id: str, official_context: Optional[dict]) -> int:
+def get_compat_context_window(model_id: str, official_context: Optional[dict]) -> Optional[int]:
     if official_context and official_context.get('context', 0) > 0:
         return official_context['context']
     return get_context_window(model_id)
@@ -165,40 +165,95 @@ def sanitize_anthropic_tools(tools: list) -> tuple:
     return (out, dropped_search_tool)
 
 
+def validate_anthropic_request(a: dict) -> None:
+    """Check containers consumed by the cross-protocol converter.
+
+    Native Messages bypasses this validator. Unknown block fields are left to
+    their protocol handler; malformed known fields must produce a client error
+    before token estimation or conversion can raise a Python exception.
+    """
+    if not isinstance(a, dict):
+        raise ValueError('Request body must be an object')
+    if not isinstance(a.get('messages'), list):
+        raise ValueError('messages must be an array')
+    if a.get('model') is not None and not isinstance(a['model'], str):
+        raise ValueError('model must be a string')
+    for field in ('thinking', 'output_config'):
+        if field in a and not isinstance(a[field], dict):
+            raise ValueError(f'{field} must be an object')
+    tools = a.get('tools', [])
+    if not isinstance(tools, list):
+        raise ValueError('tools must be an array')
+    for index, tool in enumerate(tools or []):
+        if not isinstance(tool, dict):
+            raise ValueError(f'tools[{index}] must be an object')
+        if not isinstance(tool.get('input_schema'), dict):
+            raise ValueError(f'tools[{index}].input_schema must be an object')
+        if not isinstance(tool.get('name'), str) or not tool['name']:
+            raise ValueError(f'tools[{index}].name must be a non-empty string')
+        for field in ('name', 'description'):
+            if field in tool and not isinstance(tool[field], str):
+                raise ValueError(f'tools[{index}].{field} must be a string')
+
+    def content(value, path, *, tool_result=False):
+        if tool_result and value is None:
+            return
+        if isinstance(value, str):
+            return
+        if not isinstance(value, list):
+            raise ValueError(f'{path} must be a string or array of content blocks')
+        for index, block in enumerate(value):
+            location = f'{path}[{index}]'
+            if not isinstance(block, dict):
+                raise ValueError(f'{location} must be an object')
+            kind = block.get('type')
+            if kind in ('text', 'thinking'):
+                field = 'text' if kind == 'text' else 'thinking'
+                if not isinstance(block.get(field), str):
+                    raise ValueError(f'{location}.{field} must be a string')
+            elif kind == 'image':
+                source = block.get('source')
+                if not isinstance(source, dict):
+                    raise ValueError(f'{location}.source must be an object')
+                for field in ('type', 'url', 'data', 'media_type'):
+                    if field in source and not isinstance(source[field], str):
+                        raise ValueError(f'{location}.source.{field} must be a string')
+            elif kind == 'tool_use':
+                for field in ('id', 'name'):
+                    if not isinstance(block.get(field), str) or not block[field]:
+                        raise ValueError(f'{location}.{field} must be a non-empty string')
+                if 'input' in block and not isinstance(block['input'], dict):
+                    raise ValueError(f'{location}.input must be an object')
+            elif kind == 'tool_result':
+                if not isinstance(block.get('tool_use_id'), str) or not block['tool_use_id']:
+                    raise ValueError(f'{location}.tool_use_id must be a non-empty string')
+                if 'content' in block:
+                    content(block['content'], f'{location}.content', tool_result=True)
+
+    if 'system' in a and a['system'] is not None:
+        content(a['system'], 'system')
+    for index, message in enumerate(a['messages']):
+        if not isinstance(message, dict):
+            raise ValueError(f'messages[{index}] must be an object')
+        if message.get('role') is not None and not isinstance(message['role'], str):
+            raise ValueError(f'messages[{index}].role must be a string')
+        content(message.get('content'), f'messages[{index}].content')
+
+
 def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dict:
     """Translate Anthropic Messages request -> OpenAI Chat Completions body."""
-    if not a or not isinstance(a, dict):
-        return {'model': '', 'messages': []}
-    if not isinstance(a.get('messages'), list):
-        return {'model': '', 'messages': []}
+    validate_anthropic_request(a)
+    # Conversion removes dialect-only annotations from its own copy. Keep the
+    # caller's tool schemas and explicitly supplied strict intent unchanged.
+    from copy import deepcopy
+    a = deepcopy(a)
 
     strip_cache_control(a)
 
-    context_limit = get_compat_context_window(a.get('model', ''), official_context)
-    max_allowed_tokens = max(4000, context_limit - (a.get('max_tokens', 4096) or 4096) - 2000)
-    current_tokens = estimate_input_tokens(a)
-
-    # V19 fix (transparency audit 2026-07-27): silent history truncation is
-    # opt-in via WRAPPER_AUTO_TRUNCATE. Default OFF: forward the conversation
-    # as-is and let upstream decide (its context error is visible to the client).
-    if current_tokens > max_allowed_tokens and _env_flag('WRAPPER_AUTO_TRUNCATE', '0'):
-        while len(a['messages']) > 1 and current_tokens > max_allowed_tokens:
-            if a['messages'][0] and a['messages'][0].get('role') == 'system':
-                break
-            remaining_users = sum(1 for m in a['messages'] if m and m.get('role') == 'user')
-            if remaining_users <= 1:
-                break
-            if a['messages'][0].get('role') != 'user':
-                a['messages'].pop(0)
-            else:
-                a['messages'].pop(0)
-                while a['messages'] and a['messages'][0] and a['messages'][0].get('role') != 'user':
-                    a['messages'].pop(0)
-            while a['messages'] and a['messages'][0] and a['messages'][0].get('role') not in ('user', 'system'):
-                a['messages'].pop(0)
-            if not a['messages']:
-                break
-            current_tokens = estimate_input_tokens(a)
+    # Preserve complete history, including atomic tool-call/result groups.
+    # A guessed tokenizer budget cannot justify deleting caller messages.
+    # Explicit upstream context failures are handled by bounded transport
+    # recovery; WRAPPER_AUTO_TRUNCATE no longer silently removes history.
 
     if not is_anthropic_message_order_valid(a['messages']):
         return {
@@ -361,6 +416,9 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
         ('service_tier', 'service_tier'),
         ('user', 'user'),
         ('metadata', 'metadata'),
+        ('chat_template_kwargs', 'chat_template_kwargs'),
+        ('reasoning_effort', 'reasoning_effort'),
+        ('reasoning_budget', 'reasoning_budget'),
     ]
     for src, dst in param_map:
         if a.get(src) is not None:
@@ -382,10 +440,12 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
                 # OpenAI nested: {type, function:{name, description, parameters}}
                 if isinstance(ttool.get('function'), dict):
                     fn = ttool['function']
+                    strict_source = fn
                     name = fn.get('name') or ''
                     desc = fn.get('description') or ''
                     params = fn.get('parameters') or fn.get('input_schema') or {}
                 else:
+                    strict_source = ttool
                     name = ttool.get('name') or ''
                     desc = ttool.get('description') or ''
                     params = ttool.get('input_schema') or ttool.get('parameters') or {}
@@ -397,6 +457,7 @@ def anthropic_to_openai(a: dict, official_context: Optional[dict] = None) -> dic
                         'name': name,
                         'description': desc,
                         'parameters': params if isinstance(params, dict) else {},
+                        **({'strict': strict_source['strict']} if 'strict' in strict_source else {}),
                     },
                 })
             if oai_tools:

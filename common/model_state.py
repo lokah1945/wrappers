@@ -29,7 +29,7 @@ from .model.errors import classify_provider_error, classify_upstream_error, erro
 from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 logger = logging.getLogger("model-state")
 
 
@@ -117,6 +117,16 @@ class ModelStateStore:
                 version INTEGER PRIMARY KEY,
                 applied_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS model_context_observations (
+                provider TEXT NOT NULL,
+                account_scope TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                endpoint TEXT NOT NULL,
+                limits_json TEXT NOT NULL,
+                checked_at REAL NOT NULL,
+                expires_at REAL NOT NULL,
+                PRIMARY KEY(provider, account_scope, model_id, endpoint)
+            );
         """)
         row = conn.execute(
             "SELECT value FROM model_state_meta WHERE key='schema_version'"
@@ -131,6 +141,11 @@ class ModelStateStore:
         if current_version < 2:
             conn.execute(
                 "INSERT OR IGNORE INTO model_state_migrations(version, applied_at) VALUES(2,?)",
+                (time.time(),),
+            )
+        if current_version < 3:
+            conn.execute(
+                "INSERT OR IGNORE INTO model_state_migrations(version, applied_at) VALUES(3,?)",
                 (time.time(),),
             )
         conn.execute(
@@ -214,6 +229,48 @@ class ModelStateStore:
 
     def get_ids(self, fresh_only: bool = False) -> list[str]:
         return [str(item.get("id")) for item in self.get_catalog(fresh_only) if item.get("id")]
+
+    def record_context_limit(self, model_id: str, credential: str, endpoint: str,
+                             limits: dict, ttl_sec: int = 3600) -> None:
+        """Numeric rejection evidence scoped to credential + route, not a global cap.
+
+        No prompt, raw error or credential is persisted. An observation cannot
+        replace advertised capacity or pre-truncate another request.
+        """
+        from urllib.parse import urlsplit
+        from .model.metadata import positive_int
+        from .model.validation import validate_model_id
+        validate_model_id(model_id)
+        url = urlsplit(endpoint)
+        safe_endpoint = f'{url.scheme}://{url.hostname or ""}{":" + str(url.port) if url.port else ""}{url.path}' if url.scheme else url.path
+        values = {key: positive_int(limits.get(key)) for key in
+                  ('context_window', 'input_tokens', 'max_output_tokens')}
+        if not any(value is not None for value in values.values()):
+            return
+        now = time.time()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute('DELETE FROM model_context_observations WHERE expires_at < ?', (now,))
+                conn.execute('''INSERT OR REPLACE INTO model_context_observations
+                    (provider,account_scope,model_id,endpoint,limits_json,checked_at,expires_at)
+                    VALUES(?,?,?,?,?,?,?)''', (self.provider, credential_fingerprint(credential),
+                    model_id, safe_endpoint, json.dumps(values), now, now + max(60, ttl_sec)))
+                conn.commit()
+            finally:
+                conn.close()
+
+    def context_observations(self, model_id: str) -> list[dict]:
+        conn = self._connect()
+        try:
+            rows = conn.execute('''SELECT account_scope,endpoint,limits_json,checked_at,expires_at
+                FROM model_context_observations WHERE provider=? AND model_id=? AND expires_at>?''',
+                (self.provider, model_id, time.time())).fetchall()
+            return [{**dict(row), 'limits': json.loads(row['limits_json']),
+                     'source': 'upstream_context_error', 'scope': 'account_endpoint'}
+                    for row in rows]
+        finally:
+            conn.close()
 
     def catalog_age_sec(self) -> Optional[float]:
         conn = self._connect()

@@ -1,0 +1,38 @@
+{
+  "recorded_at_utc": "2026-10-07T15:42:56.854636+00:00",
+  "wrapper": "nvidia-python",
+  "execution": "Latest source isolated staging on port19611; production state untouched; native Responses passthrough only. Explicit qualification model choices, no runtime model substitution.",
+  "sdk_version": "2.54.0",
+  "native_mode": "native",
+  "calls": 1,
+  "source_sha256": {
+    "nvidia-python/src/main.py": "0edb2b7f6063a51fba8dfec28b8fc21dfe86927a951ad41696b426cd8a4ab9d3"
+  },
+  "checks": [
+    {
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "stream": true,
+      "max_output_tokens": 256,
+      "reasoning": null,
+      "passed": true,
+      "http_status": 200,
+      "terminal_status": "completed",
+      "visible_characters": 2,
+      "event_types": [
+        "response.completed",
+        "response.content_part.added",
+        "response.content_part.done",
+        "response.created",
+        "response.in_progress",
+        "response.output_item.added",
+        "response.output_item.done",
+        "response.output_text.delta",
+        "response.output_text.done"
+      ],
+      "completed_count": 1,
+      "latency_sec": 3.203
+    }
+  ],
+  "passed": 1,
+  "failed": 0
+}

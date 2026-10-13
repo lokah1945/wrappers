@@ -1,0 +1,285 @@
+{
+  "recorded_at_utc": "2026-10-07T15:46:34.917719+00:00",
+  "wrapper": "nous",
+  "model": "poolside/laguna-xs-2.1:free",
+  "execution": "Latest source, isolated19621, private cloned OAuth file, temporary state/logs, central registry disabled, no production changes. Native Responses policy explicitly native: no Chat adapter fallback.",
+  "source_sha256_at_start": {
+    "nous/src/main.py": "8d5366a6c630668396f9d77b1aa1bf3ff38e5caa35cde2158dd5d5d8937735af",
+    "common/compat.py": "effd430618e1f273503fea58487913431cb79ba80dab35f89cf6b925fde5601e"
+  },
+  "sdk_versions": {
+    "openai": "2.31.0",
+    "pinned_openai": "2.54.0"
+  },
+  "client_versions": {
+    "claude": "2.1.202",
+    "codex": "0.160.1",
+    "opencode": "1.17.20"
+  },
+  "checks": [
+    {
+      "client": "claude",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "native, no Chat adapter fallback",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 3.74
+    },
+    {
+      "client": "codex",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "native, no Chat adapter fallback",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 2.809
+    },
+    {
+      "client": "opencode",
+      "exit_code": 0,
+      "model": "poolside/laguna-xs-2.1:free",
+      "native_upstream_policy": "native, no Chat adapter fallback",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "terminal_event_observed": true,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text"
+      ],
+      "latency_sec": 10.519
+    },
+    {
+      "case": "native_responses_tool_request",
+      "model": "poolside/laguna-xs-2.1:free",
+      "max_output_tokens": 512,
+      "status": 200,
+      "response_status": "completed",
+      "output_types": [
+        "message",
+        "function_call"
+      ],
+      "function_call_count": 1,
+      "called_names": [
+        "get_status"
+      ],
+      "passed": true,
+      "latency_sec": 3.548
+    },
+    {
+      "case": "native_responses_tool_result_full_history",
+      "model": "poolside/laguna-xs-2.1:free",
+      "max_output_tokens": 512,
+      "history_policy": "Full native Responses input; no previous_response_id; no local adapter store",
+      "status": 200,
+      "response_status": "completed",
+      "output_types": [
+        "message"
+      ],
+      "visible_text_length": 45,
+      "contains_expected_value": true,
+      "passed": true,
+      "latency_sec": 2.837
+    },
+    {
+      "case": "native_responses_pinned_sdk_accumulator",
+      "model": "poolside/laguna-xs-2.1:free",
+      "sdk_version": "2.54.0",
+      "max_output_tokens": 256,
+      "status": 200,
+      "response_status": "completed",
+      "event_count": 106,
+      "completed_count": 1,
+      "visible_text_length": 2,
+      "passed": true,
+      "latency_sec": 8.393
+    }
+  ],
+  "transport_attempts": [
+    {
+      "credential_sha256_prefix": "921fbfcef618",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/chat/completions",
+      "stream": true,
+      "status": 200,
+      "request_fields": [
+        "max_tokens",
+        "messages",
+        "metadata",
+        "model",
+        "stream"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "5a7758e25571",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": true,
+      "status": 200,
+      "request_fields": [
+        "client_metadata",
+        "include",
+        "input",
+        "instructions",
+        "model",
+        "parallel_tool_calls",
+        "prompt_cache_key",
+        "reasoning",
+        "store",
+        "stream",
+        "tool_choice",
+        "tools"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "7f6e047e640a",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/chat/completions",
+      "stream": true,
+      "status": 200,
+      "request_fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "stream",
+        "stream_options"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "baf0f5e2e128",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/chat/completions",
+      "stream": true,
+      "status": 200,
+      "request_fields": [
+        "max_tokens",
+        "messages",
+        "model",
+        "stream",
+        "stream_options"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "1604051bf007",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": false,
+      "status": 200,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "tool_choice",
+        "tools"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "921fbfcef618",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": false,
+      "status": 429,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "tool_choice",
+        "tools"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "baf0f5e2e128",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": false,
+      "status": 429,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "tool_choice",
+        "tools"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "5a7758e25571",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": false,
+      "status": 200,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "tool_choice",
+        "tools"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "1604051bf007",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": true,
+      "status": 429,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "stream"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "7f6e047e640a",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": true,
+      "status": 429,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "stream"
+      ]
+    },
+    {
+      "credential_sha256_prefix": "5a7758e25571",
+      "model": "poolside/laguna-xs-2.1:free",
+      "path": "v1/responses",
+      "stream": true,
+      "status": 200,
+      "request_fields": [
+        "input",
+        "max_output_tokens",
+        "model",
+        "store",
+        "stream"
+      ]
+    }
+  ],
+  "passed": 6,
+  "failed": 0
+}

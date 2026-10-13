@@ -7,10 +7,10 @@ Provides:
   - classify(model_id)           -> model type, streaming, capabilities, params
   - describe(model_id)           -> full descriptor with endpoints
   - build_catalog(ids)           -> full catalog from cached IDs + curated list
-  - get_context_window(model_id) -> heuristic context window
+  - get_context_window(model_id) -> unknown without provider metadata
   - CAPABILITY_PARAMS            -> supported params per capability type
   - CURATED_GENAI                -> curated non-chat models
-  - MODEL_CONTEXT_WINDOWS        -> authoritative context window map
+  - MODEL_CONTEXT_WINDOWS        -> empty compatibility symbol
 """
 
 import time
@@ -21,7 +21,7 @@ NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com'
 NVIDIA_GENAI_URL = 'https://ai.api.nvidia.com'
 NVIDIA_NVCF_URL = 'https://api.nvcf.nvidia.com'
 
-DEFAULT_CONTEXT_WINDOW = 131072
+DEFAULT_CONTEXT_WINDOW = None
 
 # ── Capability type constants ─────────────────────────────────────────────
 LLM = 'llm'
@@ -53,73 +53,14 @@ CURATED_GENAI = [
 # ── Retired models ──────────────────────────────────────────────────────
 RETIRED_MODELS: Dict[str, str] = {}
 
-# ── Model context windows (heuristic, overridden by NGC registry) ──────
-# SINGLE SOURCE OF TRUTH for context-window heuristics. Used by both the
-# OpenAI path (main.py) and the Anthropic translation path (anthropic_compat.py).
-# The NGC registry (registry.py) always wins over these heuristics when it has
-# an entry for the model. These are fallbacks only.
-MODEL_CONTEXT_WINDOWS: Dict[str, int] = {
-    'claude': 200000,
-    'gpt-4': 128000,
-    'gpt-oss': 128000,
-    'llama-3.1': 128000,
-    'llama-3.2': 128000,
-    'llama-3.3': 128000,
-    'llama-3': 128000,
-    'llama-4': 131072,
-    'llama2': 4096,
-    'gemma-3': 128000,
-    'gemma-4': 131072,
-    'gemma-2': 8192,
-    'phi-3.5': 128000,
-    'phi-4': 16384,
-    'phi-4-mini': 131072,
-    'phi-3': 128000,
-    # NGC-verified: deepseek-v4-pro context=262144
-    'deepseek-v4': 262144,
-    'deepseek-coder': 262144,
-    'deepseek-r1': 131072,
-    'qwen2.5': 128000,
-    'qwen3': 131072,
-    'qwen3.5': 131072,
-    'qwen3-next': 131072,
-    'qwen': 32768,
-    'kimi': 131072,
-    'step': 131072,
-    'seed-oss': 131072,
-    # NGC-verified: nemotron-3-ultra-550b context=1048576
-    'nemotron': 1048576,
-    'nemotron-3': 1048576,
-    'yi': 1000000,
-    'mistral': 131072,
-    'mistral-large': 131072,
-    'mistral-medium': 131072,
-    'mistral-small': 131072,
-    'mixtral': 32000,
-    'ministral': 131072,
-    'codestral': 32768,
-    # NGC-verified: glm-5.2 context=202752
-    'glm': 202752,
-    'minimax': 196608,
-    'dbrx': 131072,
-    'jamba': 256000,
-    'granite': 32768,
-    'solar': 32768,
-    'kosmos': 8192,
-    'dracarys': 131072,
-    'zamba': 131072,
-}
+# Context limits belong to exact upstream model records (registry.py).
+# Retain these symbols for callers, but unknown must never become 131072.
+MODEL_CONTEXT_WINDOWS: Dict[str, int] = {}
 
 
-def get_context_window(model_id: str) -> int:
-    """Get heuristic context window for a model."""
-    if not model_id:
-        return DEFAULT_CONTEXT_WINDOW
-    lower = model_id.lower()
-    for pattern, window in MODEL_CONTEXT_WINDOWS.items():
-        if pattern in lower:
-            return window
-    return DEFAULT_CONTEXT_WINDOW
+def get_context_window(model_id: str) -> Optional[int]:
+    """No context capacity can be inferred safely from a model ID alone."""
+    return None
 
 
 # ── Capability definitions ──────────────────────────────────────────────

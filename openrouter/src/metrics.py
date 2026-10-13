@@ -32,6 +32,8 @@ class Metrics:
         self._load_persisted()
 
     def _persist_path(self) -> str:
+        if os.environ.get('METRICS_SNAPSHOT_FILE'):
+            return os.environ['METRICS_SNAPSHOT_FILE']
         if self._db_path:
             return str(self._db_path).replace('.db', '-metrics.json')
         return str(Path(__file__).resolve().parents[1] / 'metrics-snapshot.json')

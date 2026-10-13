@@ -1,0 +1,46 @@
+{
+  "completed_at_utc": "2026-10-07T16:03:54.989683+00:00",
+  "scope": "actual live nvidia-python endpoint9101; controlled synthetic echo tool, no shell/files/network tool execution",
+  "exact_model": "nvidia/nemotron-3-super-120b-a12b",
+  "source_combined_sha256": "6ab07899b94d7ed5978e0889db3f2b8a5dcf66d2a935dc65fac3d5aa0e1c9ee5",
+  "checks": [
+    {
+      "surface": "chat",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "execution": "live production, two-turn structured tool loop, bounded max512, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "stop",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    },
+    {
+      "surface": "responses",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "execution": "live production, two-turn structured tool loop, bounded max512, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "completed",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    },
+    {
+      "surface": "messages",
+      "model": "nvidia/nemotron-3-super-120b-a12b",
+      "execution": "live production, two-turn structured tool loop, bounded max512, manual full history (not account-affinity previous_response_id)",
+      "tool_name_correct": true,
+      "arguments_valid": true,
+      "terminal": "end_turn",
+      "passed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2
+    }
+  ],
+  "passed": 3,
+  "failed": 0
+}

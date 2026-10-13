@@ -119,6 +119,22 @@ def classify_upstream_error(status: int, payload: Any = "") -> ErrorClassificati
             rotate_key=True,
             account_scoped=True,
         )
+    if status == 402:
+        if looks_anti_bot_challenge(payload):
+            return ErrorClassification(
+                ErrorState.TRANSIENT_FAILURE,
+                "ANTI_BOT_CHALLENGE",
+                retry_same_model=True,
+            )
+        # Credits/usage are account scoped: another credential can still
+        # serve the exact same model without changing the requested payload.
+        return ErrorClassification(
+            ErrorState.ACCOUNT_UNAVAILABLE,
+            "ACCOUNT_QUOTA_EXHAUSTED",
+            retry_same_model=True,
+            rotate_key=True,
+            account_scoped=True,
+        )
     if status == 403:
         if looks_anti_bot_challenge(payload):
             # Anti-bot/Cloudflare transport block — NOT an authentication

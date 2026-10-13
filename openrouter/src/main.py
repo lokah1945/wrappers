@@ -105,7 +105,7 @@ except ImportError:
 # ── FastAPI + deps ───────────────────────────────────────────────────────
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -122,10 +122,12 @@ except ImportError:
 
 # B-08 fix: shared sentinel-task idle iterator + CRLF normalisation.
 from common.sse import (  # noqa: E402
+    ClosingStreamingResponse as StreamingResponse,
     IDLE as _IDLE,
     iter_chunks_with_idle as _iter_chunks_with_idle,
     normalize_sse_newlines as _normalize_sse_newlines,
 )
+from common.auth import extract_client_tokens, tokens_match
 
 from dotenv import load_dotenv
 
@@ -167,6 +169,8 @@ try:
     )
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
+        responses_use_native_upstream as _responses_use_native_upstream,
+        responses_chat_fallback_allowed as _responses_chat_fallback_allowed,
         is_auto_discovery as _is_auto_discovery,
         passthrough_anthropic_sse as _passthrough_anthropic_sse,
         translate_anthropic_stream_to_openai_chat as _translate_anthropic_stream_to_openai_chat,
@@ -216,6 +220,10 @@ MODEL_CATALOG_REFRESH_SEC = int(os.environ.get('MODEL_CATALOG_REFRESH_SEC', '864
 MODEL_STORE = ModelStateStore('openrouter', MODEL_STATE_DB, MODEL_CATALOG_TTL_SEC)
 MODEL_REGISTRY = LocalModelRegistry('openrouter', profile_db_path=MODEL_STATE_DB)
 MODEL_REGISTRY_CLIENT = ModelRegistryClient()
+from common.model_catalog import CachedModelCatalog
+from common.model.metadata import discovery_limits
+MODEL_CATALOG = CachedModelCatalog(MODEL_STORE, MODEL_REGISTRY, MODEL_REGISTRY_CLIENT,
+                                  f"{OPENROUTER_BASE}/models", ttl_sec=MODEL_CATALOG_TTL_SEC)
 _MODEL_REFRESH_TASK = None
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 VERSION = '1.0.0'
@@ -308,13 +316,10 @@ def _bearer_token() -> str:
 
 
 def _client_ip(request: Request) -> str:
+    """Use the ASGI peer; forwarded headers require server-level trust."""
     host = getattr(request.client, 'host', None) if request.client else None
-    if host:
-        return host
-    xff = request.headers.get('x-forwarded-for')
-    if xff:
-        return xff.split(',')[0].strip()
-    return 'unknown'
+    return host or 'unknown'
+
 
 
 # ── Rate Limiting ────────────────────────────────────────────────────────
@@ -470,28 +475,25 @@ async def _refresh_models_loop():
         logger.info(f"[openrouter] Initial model catalog: {len(ids)} models")
 
         while True:
-            await asyncio.sleep(MODEL_CATALOG_REFRESH_SEC)
+            await asyncio.sleep(max(60, min(MODEL_CATALOG_REFRESH_SEC, MODEL_CATALOG_TTL_SEC)))
             ids = await _refresh_models()
             logger.info(f"[openrouter] Model catalog refreshed: {len(ids)} models")
     except asyncio.CancelledError:
         pass
 
 
+async def _fetch_model_catalog():
+    agent = await get_agent()
+    async with agent.get(f"{OPENROUTER_BASE}/models", headers={"Accept": "application/json"}) as resp:
+        if resp.status != 200:
+            raise ValueError('OpenRouter model catalog unavailable')
+        data = await resp.json()
+        return data.get('data', [])
+
+
 async def _refresh_models(force: bool = False) -> list:
-    """Fetch model list from OpenRouter upstream."""
-    try:
-        agent = await get_agent()
-        headers = {"Accept": "application/json"}
-        async with agent.get(f"{OPENROUTER_BASE}/models", headers=headers) as resp:
-            if resp.status != 200:
-                logger.warning(f"[openrouter] Failed to fetch models: {resp.status}")
-                return []
-            data = await resp.json()
-            models = [m["id"] for m in data.get("data", [])]
-            return models
-    except Exception as e:
-        logger.warning(f"[openrouter] Model refresh error: {e}")
-        return []
+    models = await MODEL_CATALOG.refresh(_fetch_model_catalog, force=force)
+    return [m['id'] for m in models]
 
 
 # ── Background tasks ───────────────────────────────────────────────────────
@@ -563,6 +565,8 @@ async def lifespan(app: FastAPI):
     """Application lifecycle: startup and shutdown."""
     # Startup
     global _MODEL_REFRESH_TASK
+    from common.compat import initialize_upstream_compatibility
+    await initialize_upstream_compatibility(OPENROUTER_BASE)
     logger.info("[openrouter] Starting wrapper-openrouter")
     pool.load_from_env()
 
@@ -606,6 +610,8 @@ async def lifespan(app: FastAPI):
     # B-35 fix: await outstanding fire-and-forget tasks so metrics/model-state
     # writes are not lost (and cannot be GC'd mid-flight).
     await _drain_background_tasks()
+    await MODEL_CATALOG.close()
+    await MODEL_REGISTRY_CLIENT.stop()
 
     await metrics.close()
     if _agent and not _agent.closed:
@@ -738,17 +744,8 @@ async def auth_middleware(request: Request, call_next):
     # inference DISABLE_AUTH bypass. B-27/B-28 continue to apply to normal
     # inference routes unless the operator explicitly disables inference auth.
     if is_management or (not DISABLE_AUTH and not _is_public_path(path, method)):
-        auth = request.headers.get('Authorization', '')
-        x_api_key = request.headers.get('x-api-key', '')
         # B-26: privileged provisioning surface uses its own token.
         token = _management_token() if is_management else _bearer_token()
-        client_token = ''
-        if auth.lower().startswith('bearer '):
-            client_token = auth[7:].strip()
-        elif x_api_key:
-            client_token = x_api_key.strip()
-        elif auth:
-            client_token = auth.strip()
 
         # B-28 fix: fail CLOSED when no token is configured instead of
         # silently allowing every request through.
@@ -768,8 +765,8 @@ async def auth_middleware(request: Request, call_next):
         else:
             # B-30 parity: compare as bytes so a non-ASCII token yields a
             # clean 401 instead of a TypeError → 500.
-            ok = bool(client_token) and hmac.compare_digest(
-                client_token.encode('utf-8'), token.encode('utf-8'))
+            ok = any(tokens_match(candidate, token)
+                     for candidate in extract_client_tokens(request.headers))
             if not ok:
                 return _error_response(
                     {"error": {"message": "Unauthorized", "type": "authentication_error"}},
@@ -806,17 +803,20 @@ async def auth_middleware(request: Request, call_next):
 async def _proxy_request(method: str, path: str, body: dict | None = None,
                          headers: dict | None = None, stream: bool = False,
                          request: Request | None = None,
-                         terminal_done: bool = True) -> Response:
+                         terminal_done: bool = False) -> Response:
     """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
     Iterates over all available keys on retriable failures (429, 5xx, network errors).
     Returns 429 (not 503) when all keys are exhausted so SDKs auto-retry.
 
-    terminal_done: COMPATIBILITY_LAYER=2 (Anthropic upstream) streams end with
-    message_stop, not [DONE]; pass terminal_done=False to skip the synthesized
-    [DONE] terminator.
+    terminal_done: optional legacy OpenAI stream finalization. Native matching
+    dialects preserve every upstream frame and terminal verbatim by default.
     """
+    from common.context_recovery import context_request, ContextRecoveryState
+    from common.http_headers import upstream_response_headers
+    context_state = ContextRecoveryState()
     model_id = (body or {}).get("model", "") if body else ""
+    endpoint = path.strip('/').rsplit('/', 1)[-1]
 
     # Parity fix: openrouter was the ONLY wrapper with no call-plan validation
     # and no model-identity guard (MODEL_REGISTRY / same_provider_model_id were
@@ -824,8 +824,8 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     # a mutated/invalid model id cannot burn a key's quota, and so the
     # "NO MODEL FALLBACK" contract is enforced here too.
     if model_id:
-        surface = ('anthropic_messages' if '/messages' in path
-                   else ('openai_responses' if '/responses' in path else 'openai_chat'))
+        surface = ('anthropic_messages' if endpoint == 'messages'
+                   else ('openai_responses' if endpoint == 'responses' else 'openai_chat'))
         try:
             call_plan = MODEL_REGISTRY.call_plan(model_id, surface)
             if not same_provider_model_id('openrouter', call_plan.model.provider_model_id, model_id):
@@ -843,12 +843,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     attempts = max(1, pool.total_keys)
     last_status = 429
     last_data = {"error": {"message": "All keys exhausted or rate-limited", "type": "rate_limit_error"}}
+    last_headers = {}
 
+    attempted_keys: set[str] = set()
     for _ in range(attempts):
-        acq = await pool.acquire(model=model_id)
+        acq = await pool.acquire(model=model_id, exclude=attempted_keys)
         if not acq:
             break
         key_obj = acq['key']
+        attempted_keys.add(key_obj.api_key)
         key_released = False  # I4: exactly-once release guard
 
         url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
@@ -877,16 +880,28 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
             if stream:
                 # Streaming: do NOT async-with so caller owns release; release in finally.
-                resp = await agent.request(method, url, json=body, headers=fwd, timeout=timeout)
+                resp = await context_request(
+                    lambda payload: agent.request(method, url, json=payload, headers=fwd, timeout=timeout),
+                    body, state=context_state, store=globals().get('MODEL_STORE'),
+                    credential=key_obj.api_key, endpoint=url)
                 if resp.status >= 400:
-                    # Parse Retry-After header for 429 cooldown (anti rate-limit).
-                    retry_after = _parse_retry_after(resp.headers, None) if resp.status == 429 else None
-                    pool.mark_failure(key_obj, status_code=resp.status,
-                                      available_keys=pool.available_keys,
-                                      model=model_id,
-                                      retry_after=retry_after)
-                    error_text = await resp.text()
-                    resp.release()
+                    last_headers = upstream_response_headers(resp)
+                    try:
+                        error_text = await resp.text()
+                        try:
+                            last_data = json.loads(error_text)
+                        except Exception:
+                            last_data = {"error": {"message": error_text[:2000], "type": "upstream_error",
+                                                     "status": resp.status}}
+                    finally:
+                        resp.release()
+                    if endpoint == 'responses' and _responses_chat_fallback_allowed(resp.status, last_data):
+                        return JSONResponse(last_data, status_code=resp.status, headers=last_headers)
+                    retry_after = _parse_retry_after(resp.headers, last_data) if resp.status == 429 else None
+                    if _should_cooldown_key(resp.status, last_data):
+                        pool.mark_failure(key_obj, status_code=resp.status,
+                                          available_keys=pool.available_keys,
+                                          model=model_id, retry_after=retry_after)
                     pool.release(key_obj)
                     key_released = True  # I4: mark released, skip outer finally
                     # B-39 fix: record upstream stream failures.
@@ -897,14 +912,9 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                                                                resp.status, last_data, url),
                                           'model-state')
                     last_status = resp.status
-                    try:
-                        last_data = json.loads(error_text)
-                    except Exception:
-                        last_data = {"error": {"message": error_text[:2000], "type": "upstream_error",
-                                                 "status": resp.status}}
-                    if _is_retriable_status(resp.status):
+                    if _is_retriable_status(resp.status) or classify_upstream_error(resp.status, last_data).retry_same_model:
                         continue  # retry with next key
-                    return JSONResponse(last_data, status_code=resp.status)
+                    return JSONResponse(last_data, status_code=resp.status, headers=last_headers)
                 pool.mark_success(key_obj, available_keys=pool.available_keys) if hasattr(pool, 'mark_success') else None
                 # B-39 fix: streaming requests were never counted, so
                 # error_rate was permanently ~0 and the dashboard reported
@@ -922,6 +932,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 resp_ref = resp
                 released = False
                 key_released = True  # I4: stream path owns release; outer finally skips
+
+                def release_stream():
+                    nonlocal released
+                    if not released:
+                        released = True
+                        try:
+                            resp_ref.release()
+                        finally:
+                            pool.release(key_obj)
 
                 async def stream_gen():
                     nonlocal released
@@ -957,13 +976,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     except asyncio.CancelledError:
                         raise
                     finally:
-                        if not released:
-                            released = True
-                            try:
-                                resp_ref.release()
-                            except Exception:
-                                pass
-                            pool.release(key_obj)
+                        release_stream()
 
                 async def stream_with_heartbeat():
                     # B-08 fix: use the shared sentinel-task iterator instead of
@@ -973,24 +986,25 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # heartbeated forever and the client hung until its own
                     # timeout. (nous N-05 / blackbox BB-5 parity.)
                     last_hb = time.time()
-                    at_line_boundary = True
+                    at_event_boundary = True
+                    framing_tail = b''
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
                     inner = stream_gen()
                     try:
                         async for chunk in _iter_chunks_with_idle(inner, hb_interval):
                             now = time.time()
                             if chunk is _IDLE:
-                                # Only inject a comment at a clean line boundary
-                                # so a heartbeat can never split a data: frame.
-                                if at_line_boundary and (now - last_hb) > hb_interval:
+                                # Wait for a complete event, including its blank
+                                # line, to preserve event/data association.
+                                if at_event_boundary and (now - last_hb) > hb_interval:
                                     yield b': heartbeat\n\n'
                                     last_hb = now
                                 continue
                             yield chunk
-                            if isinstance(chunk, (bytes, bytearray)) and len(chunk):
-                                at_line_boundary = chunk.endswith(b'\n')
-                            elif chunk:
-                                at_line_boundary = str(chunk).endswith('\n')
+                            if chunk:
+                                raw_chunk = bytes(chunk) if isinstance(chunk, (bytes, bytearray)) else str(chunk).encode()
+                                framing_tail = (framing_tail + raw_chunk)[-4:]
+                                at_event_boundary = framing_tail.endswith((b'\n\n', b'\r\n\r\n'))
                             last_hb = time.time()
                     except (GeneratorExit, asyncio.CancelledError):
                         raise
@@ -998,8 +1012,8 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                         # B-08: a real upstream failure must terminate the
                         # stream visibly rather than being masked as idle.
                         logger.warning(
-                            f'[openrouter] upstream stream error ({type(e).__name__}: {e}); finalizing')
-                        yield f': upstream-error {type(e).__name__}\n\n'.encode()
+                            f'[openrouter] upstream stream error ({type(e).__name__}: {e})')
+                        raise
                     finally:
                         try:
                             await inner.aclose()
@@ -1008,19 +1022,21 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
                 return StreamingResponse(
                     stream_with_heartbeat(),
+                    on_close=release_stream,
                     status_code=resp.status,
                     media_type="text/event-stream",
                     headers={
-                        **{k: sanitize_header_value(v) for k, v in resp.headers.items()
-                           if k.lower() not in ('content-encoding', 'content-length', 'transfer-encoding')},
-                        "Cache-Control": "no-cache",
-                        "Connection": "keep-alive",
-                        "X-Accel-Buffering": "no",
+                        "cache-control": "no-cache", "x-accel-buffering": "no",
+                        **upstream_response_headers(resp),
                     },
                 )
 
             # Non-streaming
-            async with agent.request(method, url, json=body, headers=fwd, timeout=timeout) as resp:
+            async with context_request(
+                lambda payload: agent.request(method, url, json=payload, headers=fwd, timeout=timeout),
+                body, state=context_state, store=globals().get('MODEL_STORE'),
+                credential=key_obj.api_key, endpoint=url) as resp:
+                response_headers = upstream_response_headers(resp)
                 await metrics.record_request(model=model_id, status_code=resp.status)
                 text = await resp.text()
                 if model_id:
@@ -1035,16 +1051,20 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     except Exception:
                         body_data = {"error": {"message": text[:2000], "type": "upstream_error",
                                            "status": resp.status}}
+                    if endpoint == 'responses' and _responses_chat_fallback_allowed(resp.status, body_data):
+                        return JSONResponse(body_data, status_code=resp.status, headers=response_headers)
                     retry_after = _parse_retry_after(resp.headers, body_data if isinstance(body_data, dict) else None) if resp.status == 429 else None
-                    pool.mark_failure(key_obj, status_code=resp.status,
-                                      available_keys=pool.available_keys,
-                                      model=model_id,
-                                      retry_after=retry_after)
+                    if _should_cooldown_key(resp.status, body_data):
+                        pool.mark_failure(key_obj, status_code=resp.status,
+                                          available_keys=pool.available_keys,
+                                          model=model_id,
+                                          retry_after=retry_after)
                     last_status = resp.status
                     last_data = body_data
-                    if _is_retriable_status(resp.status):
+                    last_headers = response_headers
+                    if _is_retriable_status(resp.status) or classify_upstream_error(resp.status, body_data).retry_same_model:
                         continue  # retry with next key
-                    return JSONResponse(body_data, status_code=resp.status)
+                    return JSONResponse(body_data, status_code=resp.status, headers=response_headers)
                 # Success
                 if hasattr(pool, 'mark_success'):
                     pool.mark_success(key_obj, available_keys=pool.available_keys)
@@ -1052,7 +1072,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     data = json.loads(text) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
-                return JSONResponse(content=data, status_code=resp.status)
+                return JSONResponse(content=data, status_code=resp.status, headers=response_headers)
 
         except asyncio.TimeoutError:
             pool.mark_failure(key_obj, reason="timeout", available_keys=pool.available_keys)
@@ -1084,7 +1104,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     return JSONResponse(
         last_data if isinstance(last_data, dict) else {"error": {"message": str(last_data)[:2000], "type": "rate_limit_error"}},
         status_code=last_status if last_status in (429, 401, 402, 403, 408, 409) else 429,
-        headers={"Retry-After": retry_after},
+        headers={**last_headers, "retry-after": last_headers.get('retry-after', retry_after)},
     )
 
 
@@ -1102,6 +1122,7 @@ def _check_free_only(model: str) -> JSONResponse | None:
 
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
+    from common.context_recovery import context_response_headers
     try:
         body = await request.json()
     except Exception:
@@ -1118,8 +1139,9 @@ async def chat_completions(request: Request):
         return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
                                           "type": "invalid_request_error"}}, status_code=400)
     # WRAPPER_CONTRACT §4: unknown roles and orphan tool messages are rejected.
+    cross_dialect = _is_anthropic_upstream()
     for _m in body.get("messages") or []:
-        if isinstance(_m, dict) and _m.get("role") not in (None, "system", "user", "assistant", "tool", "developer", "function"):
+        if cross_dialect and isinstance(_m, dict) and _m.get("role") not in (None, "system", "user", "assistant", "tool", "developer", "function"):
             return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
                                               "type": "invalid_request_error"}}, status_code=400)
         if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_call_id"):
@@ -1144,6 +1166,7 @@ async def chat_completions(request: Request):
             return StreamingResponse(
                 _translate_anthropic_stream_to_openai_chat(
                     res.body_iterator, model, float(HEARTBEAT_MS) / 1000.0),
+                on_close=res.aclose,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache", "Connection": "keep-alive",
@@ -1163,27 +1186,13 @@ async def chat_completions(request: Request):
                 return JSONResponse(oai_resp, status_code=res.status_code)
         return res
 
-    res = await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
-    if isinstance(res, JSONResponse) and res.status_code == 200:
-        try:
-            payload = json.loads(res.body)
-            if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
-                oai_resp = anthropic_to_openai_response(payload, model)
-                return JSONResponse(oai_resp, status_code=200)
-        except Exception:
-            pass
-    return res
+    return await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
 
 
 @app.post("/v1/responses")
 async def responses(request: Request):
-    """OpenAI Responses API (Codex/Claude Code) → Chat Completions translation.
-
-    The Responses API uses `input` (string or array) instead of `messages`.
-    We translate to Chat Completions, forward to OpenRouter, then translate
-    the response back to Responses format. Streaming is supported via the
-    ResponsesStreamState event lifecycle.
-    """
+    """Native OpenAI Responses, cross-Anthropic, or an explicit Chat adapter."""
+    from common.context_recovery import context_response_headers
     try:
         body = await request.json()
     except Exception:
@@ -1206,6 +1215,29 @@ async def responses(request: Request):
     if blocked:
         return blocked
 
+    if _responses_use_native_upstream():
+        native_response = await _proxy_request('POST', 'responses', body,
+                                               stream=bool(body.get('stream', False)), request=request)
+        if not isinstance(native_response, JSONResponse):
+            return native_response
+        try:
+            native_payload = json.loads(native_response.body)
+        except Exception:
+            return native_response
+        if not _responses_chat_fallback_allowed(native_response.status_code, native_payload):
+            return native_response
+        previous_id = body.get('previous_response_id')
+        if previous_id is not None:
+            fallback_principal = _request_principal(request)
+            _get_stored_conversation(fallback_principal, previous_id)  # expire stale histories
+            if _response_store_key(fallback_principal, previous_id) not in _RESPONSE_STORE:
+                return _error_response({'error': {
+                    'type': 'invalid_request_error', 'code': 'previous_response_not_found',
+                    'message': 'previous_response_id is unavailable to the Chat adapter. '
+                               'Retry with the full conversation in input and omit previous_response_id.'}},
+                    status_code=400)
+        logger.info('[responses] native endpoint unavailable; using approved Chat adapter')
+
     # Translate Responses → Chat Completions
     principal = _request_principal(request)
     chat_body = responses_to_chat(body, principal=principal)
@@ -1222,12 +1254,16 @@ async def responses(request: Request):
             chat_sse = _translate_anthropic_stream_to_openai_chat(
                 response.body_iterator, model, float(HEARTBEAT_MS) / 1000.0)
             return StreamingResponse(
-                _translate_openai_chat_sse_to_responses(chat_sse, model),
+                _remember_response_stream(
+                    _translate_openai_chat_sse_to_responses(chat_sse, model),
+                    principal, chat_body.get('messages', [])),
+                on_close=response.aclose,
                 media_type="text/event-stream",
                 headers={
                     "Cache-Control": "no-cache", "Connection": "keep-alive",
                     "X-Accel-Buffering": "no",
                     "x-request-id": response.headers.get("x-request-id", ""),
+                **context_response_headers(response),
                 },
             )
         if isinstance(response, JSONResponse):
@@ -1240,10 +1276,8 @@ async def responses(request: Request):
             if isinstance(payload, dict) and payload.get("type") == "message" and "content" in payload:
                 oai_chat = anthropic_to_openai_response(payload, model)
                 resp_obj = chat_to_responses(model, oai_chat, body)
-                rid = resp_obj.get('id')
-                if rid and principal:
-                    _store_response(principal, rid, chat_body.get('messages', []))
-                return JSONResponse(resp_obj, status_code=response.status_code)
+                _remember_completed_response(principal, resp_obj, chat_body.get('messages', []))
+                return JSONResponse(resp_obj, status_code=response.status_code, headers=context_response_headers(response))
         return response
 
     response = await _proxy_request("POST", "chat/completions", chat_body, stream=is_stream, request=request)
@@ -1259,26 +1293,28 @@ async def responses(request: Request):
         if isinstance(payload, dict) and 'error' in payload:
             return JSONResponse(
                 {"error": payload['error'], "type": "error"},
-                status_code=response.status_code,
+                status_code=response.status_code, headers=context_response_headers(response),
             )
         if isinstance(payload, dict) and 'choices' in payload:
             resp_obj = chat_to_responses(model, payload, body)
-            rid = resp_obj.get('id')
-            if rid and principal:
-                _store_response(principal, rid, chat_body.get('messages', []))
-            return JSONResponse(resp_obj, status_code=response.status_code)
+            _remember_completed_response(principal, resp_obj, chat_body.get('messages', []))
+            return JSONResponse(resp_obj, status_code=response.status_code, headers=context_response_headers(response))
         return response
 
     # Streaming: translate OpenAI SSE → Responses SSE event lifecycle.
     if is_stream and isinstance(response, StreamingResponse):
         return StreamingResponse(
-            _translate_openai_stream_to_responses(response.body_iterator, model),
+            _remember_response_stream(
+                _translate_openai_stream_to_responses(response.body_iterator, model),
+                principal, chat_body.get('messages', [])),
+            on_close=response.aclose,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
                 "x-request-id": response.headers.get("x-request-id", ""),
+                **context_response_headers(response),
             },
         )
 
@@ -1288,14 +1324,61 @@ async def responses(request: Request):
         if isinstance(payload, dict) and 'choices' in payload:
             resp = chat_to_responses(model, payload, body)
             # Store for previous_response_id continuity.
-            resp_id = resp.get('id')
-            if resp_id and principal:
-                # B-33: bounded + TTL-pruned write.
-                _store_response(principal, resp_id, chat_body.get('messages', []))
-            return JSONResponse(resp, status_code=response.status_code)
+            _remember_completed_response(principal, resp, chat_body.get('messages', []))
+            return JSONResponse(resp, status_code=response.status_code, headers=context_response_headers(response))
     except Exception as e:
         logger.warning(f"[openrouter] /v1/responses translation failed: {e}")
     return response
+
+
+def _remember_completed_response(principal: str, response: dict, messages: list):
+    """Save the assistant turn as well as its input for the next tool result."""
+    if not principal or not response.get('id') or response.get('status') != 'completed':
+        return
+    text_parts = []
+    reasoning_parts = []
+    tool_calls = []
+    for item in response.get('output') or []:
+        if item.get('type') == 'message':
+            text_parts.extend(part.get('text', '') for part in item.get('content') or []
+                              if part.get('type') == 'output_text')
+        elif item.get('type') == 'reasoning':
+            reasoning_parts.extend(part.get('text', '') for part in item.get('content') or []
+                                   if part.get('type') == 'reasoning_text')
+        elif item.get('type') == 'function_call':
+            tool_calls.append({'id': item.get('call_id') or item.get('id'), 'type': 'function',
+                               'function': {'name': item.get('name', ''),
+                                            'arguments': item.get('arguments', '')}})
+    assistant = {'role': 'assistant', 'content': ''.join(text_parts) or (None if tool_calls else '')}
+    if tool_calls:
+        assistant['tool_calls'] = tool_calls
+    if reasoning_parts:
+        assistant['reasoning_content'] = ''.join(reasoning_parts)
+    _store_response(principal, response['id'], list(messages) + [assistant])
+
+
+async def _remember_response_stream(generator, principal: str, messages: list):
+    """Persist a successful turn before exposing its terminal event."""
+    try:
+        async for frame in generator:
+            text = frame.decode('utf-8') if isinstance(frame, bytes) else frame
+            for line in text.splitlines():
+                if not line.startswith('data:'):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == '[DONE]':
+                    continue
+                try:
+                    event = json.loads(payload)
+                except (ValueError, TypeError):
+                    continue
+                if isinstance(event, dict) and event.get('type') == 'response.completed':
+                    _remember_completed_response(principal, event.get('response') or {}, messages)
+            yield frame
+    finally:
+        close = getattr(generator, 'aclose', None)
+        if close is not None:
+            await close()
 
 
 async def _translate_openai_stream_to_responses(openai_gen, model: str):
@@ -1486,6 +1569,8 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                     continue
                 fn = tc.get('function') or {}
                 acc = _get_tool_acc(tc)
+                if isinstance(fn.get('name'), str) and fn['name']:
+                    acc['name'] += fn['name']
                 if not acc['added']:
                     acc['added'] = True
                     events.append(_sse('response.output_item.added', {
@@ -1495,12 +1580,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                             'call_id': acc['call_id'], 'name': acc['name'], 'arguments': '',
                         },
                     }))
-                if isinstance(fn.get('name'), str) and fn['name']:
-                    acc['name'] += fn['name']
-                    events.append(_sse('response.function_call_arguments.delta', {
-                        'type': 'response.function_call_arguments.delta', 'item_id': acc['call_id'],
-                        'output_index': acc['output_index'], 'delta': fn['name'], 'name': acc['name'],
-                    }))
+                # Function names are item metadata, never JSON argument deltas.
                 if isinstance(fn.get('arguments'), str) and fn['arguments']:
                     acc['args'] += fn['arguments']
                     events.append(_sse('response.function_call_arguments.delta', {
@@ -1538,6 +1618,13 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 if is_done:
                     done = True
                     break
+
+        # An upstream may close without a trailing newline. Use the full
+        # parser so final tool/reasoning/error frames keep their semantics.
+        if buffer.strip() and not done:
+            events, done = _parse_line(buffer.decode('utf-8', errors='replace').strip())
+            for ev in events:
+                yield ev
 
         # CODEX-RESP-01 fix: completion events are emitted UNCONDITIONALLY.
         # The old text-gated guard skipped them when the model emitted only
@@ -1721,38 +1808,21 @@ async def images_generations(request: Request):
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """List models from OpenRouter, optionally augmented with catalog."""
-    try:
-        agent = await get_agent()
-        acq = await pool.acquire()
-        if not acq:
-            return JSONResponse({"data": []})
-        key_obj = acq['key']
-
-        headers = {
-            "Authorization": f"Bearer {key_obj.api_key}",
-            "Accept": "application/json",
-        }
-        async with agent.get(f"{OPENROUTER_BASE}/models", headers=headers) as resp:
-            pool.release(key_obj)
-            if resp.status != 200:
-                return JSONResponse({"data": []}, status_code=resp.status)
-            data = await resp.json()
-            models = data.get("data", [])
-
-            # Filter FREE_ONLY
-            if free_only_enabled():
-                models = [m for m in models if is_free_model(m.get("id", ""))]
-
-            return JSONResponse({"data": models, "object": "list"})
-    except Exception as e:
-        logger.error(f"[openrouter] Error listing models: {e}")
-        return JSONResponse({"data": []})
+    """Serve persistent provider metadata; stale catalogs refresh once in background."""
+    entries = await MODEL_CATALOG.get(_fetch_model_catalog)
+    if free_only_enabled():
+        entries = [m for m in entries if is_free_model(m.get('id', ''))]
+    return JSONResponse({'object': 'list', 'data': [{**m, **discovery_limits(m)} for m in entries]})
 
 
-@app.get("/v1/models/{model_id}")
+@app.get("/v1/models/{model_id:path}")
 async def get_model_detail(model_id: str, request: Request):
-    return await _proxy_request("GET", f"models/{model_id}")
+    entries = await MODEL_CATALOG.get(_fetch_model_catalog)
+    model = next((m for m in entries if m.get('id') == model_id), None)
+    if model is None or (free_only_enabled() and not is_free_model(model_id)):
+        return _error_response({'error': {'type': 'invalid_request_error',
+                             'message': 'Model is absent from the cached provider catalog'}}, status_code=404)
+    return JSONResponse({**model, **discovery_limits(model)})
 
 
 @app.get("/api/tags")
@@ -1821,6 +1891,7 @@ async def capabilities(request: Request):
                 "id": m.get("id") if isinstance(m, dict) else m,
                 "capabilities": ["chat", "completion"],
                 "streaming": True,
+                **discovery_limits(m if isinstance(m, dict) else {}),
             }
             for m in models_list
         ],
@@ -1835,6 +1906,7 @@ async def capabilities(request: Request):
 @app.post("/v1/messages")
 async def messages(request: Request):
     """Anthropic Messages API → OpenAI Chat Completions translation."""
+    from common.context_recovery import context_response_headers
     try:
         body = await request.json()
     except Exception:
@@ -1843,8 +1915,9 @@ async def messages(request: Request):
     model = body.get("model", "")
 
     # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
+    cross_dialect = not _is_anthropic_upstream()
     for _m in body.get("messages") or []:
-        if isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
+        if cross_dialect and isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
             return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
                                               "type": "invalid_request_error"}}, status_code=400)
         if isinstance(_m, dict) and _m.get("role") == "tool" and not _m.get("tool_use_id") and not _m.get("tool_call_id"):
@@ -1858,21 +1931,9 @@ async def messages(request: Request):
     # COMPATIBILITY_LAYER=2: upstream speaks Anthropic — the /v1/messages
     # surface passes through verbatim (model alias only); no translation.
     if _is_anthropic_upstream():
-        response = await _proxy_request("POST", "messages", body,
-                                        stream=bool(body.get("stream", False)),
-                                        request=request, terminal_done=False)
-        if isinstance(response, StreamingResponse):
-            return StreamingResponse(
-                _passthrough_anthropic_sse(response.body_iterator,
-                                           float(HEARTBEAT_MS) / 1000.0),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache", "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no",
-                    "x-request-id": response.headers.get("x-request-id", ""),
-                },
-            )
-        return response
+        return await _proxy_request("POST", "messages", body,
+                                    stream=bool(body.get("stream", False)),
+                                    request=request, terminal_done=False)
 
     # Translate Anthropic → OpenAI
     openai_body = _anthropic_to_openai(body)
@@ -1896,23 +1957,25 @@ async def messages(request: Request):
         if isinstance(payload, dict) and 'error' in payload:
             return JSONResponse(
                 {"type": "error", "error": payload['error']},
-                status_code=response.status_code,
+                status_code=response.status_code, headers=context_response_headers(response),
             )
         if isinstance(payload, dict) and 'choices' in payload:
             return JSONResponse(_openai_to_anthropic_response(payload, body),
-                                status_code=response.status_code)
+                                status_code=response.status_code, headers=context_response_headers(response))
         return response
 
     # For streaming, translate OpenAI SSE → Anthropic SSE
     if openai_body["stream"] and isinstance(response, StreamingResponse):
         return StreamingResponse(
             _translate_openai_stream_to_anthropic(response.body_iterator, body),
+            on_close=response.aclose,
             media_type="text/event-stream",
             headers={
                 "Cache-Control": "no-cache",
                 "Connection": "keep-alive",
                 "X-Accel-Buffering": "no",
                 "x-request-id": response.headers.get("x-request-id", ""),
+                **context_response_headers(response),
             },
         )
 
@@ -1921,7 +1984,7 @@ async def messages(request: Request):
         payload = json.loads(response.body)
         if isinstance(payload, dict) and 'choices' in payload:
             anthropic_resp = _openai_to_anthropic_response(payload, body)
-            return JSONResponse(anthropic_resp, status_code=response.status_code)
+            return JSONResponse(anthropic_resp, status_code=response.status_code, headers=context_response_headers(response))
     except Exception:
         pass
     return response
@@ -1974,9 +2037,11 @@ def _store_response(principal: str, response_id: str, messages: list) -> None:
         return
     key = _response_store_key(principal, response_id)
     try:
-        size = len(json.dumps(messages, ensure_ascii=False))
-    except (TypeError, ValueError):
-        size = 0
+        serialized = json.dumps(messages, ensure_ascii=False)
+        size = len(serialized.encode('utf-8'))
+        messages = json.loads(serialized)
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        return
     # Reject a single oversized entry outright rather than evicting everything.
     if size > _RESPONSE_STORE_MAX_BYTES:
         logger.warning('[responses] history for %s too large (%dB); not stored', response_id, size)
@@ -1996,13 +2061,14 @@ def _prune_response_store() -> None:
     while len(_RESPONSE_STORE) > _RESPONSE_STORE_MAX_ENTRIES:
         _RESPONSE_STORE.popitem(last=False)
     total = sum(s for _ts, s, _m in _RESPONSE_STORE.values())
-    while total > _RESPONSE_STORE_MAX_BYTES and len(_RESPONSE_STORE) > 1:
+    while total > _RESPONSE_STORE_MAX_BYTES and _RESPONSE_STORE:
         _k, (_ts, s, _m) = _RESPONSE_STORE.popitem(last=False)
         total -= s
 
 
 def _get_stored_conversation(principal: str, response_id: str) -> list:
     """Read a stored history, honouring TTL (B-33)."""
+    _prune_response_store()
     key = _response_store_key(principal, response_id)
     entry = _RESPONSE_STORE.get(key)
     if not entry:
@@ -2011,7 +2077,7 @@ def _get_stored_conversation(principal: str, response_id: str) -> list:
     if _RESPONSE_STORE_TTL_SEC > 0 and (time.time() - ts) > _RESPONSE_STORE_TTL_SEC:
         _RESPONSE_STORE.pop(key, None)
         return []
-    return list(msgs)
+    return json.loads(json.dumps(msgs, ensure_ascii=False))
 
 
 def _response_store_key(principal: str, response_id: str) -> str:
@@ -2022,9 +2088,8 @@ def _response_store_key(principal: str, response_id: str) -> str:
 def _request_principal(request: Request) -> str:
     """Stable per-client principal for response-store namespacing.
     Uses the BEARER_TOKEN fingerprint (or 'anon' if auth disabled)."""
-    tok = (request.headers.get('authorization') or request.headers.get('x-api-key') or '').strip()
-    if tok.lower().startswith('bearer '):
-        tok = tok[7:].strip()
+    from common.auth import authenticated_client_token
+    tok = authenticated_client_token(request.headers)
     if not tok:
         return 'anon'
     import hashlib
@@ -2041,6 +2106,8 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
       - `function_call` / `function_call_output` items → tool_calls / tool role.
       - Forward all client params verbatim (transparent proxy principle).
     """
+    from copy import deepcopy
+    body = deepcopy(body)
     model = body.get('model') or ''
     msgs: list = []
     prev = body.get('previous_response_id')
@@ -2112,9 +2179,13 @@ def responses_to_chat(body: dict, principal: str = '') -> dict:
                 'name': name,
                 'description': fn.get('description', '') or '',
                 'parameters': fn.get('parameters') or fn.get('input_schema') or {},
+                **({'strict': fn['strict']} if 'strict' in fn else {}),
             }})
         if tools:
             out['tools'] = tools
+    choice = out.get('tool_choice')
+    if isinstance(choice, dict) and choice.get('type') == 'function' and isinstance(choice.get('name'), str):
+        out['tool_choice'] = {'type': 'function', 'function': {'name': choice['name']}}
     return out
 
 
@@ -2163,6 +2234,8 @@ def _anthropic_to_openai(body: dict) -> dict:
       - tool_use blocks in assistant messages → tool_calls array.
       - image blocks → image_url (base64 data URI).
     """
+    from copy import deepcopy
+    body = deepcopy(body)
     messages = []
     system = body.get("system", "")
     if system:
@@ -2296,6 +2369,39 @@ def _anthropic_to_openai(body: dict) -> dict:
     for src, dst in param_map:
         if body.get(src) is not None:
             openai_body[dst] = body[src]
+
+    # OpenRouter's documented Messages -> unified Chat reasoning mapping.
+    # Native routes bypass this converter. Keep explicit reasoning extensions;
+    # mapped Anthropic controls replace only conflicting enable/effort/budget.
+    # https://openrouter.ai/docs/guides/best-practices/reasoning-tokens
+    explicit_reasoning = body.get("reasoning")
+    reasoning = dict(explicit_reasoning) if isinstance(explicit_reasoning, dict) else {}
+    thinking = body.get("thinking")
+    thinking_type = thinking.get("type") if isinstance(thinking, dict) else None
+    output_config = body.get("output_config")
+    effort = output_config.get("effort") if isinstance(output_config, dict) else None
+    mapped_reasoning = None
+    if thinking_type == "disabled":
+        mapped_reasoning = {"enabled": False}
+    elif effort is not None:
+        mapped_reasoning = {"effort": effort}
+    elif thinking_type == "adaptive":
+        mapped_reasoning = {"enabled": True}
+    elif thinking_type == "enabled":
+        if thinking.get("budget_tokens") is not None:
+            mapped_reasoning = {"max_tokens": thinking["budget_tokens"]}
+        else:
+            mapped_reasoning = {"enabled": True}
+    if explicit_reasoning is not None and not isinstance(explicit_reasoning, dict):
+        # Preserve an invalid explicit value so upstream validation stays visible.
+        openai_body["reasoning"] = explicit_reasoning
+    elif mapped_reasoning is not None:
+        for key in ("enabled", "effort", "max_tokens"):
+            reasoning.pop(key, None)
+        openai_body["reasoning"] = {**reasoning, **mapped_reasoning}
+    elif isinstance(explicit_reasoning, dict):
+        openai_body["reasoning"] = reasoning
+
     # Strip Anthropic-only cache_control annotations (upstream may 400 on them).
     _strip_cache(openai_body)
     if body.get("tools"):
@@ -2306,6 +2412,7 @@ def _anthropic_to_openai(body: dict) -> dict:
                     "name": t.get("name", ""),
                     "description": t.get("description", ""),
                     "parameters": t.get("input_schema", {}) or {"type": "object", "properties": {}},
+                    **({"strict": t["strict"]} if "strict" in t else {}),
                 },
             }
             for t in body["tools"] if isinstance(t, dict) and t.get("name")
@@ -2315,8 +2422,8 @@ def _anthropic_to_openai(body: dict) -> dict:
         if isinstance(tc, dict):
             if tc.get("type") == "any":
                 openai_body["tool_choice"] = "required"
-            elif tc.get("type") == "auto":
-                openai_body["tool_choice"] = "auto"
+            elif tc.get("type") in ("auto", "none"):
+                openai_body["tool_choice"] = tc["type"]
             elif tc.get("type") == "tool":
                 openai_body["tool_choice"] = {"type": "function", "function": {"name": tc.get("name", "")}}
         elif isinstance(tc, str):

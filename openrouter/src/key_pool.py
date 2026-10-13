@@ -187,7 +187,7 @@ class KeyPool:
             if not k.is_hard_blocked() and k.current_rpm() < (k.hard_rpm or self.hard_limit)
         )
 
-    async def acquire(self, model: str = '') -> dict | None:
+    async def acquire(self, model: str = '', exclude: set[str] | None = None) -> dict | None:
         """Acquire the best available key for a request."""
         async with self._lock:
             # Default OFF for multi-agent localhost deployments; per-key RPM
@@ -205,6 +205,7 @@ class KeyPool:
             candidates = [
                 k for k in self.keys
                 if not k.is_hard_blocked()
+                and (not exclude or k.api_key not in exclude)
                 and not (model and k.is_model_blocked(model))
                 and k.current_rpm() < (k.hard_rpm or self.hard_limit)
             ]

@@ -1,0 +1,105 @@
+{
+  "started_at_utc": "2026-10-11T03:44:21.648884+00:00",
+  "execution": "live production endpoints; real bounded inference; selected model never changes",
+  "limits": "CLI 256 where configurable; SDK 512. Codex does not guarantee a request output cap. Bounded smoke proves tested paths only. Full history does not qualify server-side continuation across key rotation.",
+  "source_fingerprints": {
+    "files": {
+      "wrappers.json": "2e9bbfd58bad239a3e87650ca61f8466f1868d9e13262234f2905c99c51520eb",
+      "common/compat.py": "635fff2088b66ac13042a035b38b20c75930134762309a795fd9a5542a9ee2ef",
+      "common/body_guard.py": "44909029175cf66a0a7503f683cb8e6dab8ef8b7c7b4248370139177862185bd",
+      "nous/src/main.py": "3ab9f534cc610867ec49b61821e234421643a51ca534af2933bec7c4c5d585c0"
+    },
+    "combined_sha256": "602202169eb95ee558fb28f14160ed5020f749ba078850b0f003c423657a2f4a",
+    "meaning": "working-tree files at qualification time; service deployment requires a separate rollout record"
+  },
+  "client_versions": {
+    "claude": {
+      "available": true,
+      "version": "2.1.202"
+    },
+    "codex": {
+      "available": true,
+      "version": "0.160.1"
+    },
+    "opencode": {
+      "available": true,
+      "version": "1.17.20"
+    }
+  },
+  "sdk_versions": {
+    "openai": "2.54.0",
+    "anthropic": "0.125.0"
+  },
+  "checks": [
+    {
+      "kind": "client",
+      "client": "claude",
+      "model": "poolside/laguna-xs-2.1:free",
+      "exit_code": 0,
+      "timed_out": false,
+      "terminal_event_observed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "tool_execution_observed": false,
+      "event_types": [
+        "result"
+      ],
+      "latency_sec": 1.497,
+      "passed": true,
+      "wrapper": "nous"
+    },
+    {
+      "kind": "client",
+      "client": "codex",
+      "model": "poolside/laguna-xs-2.1:free",
+      "exit_code": 0,
+      "timed_out": false,
+      "terminal_event_observed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "tool_execution_observed": false,
+      "event_types": [
+        "item.completed",
+        "thread.started",
+        "turn.completed",
+        "turn.started"
+      ],
+      "latency_sec": 3.44,
+      "passed": true,
+      "wrapper": "nous"
+    },
+    {
+      "kind": "client",
+      "client": "opencode",
+      "model": "poolside/laguna-xs-2.1:free",
+      "exit_code": 0,
+      "timed_out": false,
+      "terminal_event_observed": true,
+      "has_visible_answer": true,
+      "answer_matches_OK": true,
+      "visible_characters": 2,
+      "tool_execution_observed": false,
+      "event_types": [
+        "step_finish",
+        "step_start",
+        "text"
+      ],
+      "latency_sec": 6.838,
+      "passed": true,
+      "wrapper": "nous"
+    }
+  ],
+  "backend_policies": {
+    "nous": {
+      "origin": "http://127.0.0.1:9102",
+      "model": "poolside/laguna-xs-2.1:free",
+      "configured_responses_mode": "auto",
+      "policy": "native-first; deployment mode must also be checked against service environment"
+    }
+  },
+  "completed_at_utc": "2026-10-11T03:44:33.444967+00:00",
+  "passed": 3,
+  "failed": 0
+}

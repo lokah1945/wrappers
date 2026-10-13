@@ -80,13 +80,17 @@ async def chat_completions(request: web.Request):
     mode = _mode(model)
     stream = bool(body.get('stream'))
 
+    # A pre-stream rejection must happen before StreamResponse.prepare sends
+    # HTTP 200. Returning json_response afterward cannot replace sent headers.
+    if mode == 'http500':
+        return web.json_response({'error': {'message': 'mock 500', 'type': 'server_error'}}, status=500)
+    if mode == 'http429':
+        return web.json_response({'error': {'message': 'mock 429', 'type': 'rate_limit_error'}},
+                                 status=429, headers={'Retry-After': '1'})
+
     if not stream:
         if mode == 'error':
             return web.json_response({'error': {'message': 'mock exploded', 'type': 'server_error'}}, status=500)
-        if mode == 'http500':
-            return web.json_response({'error': {'message': 'mock 500', 'type': 'server_error'}}, status=500)
-        if mode == 'http429':
-            return web.json_response({'error': {'message': 'mock 429', 'type': 'rate_limit_error'}}, status=429)
         if mode == 'http429once':
             # First request 429, subsequent requests succeed — simulates a
             # transient upstream rate limit so the audit can prove the wrapper
@@ -207,16 +211,6 @@ async def chat_completions(request: web.Request):
             await _write(resp, _chunk(finish='stop'), space=space, crlf=crlf)
             await _write(resp, '[DONE]', space=space, crlf=crlf)
             return resp
-
-        if mode == 'http500':
-            return web.json_response(
-                {'error': {'message': 'internal upstream failure', 'type': 'server_error'}},
-                status=500)
-
-        if mode == 'http429':
-            return web.json_response(
-                {'error': {'message': 'rate limited', 'type': 'rate_limit_error'}},
-                status=429, headers={'Retry-After': '1'})
 
         if mode == 'bigchunk':
             # Many complete events delivered in ONE TCP write: exercises

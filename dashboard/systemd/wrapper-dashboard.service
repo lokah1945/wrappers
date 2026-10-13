@@ -1,0 +1,15 @@
+[Unit]
+Description=Unified read-only wrapper dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/root/wrapper
+Environment=PYTHONPATH=/root/wrapper
+ExecStart=/usr/bin/python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 9105
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

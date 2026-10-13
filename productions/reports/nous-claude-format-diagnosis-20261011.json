@@ -1,0 +1,34 @@
+{
+  "checked_at_utc": "2026-10-10T19:48:43.785757+00:00",
+  "wrapper": "nous",
+  "execution": "one authorized bounded Claude client request; response body classified privately and discarded",
+  "check": {
+    "kind": "client",
+    "client": "claude",
+    "model": "poolside/laguna-xs-2.1:free",
+    "exit_code": 0,
+    "timed_out": false,
+    "terminal_event_observed": true,
+    "has_visible_answer": true,
+    "answer_matches_OK": true,
+    "visible_characters": 2,
+    "tool_execution_observed": false,
+    "event_types": [
+      "result"
+    ],
+    "latency_sec": 2.375,
+    "passed": true
+  },
+  "classification": {
+    "answer_classification": "exact_OK",
+    "trimmed_visible_characters": 2
+  },
+  "initial_observation": {
+    "exit_code": 0,
+    "terminal_event_observed": true,
+    "visible_characters": 3,
+    "answer_matches_OK": false,
+    "meaning": "Original body was not retained; its semantic class remains unknown"
+  },
+  "limitations": "A fresh request cannot prove the exact content of a prior discarded response."
+}

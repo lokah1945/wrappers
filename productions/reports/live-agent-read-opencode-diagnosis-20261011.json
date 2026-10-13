@@ -1,0 +1,57 @@
+{
+  "checks": [
+    {
+      "client": "opencode",
+      "summary": {
+        "exit_code": 0,
+        "timed_out": false,
+        "terminal_event_observed": false,
+        "client_error_observed": false,
+        "has_visible_answer": false,
+        "answer_nonce_matches": false,
+        "answer_exact": false,
+        "visible_characters": 0,
+        "successful_read_tool_events": 0,
+        "tool_execution_observed": false,
+        "forbidden_tool_events": 0,
+        "event_types": [
+          "step_finish",
+          "step_start",
+          "tool_use"
+        ],
+        "unknown_event_type_count": 0,
+        "latency_sec": 16.207,
+        "passed": false
+      },
+      "events": [
+        {
+          "type": "step_start",
+          "item_type": null,
+          "part_type": "step-start"
+        },
+        {
+          "type": "tool_use",
+          "item_type": null,
+          "part_type": "tool",
+          "tool": "read",
+          "state": "{'status': 'error', 'input': {'filePath': '[TEMP_FIXTURE]/qualification.txt'}, 'error': 'The user has specified a rule which prevents you from using this specific tool call. Here are some of the relevant rules [{\"permission\":\"*\",\"action\":\"allow\",\"pattern\":\"*\"},{\"permission\":\"read\",\"pattern\":\"*\",\"action\":\"allow\"},{\"permission\":\"read\",\"pattern\":\"*.env\",\"action\":\"ask\"},{\"permission\":\"read\",\"pattern\":\"*.env.*\",\"action\":\"ask\"},{\"permission\":\"read\",\"pattern\":\"*.env.example\",\"action\":\"allow\"},{\"permission\":\"*\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"read\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"read\",\"pattern\":\"[TEMP_FIXTURE]/qualification.txt\",\"action\":\"allow\"},{\"permission\":\"*\",\"action\":\"deny\",\"pattern\":\"*\"},{\"permission\":\"read\",\"pattern\":\"*\",\"action\":\"deny\"},{\"permission\":\"read\",\"pattern\":\"[TEMP_FIXTURE]/qualification.txt\",\"action\":\"allow\"}]', 'time': {'start': 1791690387723, 'end': 1791690387746}}"
+        },
+        {
+          "type": "step_finish",
+          "item_type": null,
+          "part_type": "step-finish"
+        },
+        {
+          "type": "step_start",
+          "item_type": null,
+          "part_type": "step-start"
+        },
+        {
+          "type": "step_finish",
+          "item_type": null,
+          "part_type": "step-finish"
+        }
+      ]
+    }
+  ]
+}

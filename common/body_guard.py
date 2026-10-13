@@ -35,6 +35,12 @@ logger = logging.getLogger('wrapper-body-guard')
 _ALLOW_NON_OBJECT_PATHS: frozenset[str] = frozenset()
 
 _METHODS_WITH_BODY = (b'POST', b'PUT', b'PATCH')
+_INVALID_JSON = object()
+# These inference handlers consume JSON even when a client mislabels its body.
+# Keep this exact-path list separate from uploads and future binary endpoints.
+_JSON_INFERENCE_PATHS: frozenset[str] = frozenset({
+    '/v1/chat/completions', '/v1/responses', '/v1/messages',
+})
 
 
 class JSONBodyGuard:
@@ -72,8 +78,10 @@ class JSONBodyGuard:
 
         headers = {k.lower(): v for k, v in scope.get('headers', [])}
         ctype = headers.get(b'content-type', b'').decode('latin-1', 'replace').lower()
-        # Only inspect JSON payloads; leave multipart/binary uploads alone.
-        if ctype and 'json' not in ctype:
+        # Known inference routes always consume JSON. A mismatched header must
+        # not let null/arrays/scalars reach handlers that require an object.
+        # Other multipart/binary endpoints keep their original upload behavior.
+        if path not in _JSON_INFERENCE_PATHS and ctype and 'json' not in ctype:
             await self.app(scope, receive, send)
             return
 
@@ -114,12 +122,12 @@ class JSONBodyGuard:
             except (json.JSONDecodeError, ValueError, UnicodeDecodeError):
                 # Malformed JSON: routes already return a shaped 400 for this,
                 # and their message includes the parser detail. Pass through.
-                parsed = None
-            if parsed is not None and not isinstance(parsed, dict):
+                parsed = _INVALID_JSON
+            if parsed is not _INVALID_JSON and not isinstance(parsed, dict):
                 logger.warning(
                     '[body-guard] rejecting non-object JSON body on %s (%s)',
                     path, type(parsed).__name__)
-                await _reject(send, path, type(parsed).__name__)
+                await _reject(send, path, 'null' if parsed is None else type(parsed).__name__)
                 return
 
         await self.app(scope, _replay(chunks, receive), send)

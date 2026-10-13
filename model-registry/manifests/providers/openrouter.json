@@ -1,0 +1,16 @@
+{
+  "provider": "openrouter",
+  "catalog_url": "https://openrouter.ai/api/v1/models",
+  "default_endpoint": "https://openrouter.ai/api",
+  "adapters": {
+    "openai_chat": "openrouter.chat.v1",
+    "openai_responses": "openrouter.responses.native.v1",
+    "anthropic_messages": "anthropic-to-openrouter-chat.v1"
+  },
+  "policy": {
+    "transparent": true,
+    "model_substitution": false,
+    "provider_substitution": false,
+    "key_rotation": true
+  }
+}
