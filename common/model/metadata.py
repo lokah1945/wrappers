@@ -111,3 +111,77 @@ def merge_context_metadata(primary: dict | None, fallback: dict | None) -> dict:
                 ('source', 'scope', 'checked_at', 'expires_at', 'stale')}
     result['status'] = 'known' if positive_int(result.get('context_window')) else 'unknown'
     return result
+
+
+def merge_observed_context(entry: dict | None, observations: list | None) -> dict:
+    """Fill unknown context fields with account-scoped empirical evidence.
+
+    Published catalog values always win; observations (background context
+    probe or upstream rejection evidence) only fill gaps. An accepted probe
+    proves a verified floor — exposed as verified_context_window, never as
+    context_window — so small-context models are never over-labeled.
+    """
+    result = copy.deepcopy(entry) if isinstance(entry, dict) else {}
+    if not isinstance(observations, list) or not observations:
+        return result
+    metadata = context_metadata(result)
+    published = positive_int(metadata.get('context_window'))
+    now = time.time()
+    best_exact = None
+    best_floor = None
+    for obs in observations:
+        if not isinstance(obs, dict):
+            continue
+        expiry = obs.get('expires_at')
+        if not isinstance(expiry, (int, float)) or expiry <= now:
+            continue
+        limits = obs.get('limits') or {}
+        checked = obs.get('checked_at') if isinstance(obs.get('checked_at'), (int, float)) else 0
+        exact = positive_int(limits.get('context_window'))
+        floor = positive_int(limits.get('input_tokens'))
+        if exact and (best_exact is None or checked > (best_exact.get('checked_at') or 0)):
+            best_exact = {'context_window': exact, 'checked_at': checked,
+                          'expires_at': expiry,
+                          'max_output_tokens': positive_int(limits.get('max_output_tokens'))}
+        if floor and (best_floor is None or floor > (best_floor.get('input_tokens') or 0)):
+            best_floor = {'input_tokens': floor, 'checked_at': checked, 'expires_at': expiry}
+    chosen = best_exact or best_floor
+    if chosen is None:
+        return result
+    if published:
+        # Advertised capacity is authoritative and is never overridden,
+        # but fresh empirical evidence is attached as provenance so the
+        # verification is visible: the exact window observed on this
+        # account/route and/or the verified floor actually accepted.
+        provenance = {}
+        if best_exact:
+            provenance['observed_context_window'] = best_exact['context_window']
+        if best_floor:
+            provenance['verified_context_window'] = best_floor['input_tokens']
+        if provenance:
+            provenance['source'] = 'empirical_probe'
+            provenance['scope'] = 'account_endpoint'
+            for key in ('checked_at', 'expires_at'):
+                if chosen.get(key) is not None:
+                    provenance[key] = chosen[key]
+            merged = dict(metadata)
+            merged['probe'] = provenance
+            result['context_metadata'] = merged
+        return result
+    merged = dict(metadata)
+    if best_exact:
+        merged['context_window'] = best_exact['context_window']
+        if best_exact.get('max_output_tokens') and not positive_int(merged.get('max_output_tokens')):
+            merged['max_output_tokens'] = best_exact['max_output_tokens']
+        merged['status'] = 'probe_verified'
+    else:
+        merged['verified_context_window'] = best_floor['input_tokens']
+        merged['status'] = 'observed_floor'
+    merged['source'] = 'empirical_probe'
+    merged['scope'] = 'account_endpoint'
+    for key in ('checked_at', 'expires_at'):
+        if chosen.get(key) is not None:
+            merged[key] = chosen[key]
+    merged['stale'] = False
+    result['context_metadata'] = merged
+    return result

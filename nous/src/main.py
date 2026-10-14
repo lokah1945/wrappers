@@ -84,6 +84,13 @@ try:
         stream_anthropic_to_openai,
         openai_chat_to_anthropic_request,
     )
+    from common.translations.think_tags import (
+        ThinkTagStreamFilter as _ThinkTagStreamFilter,
+        extract_inline_thinking as _extract_inline_thinking,
+        strip_trailing_think_tags as _strip_think_tags,
+    )
+    from common.model.context_probe import ContextProbeService, ProbeOutcome
+    from common.model.metadata import merge_observed_context, positive_int as _probe_pos_int
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
         responses_use_native_upstream as _responses_use_native_upstream,
@@ -729,7 +736,17 @@ def get_model_meta(mid, upstream=None):
     if upstream is None:
         upstream = next((m for m in MODEL_CATALOG.snapshot() if m.get('id') == rooted), {})
     base.update(upstream or {})
-    base.update(discovery_limits(upstream))
+    # Empirical reinforcement (2026-10-15): account-scoped context
+    # evidence (background probe / rejection parser) fills gaps the
+    # published catalog leaves unknown. Published values always win;
+    # a verified floor never over-labels a small-context model.
+    try:
+        _observed = MODEL_STORE.context_observations(rooted)
+        if _observed:
+            base = merge_observed_context(base, _observed)
+    except Exception:
+        pass
+    base.update(discovery_limits(base))
     # Provider-declared modalities are authoritative for this model; the
     # Codex template defaults (input_modalities=[text, image] with
     # supports_vision=False) must never mask what Nous actually publishes
@@ -1466,6 +1483,19 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
         text = ""
     reasoning = msg.get("reasoning_content") or msg.get("reasoning") or ""
 
+    # Anti-trace (2026-10-15 forensics): start-anchored inline thinking
+    # extraction + trailing stray think-tag cleanup. Nous reasoning
+    # models can emit inline reasoning tags in content; the extracted
+    # span is removed from visible text, literal mid-prose mentions are
+    # preserved, and stray trailing closers never render as prose.
+    if isinstance(text, str):
+        if not reasoning:
+            _inline, text = _extract_inline_thinking(text)
+            if _inline:
+                reasoning = _inline
+        else:
+            text = _strip_think_tags(text)
+
     content = []
     # Keep thinking SEPARATE — never concatenate into text (Claude Code contract)
     if reasoning:
@@ -1769,6 +1799,8 @@ class AnthropicStreamState:
         self.open_tool_blocks = set()
         self.finished = False
         self.msg_id = f"msg_{int(time.time()*1000)}"
+        # Anti-trace: tag-aware content stream filter
+        self._think_filter = _ThinkTagStreamFilter()
 
     def _usage(self, raw=None):
         raw = raw or {}
@@ -1778,6 +1810,50 @@ class AnthropicStreamState:
             "cache_creation_input_tokens": raw.get("cache_creation_input_tokens", 0) or 0,
             "cache_read_input_tokens": raw.get("cache_read_input_tokens", 0) or 0,
         }
+
+    def _emit_thinking_block(self, piece):
+        """Open (if needed) a thinking block and append a thinking_delta."""
+        events = []
+        if self.current_block != "thinking":
+            # R-02: close every open tool block before opening thinking.
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            self.open_tool_blocks.clear()
+            if self.current_block and self.current_block != "tool_use":
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            self.index += 1
+            events.append({"type": "content_block_start", "data": {
+                "type": "content_block_start", "index": self.index,
+                "content_block": {"type": "thinking", "thinking": ""},
+            }})
+            self.current_block = "thinking"
+        events.append({"type": "content_block_delta", "data": {
+            "type": "content_block_delta", "index": self.index,
+            "delta": {"type": "thinking_delta", "thinking": piece},
+        }})
+        return events
+
+    def _emit_text_block(self, piece):
+        """Open (if needed) a text block and append a text_delta."""
+        events = []
+        if self.current_block != "text":
+            # R-02: close every open tool block before opening text.
+            for _ti in sorted(self.open_tool_blocks):
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
+            self.open_tool_blocks.clear()
+            if self.current_block and self.current_block != "tool_use":
+                events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
+            self.index += 1
+            events.append({"type": "content_block_start", "data": {
+                "type": "content_block_start", "index": self.index,
+                "content_block": {"type": "text", "text": ""},
+            }})
+            self.current_block = "text"
+        events.append({"type": "content_block_delta", "data": {
+            "type": "content_block_delta", "index": self.index,
+            "delta": {"type": "text_delta", "text": piece},
+        }})
+        return events
 
     def translate_chunk(self, chunk):
         events = []
@@ -1846,28 +1922,35 @@ class AnthropicStreamState:
             content = None
 
         if content:
-            if self.current_block != "text":
-                # R-02: close every open tool block before opening text.
-                for _ti in sorted(self.open_tool_blocks):
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
-                self.open_tool_blocks.clear()
-                if self.current_block and self.current_block != "tool_use":
-                    events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
-                self.index += 1
-                events.append({"type": "content_block_start", "data": {
-                    "type": "content_block_start", "index": self.index,
-                    "content_block": {"type": "text", "text": ""},
-                }})
-                self.current_block = "text"
-            events.append({"type": "content_block_delta", "data": {
-                "type": "content_block_delta", "index": self.index,
-                "delta": {"type": "text_delta", "text": content},
-            }})
+            # Anti-trace: content flows through the shared think-tag
+            # filter (start-anchored extraction, cross-chunk buffering,
+            # trailing stray-closer suppression). reasoning_content is
+            # never marker-parsed.
+            for _kind, _piece in self._think_filter.feed(content):
+                if not _piece:
+                    continue
+                if _kind == "thinking":
+                    events.extend(self._emit_thinking_block(_piece))
+                else:
+                    # Whitespace-only pieces never open a text block
+                    # (upstream trailing-newline artifacts).
+                    if not _piece.strip() and self.current_block != "text":
+                        continue
+                    events.extend(self._emit_text_block(_piece))
 
         for tc in delta.get("tool_calls", []) or []:
             idx = tc.get("index", 0)
             fn = tc.get("function", {}) or {}
             if idx not in self.tool_map:
+                # Anti-trace: flush pending filtered content (stray
+                # trailing think-tags stripped) before the tool opens.
+                for _fkind, _fpiece in self._think_filter.flush_tool_boundary():
+                    if not _fpiece:
+                        continue
+                    if _fkind == "thinking":
+                        events.extend(self._emit_thinking_block(_fpiece))
+                    elif _fpiece.strip() or self.current_block == "text":
+                        events.extend(self._emit_text_block(_fpiece))
                 # R-02: close only a text/thinking block here. Closing the
                 # previous TOOL block orphaned its later argument fragments
                 # (content_block_delta on a closed index -> Claude Code drops
@@ -1893,6 +1976,15 @@ class AnthropicStreamState:
 
         if ch.get("finish_reason") and not self.finished:
             self.finished = True
+            # Anti-trace: final flush of filtered content; trailing
+            # stray think-tags never render as visible text.
+            for _fkind, _fpiece in self._think_filter.close():
+                if not _fpiece:
+                    continue
+                if _fkind == "thinking":
+                    events.extend(self._emit_thinking_block(_fpiece))
+                elif _fpiece.strip() or self.current_block == "text":
+                    events.extend(self._emit_text_block(_fpiece))
             # R-02: close all open tool blocks, then any text/thinking block.
             for _ti in sorted(self.open_tool_blocks):
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
@@ -1930,6 +2022,14 @@ class AnthropicStreamState:
                 "content": [], "stop_reason": None, "stop_sequence": None,
                 "usage": self._usage(),
             }}})
+        # Anti-trace: final flush (no-finish_reason path).
+        for _fkind, _fpiece in self._think_filter.close():
+            if not _fpiece:
+                continue
+            if _fkind == "thinking":
+                events.extend(self._emit_thinking_block(_fpiece))
+            elif _fpiece.strip() or self.current_block == "text":
+                events.extend(self._emit_text_block(_fpiece))
         # B-06: capture before clearing.
         was_in_tool_block = (self.current_block == "tool_use") or bool(self.open_tool_blocks)
         # R-02: close every open tool block first.
@@ -2684,9 +2784,70 @@ async def refresh_model_catalog_once():
     return await MODEL_CATALOG.refresh(_fetch_model_catalog, force=True)
 
 
+_CONTEXT_PROBE = None
+
+
+async def _probe_context_upstream(payload: dict):
+    """Probe a model's max context via the NOUS upstream chat surface."""
+    key = (os.environ.get('NOUS_API_KEY', '').strip()
+           or os.environ.get('NOUS_API_KEY_1', '').strip())
+    if not key:
+        return ProbeOutcome(status='skipped', detail='no upstream key available')
+    url = f"{NOUS_BASE}/v1/chat/completions"
+    try:
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers={
+                'authorization': f'Bearer {key}',
+                'content-type': 'application/json',
+            }) as resp:
+                if resp.status == 200:
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = {}
+                    usage = (body or {}).get('usage') or {}
+                    return ProbeOutcome(status='accepted', http_status=200,
+                                        prompt_tokens=_probe_pos_int(usage.get('prompt_tokens')))
+                detail = (await resp.text())[:500]
+                if resp.status in (404, 410):
+                    # EOL/retired upstream model: terminally unavailable.
+                    return ProbeOutcome(status='dead', http_status=resp.status, detail=detail)
+                if resp.status in (400, 413, 422):
+                    evidence = None
+                    if _CONTEXT_PROBE is not None:
+                        try:
+                            evidence = _CONTEXT_PROBE.parse_rejection(resp.status, detail)
+                        except Exception:
+                            evidence = None
+                    if evidence:
+                        return ProbeOutcome(status='rejected', http_status=resp.status,
+                                            evidence=evidence, detail=detail)
+                return ProbeOutcome(status='error', http_status=resp.status, detail=detail)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return ProbeOutcome(status='error', detail=str(exc)[:300])
+
+
 async def model_catalog_refresh_loop():
+    global _CONTEXT_PROBE
+    if _CONTEXT_PROBE is None:
+        _CONTEXT_PROBE = ContextProbeService(
+            'nous', MODEL_STORE, _probe_context_upstream,
+            endpoint=f"{NOUS_BASE}/v1/chat/completions")
     while True:
         await refresh_model_catalog_once()
+        # Reinforcement: after each catalog refresh, enqueue models whose
+        # advertised context is unknown for background verification.
+        try:
+            _entries = MODEL_CATALOG.snapshot()
+            if free_only_enabled():
+                _entries = [m for m in _entries
+                            if isinstance(m, dict) and is_free_model(str(m.get('id') or ''))]
+            _CONTEXT_PROBE.notify_catalog(_entries)
+        except Exception:
+            pass
         await asyncio.sleep(max(60, min(MODEL_CATALOG_REFRESH_SEC, MODEL_CATALOG_TTL_SEC)))
 
 # --------------------------------------------------------------------------

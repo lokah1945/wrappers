@@ -33,6 +33,10 @@ from common.translations import (
     anthropic_to_openai_response, is_retriable_status, parse_retry_after,
     should_cooldown_key, strip_cache_control, normalize_upstream_error,
 )
+from common.translations.think_tags import (
+    ThinkTagStreamFilter, extract_inline_thinking, strip_trailing_think_tags,
+)
+from common.translations import parse_dsml_from_text
 
 
 def _load(path, names, **globals_):
@@ -45,8 +49,16 @@ def _load(path, names, **globals_):
         asyncio=asyncio, json=json, os=os, random=random, time=time,
         logger=logging.getLogger(__name__), aiohttp=aiohttp,
         JSONResponse=JSONResponse, Response=Response,
-        StreamingResponse=StreamingResponse, close_stream=close_stream, **globals_,
+        StreamingResponse=StreamingResponse, close_stream=close_stream,
     )
+    # Anti-trace helpers: setdefault so callers that re-pass a previously
+    # built namespace (as **globals_) never hit duplicate keywords, and
+    # explicit caller overrides always win.
+    namespace.setdefault('_ThinkTagStreamFilter', ThinkTagStreamFilter)
+    namespace.setdefault('_extract_inline_thinking', extract_inline_thinking)
+    namespace.setdefault('_strip_think_tags', strip_trailing_think_tags)
+    namespace.setdefault('_parse_dsml_from_text', parse_dsml_from_text)
+    namespace.update(globals_)
     module = ast.Module(body=[ast.ImportFrom(module='__future__', names=[
         ast.alias(name='annotations')], level=0), *nodes], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), 'exec'), namespace)

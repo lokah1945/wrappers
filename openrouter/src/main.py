@@ -167,6 +167,13 @@ try:
         stream_anthropic_to_openai,
         openai_chat_to_anthropic_request,
     )
+    from common.translations.think_tags import (
+        ThinkTagStreamFilter as _ThinkTagStreamFilter,
+        extract_inline_thinking as _extract_inline_thinking,
+        strip_trailing_think_tags as _strip_think_tags,
+    )
+    from common.model.context_probe import ContextProbeService, ProbeOutcome
+    from common.model.metadata import merge_observed_context, positive_int as _probe_pos_int
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
         responses_use_native_upstream as _responses_use_native_upstream,
@@ -490,19 +497,121 @@ async def get_agent() -> aiohttp.ClientSession:
 
 
 # ── Model Refresh ─────────────────────────────────────────────────────────
+_CONTEXT_PROBE = None
+
+
+async def _probe_context_upstream(payload: dict):
+    """Probe a model's max context via the OpenRouter upstream."""
+    key = (os.environ.get('OPENROUTER_API_KEY', '').strip()
+           or os.environ.get('OPENROUTER_API_KEY_1', '').strip())
+    if not key:
+        return ProbeOutcome(status='skipped', detail='no upstream key available')
+    url = f"{OPENROUTER_BASE}/chat/completions"
+    try:
+        timeout = aiohttp.ClientTimeout(total=300)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload, headers={
+                'authorization': f'Bearer {key}',
+                'content-type': 'application/json',
+            }) as resp:
+                if resp.status == 200:
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = {}
+                    usage = (body or {}).get('usage') or {}
+                    return ProbeOutcome(status='accepted', http_status=200,
+                                        prompt_tokens=_probe_pos_int(usage.get('prompt_tokens')))
+                detail = (await resp.text())[:500]
+                if resp.status in (404, 410):
+                    # EOL/retired upstream model: terminally unavailable.
+                    return ProbeOutcome(status='dead', http_status=resp.status, detail=detail)
+                if resp.status in (400, 413, 422):
+                    evidence = None
+                    if _CONTEXT_PROBE is not None:
+                        try:
+                            evidence = _CONTEXT_PROBE.parse_rejection(resp.status, detail)
+                        except Exception:
+                            evidence = None
+                    if evidence:
+                        return ProbeOutcome(status='rejected', http_status=resp.status,
+                                            evidence=evidence, detail=detail)
+                return ProbeOutcome(status='error', http_status=resp.status, detail=detail)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        return ProbeOutcome(status='error', detail=str(exc)[:300])
+
+
 async def _refresh_models_loop():
     """Periodically refresh model catalog from upstream."""
+    global _CONTEXT_PROBE
+    if _CONTEXT_PROBE is None:
+        _CONTEXT_PROBE = ContextProbeService(
+            'openrouter', MODEL_STORE, _probe_context_upstream,
+            endpoint=f"{OPENROUTER_BASE}/chat/completions")
     # B-22: `global _MODEL_REFRESH_TASK` removed — never assigned in this scope
     # (the task handle is set by lifespan, which declares it correctly).
     try:
         # Initial load
         ids = await _refresh_models()
         logger.info(f"[openrouter] Initial model catalog: {len(ids)} models")
+        # Reinforcement: enqueue models with unknown advertised context
+        # right away (the next refresh is hours away).
+        try:
+            _entries = list(MODEL_CATALOG.snapshot())
+            if free_only_enabled():
+                _kept = []
+                for _m in _entries:
+                    if not isinstance(_m, dict):
+                        continue
+                    _pricing = _m.get('pricing') if isinstance(_m.get('pricing'), dict) else None
+                    _free = None
+                    if _pricing is not None:
+                        try:
+                            _free = (float(_pricing.get('prompt', '1') or '1') == 0.0
+                                     and float(_pricing.get('completion', '1') or '1') == 0.0)
+                        except (TypeError, ValueError):
+                            _free = None
+                    if _free is None:
+                        _free = is_free_model(_m.get('id', ''))
+                    if _free:
+                        _kept.append(_m)
+                _entries = _kept
+            _CONTEXT_PROBE.notify_catalog(_entries)
+        except Exception:
+            pass
 
         while True:
             await asyncio.sleep(max(60, min(MODEL_CATALOG_REFRESH_SEC, MODEL_CATALOG_TTL_SEC)))
             ids = await _refresh_models()
             logger.info(f"[openrouter] Model catalog refreshed: {len(ids)} models")
+            # Reinforcement: enqueue models with unknown advertised
+            # context for background verification (follows the same
+            # refresh cadence as the catalog itself).
+            try:
+                _entries = list(MODEL_CATALOG.snapshot())
+                if free_only_enabled():
+                    _kept = []
+                    for _m in _entries:
+                        if not isinstance(_m, dict):
+                            continue
+                        _pricing = _m.get('pricing') if isinstance(_m.get('pricing'), dict) else None
+                        _free = None
+                        if _pricing is not None:
+                            try:
+                                _free = (float(_pricing.get('prompt', '1') or '1') == 0.0
+                                         and float(_pricing.get('completion', '1') or '1') == 0.0)
+                            except (TypeError, ValueError):
+                                _free = None
+                        if _free is None:
+                            _free = is_free_model(_m.get('id', ''))
+                        if _free:
+                            _kept.append(_m)
+                    _entries = _kept
+                _CONTEXT_PROBE.notify_catalog(_entries)
+            except Exception:
+                pass
     except asyncio.CancelledError:
         pass
 
@@ -1978,7 +2087,20 @@ async def list_models(request: Request):
             if free:
                 kept.append(m)
         entries = kept
-    return JSONResponse({'object': 'list', 'data': [{**m, **discovery_limits(m)} for m in entries]})
+    def _with_observations(m):
+        # Empirical reinforcement (2026-10-15): account-scoped context
+        # evidence fills gaps; published values always win; a verified
+        # floor never over-labels a small-context model.
+        try:
+            if isinstance(m, dict):
+                obs = MODEL_STORE.context_observations(str(m.get('id') or ''))
+                if obs:
+                    return merge_observed_context(m, obs)
+        except Exception:
+            pass
+        return m
+    return JSONResponse({'object': 'list',
+                        'data': [{**_with_observations(m), **discovery_limits(_with_observations(m))} for m in entries]})
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -1999,6 +2121,12 @@ async def get_model_detail(model_id: str, request: Request):
     if model is None or blocked:
         return _error_response({'error': {'type': 'invalid_request_error',
                              'message': 'Model is absent from the cached provider catalog'}}, status_code=404)
+    try:
+        _obs = MODEL_STORE.context_observations(str(model.get('id') or ''))
+        if _obs:
+            model = merge_observed_context(model, _obs)
+    except Exception:
+        pass
     return JSONResponse({**model, **discovery_limits(model)})
 
 
@@ -2622,8 +2750,20 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
     if reasoning:
         content_blocks.append({"type": "thinking", "thinking": reasoning})
-    if message.get("content"):
-        content_blocks.append({"type": "text", "text": message["content"]})
+    _or_text = message.get("content")
+    if isinstance(_or_text, str):
+        # Anti-trace (2026-10-15 forensics): start-anchored inline
+        # thinking extraction; extracted span removed from visible
+        # text; trailing stray closers stripped.
+        if not reasoning:
+            _inline, _or_text = _extract_inline_thinking(_or_text)
+            if _inline:
+                reasoning = _inline
+                content_blocks.append({"type": "thinking", "thinking": reasoning})
+        else:
+            _or_text = _strip_think_tags(_or_text)
+    if _or_text:
+        content_blocks.append({"type": "text", "text": _or_text})
     if message.get("tool_calls"):
         for tc in message["tool_calls"]:
             fn = tc.get("function", {})
@@ -2691,6 +2831,57 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
     thinking_started = False
     thinking_index = None
     tool_call_blocks = {}  # OpenAI tool index → Anthropic block index
+    thinking_index = 0
+    _think_filter = _ThinkTagStreamFilter()  # anti-trace: tag-aware content filter
+
+    async def _emit_filtered(pieces):
+        """Anti-trace emission: filtered (thinking|text) pieces with
+        proper block lifecycle (R-02 semantics preserved)."""
+        nonlocal block_open, block_index, text_started, thinking_started, thinking_index
+        for _fkind, _fpiece in pieces:
+            if not _fpiece:
+                continue
+            if _fkind == 'thinking':
+                if not thinking_started:
+                    if block_open and text_started:
+                        yield _sse('content_block_stop', {
+                            'type': 'content_block_stop', 'index': block_index,
+                        })
+                        block_index += 1
+                        text_started = False
+                        block_open = False
+                    thinking_index = block_index
+                    yield _sse('content_block_start', {
+                        'type': 'content_block_start', 'index': thinking_index,
+                        'content_block': {'type': 'thinking', 'thinking': ''},
+                    })
+                    thinking_started = True
+                    block_open = True
+                    block_index += 1
+                yield _sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': thinking_index,
+                    'delta': {'type': 'thinking_delta', 'thinking': _fpiece},
+                })
+            else:
+                if not _fpiece.strip() and not text_started:
+                    continue
+                if not text_started:
+                    if block_open and thinking_started:
+                        yield _sse('content_block_stop', {
+                            'type': 'content_block_stop', 'index': thinking_index,
+                        })
+                        thinking_started = False
+                        block_open = False
+                    yield _sse('content_block_start', {
+                        'type': 'content_block_start', 'index': block_index,
+                        'content_block': {'type': 'text', 'text': ''},
+                    })
+                    text_started = True
+                    block_open = True
+                yield _sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': block_index,
+                    'delta': {'type': 'text_delta', 'text': _fpiece},
+                })
     open_tool_blocks: set = set()  # R-02: concurrently-open tool_use blocks
     finish_reason = None
     output_tokens = 0
@@ -2809,27 +3000,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                         'delta': {'type': 'thinking_delta', 'thinking': reason_delta},
                     })
 
-                # Text content
+                # Text content (anti-trace: think-tag filtered)
                 if delta.get('content'):
-                    if not text_started:
-                        # Close an open thinking block if any (tool blocks stay
-                        # open concurrently — R-02).
-                        if block_open and thinking_started:
-                            yield _sse('content_block_stop', {
-                                'type': 'content_block_stop', 'index': thinking_index,
-                            })
-                            thinking_started = False
-                            block_open = False
-                        yield _sse('content_block_start', {
-                            'type': 'content_block_start', 'index': block_index,
-                            'content_block': {'type': 'text', 'text': ''},
-                        })
-                        text_started = True
-                        block_open = True
-                    yield _sse('content_block_delta', {
-                        'type': 'content_block_delta', 'index': block_index,
-                        'delta': {'type': 'text_delta', 'text': delta['content']},
-                    })
+                    async for _ev in _emit_filtered(_think_filter.feed(delta['content'])):
+                        yield _ev
 
                 # Tool calls
                 # B-03 fix (CRITICAL): three compounded defects previously
@@ -2850,6 +3024,11 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     tc_idx = tc.get('index', 0)
                     fn = tc.get('function') or {}
                     if tc_idx not in tool_call_blocks:
+                        # Anti-trace: flush pending filtered content
+                        # (stray trailing think-tags stripped) before
+                        # the tool block opens.
+                        async for _ev in _emit_filtered(_think_filter.flush_tool_boundary()):
+                            yield _ev
                         # R-02: close only a TEXT or THINKING block here.
                         # Closing the previous TOOL block orphaned its later
                         # argument fragments (OpenAI interleaves fragments
@@ -2896,6 +3075,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 if choice.get('finish_reason'):
                     finish_reason = choice['finish_reason']
 
+        # Anti-trace: final content flush; trailing stray think-tags
+        # never reach the client as visible text.
+        async for _ev in _emit_filtered(_think_filter.close()):
+            yield _ev
         # B-04 / R-02: close the open TEXT/THINKING block (if any), then every
         # concurrently-open tool_use block, lowest index first.
         if block_open and text_started:

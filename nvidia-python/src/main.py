@@ -106,6 +106,9 @@ except ImportError:
     )
     from common.model import LocalModelRegistry, ModelRegistryClient, same_provider_model_id
 
+from common.model.context_probe import ContextProbeService, ProbeOutcome
+from common.model.metadata import merge_observed_context, positive_int
+
 try:
     from watchdog.observers import Observer
     from watchdog.events import FileSystemEventHandler
@@ -1543,6 +1546,16 @@ class Server:
         official = (self.registry.get_official_context(model_id)
                     if self.registry and BASE_LLM == 'https://integrate.api.nvidia.com' else None)
         raw['context_metadata'] = merge_context_metadata({'context_metadata': endpoint}, official)
+        # Empirical reinforcement (2026-10-15): account-scoped context
+        # evidence from the background probe / rejection parser fills
+        # gaps the published catalogs leave unknown. Published values
+        # always win; a verified floor never over-labels a model.
+        try:
+            observed = self.model_state.context_observations(model_id)
+            if observed:
+                raw = merge_observed_context(raw, observed)
+        except Exception:
+            pass
         # Remove normalized fields from a prior merged cache before reapplying
         # verified limits. Unknown capacity must not retain an old guessed cap.
         for field in ('context_window', 'context_length', 'max_context_window',
@@ -1562,6 +1575,13 @@ class Server:
             self.model_state.upsert_catalog(entries, source='nvidia:cached-upstream-metadata')
             MODEL_REGISTRY.register_catalog(entries, revision='runtime-catalog')
             MODEL_REGISTRY_CLIENT.schedule_catalog('nvidia', entries, 'runtime-catalog')
+            # Reinforcement: enqueue models needing context verification.
+            probe = getattr(self, '_context_probe', None)
+            if probe is not None:
+                try:
+                    probe.notify_catalog(entries)
+                except Exception:
+                    pass
 
     def _enrich_model_metadata(self, model_id, desc, status):
         from common.model.metadata import discovery_limits
@@ -1606,6 +1626,54 @@ class Server:
                             and 'vision' not in caps):
                         result['capabilities'] = sorted(caps | {'vision'})
         return result
+
+    async def _probe_context_upstream(self, payload: dict):
+        """Probe a model's max context via the upstream chat surface.
+
+        Uses a key from the existing pool (peek_key): rotation,
+        cooldown and model-scoped carve-out semantics all apply.
+        """
+        peek = getattr(self.pool, 'peek_key', None)
+        key_entry = peek() if callable(peek) else None
+        api_key = getattr(key_entry, 'api_key', None) or os.environ.get('NVIDIA_API_KEY', '')
+        if not api_key:
+            return ProbeOutcome(status='skipped', detail='no upstream key available')
+        url = BASE_LLM.rstrip('/') + '/v1/chat/completions'
+        try:
+            timeout = aiohttp.ClientTimeout(total=300)
+            async with self._session.post(url, json=payload, headers={
+                'authorization': f'Bearer {api_key}',
+                'content-type': 'application/json',
+                'accept': 'application/json',
+            }, timeout=timeout) as resp:
+                if resp.status == 200:
+                    try:
+                        body = await resp.json(content_type=None)
+                    except Exception:
+                        body = {}
+                    usage = (body or {}).get('usage') or {}
+                    return ProbeOutcome(status='accepted', http_status=200,
+                                        prompt_tokens=positive_int(usage.get('prompt_tokens')))
+                detail = (await resp.text())[:500]
+                if resp.status in (404, 410):
+                    # EOL/retired upstream model: terminally unavailable.
+                    return ProbeOutcome(status='dead', http_status=resp.status, detail=detail)
+                if resp.status in (400, 413, 422):
+                    evidence = None
+                    probe = getattr(self, '_context_probe', None)
+                    if probe is not None:
+                        try:
+                            evidence = probe.parse_rejection(resp.status, detail)
+                        except Exception:
+                            evidence = None
+                    if evidence:
+                        return ProbeOutcome(status='rejected', http_status=resp.status,
+                                            evidence=evidence, detail=detail)
+                return ProbeOutcome(status='error', http_status=resp.status, detail=detail)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            return ProbeOutcome(status='error', detail=str(exc)[:300])
 
     async def init(self):
         await MODEL_REGISTRY_CLIENT.start()
@@ -1666,6 +1734,14 @@ class Server:
         self.registry.set_model_ids(lambda: self.pool.models_cached)
         self.registry.on_refresh = self._sync_context_catalog
         self.pool.on_models_refresh = self._sync_context_catalog
+        # Reinforcement (2026-10-15): background max-context probing that
+        # follows the existing refresh cycle. Probes go through the
+        # upstream chat surface with pool keys; the service skips work
+        # while live requests are waiting (F7 parity).
+        self._context_probe = ContextProbeService(
+            'nvidia', self.model_state, self._probe_context_upstream,
+            busy_fn=lambda: bool(getattr(self.pool, '_waiting', None)),
+            endpoint=BASE_LLM.rstrip('/') + '/v1/chat/completions')
         await self.registry.refresh(force=True)
 
         # Hydrate the last good persistent catalog first.  This keeps model

@@ -21,6 +21,12 @@ except Exception:  # pragma: no cover - fallback for standalone use
         return False
 
 
+try:
+    from .think_tags import extract_inline_thinking, strip_trailing_think_tags
+except ImportError:  # pragma: no cover - standalone use outside the package
+    from think_tags import extract_inline_thinking, strip_trailing_think_tags
+
+
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use blocks).
 
@@ -641,19 +647,23 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning and isinstance(reasoning, str):
         content.append({"type": "thinking", "thinking": reasoning})
-    # CRIT-03: Extract thinking from content field when reasoning_content is not provided.
-    # Nemotron models (e.g. nvidia/nemotron-3-ultra-550b-a55b) embed
-    # <thinking>...</thinking> tags in the content string instead of using
-    # a separate reasoning_content field. Without this extraction, the tags
-    # pass through into visible text output for the client.
-    if not reasoning and isinstance(msg.get("content"), str):
-        m = re.search(r'<thinking>([\s\S]*?)</thinking>', msg["content"])
-        if m:
-            reasoning = m.group(1).strip()
-            content.append({"type": "thinking", "thinking": reasoning})
+    # CRIT-03 + anti-trace (2026-10-15 forensics): inline thinking
+    # extraction is START-ANCHORED (only when the content begins with an
+    # opener tag), the extracted span is REMOVED from the visible text,
+    # and trailing stray closers are stripped. The previous non-greedy
+    # regex matched literal mid-prose tag mentions, duplicated a
+    # fragment into thinking AND left the raw tags in the text.
+    raw_text = msg.get("content") or ""
+    if isinstance(raw_text, str):
+        if not reasoning:
+            inline_thinking, raw_text = extract_inline_thinking(raw_text)
+            if inline_thinking:
+                reasoning = inline_thinking
+                content.append({"type": "thinking", "thinking": reasoning})
+        else:
+            raw_text = strip_trailing_think_tags(raw_text)
 
     # Text content
-    raw_text = msg.get("content") or ""
     if raw_text:
         clean_text, dsml_tools = parse_dsml_from_text(raw_text)
         if clean_text:

@@ -58,9 +58,15 @@ def load_openrouter_translator(name: str):
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     start = src.index(f"async def {name}")
     end = src.index("\n# ══", start)
+    from common.translations.think_tags import (
+        ThinkTagStreamFilter, extract_inline_thinking, strip_trailing_think_tags,
+    )
     ns = {
         'json': json, 'time': __import__('time'), 'asyncio': asyncio,
         'HEARTBEAT_MS': 100000,
+        '_ThinkTagStreamFilter': ThinkTagStreamFilter,
+        '_extract_inline_thinking': extract_inline_thinking,
+        '_strip_think_tags': strip_trailing_think_tags,
         'logger': types.SimpleNamespace(error=lambda *a, **k: None,
                                         warning=lambda *a, **k: None,
                                         info=lambda *a, **k: None),
@@ -729,7 +735,7 @@ def test_b06_local_non_streaming_translators_use_strict_finish_mapping():
 def test_b06_openrouter_non_streaming_content_filter_maps_to_refusal():
     src = (ROOT / 'openrouter' / 'src' / 'main.py').read_text()
     i = src.index('def _openai_to_anthropic_response(')
-    block = src[i:i + 1800]
+    block = src[i:i + 2600]
     assert '"content_filter": "refusal"' in block
     assert '"content_filter": "end_turn"' not in block
 

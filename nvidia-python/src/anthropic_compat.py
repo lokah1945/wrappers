@@ -17,6 +17,7 @@ import asyncio
 from typing import Optional, AsyncGenerator
 
 from .capabilities import get_context_window
+from common.translations.think_tags import ThinkTagStreamFilter, strip_trailing_think_tags
 
 
 def _env_flag(name: str, default: str = '0') -> bool:
@@ -105,6 +106,10 @@ def extract_internal_reasoning(msg: dict) -> dict:
             tag_len = 11 if trimmed.startswith('<thinking>') else 8
             content = trimmed[end + tag_len:].strip()
 
+    # Anti-trace: strip stray trailing think-tags (e.g. NIM's closing-tag
+    # artifact) from non-stream content so they never render as prose.
+    if isinstance(content, str):
+        content = strip_trailing_think_tags(content)
     return {'reasoning': reasoning or '', 'content': content}
 
 
@@ -695,6 +700,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     errored = False
     error_message = ''
     client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
+    _think_filter = ThinkTagStreamFilter()  # anti-trace: tag-aware content filter
 
     async def stop_open():
         """Close the open TEXT/THINKING block only.
@@ -902,137 +908,54 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
 
             break
 
+    async def _emit_filtered_content(text):
+        """Anti-trace content emission: think-tag aware, whitespace guarded."""
+        for _kind, _piece in _think_filter.feed(text):
+            if not _piece:
+                continue
+            if _kind == 'thinking':
+                async for c in emit_thinking_delta(_piece):
+                    yield c
+            else:
+                # NIM emits whitespace-only content deltas (e.g. a lone
+                # newline after tool_calls). Without an open text block they
+                # would open standalone whitespace text blocks that clients
+                # render as junk lines (transcript: 47 occurrences).
+                if not _piece.strip() and text_index is None:
+                    continue
+                async for c in emit_text(_piece):
+                    yield c
+
     async def parse_and_emit(chunk, is_reasoning):
-        # B-18 (hygiene): this scope only rebinds these three; the rest are
-        # mutated by sibling closures that declare them properly.
-        nonlocal in_dsml_mode, completed_thinking, in_think_tag
+        nonlocal in_dsml_mode
         if in_dsml_mode:
             async for c in process_dsml(chunk):
                 yield c
             return
-
-        if completed_thinking:
-            is_reasoning = False
-
-        if not is_reasoning and in_think_tag and thinking_index is not None:
-            # RUNTIME FINDING R-04 (CRITICAL): the loop variable was `chunk`,
-            # SHADOWING this function's `chunk` parameter — the model's actual
-            # text. After the thinking->text transition, `chunk` held the last
-            # SSE frame emitted by stop_open(), so the literal string
-            #   'event: content_block_stop\ndata: {...}\n\n'
-            # was passed on and rendered to the user as assistant prose.
-            # This is the same visible defect as the nous B-10 leak, reached by
-            # a completely different route, and it only triggers when a
-            # reasoning model transitions from thinking to text — which is why
-            # no unit test caught it. Use a distinct loop variable.
-            async for _stop_ev in stop_open():
-                yield _stop_ev
-            in_think_tag = False
-            completed_thinking = True
-
-        if completed_thinking:
-            dsml_start_idx = chunk.find('<|DSML|tool_calls>')
-            if dsml_start_idx == -1:
-                dsml_start_idx = chunk.find('｜DSML｜tool_calls>')
-            if dsml_start_idx != -1:
-                before = chunk[:dsml_start_idx]
-                after = chunk[dsml_start_idx:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_dsml_mode = True
-                async for c in process_dsml(after):
-                    yield c
-                return
-            async for c in emit_text(chunk):
+        if is_reasoning:
+            # Anti-trace (2026-10-15 forensics): reasoning_content is
+            # upstream-extracted reasoning. Never marker-parse it: a literal
+            # closing tag quoted inside the model's own reasoning split the
+            # thinking block mid-sentence and leaked the remainder into
+            # visible prose (reproduced live).
+            async for c in emit_thinking_delta(chunk):
                 yield c
             return
-
-        if is_reasoning and not in_think_tag and thinking_index is not None:
-            async for c in emit_text(chunk):
+        # DSML tool markup diverts before tag filtering (unchanged behavior).
+        dsml_start_idx = chunk.find('<|DSML|tool_calls>')
+        if dsml_start_idx == -1:
+            dsml_start_idx = chunk.find('｜DSML｜tool_calls>')
+        if dsml_start_idx != -1:
+            before, after = chunk[:dsml_start_idx], chunk[dsml_start_idx:]
+            if before:
+                async for c in _emit_filtered_content(before):
+                    yield c
+            in_dsml_mode = True
+            async for c in process_dsml(after):
                 yield c
             return
-        if is_reasoning and not in_think_tag:
-            in_think_tag = True
-            async for c in emit_thinking_start():
-                yield c
-
-        if in_think_tag:
-            end_idx = -1
-            tag_len = 0
-            end1 = chunk.find('</think>')
-            end2 = chunk.find('</thinking>')
-            end3 = chunk.find('<|DSML|tool_calls>')
-            if end3 == -1:
-                end3 = chunk.find('｜DSML｜tool_calls>')
-
-            if end1 != -1:
-                end_idx = end1
-                tag_len = 8
-            if end2 != -1 and (end_idx == -1 or end2 < end_idx):
-                end_idx = end2
-                tag_len = 11
-            if end3 != -1 and (end_idx == -1 or end3 < end_idx):
-                end_idx = end3
-                tag_len = 0
-
-            if end_idx != -1:
-                inside = chunk[:end_idx]
-                after = chunk[end_idx + tag_len:]
-                if inside:
-                    async for c in emit_thinking_delta(inside):
-                        yield c
-                async for c in stop_open():
-                    yield c
-                in_think_tag = False
-                completed_thinking = True
-                if after:
-                    async for c in parse_and_emit(after, False):
-                        yield c
-            else:
-                async for c in emit_thinking_delta(chunk):
-                    yield c
-        else:
-            dsml_start_idx = chunk.find('<|DSML|tool_calls>')
-            if dsml_start_idx == -1:
-                dsml_start_idx = chunk.find('｜DSML｜tool_calls>')
-            if dsml_start_idx != -1:
-                before = chunk[:dsml_start_idx]
-                after = chunk[dsml_start_idx:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_dsml_mode = True
-                async for c in process_dsml(after):
-                    yield c
-                return
-
-            start_idx = -1
-            tag_len = 0
-            start1 = chunk.find('<think>')
-            start2 = chunk.find('<thinking>')
-            if start1 != -1:
-                start_idx = start1
-                tag_len = 7
-            if start2 != -1 and (start_idx == -1 or start2 < start_idx):
-                start_idx = start2
-                tag_len = 10
-
-            if start_idx != -1:
-                before = chunk[:start_idx]
-                after = chunk[start_idx + tag_len:]
-                if before:
-                    async for c in emit_text(before):
-                        yield c
-                in_think_tag = True
-                async for c in emit_thinking_start():
-                    yield c
-                if after:
-                    async for c in parse_and_emit(after, False):
-                        yield c
-            else:
-                async for c in emit_text(chunk):
-                    yield c
+        async for c in _emit_filtered_content(chunk):
+            yield c
 
     yield _sse('message_start', {
         'type': 'message_start',
@@ -1134,6 +1057,21 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                     oi = tc.get('index', 0)
                     fn = tc.get('function', {})
                     if oi not in tool_map:
+                        # Anti-trace: flush pending filtered content
+                        # (stray trailing think-tags stripped) before
+                        # the tool block opens.
+                        try:
+                            for _fkind, _fpiece in _think_filter.flush_tool_boundary():
+                                if not _fpiece:
+                                    continue
+                                if _fkind == 'thinking':
+                                    async for c in emit_thinking_delta(_fpiece):
+                                        yield c
+                                elif _fpiece.strip() or text_index is not None:
+                                    async for c in emit_text(_fpiece):
+                                        yield c
+                        except Exception:
+                            pass
                         if expect_thinking and not real_thinking_emitted and not synthetic_thinking_emitted:
                             async for c in emit_synthetic_thinking():
                                 yield c
@@ -1206,6 +1144,22 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         except Exception:
             pass
         if not client_gone:
+            # Anti-trace: final flush of filtered content. Trailing
+            # stray think-tags (NIM nemotron closing-tag artifact,
+            # transcript tails '...</think>\n') never reach the client
+            # as visible text.
+            try:
+                for _fkind, _fpiece in _think_filter.close():
+                    if not _fpiece:
+                        continue
+                    if _fkind == 'thinking':
+                        async for c in emit_thinking_delta(_fpiece):
+                            yield c
+                    elif _fpiece.strip() or text_index is not None:
+                        async for c in emit_text(_fpiece):
+                            yield c
+            except Exception:
+                pass
             if open_idx is not None and open_idx not in set(tool_map.values()):
                 try:
                     yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
