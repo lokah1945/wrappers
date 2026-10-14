@@ -711,8 +711,20 @@ def get_model_meta(mid, upstream=None):
     rooted = resolve_model(mid) if mid else mid
     tpl = _load_model_info_template()
     base = dict(tpl)
+    # Pop template-only fields that upstream does NOT publish per-model.
+    # Empirically verified against the live Nous models endpoint: upstream
+    # returns truncation_policy=None and effective_context_window_percent=None
+    # for every model. The Codex-derived template fabricates
+    # truncation_policy {mode: tokens, limit: 10000} and 95% effective window
+    # — a client honoring those would cap conversations at 10k tokens on
+    # 1M-context models (meituan/longcat-2.5-preview ctx 1048576,
+    # stepfun/step-5-preview ctx 1000000). Only context-family fields were
+    # popped before; truncation_policy and effective_context_window_percent
+    # must be popped too so they only appear when upstream really declares
+    # them.
     for key in ('context_window', 'context_length', 'max_context_window', 'max_tokens',
-                'max_output_tokens', 'max_input_tokens'):
+                'max_output_tokens', 'max_input_tokens',
+                'truncation_policy', 'effective_context_window_percent'):
         base.pop(key, None)
     if upstream is None:
         upstream = next((m for m in MODEL_CATALOG.snapshot() if m.get('id') == rooted), {})

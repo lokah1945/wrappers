@@ -748,7 +748,16 @@ MAX_CONNECTIONS = int(os.environ.get('MAX_CONNECTIONS', '200'))
 HEADERS_TIMEOUT_MS = int(os.environ.get('HEADERS_TIMEOUT_MS', '120000'))
 PRE_RESPONSE_TIMEOUT_MS = int(os.environ.get('PRE_RESPONSE_TIMEOUT_MS', '300000'))
 TTFT_TIMEOUT_MS = int(os.environ.get('TTFT_TIMEOUT_MS', '120000'))
-REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT', '120'))
+# TIMEOUT-ENV-ALIGN fix: the operator .env sets REQUEST_TIMEOUT_SEC=600,
+# but this line historically read REQUEST_TIMEOUT (a name nothing sets), so
+# the effective non-stream timeout silently fell back to 120s. 1M-context
+# requests routinely take >120s upstream (empirical: 978k tokens = 76s
+# prefill + queueing variance) and were killed at 120s, then retried across
+# the whole key pool with a misleading 'rate-limited' 429. Read the real
+# name first; keep the legacy name as override; default 600 like the other
+# wrappers.
+REQUEST_TIMEOUT_SEC = int(os.environ.get('REQUEST_TIMEOUT_SEC')
+                          or os.environ.get('REQUEST_TIMEOUT') or '600')
 STREAM_REQUEST_TIMEOUT_SEC = int(os.environ.get('STREAM_REQUEST_TIMEOUT_SEC', '600'))
 # V-09 fix: streams use a read-idle timeout instead of a hard total timeout.
 STREAM_SOCK_READ_TIMEOUT_SEC = int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300'))
