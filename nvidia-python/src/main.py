@@ -411,7 +411,6 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
-        stream_openai_to_anthropic,
         openai_chat_to_anthropic_request,
     )
     from common.compat import (
@@ -443,6 +442,7 @@ from .anthropic_compat import (
     estimate_input_tokens,
     anthropic_error,
     extract_internal_reasoning,
+    stream_openai_to_anthropic,
 )
 
 
@@ -955,12 +955,19 @@ def _translate_nemotron_super_controls(oai_body: dict, thinking: Any, output_con
 
 def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking: Any,
                               anthropic_output_config: Any = None) -> None:
-    if anthropic_thinking is None:
-        return
-    enabled = anthropic_thinking is True or (isinstance(anthropic_thinking, dict) and anthropic_thinking.get('type') != 'disabled')
     if _is_reasoning_injection_disabled(nim_model):
         return
     cfg = find_reasoning_config(nim_model)
+    # Nemotron Super/Ultra cloud contract: Messages thinking/output_config
+    # controls map to the documented reasoning_effort / chat_template_kwargs /
+    # reasoning_budget fields with strict validation, and explicit Anthropic
+    # controls win over conflicting caller provider fields.
+    if cfg and cfg.get('mechanism') == 'nemotron_chat_template':
+        _translate_nemotron_super_controls(oai_body, anthropic_thinking, anthropic_output_config)
+        return
+    if anthropic_thinking is None:
+        return
+    enabled = anthropic_thinking is True or (isinstance(anthropic_thinking, dict) and anthropic_thinking.get('type') != 'disabled')
     if not cfg:
         if not hasattr(translate_thinking_to_nim, '_unknown_logged'):
             translate_thinking_to_nim._unknown_logged = set()
@@ -1536,7 +1543,12 @@ class Server:
         return raw
 
     def _sync_context_catalog(self):
-        entries = [self._context_catalog_entry(mid) for mid in (self.pool.models_cached or [])]
+        # Register the full descriptor (input/output modalities, endpoints,
+        # streaming) — not only context limits — so the shared registry
+        # receives the same facts /v1/models publishes.
+        entries = [self._enrich_model_metadata(
+                       mid, describe(mid, BASE_LLM, BASE_GENAI), {})
+                   for mid in (self.pool.models_cached or [])]
         if entries:
             self.model_state.upsert_catalog(entries, source='nvidia:cached-upstream-metadata')
             MODEL_REGISTRY.register_catalog(entries, revision='runtime-catalog')
@@ -1547,11 +1559,56 @@ class Server:
         raw = self._context_catalog_entry(model_id)
         result = enrich_model_metadata(model_id, {**desc, **raw}, status)
         result.update(discovery_limits(raw))
+        # OpenAI discovery contract: every /v1/models entry carries
+        # object/created/owned_by. Curated genai models never appear in the
+        # upstream listing, so backfill neutral values instead of omitting
+        # the fields (strict SDKs reject entries without them).
+        if result.get('object') != 'model':
+            result['object'] = 'model'
+        if not result.get('owned_by'):
+            owner = str(model_id).split('/', 1)[0] if (
+                isinstance(model_id, str) and '/' in str(model_id)) else 'nvidia'
+            result['owned_by'] = owner
+        if not isinstance(result.get('created'), int) or isinstance(result.get('created'), bool):
+            result['created'] = 0
+        # NGC-published modalities (NIM taxonomy) fill input-modality gaps the
+        # name heuristics cannot see (omni / vision chat models). Union-only
+        # and display-only: routing keeps using classify(); a declared
+        # modality is never removed.
+        ngc_mods = (getattr(self, '_ngc_modality_map', None) or {}).get(model_id)
+        if (ngc_mods and 'text/chat' in ngc_mods
+                and result.get('type') in ('chat', 'vision_chat')):
+            extra_in = set()
+            for mod in ngc_mods:
+                if mod in ('image/vision', 'ocr/document'):
+                    extra_in.add('image')
+                elif mod == 'video':
+                    extra_in.add('video')
+                elif mod == 'audio/speech':
+                    extra_in.add('audio')
+            if extra_in:
+                current = set(result.get('input') or [])
+                merged = sorted(current | extra_in)
+                if merged != sorted(current):
+                    result['input'] = merged
+                    result['modalities_source'] = 'ngc-catalog'
+                    caps = set(result.get('capabilities') or [])
+                    if ('image' in merged and 'image' not in current
+                            and 'vision' not in caps):
+                        result['capabilities'] = sorted(caps | {'vision'})
         return result
 
     async def init(self):
         await MODEL_REGISTRY_CLIENT.start()
         self.pool.load_from_env()
+        # NGC-published input modalities (NIM taxonomy) for /v1/models
+        # enrichment. Read once at startup; the catalog DB is refreshed by
+        # the operator pipeline.
+        try:
+            from common.catalog_integration import ngc_modality_map
+            self._ngc_modality_map = ngc_modality_map()
+        except Exception:
+            self._ngc_modality_map = {}
         self._agent = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS)
         self._session = aiohttp.ClientSession(connector=self._agent)
         self.pool.set_external_session(self._session)
@@ -2023,6 +2080,12 @@ class Server:
             unavailable = {mid for mid, st in status.items() if st.get('availability_state') not in (None, 'available') or st.get('ok') is False}
             verified_count = sum(1 for s in status.values() if s.get('ok'))
             return {
+                # DASH fix: expose the per-model state map the dashboard's
+                # Health/Models tabs consume (`states`). The data was already
+                # merged by _model_status_view but never surfaced, so the
+                # dashboard rendered "No models tracked" while /v1/models
+                # showed 93 models with live availability metadata.
+                'states': status,
                 'unavailable': list(unavailable),
                 'unavailable_count': len(unavailable),
                 'verified_count': verified_count,
@@ -3221,6 +3284,16 @@ class Server:
         from common.http_headers import upstream_response_headers
         context_state = ContextRecoveryState()
         path = self._normalize_path(path)
+        # The catch-all route parameter arrives WITHOUT the leading slash
+        # ('v1/completions'), while internal callers pass '/v1/responses'.
+        # Every consumer below needs the leading-slash form: the D11
+        # /catalog//mcp guard, route_upstream() genai routing, the
+        # target_url join (BASE_LLM + path) and the /v1/responses fallback
+        # check. Without this, proxied catch-all paths built URLs like
+        # 'https://integrate.api.nvidia.comv1/completions' -> DNS failure
+        # on every key -> bogus 429 'keys exhausted'.
+        if path and not path.startswith('/'):
+            path = '/' + path
         method = request.method
         is_post = method in ('POST', 'PUT', 'PATCH')
 

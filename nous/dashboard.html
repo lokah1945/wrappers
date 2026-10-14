@@ -384,6 +384,11 @@
   .pill.stream{ background: var(--pill-stream-bg); color: var(--pill-stream-fg); }
   .pill.model { background: var(--pill-model-bg);  color: var(--pill-model-fg); }
   .sortable { cursor: pointer; user-select: none; }
+  .ctx-chip { font-size: 0.72rem; font-weight: 700; color: #4dd0e1; background: rgba(77,208,225,.12); padding: 0.08rem 0.42rem; border-radius: 4px; white-space: nowrap; }
+  .mod-chip { display: inline-block; font-size: 0.62rem; padding: 0.04rem 0.32rem; border-radius: 4px; margin-right: 2px; }
+  .mod-in { background: rgba(129,199,132,.16); color: #81c784; }
+  .mod-out { background: rgba(79,195,247,.16); color: #4fc3f7; }
+  .mod-arrow { color: var(--muted); font-size: 0.66rem; margin: 0 2px; }
   .sortable:hover { color: var(--accent); }
   .sortable .arr { font-size: 9px; opacity: .6; margin-left: 3px; }
   .empty { padding: 40px; text-align: center; color: var(--muted); font-size: 12px; }
@@ -659,14 +664,19 @@
         <thead>
           <tr id="mod-table-head">
             <th class="sortable" data-sort="model">Model</th>
+            <th class="sortable" data-sort="ctx">Context</th>
+            <th>Modalities</th>
             <th class="sortable" data-sort="state">State</th>
             <th class="sortable" data-sort="status">HTTP Status</th>
+            <th class="sortable" data-sort="requests">Requests</th>
+            <th class="sortable" data-sort="tokens">Tokens</th>
             <th class="sortable" data-sort="reason">Reason</th>
             <th class="sortable" data-sort="checked">Last Checked</th>
           </tr>
+
         </thead>
         <tbody id="mod-table-body">
-          <tr><td colspan="5" class="loading"><span class="spinner"></span> Loading…</td></tr>
+          <tr><td colspan="9" class="loading"><span class="spinner"></span> Loading…</td></tr>
         </tbody>
       </table>
     </div>
@@ -1320,11 +1330,101 @@ document.querySelectorAll('#mod-table-head .sortable').forEach(th => {
   });
 });
 
+/* ── Model metadata helpers (context length + modalities) ── */
+function fmtCtx(n) {
+  if (n == null) return '—';
+  const v = Number(n); if (isNaN(v)) return '—';
+  if (v >= 1000000) { const m = v / 1000000; return (m >= 10 ? Math.round(m) : Math.round(m * 100) / 100) + 'M'; }
+  if (v >= 1000) return Math.round(v / 1000) + 'K';
+  return String(v);
+}
+function escMeta(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+function modChips(list, cls) {
+  if (!Array.isArray(list) || !list.length) return '';
+  return list.map(x => '<span class="mod-chip ' + cls + '">' + escMeta(x) + '</span>').join('');
+}
+function modCellHtml(inMods, outMods) {
+  if (!inMods.length && !outMods.length) return '<span style="color:var(--muted)">—</span>';
+  return '<span title="input: ' + escMeta(inMods.join(', ')) + ' → output: ' + escMeta(outMods.join(', ')) + '">' +
+    modChips(inMods, 'mod-in') + '<span class="mod-arrow">→</span>' + modChips(outMods, 'mod-out') + '</span>';
+}
+function ctxCellHtml(r) {
+  if (!r.ctx) return '<span style="color:var(--muted)">—</span>';
+  const tip = 'context ' + Number(r.ctx).toLocaleString() + ' tokens' +
+    (r.maxOut ? ' · max output ' + Number(r.maxOut).toLocaleString() : '');
+  return '<span class="ctx-chip" title="' + tip + '">' + fmtCtx(r.ctx) + '</span>';
+}
+function modelMeta(m) {
+  const mo = (m && typeof m === 'object') ? m : {};
+  const arch = mo.architecture || {};
+  const ctx = mo.context_length || mo.context_window || mo.max_context_window ||
+    arch.context_length || ((mo.top_provider || {}).context_length) || null;
+  const maxOut = mo.max_output_tokens || (mo.top_provider || {}).max_completion_tokens || null;
+  const inMods = mo.input_modalities || mo.input || arch.input_modalities || [];
+  const outMods = mo.output_modalities || mo.output || arch.output_modalities || [];
+  return { ctx: ctx != null ? Number(ctx) : null,
+           maxOut: maxOut != null ? Number(maxOut) : null,
+           inMods: Array.isArray(inMods) ? inMods : [],
+           outMods: Array.isArray(outMods) ? outMods : [] };
+}
+
 async function loadModels() {
-  // Try backend /metrics/models first (nvidia-python)
+  // Full catalog (/v1/models) is the base list — the dashboard must show
+  // EVERY model the wrapper serves. /metrics/models only contains models
+  // that received traffic; it enriches rows with usage stats instead of
+  // shrinking the list.
   const perModel = await apiFetchSafe('/metrics/models?window=' + WINDOW);
+  const traffic = {};
+  if (perModel && perModel.models) {
+    for (const r of perModel.models) if (r.model && r.model !== 'unknown') traffic[r.model] = r;
+  }
   let rows = [];
-  if (perModel && perModel.models && perModel.models.length) {
+  if (_modelsCatalog.length) {
+    rows = _modelsCatalog.map(m => {
+      const mid = typeof m === 'string' ? m : (m.id || m.model || '?');
+      const s = _modelStatusStates[mid] || {};
+      const t = traffic[mid] || null;
+      const stateStr = s.state || s.availability_state ||
+        (typeof m === 'object' && m.availability_state) || 'unknown';
+      const errCount = t ? (t.error_count || 0) : 0;
+      const meta = modelMeta(m);
+      return {
+        model: mid,
+        ctx: meta.ctx, maxOut: meta.maxOut,
+        inMods: meta.inMods, outMods: meta.outMods,
+        state: (stateStr !== 'unknown') ? stateStr :
+               (t ? (errCount > 0 ? 'errored' : 'unknown') : 'unknown'),
+        status: s.http_status || s.last_status || (t && t.last_status) ||
+                (typeof m === 'object' && m.last_status) || '—',
+        reason: s.reason_code || s.reason_detail ||
+                (t ? (errCount ? errCount + ' errors' : 'OK') : '—'),
+        checked: s.checked_at || (t && t.last_ts) ||
+                 (typeof m === 'object' && m.checked_at) || null,
+        requests: t ? (t.requests || 0) : 0,
+        tokens: t ? (t.total_tokens || 0) : 0,
+        success_rate: t ? t.success_rate : null
+      };
+    });
+    // Traffic rows for models missing from the live catalog (retired or
+    // dynamic-alias models) must not silently disappear either.
+    const seen = {};
+    for (const r of rows) seen[r.model] = true;
+    for (const mid of Object.keys(traffic)) {
+      if (!seen[mid]) {
+        const t = traffic[mid], s = _modelStatusStates[mid] || {};
+        rows.push({
+          model: mid,
+          state: s.state || s.availability_state ||
+                 (t.error_count > 0 ? 'errored' : 'unknown'),
+          status: t.last_status || s.last_status || '—',
+          reason: t.error_count ? t.error_count + ' errors' : 'OK',
+          checked: t.last_ts, requests: t.requests || 0,
+          tokens: t.total_tokens || 0, success_rate: t.success_rate
+        });
+      }
+    }
+  } else if (perModel && perModel.models && perModel.models.length) {
+    // No catalog available — metrics-only rows keep the tab populated.
     rows = perModel.models.filter(r => r.model && r.model !== 'unknown').map(r => ({
       model: r.model,
       state: (r.success_rate != null && r.success_rate >= 99) ? 'available' :
@@ -1332,22 +1432,10 @@ async function loadModels() {
       status: r.last_status || '—',
       reason: r.error_count ? (r.error_count + ' errors') : 'OK',
       checked: r.last_ts,
-      _raw: r
+      requests: r.requests || 0,
+      tokens: r.total_tokens || 0,
+      success_rate: r.success_rate
     }));
-  } else {
-    // Fall back to /metrics/model-status + /v1/models
-    rows = _modelsCatalog.map(m => {
-      const mid = typeof m === 'string' ? m : (m.id || m.model || '?');
-      const s = _modelStatusStates[mid] || {};
-      const stateStr = s.state || s.availability_state || 'unknown';
-      return {
-        model: mid,
-        state: stateStr,
-        status: s.http_status || s.last_status || '—',
-        reason: s.reason_code || s.reason_detail || '—',
-        checked: s.checked_at
-      };
-    });
   }
 
   // Summary counts
@@ -1377,7 +1465,7 @@ let _modelsTableData = [];
 function renderModelsTable() {
   const q = ($('mod-search').value || '').toLowerCase();
   let rows = _modelsTableData.filter(r =>
-    !q || (r.model + ' ' + r.state + ' ' + r.status + ' ' + r.reason).toLowerCase().includes(q));
+    !q || (r.model + ' ' + r.state + ' ' + r.status + ' ' + r.reason + ' ' + (r.inMods || []).join(' ') + ' ' + (r.outMods || []).join(' ')).toLowerCase().includes(q));
 
   const { key, dir } = _modSort;
   rows.sort((a, b) => {
@@ -1400,15 +1488,19 @@ function renderModelsTable() {
   });
 
   if (!rows.length) {
-    $('mod-table-body').innerHTML = '<tr><td colspan="5" class="empty">No models found.</td></tr>';
+    $('mod-table-body').innerHTML = '<tr><td colspan="9" class="empty">No models found.</td></tr>';
     return;
   }
   $('mod-table-body').innerHTML = rows.map(r => {
     const cls = r.state === 'available' ? 'ok' : (r.state === 'errored' || r.state === 'error' ? 'err' : 'warn');
     return '<tr>' +
       '<td class="mono" style="max-width:340px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="' + (r.model || '') + '">' + (r.model || '—') + '</td>' +
+      '<td class="num">' + ctxCellHtml(r) + '</td>' +
+      '<td style="font-size:11px">' + modCellHtml(r.inMods || [], r.outMods || []) + '</td>' +
       '<td><span class="pill ' + cls + '">' + (r.state || 'unknown') + '</span></td>' +
       '<td>' + (r.status || '—') + '</td>' +
+      '<td class="num">' + (r.requests ? fmt(r.requests) : '—') + '</td>' +
+      '<td class="num">' + (r.tokens ? fmt(r.tokens) : '—') + '</td>' +
       '<td style="font-size:11px;color:var(--muted)">' + (r.reason || '—') + '</td>' +
       '<td style="color:var(--muted)">' + (r.checked ? fmtTime(r.checked) : '—') + '</td>' +
     '</tr>';
@@ -1531,7 +1623,10 @@ $('act-limit').addEventListener('change', loadActivity);
 /* ── Health tab ────────────────────────────────────── */
 async function loadHealthPanel() {
   const health = await apiFetchSafe('/health');
+  const ready = await apiFetchSafe('/ready');
   if (!health) return;
+
+
 
   $('health-status').textContent = health.status || (health.ok ? 'ok' : '—');
   $('health-status').className = 'card-val ' + ((health.status === 'ok' || health.ok) ? 'green' : 'yellow');
@@ -1546,8 +1641,10 @@ async function loadHealthPanel() {
   }).length;
   $('health-models-ok').textContent = okCount;
 
-  // Catalog age
-  const catalogAge = health.catalog_age_sec || health.model_catalog_age_sec;
+  // Catalog age — /health or /ready both may report it
+  const catalogAge = (health && (health.catalog_age_sec || health.model_catalog_age_sec)) ||
+                     (ready && (ready.catalog_age_sec || ready.model_catalog_age_sec));
+
   if (catalogAge != null) {
     $('health-catalog-age').textContent = fmtUptime(catalogAge);
   } else {

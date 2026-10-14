@@ -27,6 +27,60 @@ from .validation import validate_provider_name
 from .metadata import context_metadata
 
 
+
+_KNOWN_MODALITIES = ("text", "image", "audio", "video")
+
+
+def _declared_capabilities(entry: Any) -> "CapabilityProfile":
+    """Map provider-declared modality facts onto a capability profile.
+
+    Only facts the provider itself publishes are mapped: OpenRouter/Nous
+    ``architecture.input_modalities``/``output_modalities``, NVIDIA
+    ``input``/``output`` arrays, the NVIDIA ``streaming`` flag,
+    ``'tools'`` in supported_parameters and ``'embeddings'`` in the NVIDIA
+    capabilities list. Everything else stays unknown (None/()) — never
+    inferred, never overwritten.
+    """
+    declared: dict = {}
+    if not isinstance(entry, dict):
+        return CapabilityProfile(**declared)
+    architecture = entry.get("architecture")
+    in_mods = None
+    out_mods = None
+    if isinstance(architecture, dict):
+        in_mods = architecture.get("input_modalities")
+        out_mods = architecture.get("output_modalities")
+    if not isinstance(in_mods, list):
+        in_mods = entry.get("input") if isinstance(entry.get("input"), list) else None
+    if not isinstance(out_mods, list):
+        out_mods = entry.get("output") if isinstance(entry.get("output"), list) else None
+    inputs = {str(m) for m in in_mods or [] if str(m) in _KNOWN_MODALITIES}
+    outputs = {str(m) for m in out_mods or [] if str(m) in _KNOWN_MODALITIES}
+    if inputs:
+        declared["input_modalities"] = tuple(sorted(inputs))
+    if outputs:
+        declared["output_modalities"] = tuple(sorted(outputs))
+    if inputs or outputs:
+        if "image" in inputs:
+            declared["vision"] = True
+        if "audio" in inputs:
+            declared["audio_input"] = True
+        if "audio" in outputs:
+            declared["audio_output"] = True
+        if "image" in outputs:
+            declared["image_generation"] = True
+    streaming = entry.get("streaming")
+    if isinstance(streaming, bool):
+        declared["streaming"] = streaming
+    params = entry.get("supported_parameters")
+    if isinstance(params, list) and "tools" in [str(p) for p in params]:
+        declared["tools"] = True
+    caps = entry.get("capabilities")
+    if isinstance(caps, list) and "embeddings" in [str(c) for c in caps]:
+        declared["embeddings"] = True
+    return CapabilityProfile(**declared)
+
+
 class LocalModelRegistry:
     def __init__(self, provider: str, manifest_root: str | Path | None = None,
                  profile_db_path: str | Path | None = None):
@@ -131,7 +185,7 @@ class LocalModelRegistry:
         return tuple(result)
 
     def register_catalog(self, models: Iterable[Any], revision: str = "catalog") -> list[str]:
-        """Register catalog identities with unknown capabilities by default."""
+        """Register catalog identities; capabilities stay unknown unless declared."""
         ids = []
         profiles_to_persist = []
         for entry in models or []:
@@ -172,10 +226,23 @@ class LocalModelRegistry:
                         limits[key] = value
                         previous[key] = dict(observed)
                 provenance['catalog_limits'] = previous
+                # Fill only unknown capability fields from provider-declared
+                # facts; an explicit manual True/False is preserved as-is.
+                merged_caps = existing.capabilities.to_dict()
+                for key, value in _declared_capabilities(metadata).to_dict().items():
+                    if value is None or value == () or value is False or value == []:
+                        continue
+                    current = merged_caps.get(key)
+                    # JSON round-trips persist tuples as lists: compare both
+                    # empty forms. An explicit False is authoritative and is
+                    # never overwritten.
+                    if current is None or current == () or current == []:
+                        merged_caps[key] = value
                 profile = replace(
                     existing,
                     catalog_revision=revision,
                     provenance=provenance,
+                    capabilities=CapabilityProfile(**merged_caps),
                     limits=LimitProfile(**limits),
                 )
             else:
@@ -185,7 +252,7 @@ class LocalModelRegistry:
                     provider_model_id=raw_id,
                     profile_revision=revision,
                     catalog_revision=revision,
-                    capabilities=CapabilityProfile(),
+                    capabilities=_declared_capabilities(metadata),
                     limits=LimitProfile(**observed_limits),
                     protocols=self._default_protocols(),
                     provenance={"source": "provider_catalog", "metadata": metadata,

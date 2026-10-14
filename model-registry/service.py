@@ -11,6 +11,7 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,56 @@ def health() -> dict[str, Any]:
         "model_substitution": False,
         "provider_substitution": False,
         "key_rotation": True,
+    }
+
+
+# ── DASH fix (2026-10-14): /ready and /stats for the unified dashboard ────
+# The gateway status page probes /health + /ready + /stats for every active
+# service. The registry answered 404 on both, so its card permanently showed
+# readiness "unknown" with empty counters. Both endpoints are read-only
+# metadata — no credentials, no key material.
+START_TS = time.time()
+
+
+@app.get("/ready")
+def ready() -> dict[str, Any]:
+    db_ok = os.path.exists(MODEL_REGISTRY_DB)
+    providers = sorted(central.registries)
+    return {
+        "ready": bool(db_ok and providers),
+        "service": "model-registry",
+        "upstream_ok": db_ok,
+        "available": len(providers),
+        "keys": len(providers),
+        "providers": providers,
+    }
+
+
+@app.get("/stats")
+def stats() -> dict[str, Any]:
+    providers = sorted(central.registries)
+    models_cached = 0
+    per_provider: dict[str, int] = {}
+    observations = 0
+    for provider in providers:
+        try:
+            count = len(central.list_models(provider))
+        except Exception:
+            count = 0
+        per_provider[provider] = count
+        models_cached += count
+        try:
+            observations += len(central.state(provider).status_map())
+        except Exception:
+            pass
+    return {
+        "uptime_seconds": int(time.time() - START_TS),
+        "keys": len(providers),
+        "available": len(providers),
+        "models_cached": models_cached,
+        "total_requests": observations,
+        "per_provider_models": per_provider,
+        "providers": providers,
     }
 
 

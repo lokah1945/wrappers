@@ -62,7 +62,7 @@ def _server(peers, records, *, native=False, keys=1):
         isinstance(target, ast.Name) and target.id == 'REASONING_CONFIGS' for target in node.targets)]
     server_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Server')
     methods = {'_handle_anthropic_messages', 'proxy_openai', '_prepare_proxy_body',
-               '_compat2_proxy', '_proxy_post', '_handle_catch_all'}
+               '_compat2_proxy', '_proxy_post', '_handle_catch_all', '_stream_proxy'}
     server_class.body = [node for node in server_class.body if getattr(node, 'name', None) in methods]
     nodes.append(server_class)
 

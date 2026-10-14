@@ -360,6 +360,8 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     next_output_index = 1
     msg_open = False
     upstream_error = None
+    saw_done = False
+    saw_finish = False
     seq = 0
 
     def _sse(event_type: str, payload: dict) -> str:
@@ -401,12 +403,16 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
 
     async def _process_frame(frame: str):
         nonlocal full_text, upstream_error, reasoning_started, acc_reason, rsn_index, next_output_index
+        nonlocal saw_done, saw_finish
         for line in frame.split('\n'):
             line = line.strip()
             if not line.startswith('data:'):
                 continue
             data_str = line[5:].strip()
-            if not data_str or data_str == '[DONE]':
+            if not data_str:
+                continue
+            if data_str == '[DONE]':
+                saw_done = True
                 continue
             try:
                 c = json.loads(data_str)
@@ -423,6 +429,8 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
             if not isinstance(c, dict) or 'choices' not in c:
                 continue
             choice = (c.get('choices') or [{}])[0] or {}
+            if choice.get('finish_reason') is not None:
+                saw_finish = True
             delta = choice.get('delta') or {}
             content = delta.get('content')
             if isinstance(content, str) and content:
@@ -512,6 +520,18 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
             'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model,
             'status': 'failed',
             'error': {'code': 'upstream_error', 'message': str(upstream_error)[:2000]}}})
+        yield 'data: [DONE]\n\n'
+        return
+    if not saw_done and not saw_finish:
+        # §2.2.5 / B-07: the chat stream ended without [DONE] and without a
+        # finish_reason. Emitting response.completed here would fabricate a
+        # successful turn from a truncated stream; Codex would persist the
+        # partial answer. Surface the failure instead.
+        yield _sse('response.failed', {'response': {
+            'id': resp_id, 'object': 'response', 'created_at': created_at, 'model': model,
+            'status': 'failed',
+            'error': {'code': 'upstream_error',
+                      'message': 'upstream stream ended without completion'}}})
         yield 'data: [DONE]\n\n'
         return
     outputs_by_index = {

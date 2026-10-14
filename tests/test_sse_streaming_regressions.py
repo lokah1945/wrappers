@@ -1074,3 +1074,36 @@ def test_contract_shared_modules_exist():
                 'common/translations/anthropic_stream.py',
                 'common/translations/shared.py'):
         assert (ROOT / rel).exists(), f'shared module missing: {rel}'
+
+
+# ── key-cooldown policy: model-scoped 403 must not cool the credential ─────
+
+def test_model_scoped_403_does_not_cool_key():
+    """OpenRouter harness/region-gated models 403 per MODEL, not per key.
+
+    Live incident (2026-10-14): three model-gated 403s hard-blocked all 3
+    keys for 300s each -> 'All keys exhausted' outage for every model.
+    """
+    from common.translations.shared import should_cooldown_key
+
+    harness_gated = {"error": {"message": (
+        "thinkingmachines/inkling-small:free is only available on agentic "
+        "harnesses. Try plugging OpenRouter into an agentic harness."), "code": 403}}
+    assert should_cooldown_key(403, harness_gated) is False
+
+    region_gated = {"error": {"message": (
+        "deepseek/deepseek-r1 is not available in your region."), "code": 403}}
+    assert should_cooldown_key(403, region_gated) is False
+
+
+def test_credential_scoped_failures_still_cool_key():
+    """Genuine credential failures (invalid/banned key, quota) must cool."""
+    from common.translations.shared import should_cooldown_key
+
+    invalid = {"error": {"message": "Your API key is invalid.", "code": 401}}
+    assert should_cooldown_key(401, invalid) is True
+    banned = {"error": {"message": "Your api key has been banned.", "code": 403}}
+    assert should_cooldown_key(403, banned) is True
+    quota = {"error": {"message": "You have insufficient credits.", "code": 402}}
+    assert should_cooldown_key(402, quota) is True
+    assert should_cooldown_key(429, {}) is True

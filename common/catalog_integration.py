@@ -29,6 +29,15 @@ from pathlib import Path
 
 logger = logging.getLogger('catalog-integration')
 
+try:
+    # FastAPI resolves route annotations against module globals, so the
+    # Request type used by mcp_sse/mcp_messages MUST be importable at module
+    # level. A function-local import leaves the annotation unresolvable and
+    # FastAPI degrades the parameter to a (required) query param -> 422.
+    from fastapi import Request as _FastAPIRequest
+except ImportError:  # pragma: no cover - FastAPI is a hard runtime dep
+    _FastAPIRequest = None
+
 # ── Resolve model_fetcher path ──────────────────────────────────────────
 # Try multiple common locations
 _CANDIDATE_PATHS = [
@@ -36,6 +45,7 @@ _CANDIDATE_PATHS = [
     str(Path(__file__).resolve().parents[2] / 'model_fetcher'),
     str(Path(__file__).resolve().parents[3] / 'model_fetcher'),
     '/root/wrapper/model_fetcher',  # Primary: wrapper monorepo location
+    '/root/project/model_fetcher',  # Actual deployment location (openrouter/.env CATALOG_REPO)
     '/root/model_fetcher',
     '/home/user/model_fetcher',
 ]
@@ -124,6 +134,49 @@ def _get_catalog_db():
         return open_db(CATALOG_DB_PATH)
     except FileNotFoundError:
         return None
+
+
+def ngc_modality_map() -> dict:
+    """NIM-taxonomy modalities per served model from the NGC catalog DB.
+
+    Returns {model_id: [nim-modality, ...]} — e.g.
+    {"nvidia/model": ["text/chat", "image/vision"]}. Empty dict when the
+    catalog is unavailable; modalities are never guessed.
+    """
+    result: dict = {}
+    try:
+        db = _get_catalog_db()
+    except Exception:
+        return result
+    if db is None:
+        return result
+    try:
+        try:
+            rows = db.execute(
+                "SELECT served_model_id, modalities_json FROM models"
+            ).fetchall()
+        except Exception:
+            return result
+        for row in rows:
+            try:
+                mid = row["served_model_id"]
+                raw = row["modalities_json"]
+            except (IndexError, KeyError, TypeError):
+                mid, raw = row[0], row[1]
+            if not isinstance(mid, str) or not mid:
+                continue
+            try:
+                mods = json.loads(raw or "[]")
+            except (TypeError, ValueError):
+                continue
+            if isinstance(mods, list) and mods:
+                result[mid] = [str(m) for m in mods if str(m)]
+        return result
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
 
 
 # ── FastMCP Server Setup ───────────────────────────────────────────────
@@ -235,36 +288,58 @@ def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
                 return json.dumps(result.data if result.success else {"error": result.error},
                                   ensure_ascii=False, indent=2, default=str)
 
-        # ── Mount SSE transport ──
+        # ── Mount SSE transport (raw ASGI, FastMCP sse_app pattern) ──
+        # Starlette's Route treats *function* endpoints as request->Response
+        # handlers, but a callable *instance* stays a raw ASGI app. That lets
+        # connect_sse own the whole SSE response at the ASGI layer, exactly
+        # like FastMCP's own sse_app() handle_sse. The previous construction
+        # wrapped a coroutine in StreamingResponse — a coroutine is not an
+        # async iterator, so the response body never started (client saw an
+        # empty 200 stream, 'coroutine ... never awaited'), and the transport
+        # was invoked with the anyio task group in the receive position
+        # (SDK signature: connect_sse(scope, receive, send)).
         sse_transport = SseServerTransport("/mcp/messages")
 
-        @app.get("/mcp/sse")
-        async def mcp_sse(request):
-            # B-31 parity: MCP transports can expose tools; protect them like
-            # every other non-discovery agent surface. This still accepts both
-            # Authorization: Bearer and x-api-key through common.auth.
-            auth = _check_auth(request.headers, surface='/mcp/sse')
-            if not auth.ok:
-                return JSONResponse({"error": {"message": auth.message, "type": "authentication_error"}}, status_code=auth.status)
-            async def event_gen():
-                async with anyio.create_task_group() as tg:
-                    async with sse_transport.connect_sse(
-                        request.scope, tg, request._receive
-                    ) as streams:
-                        await mcp._mcp_server.run(
-                            streams[0], streams[1],
-                            mcp._create_initialization_options()
-                        )
-            return StreamingResponse(event_gen(), media_type="text/event-stream")
+        class _MCPASGIEndpoint:
+            def __init__(self, kind, transport, mcp, check_auth):
+                self._kind = kind
+                self._transport = transport
+                self._mcp = mcp
+                self._check_auth = check_auth
 
-        @app.post("/mcp/messages")
-        async def mcp_messages(request):
-            auth = _check_auth(request.headers, surface='/mcp/messages')
-            if not auth.ok:
-                return JSONResponse({"error": {"message": auth.message, "type": "authentication_error"}}, status_code=auth.status)
-            return await sse_transport.handle_post_message(
-                request.scope, request._receive, request._send
-            )
+            async def __call__(self, scope, receive, send):
+                # B-31 parity: MCP transports can expose tools; protect them
+                # like every other non-discovery agent surface. This still
+                # accepts both Authorization: Bearer and x-api-key through
+                # common.auth.
+                req = _FastAPIRequest(scope, receive)
+                if self._kind == 'sse':
+                    auth = self._check_auth(req.headers, surface='/mcp/sse')
+                else:
+                    auth = self._check_auth(req.headers, surface='/mcp/messages')
+                if not auth.ok:
+                    err = JSONResponse(
+                        {"error": {"message": auth.message, "type": "authentication_error"}},
+                        status_code=auth.status)
+                    await err(scope, receive, send)
+                    return
+                if self._kind == 'sse':
+                    async with self._transport.connect_sse(
+                            scope, receive, send) as streams:
+                        await self._mcp._mcp_server.run(
+                            streams[0], streams[1],
+                            self._mcp._mcp_server.create_initialization_options())
+                else:
+                    await self._transport.handle_post_message(
+                        scope, receive, send)
+
+        from starlette.routing import Route as _StarletteRoute
+        app.router.routes.append(_StarletteRoute(
+            '/mcp/sse', endpoint=_MCPASGIEndpoint('sse', sse_transport, mcp, _check_auth),
+            methods=['GET']))
+        app.router.routes.append(_StarletteRoute(
+            '/mcp/messages', endpoint=_MCPASGIEndpoint('post', sse_transport, None, _check_auth),
+            methods=['POST']))
 
         logger.info("[catalog] MCP server mounted at /mcp/sse")
         return mcp

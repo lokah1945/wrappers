@@ -27,6 +27,7 @@ import random
 import asyncio
 import threading
 import logging
+from collections import deque
 from typing import Optional, Dict, List, AsyncGenerator, Set
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -717,6 +718,19 @@ def get_model_meta(mid, upstream=None):
         upstream = next((m for m in MODEL_CATALOG.snapshot() if m.get('id') == rooted), {})
     base.update(upstream or {})
     base.update(discovery_limits(upstream))
+    # Provider-declared modalities are authoritative for this model; the
+    # Codex template defaults (input_modalities=[text, image] with
+    # supports_vision=False) must never mask what Nous actually publishes
+    # per model.
+    arch = base.get("architecture") if isinstance(base.get("architecture"), dict) else None
+    if arch is not None:
+        in_mods = arch.get("input_modalities")
+        out_mods = arch.get("output_modalities")
+        if isinstance(in_mods, list) and in_mods:
+            base["input_modalities"] = [str(x) for x in in_mods]
+            base["supports_vision"] = "image" in [str(x) for x in in_mods]
+        if isinstance(out_mods, list) and out_mods:
+            base["output_modalities"] = [str(x) for x in out_mods]
     base.update({
         "id": mid, "slug": mid, "object": "model", "created": 0,
         "owned_by": "alias" if is_alias_name(mid) else "nous",
@@ -1480,8 +1494,14 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     else:
         # Only infer tool_use when the upstream omitted finish_reason entirely.
         stop_reason = "tool_use" if (tool_calls or dsml_tools) else "end_turn"
+    # C-06 parity: the wrapper owns the id on the Anthropic surface. The
+    # upstream OpenAI-style id (e.g. Nous "gen-...") must not appear bare as
+    # an Anthropic message id.
+    res_id = chat.get("id") or f"msg_{int(time.time() * 1000)}"
+    if not (isinstance(res_id, str) and res_id.startswith("msg_")):
+        res_id = f"msg_{res_id}"
     return {
-        "id": chat.get("id", "msg_proxy"),
+        "id": res_id,
         "type": "message",
         "role": "assistant",
         "model": model,
@@ -1736,7 +1756,7 @@ class AnthropicStreamState:
         # calls must remain open CONCURRENTLY (see common/translations).
         self.open_tool_blocks = set()
         self.finished = False
-        self.msg_id = f"msg-{int(time.time()*1000)}"
+        self.msg_id = f"msg_{int(time.time()*1000)}"
 
     def _usage(self, raw=None):
         raw = raw or {}
@@ -2205,7 +2225,16 @@ class Metrics:
     every counter reset to zero on each restart, so the dashboard's
     total_requests/error_rate were meaningless after a deploy. Now persists to
     a JSON snapshot periodically and reloads it at startup (blackbox /
-    opencode / openrouter parity)."""
+    opencode / openrouter parity).
+
+    DASH fix (2026-10-14): the dashboard's Keys / Models / Activity / Chart
+    tabs were permanently empty because this class only tracked four global
+    counters and the wrapper exposed none of the /metrics/{keys,models,
+    activity,chart/hourly} endpoints the shared dashboard template consumes.
+    Tokens were never recorded either (call sites passed only error=), so the
+    KPI cards showed "in 0 · out 0" forever. The class now tracks per-model,
+    per-key, hourly-bucket and recent-activity data (all persisted), and
+    stream usage is recorded at end-of-stream by _sniff_stream_usage()."""
 
     def __init__(self):
         self.requests = 0
@@ -2216,6 +2245,14 @@ class Metrics:
         self._lock = threading.Lock()
         self._persist_interval = float(os.environ.get('METRICS_PERSIST_SEC', '60'))
         self._last_persist = time.time()
+        # DASH fix: per-dimension tracking for the dashboard tabs.
+        # deque is imported lazily so AST-extracted sandboxes (tests) that do
+        # not carry module imports still can construct the class.
+        from collections import deque as _deque
+        self.per_model: dict = {}     # model -> counters
+        self.per_key: dict = {}       # key label -> counters
+        self.hourly: dict = {}        # epoch-hour bucket -> counters
+        self.activity = _deque(maxlen=500)  # newest last; recent-activity tab
         self._load_persisted()
 
     def _persist_path(self) -> str:
@@ -2232,6 +2269,12 @@ class Metrics:
                 self.tokens_in = int(data.get('tokens_in', 0))
                 self.tokens_out = int(data.get('tokens_out', 0))
                 self.errors = int(data.get('errors', 0))
+                if isinstance(data.get('per_model'), dict):
+                    self.per_model = data['per_model']
+                if isinstance(data.get('per_key'), dict):
+                    self.per_key = data['per_key']
+                if isinstance(data.get('hourly'), dict):
+                    self.hourly = data['hourly']
         except Exception:
             pass
 
@@ -2243,35 +2286,278 @@ class Metrics:
                     'tokens_in': self.tokens_in,
                     'tokens_out': self.tokens_out,
                     'errors': self.errors,
+                    'per_model': self.per_model,
+                    'per_key': self.per_key,
+                    'hourly': self.hourly,
                     'saved_at': time.time(),
                 }, f)
         except Exception:
             pass
 
-    def record(self, prompt=0, completion=0, error=False):
+    def _touch_model(self, model: str, now: float) -> dict:
+        return self.per_model.setdefault(model, {
+            'requests': 0, 'errors': 0, 'success_count': 0,
+            'tokens_in': 0, 'tokens_out': 0, 'first_ts': now, 'last_ts': now,
+            'last_status': 200,
+        })
+
+    def _touch_key(self, label: str, now: float) -> dict:
+        return self.per_key.setdefault(label, {
+            'requests': 0, 'errors': 0, 'rate_limited': 0,
+            'tokens_in': 0, 'tokens_out': 0, 'last_used_ts': now,
+        })
+
+    def _touch_hour(self, now: float) -> dict:
+        bucket = int(now // 3600 * 3600)
+        return self.hourly.setdefault(bucket, {
+            'requests': 0, 'errors': 0, 'rate_limited': 0, 'tokens': 0,
+        })
+
+    def record(self, prompt=0, completion=0, error=False, model='', key_label='',
+               status=200, path='', streaming=False):
+        now = time.time()
         with self._lock:
             self.requests += 1
             self.tokens_in += prompt
             self.tokens_out += completion
             if error:
                 self.errors += 1
-            now = time.time()
+            if model:
+                m = self._touch_model(model, now)
+                m['requests'] += 1
+                if error:
+                    m['errors'] += 1
+                else:
+                    m['success_count'] += 1
+                m['tokens_in'] += prompt
+                m['tokens_out'] += completion
+                m['last_ts'] = now
+                m['last_status'] = int(status) if isinstance(status, (int, float)) else 200
+            if key_label:
+                k = self._touch_key(key_label, now)
+                k['requests'] += 1
+                if error:
+                    k['errors'] += 1
+                if int(status) == 429:
+                    k['rate_limited'] += 1
+                k['tokens_in'] += prompt
+                k['tokens_out'] += completion
+                k['last_used_ts'] = now
+            h = self._touch_hour(now)
+            h['requests'] += 1
+            if error:
+                h['errors'] += 1
+            if int(status) == 429:
+                h['rate_limited'] += 1
+            h['tokens'] += prompt + completion
+            self.activity.append({
+                'ts': int(now), 'id': self.requests,
+                'model': model or 'unknown', 'key_label': key_label or '—',
+                'status_code': int(status) if isinstance(status, (int, float)) else 0,
+                'prompt_tokens': int(prompt), 'completion_tokens': int(completion),
+                'streaming': bool(streaming), 'path': path or '',
+            })
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
+
+    def record_stream_usage(self, model='', key_label='', prompt_tokens=0, completion_tokens=0):
+        """Add end-of-stream usage without re-counting the request itself."""
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            self.tokens_in += prompt_tokens
+            self.tokens_out += completion_tokens
+            if model:
+                m = self._touch_model(model, now)
+                m['tokens_in'] += prompt_tokens
+                m['tokens_out'] += completion_tokens
+                m['last_ts'] = now
+            if key_label:
+                k = self._touch_key(key_label, now)
+                k['tokens_in'] += prompt_tokens
+                k['tokens_out'] += completion_tokens
+            h = self._touch_hour(now)
+            h['tokens'] += prompt_tokens + completion_tokens
+            # Update the matching pending activity row so the Activity tab
+            # reflects real token counts for streaming requests too.
+            for row in reversed(self.activity):
+                if (row.get('streaming') and row.get('model') == (model or 'unknown')
+                        and row.get('prompt_tokens', 0) == 0):
+                    row['prompt_tokens'] = int(prompt_tokens)
+                    row['completion_tokens'] = int(completion_tokens)
+                    break
             if now - self._last_persist >= self._persist_interval:
                 self._last_persist = now
                 self._persist()
 
     def snapshot(self):
         uptime = time.time() - self.start
-        return {
-            "uptime_seconds": int(uptime),
-            "total_requests": self.requests,
-            "total_tokens": self.tokens_in + self.tokens_out,
-            "input_tokens": self.tokens_in,
-            "output_tokens": self.tokens_out,
-            "error_rate": round(self.errors / max(1, self.requests), 4)
-        }
+        with self._lock:
+            return {
+                "uptime_seconds": int(uptime),
+                "total_requests": self.requests,
+                "total_tokens": self.tokens_in + self.tokens_out,
+                "input_tokens": self.tokens_in,
+                "output_tokens": self.tokens_out,
+                "error_rate": round(self.errors / max(1, self.requests), 4)
+            }
+
+    def per_model_summary(self) -> list:
+        with self._lock:
+            rows = []
+            for model, m in self.per_model.items():
+                reqs = m.get('requests', 0)
+                errs = m.get('errors', 0)
+                succ = m.get('success_count', 0)
+                rows.append({
+                    'model': model, 'requests': reqs,
+                    'error_count': errs, 'success_count': succ,
+                    'success_rate': round(100.0 * succ / reqs, 1) if reqs else 100.0,
+                    'prompt_tokens': m.get('tokens_in', 0),
+                    'completion_tokens': m.get('tokens_out', 0),
+                    'total_tokens': m.get('tokens_in', 0) + m.get('tokens_out', 0),
+                    'first_ts': m.get('first_ts'), 'last_ts': m.get('last_ts'),
+                    'last_status': m.get('last_status', 200),
+                })
+        rows.sort(key=lambda r: (r.get('last_ts') or 0), reverse=True)
+        return rows
+
+    def per_key_summary(self) -> list:
+        now = time.time()
+        with self._lock:
+            rows = []
+            for label, k in self.per_key.items():
+                last_ts = k.get('last_used_ts')
+                rows.append({
+                    'key_label': label, 'requests': k.get('requests', 0),
+                    'rate_limited_count': k.get('rate_limited', 0),
+                    'errors': k.get('errors', 0),
+                    'prompt_tokens': k.get('tokens_in', 0),
+                    'completion_tokens': k.get('tokens_out', 0),
+                    'total_tokens': k.get('tokens_in', 0) + k.get('tokens_out', 0),
+                    'last_used_ago_s': (int(now - last_ts) if last_ts else None),
+                })
+        rows.sort(key=lambda r: r.get('requests', 0), reverse=True)
+        return rows
+
+    def recent_activity(self, limit=50, offset=0) -> list:
+        with self._lock:
+            rows = list(self.activity)
+        rows.reverse()
+        start = max(0, int(offset))
+        end = start + max(1, int(limit))
+        return rows[start:end]
+
+    def hourly_chart(self, hours=24) -> list:
+        now = int(time.time())
+        out = []
+        with self._lock:
+            for i in range(max(1, int(hours)) - 1, -1, -1):
+                bucket = int((now - i * 3600) // 3600 * 3600)
+                h = self.hourly.get(bucket, {})
+                out.append({
+                    'ts': bucket, 'hour_ago': i,
+                    'requests': h.get('requests', 0),
+                    'tokens': h.get('tokens', 0),
+                    'total_tokens': h.get('tokens', 0),
+                    'rate_limited': h.get('rate_limited', 0),
+                    'errors': h.get('errors', 0),
+                })
+        return out
 
 metrics = Metrics()
+
+
+def _metrics_key_label(key_entry) -> str:
+    """Label of the credential that served a request ('' when OAuth)."""
+    return (getattr(key_entry, 'label', '') or '') if key_entry is not None else ''
+
+
+def _result_usage_tokens(result) -> tuple:
+    """Extract (prompt, completion) from a non-stream upstream result.
+
+    Handles both dialects: Anthropic usage.{input_tokens,output_tokens} and
+    OpenAI usage.{prompt_tokens,completion_tokens}. Returns (0, 0) when the
+    body carries no usage block."""
+    body = result
+    if isinstance(body, tuple) and len(body) == 2:
+        body = body[1]
+    if not isinstance(body, dict):
+        return 0, 0
+    usage = body.get('usage')
+    if not isinstance(usage, dict):
+        return 0, 0
+    prompt = usage.get('input_tokens', usage.get('prompt_tokens', 0)) or 0
+    completion = usage.get('output_tokens', usage.get('completion_tokens', 0)) or 0
+    try:
+        return int(prompt), int(completion)
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+async def _sniff_stream_usage(source, model: str, key_label: str):
+    """Pass frames through UNCHANGED while extracting token usage.
+
+    Works for both dialects because it inspects each complete SSE data: line:
+    Anthropic (message_start / message_delta usage) and OpenAI chat chunks
+    (final usage chunk). Recorded at stream end via record_stream_usage —
+    never blocks or mutates the client-visible stream."""
+    buffer = b''
+    in_tok = 0
+    out_tok = 0
+    try:
+        async for frame in source:
+            if isinstance(frame, (bytes, bytearray)):
+                buffer += bytes(frame)
+            elif isinstance(frame, str):
+                buffer += frame.encode('utf-8', 'replace')
+            else:
+                yield frame
+                continue
+            yield frame
+            while b'\n' in buffer:
+                line_bytes, buffer = buffer.split(b'\n', 1)
+                line = line_bytes.decode('utf-8', 'replace').strip()
+                if not line.startswith('data:'):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == '[DONE]':
+                    continue
+                try:
+                    data = json.loads(data_str)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                usage = data.get('usage')
+                message = data.get('message')
+                if not isinstance(usage, dict) and isinstance(message, dict) and isinstance(message.get('usage'), dict):
+                    usage = message['usage']
+                if not isinstance(usage, dict):
+                    # Responses dialect: response.completed carries usage
+                    # nested under data.response.usage.
+                    resp_obj = data.get('response')
+                    if isinstance(resp_obj, dict) and isinstance(resp_obj.get('usage'), dict):
+                        usage = resp_obj['usage']
+                if isinstance(usage, dict):
+                    try:
+                        in_tok = max(in_tok, int(usage.get('input_tokens', 0) or 0),
+                                     int(usage.get('prompt_tokens', 0) or 0))
+                        out_tok = max(out_tok, int(usage.get('output_tokens', 0) or 0),
+                                      int(usage.get('completion_tokens', 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+    finally:
+        try:
+            metrics.record_stream_usage(model=model, key_label=key_label,
+                                        prompt_tokens=in_tok, completion_tokens=out_tok)
+        except Exception:
+            pass
+    # NOTE: the finally block above runs when the generator is closed too
+    # (GeneratorExit), so usage is recorded even on client disconnects — and
+    # a metrics failure can NEVER break the client-visible stream.
 
 
 async def record_model_result(model_id: str, key_entry, status: int, payload, endpoint: str) -> None:
@@ -2575,6 +2861,9 @@ async def health():
         "live_keys": KEY_POOL.all_stats(),
         "metrics": metrics.snapshot(),
         "model_registry": MODEL_REGISTRY_CLIENT.stats(),
+        # DASH fix: the dashboard Health tab reads catalog age from /health
+        # (it previously only lived in /ready, so the card said "not reported").
+        "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
     }
 
 
@@ -2902,15 +3191,20 @@ async def chat_completions(request: Request):
         status, result, key_entry = await post_nous_with_retries(
             anthro_body, stream=is_stream, extra_headers=extra_h, path="v1/messages")
         _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
-        metrics.record(error=(status != 200))
+        _m_id = str(body.get("model", "") or "")
+        _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+        metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                       model=_m_id, key_label=_metrics_key_label(key_entry),
+                       status=status, path="/v1/chat/completions", streaming=is_stream)
         if status != 200:
             return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
             source = _translate_anthropic_stream_to_openai_chat(result, body.get("model", ""), HEARTBEAT_MS / 1000.0)
+            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
             async def gen():
                 try:
-                    async for frame in source:
+                    async for frame in _sniff:
                         yield frame
                 finally:
                     await close_stream(source, cleanup)
@@ -2921,14 +3215,18 @@ async def chat_completions(request: Request):
     # F3 round-2 fix: model-state persistence must not delay the response;
     # fire-and-forget with a retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
-    metrics.record(error=(status != 200))
+    _m_id = str(body.get("model", "") or "")
+    _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+    metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                   model=_m_id, key_label=_metrics_key_label(key_entry),
+                   status=status, path="/v1/chat/completions", streaming=is_stream)
 
     if status != 200:
         return _native_json_response(result, status)
 
     if is_stream:
         cleanup = _stream_resource_cleanup(result, key_entry)
-        return StreamingResponse(_stream_passthrough(result, key_entry, on_close=cleanup), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
+        return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
     return _native_json_response(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---
@@ -2963,13 +3261,17 @@ async def responses(request: Request):
             client_surface='openai_responses', path='v1/responses')
         _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result,
                                              '/v1/responses'), 'model-result')
-        metrics.record(error=(status != 200))
+        _m_id = str(body.get('model', '') or '')
+        _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+        metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                       model=_m_id, key_label=_metrics_key_label(key_entry),
+                       status=status, path="/v1/responses", streaming=is_stream)
         if not _responses_chat_fallback_allowed(status, result):
             if status != 200 or not is_stream:
                 return _native_json_response(result, status)
             cleanup = _stream_resource_cleanup(result, key_entry)
             return StreamingResponse(
-                _stream_passthrough(result, key_entry, on_close=cleanup), on_close=cleanup, media_type='text/event-stream',
+                _sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type='text/event-stream',
                 headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **_native_response_headers(result)})
         previous_id = body.get('previous_response_id')
         if previous_id is not None and get_stored_conversation(
@@ -2997,15 +3299,20 @@ async def responses(request: Request):
             anthro_body, stream=is_stream, extra_headers=extra_h,
             client_surface="openai_responses", path="v1/messages")
         _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
-        metrics.record(error=(status != 200))
+        _m_id = str(chat_body.get("model", "") or "")
+        _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+        metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                       model=_m_id, key_label=_metrics_key_label(key_entry),
+                       status=status, path="/v1/responses", streaming=is_stream)
         if status != 200:
             return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
             source = _translate_anthropic_stream_to_openai_chat(result, chat_body.get("model", ""), HEARTBEAT_MS / 1000.0)
+            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
             async def gen():
                 try:
-                    async for frame in source:
+                    async for frame in _sniff:
                         yield frame
                 finally:
                     await close_stream(source, cleanup)
@@ -3027,7 +3334,11 @@ async def responses(request: Request):
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
-    metrics.record(error=(status != 200))
+    _m_id = str(chat_body.get("model", "") or "")
+    _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+    metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                   model=_m_id, key_label=_metrics_key_label(key_entry),
+                   status=status, path="/v1/responses", streaming=is_stream)
     if status != 200:
         return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
 
@@ -3036,6 +3347,7 @@ async def responses(request: Request):
         state = ResponsesStreamState(rid, chat_body["model"])
         cleanup = _stream_resource_cleanup(result, key_entry)
         source = stream_with_heartbeat(result, _responses_sse_serialize, state=state, key_entry=key_entry, on_close=cleanup)
+        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
         async def gen():
             try:
                 # Codex requires output_item.added BEFORE first delta.
@@ -3045,7 +3357,7 @@ async def responses(request: Request):
                 # which writes a Python repr ({'type': ...} with single quotes)
                 # into the SSE body — invalid JSON that Codex either ignores or
                 # renders as text. Emit a proper event:/data: frame instead.
-                async for line in source:
+                async for line in _sniff:
                     yield line
             finally:
                 await close_stream(source, cleanup)
@@ -3144,12 +3456,16 @@ async def messages(request: Request):
         status, result, key_entry = await post_nous_with_retries(
             body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages", path="v1/messages")
         _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
-        metrics.record(error=(status != 200))
+        _m_id = str(body.get("model", "") or "")
+        _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+        metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                       model=_m_id, key_label=_metrics_key_label(key_entry),
+                       status=status, path="/v1/messages", streaming=is_stream)
         if status != 200:
             return _native_json_response(result, status)
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
-            return StreamingResponse(_stream_passthrough(result, key_entry, on_close=cleanup), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
+            return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
         return _native_json_response(result)
 
     try:
@@ -3166,7 +3482,11 @@ async def messages(request: Request):
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
-    metrics.record(error=(status != 200))
+    _m_id = str(chat_body.get("model", "") or "")
+    _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+    metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                   model=_m_id, key_label=_metrics_key_label(key_entry),
+                   status=status, path="/v1/messages", streaming=is_stream)
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}
@@ -3178,9 +3498,10 @@ async def messages(request: Request):
         state = AnthropicStreamState(chat_body["model"])
         cleanup = _stream_resource_cleanup(result, key_entry)
         source = stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state, key_entry=key_entry, on_close=cleanup)
+        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
         async def gen():
             try:
-                async for line in source:
+                async for line in _sniff:
                     yield line
             finally:
                 await close_stream(source, cleanup)
@@ -3213,6 +3534,71 @@ async def model_status(request: Request):
         "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
         "states": MODEL_STORE.status_map(),
     }
+
+
+# DASH fix: the four endpoints below are what the shared dashboard template's
+# Keys / Models / Activity / Chart tabs consume. Without them those tabs
+# rendered permanent empty states ("No API keys configured", "No activity
+# recorded yet", …) even while the wrapper served live traffic. All are
+# read-only counters — no secrets, no key material, consistent with the
+# project principle that telemetry is public-by-default.
+@app.get("/metrics/models")
+async def metrics_models(request: Request):
+    window = request.query_params.get("window", "24h")
+    return {"window": window, "models": metrics.per_model_summary(), "provider": "nous"}
+
+
+@app.get("/metrics/keys")
+async def metrics_keys(request: Request):
+    window = request.query_params.get("window", "24h")
+    live = {}
+    try:
+        for k in KEY_POOL.all_stats():
+            if isinstance(k, dict) and k.get("label"):
+                live[k["label"]] = k
+    except Exception:
+        live = {}
+    rows = metrics.per_key_summary()
+    seen = set()
+    for row in rows:
+        row["live"] = live.get(row["key_label"], {})
+        row["configured_hard"] = (live.get(row["key_label"], {}) or {}).get("hard_rpm")
+        row["configured_soft"] = (live.get(row["key_label"], {}) or {}).get("soft_rpm")
+        seen.add(row["key_label"])
+    for label, lv in live.items():
+        if label not in seen:
+            rows.append({
+                "key_label": label, "requests": 0, "rate_limited_count": 0,
+                "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
+                "total_tokens": 0, "last_used_ago_s": None,
+                "live": lv,
+                "configured_hard": lv.get("hard_rpm"),
+                "configured_soft": lv.get("soft_rpm"),
+            })
+    return {"window": window, "keys": rows}
+
+
+@app.get("/metrics/activity")
+async def metrics_activity(request: Request):
+    try:
+        limit = max(1, min(500, int(request.query_params.get("limit", "50"))))
+    except ValueError:
+        limit = 50
+    try:
+        offset = max(0, int(request.query_params.get("offset", "0")))
+    except ValueError:
+        offset = 0
+    rows = metrics.recent_activity(limit=limit, offset=offset)
+    return {"limit": limit, "offset": offset, "count": len(rows), "rows": rows}
+
+
+@app.get("/metrics/chart/hourly")
+async def metrics_chart_hourly(request: Request):
+    try:
+        hours = max(1, min(168, int(request.query_params.get("hours", "24"))))
+    except ValueError:
+        hours = 24
+    return {"hours": hours, "data": metrics.hourly_chart(hours)}
 
 
 @app.get("/dashboard")

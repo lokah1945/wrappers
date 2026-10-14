@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import re
 import time
+import uuid
 from typing import Any
 
 try:
@@ -343,6 +344,42 @@ _MODEL_CAPACITY_MARKERS = (
     'invalid model name', 'model unavailable',
 )
 
+_MODEL_SCOPED_403_MARKERS = (
+    'only available on',              # OpenRouter: 'X is only available on agentic harnesses'
+    'agentic harness',                # OpenRouter harness-gated models
+    'not available in your region',   # region-gated model availability
+    'model is currently not',         # transient model gating
+)
+
+# A model id token like 'publisher/model' or 'publisher/model:variant'.
+_MODEL_ID_RE = re.compile(r'[a-z0-9][a-z0-9._-]*/[a-z0-9][a-z0-9._-]+')
+
+
+def looks_model_scoped_forbidden(body: Any) -> bool:
+    """True when a 403 describes a MODEL-level restriction, not the credential.
+
+    OpenRouter gates some models ('only available on agentic harnesses',
+    region gating). Such 403s must NOT cool the credential: three
+    model-gated requests were observed taking the whole key pool offline
+    ('All keys exhausted' for every model) because each 403 hard-blocked
+    one key for AUTH_KEY_COOLDOWN_SEC (300s).
+    """
+    try:
+        blob = json.dumps(body, ensure_ascii=False).lower() if isinstance(body, dict) else str(body).lower()
+    except (TypeError, ValueError):
+        blob = str(body).lower()
+    # Explicitly credential-scoped messages stay key failures.
+    if 'your api key' in blob or 'your account' in blob or 'api key' in blob:
+        return False
+    if any(marker in blob for marker in _MODEL_SCOPED_403_MARKERS):
+        return True
+    # An error that names a specific model id (publisher/model) is
+    # describing that model. Skip when a URL appears (paths also contain
+    # 'x/y' segments) — the explicit markers cover those cases anyway.
+    if 'http' not in blob and _MODEL_ID_RE.search(blob):
+        return True
+    return False
+
 
 def looks_model_capacity_error(body: Any) -> bool:
     """True when the upstream error is about the MODEL, not the credential.
@@ -375,6 +412,11 @@ def should_cooldown_key(status: int, body: Any) -> bool:
     # F1: anti-bot/Cloudflare transport blocks (403 with HTML body) are NOT
     # credential failures — cooldown would take the whole key pool offline.
     if status in (401, 402, 403) and looks_anti_bot_challenge(body):
+        return False
+    # A 403 that describes a MODEL-level restriction (OpenRouter harness /
+    # region gating) is not a credential failure either — cooling the key
+    # for it took whole pools offline after a few model-gated requests.
+    if status == 403 and looks_model_scoped_forbidden(body):
         return False
     if status in (429, 401, 402, 403):
         return True
@@ -492,8 +534,10 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
     if "choices" in a_resp:
         return a_resp
 
-    msg_id = a_resp.get("id") or f"msg_{int(time.time() * 1000)}"
-    oai_id = f"chatcmpl-{msg_id}"
+    # C-06: the wrapper owns the response ID on the OpenAI surface. Deriving
+    # it from the upstream Anthropic id leaked dialect markers
+    # ("chatcmpl-msg_12345") into OpenAI clients.
+    oai_id = f"chatcmpl-{int(time.time() * 1000)}-{uuid.uuid4().hex[:12]}"
     model = a_resp.get("model") or request_model or ""
     role = a_resp.get("role", "assistant")
     content_blocks = a_resp.get("content", [])
@@ -683,7 +727,18 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
 
 async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
     """Async generator: consume Anthropic SSE stream, yield OpenAI Chat SSE events."""
-    msg_id = f"chatcmpl-{int(time.time() * 1000)}"
+    msg_id = f"chatcmpl-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+
+    def _error_frame(message: str, etype: str = "api_error"):
+        # B-07: OpenAI-dialect mid-stream failure frame. No chunk fields — a
+        # bare {"error": ...} object is the established convention (vLLM /
+        # OpenRouter) and is what this repo's Responses translator detects.
+        return "data: " + json.dumps({
+            "error": {"message": str(message)[:2000], "type": etype, "code": "upstream_error"}
+        }) + "\n\n"
+
+    saw_message_stop = False
+
     async def iter_lines():
         buffer = ""
         async for chunk in anthropic_stream:
@@ -761,7 +816,31 @@ async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
                 yield f"data: {json.dumps(out_chunk)}\n\n"
 
             elif event_type == "message_stop":
+                saw_message_stop = True
                 yield "data: [DONE]\n\n"
+
+            elif event_type == "error":
+                # B-07: an upstream Anthropic error event must surface on the
+                # OpenAI chat surface as an {"error": ...} data frame. It must
+                # never be dropped and never be followed by a fabricated
+                # [DONE]/finish_reason — the client has to be able to detect
+                # the failure and retry.
+                err = data.get("error") or {}
+                if isinstance(err, dict):
+                    err_message = err.get("message") or "upstream error"
+                    err_type = err.get("type") or "api_error"
+                else:
+                    err_message = str(err) or "upstream error"
+                    err_type = "api_error"
+                yield _error_frame(err_message, err_type)
+                return
+
+    if not saw_message_stop:
+        # Abnormal EOF: the Anthropic protocol requires a terminal
+        # message_stop. Ending without one is an upstream failure — surface
+        # it as an error frame instead of letting the client treat a
+        # truncated stream as a complete successful turn.
+        yield _error_frame("upstream stream ended without message_stop")
 
 
 def _openai_content_to_anthropic(content: Any) -> Any:
@@ -904,6 +983,29 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
         msgs.append({'role': 'user', 'content': converted})
 
     out: dict = {'model': model, 'messages': msgs}
+
+    # Anthropic Messages requires alternating roles and one user message per
+    # tool-result batch. OpenAI emits each parallel tool result as its own
+    # consecutive `role: tool` message, which naively converts to consecutive
+    # user messages — Anthropic rejects that ("roles must alternate"). Merge
+    # consecutive same-role messages (text content becomes text blocks).
+    merged: list = []
+    for m in msgs:
+        if merged and merged[-1]['role'] == m['role'] and m['role'] in ('user', 'assistant'):
+            prev = merged[-1]
+            prev_blocks = prev['content'] if isinstance(prev['content'], list) else (
+                [{'type': 'text', 'text': prev['content']}] if isinstance(prev['content'], str) and prev['content'] else [])
+            if isinstance(m['content'], str):
+                add_blocks = [{'type': 'text', 'text': m['content']}] if m['content'] else []
+            elif isinstance(m['content'], list):
+                add_blocks = m['content']
+            else:
+                add_blocks = []
+            prev['content'] = prev_blocks + add_blocks
+        else:
+            merged.append(m)
+    out['messages'] = merged
+
     if system_parts:
         out['system'] = '\n\n'.join(system_parts)
     if chat_body.get('stream') is not None:
@@ -911,6 +1013,12 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
     mt = chat_body.get('max_tokens')
     if mt is not None:
         out['max_tokens'] = mt
+    else:
+        # The Anthropic Messages API hard-requires max_tokens; an OpenAI chat
+        # client that omits it would otherwise receive an upstream 400 on
+        # every layer-2 request. 8192 is the documented ceiling for the
+        # Claude 3/3.5 family and a safe default for compatible upstreams.
+        out['max_tokens'] = 8192
     for k in ('temperature', 'top_p', 'top_k'):
         if chat_body.get(k) is not None:
             out[k] = chat_body[k]

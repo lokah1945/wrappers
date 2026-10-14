@@ -133,7 +133,8 @@ def _route_namespace(wrapper, *, anthropic, response, captured, status=200):
         '_responses_use_native_upstream': lambda: not anthropic,
         '_responses_chat_fallback_allowed': responses_chat_fallback_allowed,
         '_build_forward_headers': lambda headers: dict(headers),
-        'metrics': SimpleNamespace(record=lambda **kwargs: None),
+        'metrics': SimpleNamespace(record=lambda **kwargs: None,
+                                   record_stream_usage=lambda **kwargs: None),
         'record_model_result': record, '_fire_and_forget': discard_background,
         'post_nous_with_retries': proxy, '_proxy_request': proxy,
         'anthropic_to_openai_response': no_conversion,
@@ -153,6 +154,10 @@ def _route_namespace(wrapper, *, anthropic, response, captured, status=200):
     names = {'chat_completions', 'messages', 'responses'}
     if wrapper == 'nous':
         names.update({'_stream_passthrough', '_stream_resource_cleanup', '_native_json_response', '_native_response_headers'})
+        # DASH fix: the routes now record per-model/key/activity metrics via
+        # these module helpers — extract them with the routes so the sandbox
+        # has the same dependencies as production.
+        names.update({'_result_usage_tokens', '_metrics_key_label', '_sniff_stream_usage'})
     return _load(ROOT / wrapper / 'src/main.py', names, **globals_)
 
 
@@ -313,7 +318,8 @@ def _openrouter_proxy_namespace(pool, agent):
     def discard_background(coro, *args):
         coro.close()
 
-    return _load(ROOT / 'openrouter/src/main.py', {'_proxy_request'},
+    return _load(ROOT / 'openrouter/src/main.py',
+                 {'_proxy_request', '_usage_tokens', '_sniff_stream_usage'},
                  MODEL_REGISTRY=_registry(), same_provider_model_id=lambda *args: True,
                  pool=pool, OPENROUTER_BASE='http://mock.invalid/v1', get_agent=get_agent,
                  _build_forward_headers=lambda headers: dict(headers),
@@ -322,7 +328,7 @@ def _openrouter_proxy_namespace(pool, agent):
                  classify_upstream_error=classify_upstream_error,
                  _responses_chat_fallback_allowed=responses_chat_fallback_allowed,
                  _spawn_background=discard_background, _record_model_result=record,
-                 metrics=SimpleNamespace(record_request=record),
+                 metrics=SimpleNamespace(record_request=record, record_tokens=record),
                  sanitize_header_value=lambda value: value,
                  _iter_chunks_with_idle=iter_chunks_with_idle, _IDLE=IDLE, HEARTBEAT_MS=100000,
                  _error_response=lambda content, status_code=500, **kwargs:

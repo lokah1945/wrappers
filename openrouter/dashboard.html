@@ -23,6 +23,20 @@
   .badge { display: inline-block; padding: 0.15rem 0.5rem; border-radius: 99px; font-size: 0.7rem; font-weight: bold; }
   .badge.on { background: #1b5e20; color: #81c784; }
   .badge.off { background: #b71c1c; color: #ef9a9a; }
+  #models-content { max-height: 420px; overflow-y: auto; }
+  .model-row { display: flex; align-items: center; gap: 0.5rem; padding: 0.3rem 0; border-bottom: 1px solid #2a2a3e; font-size: 0.85rem; }
+  .model-row:last-child { border-bottom: none; }
+  .model-name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .model-stats { color: var(--muted); font-size: 0.75rem; white-space: nowrap; }
+  .model-avail { font-size: 0.7rem; padding: 0.1rem 0.4rem; border-radius: 4px; white-space: nowrap; }
+  .model-avail.available { background: #1b5e20; color: #81c784; }
+  .model-avail.other { background: #31404f; color: #9fb3c8; }
+  .model-ctx { font-size: 0.75rem; font-weight: bold; color: #4dd0e1; background: rgba(77,208,225,.12); padding: 0.1rem 0.45rem; border-radius: 4px; white-space: nowrap; }
+  .mod-wrap { white-space: nowrap; }
+  .mod-chip { display: inline-block; font-size: 0.65rem; padding: 0.05rem 0.35rem; border-radius: 4px; margin-right: 2px; }
+  .mod-in { background: rgba(129,199,132,.15); color: #81c784; }
+  .mod-out { background: rgba(79,195,247,.15); color: #4fc3f7; }
+  .mod-arrow { color: var(--muted); font-size: 0.7rem; margin: 0 2px; }
 </style>
 </head>
 <body>
@@ -51,18 +65,35 @@
       <h2>Catalog</h2>
       <div id="catalog-content">Loading...</div>
     </div>
+    <div class="card" id="models-card" style="grid-column: 1 / -1">
+      <h2>Models <span id="models-count" style="color: var(--muted); font-size: 0.75rem"></span></h2>
+      <div id="models-content">Loading...</div>
+    </div>
     <div class="card" id="management-card">
       <h2>Key Management</h2>
       <div id="management-content">Loading...</div>
     </div>
   </div>
   <script>
+    function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function fmtCtx(n) {
+      if (n == null) return '—';
+      if (n >= 1000000) { const v = n / 1000000; return (v >= 10 ? Math.round(v) : Math.round(v * 100) / 100) + 'M'; }
+      if (n >= 1000) return Math.round(n / 1000) + 'K';
+      return String(n);
+    }
+    function modChips(list, cls) {
+      if (!Array.isArray(list) || !list.length) return '';
+      return list.map(x => '<span class="mod-chip ' + cls + '">' + esc(x) + '</span>').join('');
+    }
     async function refresh() {
       try {
-        const [health, stats, cHealth] = await Promise.all([
+        const [health, stats, cHealth, models, perModel] = await Promise.all([
           fetch('/health').then(r => r.json()),
           fetch('/stats').then(r => r.json()),
           fetch('/catalog/health').then(r => r.json()),
+          fetch('/v1/models').then(r => r.json()).catch(() => null),
+          fetch('/metrics/models').then(r => r.json()).catch(() => null),
         ]);
 
         document.getElementById('status-content').innerHTML = `
@@ -88,6 +119,51 @@
         document.getElementById('catalog-content').innerHTML = `
           <div class="stat"><span class="label">Status</span><div class="value ${cHealth.ok ? 'ok' : 'err'}">${cHealth.ok ? '✅ Available' : '❌ Unavailable'}</div></div>
         `;
+
+        // DASH fix: full model list from /v1/models enriched with per-model
+        // usage stats from /metrics/models — previously this dashboard had NO
+        // model list at all even though the wrapper serves 14+ models.
+        const modelsEl = document.getElementById('models-content');
+        const countEl = document.getElementById('models-count');
+        const catalog = (models && Array.isArray(models.data)) ? models.data : [];
+        const usage = {};
+        if (perModel && Array.isArray(perModel.models)) {
+          for (const m of perModel.models) if (m && m.model) usage[m.model] = m;
+        }
+        if (!catalog.length) {
+          modelsEl.innerHTML = '<div class="stat err">Model list unavailable</div>';
+          countEl.textContent = '';
+        } else {
+          countEl.textContent = `(${catalog.length} models, ${Object.keys(usage).length} with traffic)`;
+          modelsEl.innerHTML = catalog.map(m => {
+            const id = typeof m === 'string' ? m : (m.id || m.model || '?');
+            const mo = (typeof m === 'object' && m) ? m : {};
+            const u = usage[id] || null;
+            const avail = typeof m === 'object' && m.availability_state === 'available';
+            const stats = u
+              ? `${u.requests || 0} req · ${((u.total_tokens) || 0).toLocaleString()} tok${u.error_count ? ' · ' + u.error_count + ' err' : ''}`
+              : 'no traffic yet';
+            // ctx + modality metadata (OpenRouter schema: context_length +
+            // architecture.input/output_modalities; NIM schema: context_window +
+            // input/output arrays — both honored so the card never lies)
+            const ctx = mo.context_length || (mo.top_provider || {}).context_length || mo.context_window || mo.max_context_window || null;
+            const maxOut = (mo.top_provider || {}).max_completion_tokens || mo.max_output_tokens || null;
+            const arch = mo.architecture || {};
+            const inMods = mo.input_modalities || mo.input || arch.input_modalities || [];
+            const outMods = mo.output_modalities || mo.output || arch.output_modalities || [];
+            const ctxTitle = 'context ' + (ctx != null ? ctx.toLocaleString() + ' tokens' : 'unknown') + (maxOut ? ' · max output ' + maxOut.toLocaleString() : '');
+            const modsHtml = (inMods.length || outMods.length)
+              ? '<span class="mod-wrap" title="input: ' + esc(inMods.join(', ')) + ' → output: ' + esc(outMods.join(', ')) + '">' + modChips(inMods, 'mod-in') + '<span class="mod-arrow">→</span>' + modChips(outMods, 'mod-out') + '</span>'
+              : '<span class="model-stats">mods?</span>';
+            return `<div class="model-row">
+              <span class="model-name" title="${id}">${id}</span>
+              <span class="model-ctx" title="${ctxTitle}">${fmtCtx(ctx)}</span>
+              ${modsHtml}
+              <span class="model-stats">${stats}</span>
+              <span class="model-avail ${avail ? 'available' : 'other'}">${typeof m === 'object' && m.availability_state ? m.availability_state : 'unknown'}</span>
+            </div>`;
+          }).join('');
+        }
 
         // Management status
         const hasMgmt = health.keys_status && health.keys_status.openrouter && health.keys_status.openrouter.management_enabled;

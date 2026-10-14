@@ -9,11 +9,18 @@ import json
 import os
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 
 class Metrics:
-    """Thread-safe request metrics with disk persistence."""
+    """Thread-safe request metrics with disk persistence.
+
+    DASH fix (2026-10-14): per-model / per-key / hourly / activity tracking
+    added so the dashboard's Models card and /metrics/models endpoint carry
+    real data. record_tokens() lets stream/non-stream paths add usage at
+    completion WITHOUT double-counting the request itself (the request was
+    already counted by record_request at response start)."""
 
     def __init__(self, db_path: str | None = None):
         self.start = time.time()
@@ -23,6 +30,14 @@ class Metrics:
         self.errors = 0
         self._db_path = db_path
         self._lock = threading.Lock()
+        # DASH fix: dashboard dimensions.
+        # deque is imported lazily so AST-extracted sandboxes (tests) that do
+        # not carry module imports still can construct the class.
+        from collections import deque as _deque
+        self.per_model: dict = {}
+        self.per_key: dict = {}
+        self.hourly: dict = {}
+        self.activity = _deque(maxlen=500)
         # B-39 fix: persist periodically, not only on graceful shutdown, so
         # counters survive SIGKILL/OOM (blackbox BB-15/OC-14 parity). This
         # matters more here because openrouter previously had no graceful
@@ -49,6 +64,12 @@ class Metrics:
                 self.tokens_in = int(data.get('tokens_in', 0))
                 self.tokens_out = int(data.get('tokens_out', 0))
                 self.errors = int(data.get('errors', 0))
+                if isinstance(data.get('per_model'), dict):
+                    self.per_model = data['per_model']
+                if isinstance(data.get('per_key'), dict):
+                    self.per_key = data['per_key']
+                if isinstance(data.get('hourly'), dict):
+                    self.hourly = data['hourly']
         except Exception:
             pass
 
@@ -62,6 +83,9 @@ class Metrics:
                     'tokens_in': self.tokens_in,
                     'tokens_out': self.tokens_out,
                     'errors': self.errors,
+                    'per_model': self.per_model,
+                    'per_key': self.per_key,
+                    'hourly': self.hourly,
                     'saved_at': time.time(),
                 }, f)
         except Exception:
@@ -72,13 +96,106 @@ class Metrics:
 
     async def record_request(self, model: str = "", prompt_tokens: int = 0,
                               completion_tokens: int = 0, **kwargs):
+        now = time.time()
+        status_code = int(kwargs.get('status_code', 200) or 0)
+        key_label = str(kwargs.get('key_label', '') or '')
+        is_error = status_code >= 400
         with self._lock:
             self.requests += 1
             self.tokens_in += prompt_tokens
             self.tokens_out += completion_tokens
-            if kwargs.get('status_code', 200) >= 400:
+            if is_error:
                 self.errors += 1
-            now = time.time()
+            if model:
+                m = self.per_model.setdefault(model, {
+                    'requests': 0, 'errors': 0, 'success_count': 0,
+                    'tokens_in': 0, 'tokens_out': 0,
+                    'first_ts': now, 'last_ts': now, 'last_status': status_code,
+                })
+                m['requests'] += 1
+                if is_error:
+                    m['errors'] += 1
+                else:
+                    m['success_count'] += 1
+                m['tokens_in'] += prompt_tokens
+                m['tokens_out'] += completion_tokens
+                m['last_ts'] = now
+                m['last_status'] = status_code
+            if key_label:
+                k = self.per_key.setdefault(key_label, {
+                    'requests': 0, 'errors': 0, 'rate_limited': 0,
+                    'tokens_in': 0, 'tokens_out': 0, 'last_used_ts': now,
+                })
+                k['requests'] += 1
+                if is_error:
+                    k['errors'] += 1
+                if status_code == 429:
+                    k['rate_limited'] += 1
+                k['tokens_in'] += prompt_tokens
+                k['tokens_out'] += completion_tokens
+                k['last_used_ts'] = now
+            hour = int(now // 3600 * 3600)
+            h = self.hourly.setdefault(hour, {
+                'requests': 0, 'errors': 0, 'rate_limited': 0, 'tokens': 0,
+            })
+            h['requests'] += 1
+            if is_error:
+                h['errors'] += 1
+            if status_code == 429:
+                h['rate_limited'] += 1
+            h['tokens'] += prompt_tokens + completion_tokens
+            self.activity.append({
+                'ts': int(now), 'model': model or 'unknown',
+                'key_label': key_label or '—', 'status_code': status_code,
+                'prompt_tokens': int(prompt_tokens),
+                'completion_tokens': int(completion_tokens),
+                'streaming': bool(kwargs.get('streaming', False)),
+                'path': str(kwargs.get('path', '') or ''),
+            })
+            if now - self._last_persist >= self._persist_interval:
+                self._last_persist = now
+                self._persist()
+
+    async def record_tokens(self, model: str = "", prompt_tokens: int = 0,
+                            completion_tokens: int = 0, key_label: str = ""):
+        """Add usage tokens without re-counting the request (DASH fix).
+
+        record_request already counted the request when the upstream response
+        started; tokens for streaming responses only become known at
+        end-of-stream, so they are added here."""
+        if prompt_tokens <= 0 and completion_tokens <= 0:
+            return
+        now = time.time()
+        with self._lock:
+            self.tokens_in += prompt_tokens
+            self.tokens_out += completion_tokens
+            if model:
+                m = self.per_model.setdefault(model, {
+                    'requests': 0, 'errors': 0, 'success_count': 0,
+                    'tokens_in': 0, 'tokens_out': 0,
+                    'first_ts': now, 'last_ts': now, 'last_status': 200,
+                })
+                m['tokens_in'] += prompt_tokens
+                m['tokens_out'] += completion_tokens
+                m['last_ts'] = now
+            if key_label:
+                k = self.per_key.setdefault(key_label, {
+                    'requests': 0, 'errors': 0, 'rate_limited': 0,
+                    'tokens_in': 0, 'tokens_out': 0, 'last_used_ts': now,
+                })
+                k['tokens_in'] += prompt_tokens
+                k['tokens_out'] += completion_tokens
+            hour = int(now // 3600 * 3600)
+            h = self.hourly.setdefault(hour, {
+                'requests': 0, 'errors': 0, 'rate_limited': 0, 'tokens': 0,
+            })
+            h['tokens'] += prompt_tokens + completion_tokens
+            for row in reversed(self.activity):
+                if (row.get('streaming') and row.get('model') == (model or 'unknown')
+                        and row.get('prompt_tokens', 0) == 0):
+                    row['prompt_tokens'] = int(prompt_tokens)
+                    row['completion_tokens'] = int(completion_tokens)
+                    break
             if now - self._last_persist >= self._persist_interval:
                 self._last_persist = now
                 self._persist()
@@ -99,6 +216,33 @@ class Metrics:
                 "output_tokens": self.tokens_out,
                 "error_rate": min(1.0, round(self.errors / max(1, self.requests), 4)),
             }
+
+    def per_model_summary(self) -> list:
+        with self._lock:
+            rows = []
+            for model, m in self.per_model.items():
+                reqs = m.get('requests', 0)
+                succ = m.get('success_count', 0)
+                rows.append({
+                    'model': model, 'requests': reqs,
+                    'error_count': m.get('errors', 0), 'success_count': succ,
+                    'success_rate': round(100.0 * succ / reqs, 1) if reqs else 100.0,
+                    'prompt_tokens': m.get('tokens_in', 0),
+                    'completion_tokens': m.get('tokens_out', 0),
+                    'total_tokens': m.get('tokens_in', 0) + m.get('tokens_out', 0),
+                    'first_ts': m.get('first_ts'), 'last_ts': m.get('last_ts'),
+                    'last_status': m.get('last_status', 200),
+                })
+        rows.sort(key=lambda r: (r.get('last_ts') or 0), reverse=True)
+        return rows
+
+    def recent_activity(self, limit: int = 50, offset: int = 0) -> list:
+        with self._lock:
+            rows = list(self.activity)
+        rows.reverse()
+        start = max(0, int(offset))
+        end = start + max(1, int(limit))
+        return rows[start:end]
 
     async def close(self):
         self._persist()

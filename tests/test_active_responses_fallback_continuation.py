@@ -27,6 +27,8 @@ def route(wrapper, *, status=501, native_reply=None, principal='tenant-a', strea
     names = {'responses', 'responses_to_chat', '_response_store_key'}
     if wrapper == 'nous':
         names |= {'get_stored_conversation', '_prune_response_store_locked'}
+        # DASH fix: routes now call these metrics helpers — extract them too.
+        names |= {'_result_usage_tokens', '_metrics_key_label', '_sniff_stream_usage'}
     else:
         names |= {'_get_stored_conversation', '_prune_response_store'}
     nodes = [node for node in ast.parse(path.read_text()).body if getattr(node, 'name', None) in names]
@@ -73,7 +75,9 @@ def route(wrapper, *, status=501, native_reply=None, principal='tenant-a', strea
         '_build_forward_headers': lambda headers: dict(headers),
         '_extract_principal': lambda request: principal,
         '_request_principal': lambda request: principal,
-        'metrics': SimpleNamespace(record=lambda **kwargs: None),
+        'metrics': SimpleNamespace(record=lambda **kwargs: None,
+                                   record_stream_usage=lambda **kwargs: None,
+                                   record_tokens=lambda *args, **kwargs: None),
         'record_model_result': record, '_fire_and_forget': discard,
         '_native_json_response': lambda body, status=200: JSONResponse(body, status_code=status),
         '_error_response': lambda body, status_code=500: JSONResponse(body, status_code=status_code),

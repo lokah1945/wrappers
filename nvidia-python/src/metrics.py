@@ -381,7 +381,8 @@ class Metrics:
                        SUM(pacing_ms)         AS total_pacing_ms,
                        SUM(CASE WHEN pacing_ms > 0 THEN 1 ELSE 0 END) AS paced_requests,
                        SUM(streaming)         AS streaming_count,
-                       AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END) AS avg_ttft_ms
+                       AVG(CASE WHEN streaming = 1 AND ttft_ms > 0 THEN ttft_ms ELSE NULL END) AS avg_ttft_ms,
+                       SUM(CASE WHEN status_code >= 400 THEN 1 ELSE 0 END) AS errors
                   FROM requests WHERE ts >= ?
             ''', (since,))
             r = await cursor.fetchone()
@@ -446,6 +447,10 @@ class Metrics:
                 'req_per_5min': req_5m,
                 'req_per_hour': req_1h,
                 'req_per_day': req_24h,
+                # DASH fix: error counters the dashboard KPI card reads
+                # (previously "not reported by this wrapper").
+                'errors': r[12] or 0,
+                'error_rate': round((r[12] or 0) / total_requests, 4) if total_requests else 0.0,
             }
             self._summary_cache[window_str] = (time.time(), result)  # V-23 fix
             return result

@@ -225,6 +225,31 @@ from common.model.metadata import discovery_limits
 MODEL_CATALOG = CachedModelCatalog(MODEL_STORE, MODEL_REGISTRY, MODEL_REGISTRY_CLIENT,
                                   f"{OPENROUTER_BASE}/models", ttl_sec=MODEL_CATALOG_TTL_SEC)
 _MODEL_REFRESH_TASK = None
+
+# FREE_ONLY truth set: model ids the provider itself prices at zero
+# (prompt AND completion). The ':free'/'-free' suffix convention is not the
+# provider's own signal — real zero-cost models can carry no suffix
+# (google/lyria-3-*-preview, openrouter/free). Recomputed on catalog refresh
+# so request gating matches the listing filter.
+_FREE_PRICED_IDS: set = set()
+
+
+def _recompute_free_priced_ids(models) -> None:
+    global _FREE_PRICED_IDS
+    ids = set()
+    for m in models or []:
+        if not isinstance(m, dict):
+            continue
+        pricing = m.get("pricing") or {}
+        if not isinstance(pricing, dict):
+            continue
+        try:
+            if (float(pricing.get("prompt", "1") or "1") == 0.0
+                    and float(pricing.get("completion", "1") or "1") == 0.0):
+                ids.add(m.get("id"))
+        except (TypeError, ValueError):
+            continue
+    _FREE_PRICED_IDS = ids
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 VERSION = '1.0.0'
 
@@ -493,6 +518,7 @@ async def _fetch_model_catalog():
 
 async def _refresh_models(force: bool = False) -> list:
     models = await MODEL_CATALOG.refresh(_fetch_model_catalog, force=force)
+    _recompute_free_priced_ids(models)
     return [m['id'] for m in models]
 
 
@@ -679,7 +705,10 @@ PUBLIC_PATHS_ANY = frozenset({
 # Public model discovery (Ollama + OpenAI compatible) — agents need to list
 # models before authenticating. GET only. MCP POST messages are deliberately
 # absent here so every POST surface remains authenticated (B-31 parity).
-PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version', '/mcp/sse', '/mcp'})
+PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version', '/mcp/sse', '/mcp', '/metrics/models'})
+# DASH fix: /metrics/models is a read-only per-model counter (no key material,
+# no secrets) consumed by the dashboard's Models card. Public GET matches the
+# project principle that telemetry is accessible without token.
 
 # B-26 fix: the OpenRouter *Provisioning* API (create/delete/rotate keys) is
 # privileged and must never share the bypass with read-only catalog routes.
@@ -797,6 +826,103 @@ async def auth_middleware(request: Request, call_next):
 
 
 # ══════════════════════════════════════════════════════════════════════════
+# DASH fix: usage extraction helpers (2026-10-14)
+# The wrapper counted requests but NEVER tokens — /stats showed input/output
+# tokens permanently at 0 across 9k+ requests, so the dashboard's token KPIs
+# were dead. These helpers feed record_tokens() at completion time without
+# touching the client-visible response bytes.
+# ══════════════════════════════════════════════════════════════════════════
+
+def _usage_tokens(data) -> tuple:
+    """(prompt, completion) from an OpenAI/Anthropic/Responses usage block."""
+    if not isinstance(data, dict):
+        return 0, 0
+    usage = data.get('usage')
+    if not isinstance(usage, dict):
+        return 0, 0
+    try:
+        prompt = int(usage.get('prompt_tokens', usage.get('input_tokens', 0)) or 0)
+        completion = int(usage.get('completion_tokens', usage.get('output_tokens', 0)) or 0)
+        return prompt, completion
+    except (TypeError, ValueError):
+        return 0, 0
+
+
+async def _sniff_stream_usage(source, model: str, key_label: str):
+    """Yield frames UNCHANGED while extracting token usage from SSE frames.
+
+    Sniffs both dialects (OpenAI chat chunks with a final usage object and
+    Anthropic message_start/message_delta usage). Chunks may split SSE lines
+    at arbitrary boundaries, so bytes accumulate in a line buffer. Usage is
+    recorded at stream end (also on close/cancel) and can never break the
+    client-visible stream."""
+    buffer = b''
+    in_tok = 0
+    out_tok = 0
+    try:
+        async for frame in source:
+            if isinstance(frame, (bytes, bytearray)):
+                buffer += bytes(frame)
+            elif isinstance(frame, str):
+                buffer += frame.encode('utf-8', 'replace')
+            else:
+                yield frame
+                continue
+            yield frame
+            while b'\n' in buffer:
+                line_bytes, buffer = buffer.split(b'\n', 1)
+                line = line_bytes.decode('utf-8', 'replace').strip()
+                if not line.startswith('data:'):
+                    continue
+                data_str = line[5:].strip()
+                if not data_str or data_str == '[DONE]':
+                    continue
+                try:
+                    data = json.loads(data_str)
+                except (ValueError, TypeError):
+                    continue
+                if not isinstance(data, dict):
+                    continue
+                usage = data.get('usage')
+                message = data.get('message')
+                if not isinstance(usage, dict) and isinstance(message, dict) and isinstance(message.get('usage'), dict):
+                    usage = message['usage']
+                if not isinstance(usage, dict):
+                    # Responses dialect: response.completed carries usage
+                    # nested under data.response.usage.
+                    resp_obj = data.get('response')
+                    if isinstance(resp_obj, dict) and isinstance(resp_obj.get('usage'), dict):
+                        usage = resp_obj['usage']
+                if isinstance(usage, dict):
+                    try:
+                        in_tok = max(in_tok, int(usage.get('input_tokens', 0) or 0),
+                                     int(usage.get('prompt_tokens', 0) or 0))
+                        out_tok = max(out_tok, int(usage.get('output_tokens', 0) or 0),
+                                      int(usage.get('completion_tokens', 0) or 0))
+                    except (TypeError, ValueError):
+                        pass
+    finally:
+        try:
+            _spawn_background(
+                metrics.record_tokens(model=model, key_label=key_label,
+                                      prompt_tokens=in_tok, completion_tokens=out_tok),
+                'metrics-stream-usage')
+        except Exception:
+            pass
+        # Close the wrapped upstream generator SYNCHRONOUSLY. Relying on the
+        # asyncgen GC finalizer adds one extra event-loop turn before the
+        # credential/socket release runs — stream ownership tests assert the
+        # release happens within the close call itself, and a real client
+        # disconnect must release the upstream immediately, not "eventually".
+        try:
+            _close = getattr(source, 'aclose', None)
+            if _close is not None:
+                await _close()
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════════════════════════════════════
 # PROXY ROUTES
 # ══════════════════════════════════════════════════════════════════════════
 
@@ -905,7 +1031,9 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     pool.release(key_obj)
                     key_released = True  # I4: mark released, skip outer finally
                     # B-39 fix: record upstream stream failures.
-                    _spawn_background(metrics.record_request(model=model_id, status_code=resp.status),
+                    _spawn_background(metrics.record_request(model=model_id, status_code=resp.status,
+                                                              key_label=getattr(key_obj, 'label', ''),
+                                                              path=path),
                                       'metrics-stream-err')
                     if model_id:
                         _spawn_background(_record_model_result(model_id, key_obj.api_key,
@@ -919,7 +1047,9 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 # B-39 fix: streaming requests were never counted, so
                 # error_rate was permanently ~0 and the dashboard reported
                 # false health. Count the stream as a request now.
-                _spawn_background(metrics.record_request(model=model_id, status_code=200),
+                _spawn_background(metrics.record_request(model=model_id, status_code=200,
+                                                          key_label=getattr(key_obj, 'label', ''),
+                                                          streaming=True, path=path),
                                   'metrics-stream')
                 if model_id:
                     _spawn_background(_record_model_result(model_id, key_obj.api_key, 200, None, url),
@@ -989,7 +1119,10 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     at_event_boundary = True
                     framing_tail = b''
                     hb_interval = float(HEARTBEAT_MS) / 1000.0
-                    inner = stream_gen()
+                    # DASH fix: sniff usage from the raw upstream frames as they
+                    # pass through; bytes are yielded UNCHANGED to the client.
+                    inner = _sniff_stream_usage(
+                        stream_gen(), model_id, getattr(key_obj, 'label', ''))
                     try:
                         async for chunk in _iter_chunks_with_idle(inner, hb_interval):
                             now = time.time()
@@ -1037,7 +1170,8 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 body, state=context_state, store=globals().get('MODEL_STORE'),
                 credential=key_obj.api_key, endpoint=url) as resp:
                 response_headers = upstream_response_headers(resp)
-                await metrics.record_request(model=model_id, status_code=resp.status)
+                await metrics.record_request(model=model_id, status_code=resp.status,
+                                             key_label=getattr(key_obj, 'label', ''), path=path)
                 text = await resp.text()
                 if model_id:
                     _spawn_background(
@@ -1072,6 +1206,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     data = json.loads(text) if text else {}
                 except Exception:
                     data = {"error": {"message": text[:2000], "type": "api_error"}}
+                # DASH fix: extract usage from the completed non-stream body
+                # so token KPIs reflect real consumption.
+                _tok = _usage_tokens(data) if resp.status == 200 else (0, 0)
+                if _tok[0] or _tok[1]:
+                    _spawn_background(
+                        metrics.record_tokens(model=model_id,
+                                               key_label=getattr(key_obj, 'label', ''),
+                                               prompt_tokens=_tok[0], completion_tokens=_tok[1]),
+                        'metrics-usage')
                 return JSONResponse(content=data, status_code=resp.status, headers=response_headers)
 
         except asyncio.TimeoutError:
@@ -1112,11 +1255,16 @@ def _check_free_only(model: str) -> JSONResponse | None:
     """Check FREE_ONLY constraint. Returns error response if blocked.
     Returns 400 (not 403) for consistency with nous/opencode/blackbox wrappers."""
     if free_only_enabled() and model and not is_free_model(model):
-        return _error_response(
-            {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
-                                   "Use models with :free suffix.", "type": "invalid_request_error"}},
-            status_code=400,
-        )
+        # Zero-priced catalog entries without the ':free' suffix are still
+        # free (the listing shows them). The suffix stays authoritative for
+        # models absent from the cached catalog.
+        if model not in _FREE_PRICED_IDS:
+            return _error_response(
+                {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
+                                      "Use a zero-priced model or the :free suffix.",
+                           "type": "invalid_request_error"}},
+                status_code=400,
+            )
     return None
 
 
@@ -1811,7 +1959,25 @@ async def list_models(request: Request):
     """Serve persistent provider metadata; stale catalogs refresh once in background."""
     entries = await MODEL_CATALOG.get(_fetch_model_catalog)
     if free_only_enabled():
-        entries = [m for m in entries if is_free_model(m.get('id', ''))]
+        # FREE_ONLY listing truth is the provider's own pricing: prompt AND
+        # completion both zero. The ':free'/'-free' suffix alone hides real
+        # zero-cost models (google/lyria-3-*-preview, openrouter/free).
+        # Entries without a pricing block fall back to the suffix rule.
+        kept = []
+        for m in entries:
+            pricing = m.get('pricing') if isinstance(m, dict) else None
+            free = None
+            if isinstance(pricing, dict):
+                try:
+                    free = (float(pricing.get('prompt', '1') or '1') == 0.0
+                            and float(pricing.get('completion', '1') or '1') == 0.0)
+                except (TypeError, ValueError):
+                    free = None
+            if free is None:
+                free = is_free_model(m.get('id', ''))
+            if free:
+                kept.append(m)
+        entries = kept
     return JSONResponse({'object': 'list', 'data': [{**m, **discovery_limits(m)} for m in entries]})
 
 
@@ -1819,7 +1985,18 @@ async def list_models(request: Request):
 async def get_model_detail(model_id: str, request: Request):
     entries = await MODEL_CATALOG.get(_fetch_model_catalog)
     model = next((m for m in entries if m.get('id') == model_id), None)
-    if model is None or (free_only_enabled() and not is_free_model(model_id)):
+    blocked = False
+    if free_only_enabled():
+        pricing = model.get('pricing') if isinstance(model, dict) else None
+        if isinstance(pricing, dict):
+            try:
+                blocked = not (float(pricing.get('prompt', '1') or '1') == 0.0
+                               and float(pricing.get('completion', '1') or '1') == 0.0)
+            except (TypeError, ValueError):
+                blocked = not is_free_model(model_id)
+        else:
+            blocked = not is_free_model(model_id)
+    if model is None or blocked:
         return _error_response({'error': {'type': 'invalid_request_error',
                              'message': 'Model is absent from the cached provider catalog'}}, status_code=404)
     return JSONResponse({**model, **discovery_limits(model)})
@@ -2468,8 +2645,14 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
                    "function_call": "tool_use", "content_filter": "refusal"}.get(finish_reason, "end_turn")
 
     usage = openai_resp.get("usage", {})
+    # C-06 parity: the wrapper owns the id on the Anthropic surface. A bare
+    # upstream OpenAI-style id (e.g. OpenRouter "gen-...") must not appear as
+    # an Anthropic message id.
+    res_id = openai_resp.get("id") or f"msg_{int(time.time() * 1000)}"
+    if not (isinstance(res_id, str) and res_id.startswith("msg_")):
+        res_id = f"msg_{res_id}"
     return {
-        "id": openai_resp.get("id", f"msg_{int(time.time()*1000)}"),
+        "id": res_id,
         "type": "message",
         "role": "assistant",
         "model": request_body.get("model", ""),
@@ -3012,30 +3195,42 @@ async def openrouter_key_usage():
 # MCP TRANSPORT ROUTES
 # ══════════════════════════════════════════════════════════════════════════
 
-@app.get("/mcp/sse")
-async def mcp_sse(request: Request):
-    """SSE transport endpoint for MCP."""
-    if not MCP_SERVER or not SSE_TRANSPORT:
-        return _error_response({"error": "MCP not available"}, status_code=503)
+# ── MCP transport (raw ASGI, FastMCP sse_app pattern) ──────────────────
+# Starlette's Route treats *function* endpoints as request->Response
+# handlers, but a callable *instance* stays a raw ASGI app. connect_sse then
+# owns the SSE response at the ASGI layer, exactly like FastMCP's own
+# sse_app() handle_sse. The previous StreamingResponse(coroutine) form could
+# never start the body ('coroutine object is not iterable' -> empty 200
+# stream) and passed the anyio task group in the receive position (SDK
+# signature: connect_sse(scope, receive, send)).
+class _MCPASGIEndpoint:
+    """Raw ASGI endpoint for /mcp/sse (GET) and /mcp/messages (POST)."""
 
-    async def event_generator():
-        async with anyio.create_task_group() as tg, SSE_TRANSPORT.connect_sse(
-            request.scope, tg, request._receive
-        ) as streams:
-            await MCP_SERVER._mcp_server.run(
-                streams[0], streams[1],
-                MCP_SERVER._create_initialization_options()
-            )
+    def __init__(self, kind: str):
+        self._kind = kind
 
-    return StreamingResponse(event_generator(), media_type="text/event-stream")
+    async def __call__(self, scope, receive, send):
+        if not MCP_SERVER or not SSE_TRANSPORT:
+            err = JSONResponse(
+                {"error": {"message": "MCP not available", "type": "api_error"}},
+                status_code=503)
+            await err(scope, receive, send)
+            return
+        if self._kind == "sse":
+            async with SSE_TRANSPORT.connect_sse(scope, receive, send) as streams:
+                await MCP_SERVER._mcp_server.run(
+                    streams[0], streams[1],
+                    MCP_SERVER._mcp_server.create_initialization_options())
+        else:
+            await SSE_TRANSPORT.handle_post_message(scope, receive, send)
 
 
-@app.post("/mcp/messages")
-async def mcp_messages(request: Request):
-    """Streamable HTTP transport for MCP (JSON-RPC messages)."""
-    if not MCP_SERVER or not SSE_TRANSPORT:
-        return _error_response({"error": "MCP not available"}, status_code=503)
-    return await SSE_TRANSPORT.handle_post_message(request.scope, request._receive, request._send)
+from starlette.routing import Route as _StarletteRoute  # noqa: E402
+
+app.router.routes.append(_StarletteRoute(
+    "/mcp/sse", endpoint=_MCPASGIEndpoint("sse"), methods=["GET"]))
+app.router.routes.append(_StarletteRoute(
+    "/mcp/messages", endpoint=_MCPASGIEndpoint("post"), methods=["POST"]))
 
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -3080,6 +3275,12 @@ async def prom_metrics():
         content=pool_metrics + "\n" + req_metrics,
         media_type="text/plain; version=0.0.4",
     )
+
+
+@app.get("/metrics/models")
+async def metrics_models():
+    """Per-model request/usage counters for the dashboard Models card (DASH fix)."""
+    return {"models": metrics.per_model_summary(), "provider": "openrouter"}
 
 
 @app.get("/stats")
