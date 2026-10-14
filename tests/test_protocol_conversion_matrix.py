@@ -31,7 +31,9 @@ def test_anthropic_to_openai_response_conversion():
 
     oai = anthropic_to_openai_response(a_resp)
     assert oai["object"] == "chat.completion"
-    assert oai["id"] == "chatcmpl-msg_12345"
+    # C-06: wrapper-owned ID format (chatcmpl-{timestamp}_{uuid}) not upstream msg_ leak
+    assert oai["id"].startswith("chatcmpl-")
+    assert oai["id"] != "chatcmpl-msg_12345"  # No upstream ID leak
     assert oai["model"] == "claude-3-5-sonnet-20241022"
     
     choice = oai["choices"][0]

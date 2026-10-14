@@ -411,6 +411,7 @@ try:
         anthropic_to_openai_response,
         openai_to_anthropic_response,
         stream_anthropic_to_openai,
+        stream_openai_to_anthropic,
         openai_chat_to_anthropic_request,
     )
     from common.compat import (
@@ -439,8 +440,6 @@ except ImportError:
 from .anthropic_compat import (
     anthropic_to_openai,
     validate_anthropic_request,
-    openai_to_anthropic as _openai_to_anthropic_impl,
-    stream_openai_to_anthropic,
     estimate_input_tokens,
     anthropic_error,
     extract_internal_reasoning,
@@ -448,17 +447,27 @@ from .anthropic_compat import (
 
 
 def openai_to_anthropic(*args, **kwargs):
-    """Compatibility wrapper around anthropic_compat.openai_to_anthropic.
+    """Compatibility wrapper using shared openai_to_anthropic_response.
 
-    Native nvidia code calls (openai_response, model, ...). Some cross-wrapper
-    tooling imports src.main and calls the opencode/nous order (model, response).
-    Accept both without changing the actual translator.
+    The shared function has signature: openai_to_anthropic_response(o_resp, model, request_id)
+    The legacy signature was: openai_to_anthropic(model, o_resp, request_id, expect_thinking, estimated_input)
     """
+    # Handle legacy argument order: (model, o_resp, request_id, ...) or (o_resp, model, ...)
     if len(args) >= 2 and isinstance(args[0], str) and isinstance(args[1], dict):
-        model, data = args[0], args[1]
-        rest = args[2:]
-        return _openai_to_anthropic_impl(data, model, *rest, **kwargs)
-    return _openai_to_anthropic_impl(*args, **kwargs)
+        # Legacy: (model, o_resp, request_id, ...)
+        model, o_resp = args[0], args[1]
+        request_id = args[2] if len(args) > 2 else kwargs.get('request_id')
+        return openai_to_anthropic_response(o_resp, model, request_id)
+    elif len(args) >= 2 and isinstance(args[0], dict) and isinstance(args[1], str):
+        # New: (o_resp, model, request_id, ...)
+        o_resp, model = args[0], args[1]
+        request_id = args[2] if len(args) > 2 else kwargs.get('request_id')
+        return openai_to_anthropic_response(o_resp, model, request_id)
+    elif len(args) == 1 and isinstance(args[0], dict):
+        # Just o_resp
+        return openai_to_anthropic_response(args[0], kwargs.get('model', ''), kwargs.get('request_id'))
+    # Fallback
+    return openai_to_anthropic_response(*args, **kwargs)
 
 
 def _parse_dsml_from_text(text: str) -> tuple:
@@ -946,9 +955,6 @@ def _translate_nemotron_super_controls(oai_body: dict, thinking: Any, output_con
 
 def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking: Any,
                               anthropic_output_config: Any = None) -> None:
-    if (nim_model or '').lower() == 'nvidia/nemotron-3-super-120b-a12b':
-        _translate_nemotron_super_controls(oai_body, anthropic_thinking, anthropic_output_config)
-        return
     if anthropic_thinking is None:
         return
     enabled = anthropic_thinking is True or (isinstance(anthropic_thinking, dict) and anthropic_thinking.get('type') != 'disabled')
@@ -970,7 +976,7 @@ def translate_thinking_to_nim(oai_body: dict, nim_model: str, anthropic_thinking
             # explicitly requests thinking, config default-off values (e.g.
             # GLM's {'thinking': False} opt-out) must not force it back off.
             # Opting out of default thinking applies only when the client did
-            # NOT request thinking (handled by the `enabled` branch below).
+            # NOT request thinking (handled by the `enabled` branch above).
             obj[k] = (True if v is False else v) if enabled else False
         oai_body['chat_template_kwargs'] = {**(oai_body.get('chat_template_kwargs') or {}), **obj}
     elif cfg['mechanism'] == 'reasoning_effort':
@@ -1333,10 +1339,11 @@ def model_from_path(path: str) -> str:
 def forward_headers(request: Request) -> dict:
     """Preserve native extension headers after removing local transport/auth.
 
-    The caller supplies provider Authorization and Content-Type. The shared
-    filter also removes Connection-nominated fields and local proxy identity.
+    The caller supplies provider Authorization. The shared filter also removes
+    Connection-nominated fields and local proxy identity. Content-Type is
+    added explicitly as a trusted wrapper header.
     """
-    headers = _build_forward_headers(request.headers)
+    headers = _build_forward_headers(request.headers, extra={'content-type': 'application/json'})
     # Generate a request ID if the client didn't provide one
     if 'x-request-id' not in headers:
         headers['x-request-id'] = generate_request_id()
@@ -2787,7 +2794,8 @@ class Server:
         if isinstance(data, dict) and data.get('type') == 'message' and 'content' in data:
             anthropic_resp = data
         else:
-            anthropic_resp = openai_to_anthropic(data, model_id, f"msg_{int(time.time())}", expect_thinking=expect_thinking, estimated_input=input_tok_est)
+            # Use shared openai_to_anthropic_response (C-01/C-06/C-09 fixes)
+            anthropic_resp = openai_to_anthropic_response(data, model_id, f"msg_{int(time.time())}")
         return JSONResponse(status_code=200, content=anthropic_resp, headers=result.get('headers', {}))
 
     def _select_timeout(self, is_streaming: bool, metric_path: str) -> int:

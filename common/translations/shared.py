@@ -597,6 +597,16 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning and isinstance(reasoning, str):
         content.append({"type": "thinking", "thinking": reasoning})
+    # CRIT-03: Extract thinking from content field when reasoning_content is not provided.
+    # Nemotron models (e.g. nvidia/nemotron-3-ultra-550b-a55b) embed
+    # <thinking>...</thinking> tags in the content string instead of using
+    # a separate reasoning_content field. Without this extraction, the tags
+    # pass through into visible text output for the client.
+    if not reasoning and isinstance(msg.get("content"), str):
+        m = re.search(r'<thinking>([\s\S]*?)</thinking>', msg["content"])
+        if m:
+            reasoning = m.group(1).strip()
+            content.append({"type": "thinking", "thinking": reasoning})
 
     # Text content
     raw_text = msg.get("content") or ""
@@ -715,6 +725,8 @@ async def stream_anthropic_to_openai(anthropic_stream, model: str = ""):
                 elif d_type == "thinking_delta":
                     thinking = delta.get("thinking", "")
                     if thinking:
+                        # H-09: Filter special tokens from reasoning
+                        thinking = _filter_special_tokens(thinking)
                         yield f"data: {json.dumps({'id': msg_id, 'object': 'chat.completion.chunk', 'created': int(time.time()), 'model': model, 'choices': [{'index': 0, 'delta': {'reasoning_content': thinking}, 'finish_reason': None}]})}\n\n"
                 elif d_type == "input_json_delta":
                     partial = delta.get("partial_json", "")

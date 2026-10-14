@@ -51,6 +51,26 @@ def _flatten_text(content) -> str:
     return ''
 
 
+# Known special tokens to filter from upstream output (H-09 / CRIT-01)
+# Includes Nemotron reasoning tags that appear in content field
+_SPECIAL_TOKENS = frozenset({
+    '<|end_of_turn|>', '<|tool_call_begin|>', '<|tool_call_end|>',
+    '<|tool_calls_section_begin|>', '<|tool_calls_section_end|>',
+    '<|tool_call|>', '<|tool_calls|>',
+    '❓', '回答', '<thinking>', '</thinking>',
+})
+
+
+def _filter_special_tokens(text: str) -> str:
+    """Filter known special tokens from upstream output (H-09 / CRIT-01)."""
+    if not isinstance(text, str):
+        return text
+    for token in _SPECIAL_TOKENS:
+        if token in text:
+            text = text.replace(token, '')
+    return text
+
+
 def extract_internal_reasoning(msg: dict) -> dict:
     """Normalize reasoning from upstream into a single internal representation."""
     m = msg or {}

@@ -20,6 +20,7 @@ from __future__ import annotations
 import hmac
 import logging
 import os
+import hashlib
 from typing import Optional
 
 logger = logging.getLogger('wrapper-auth')
@@ -193,3 +194,19 @@ def is_public_path(path: str, method: str,
             if path.startswith(prefix):
                 return True
     return False
+
+
+def response_store_principal(headers, request_client) -> str:
+    """H-14: Consistent principal for response store across all wrappers.
+
+    Uses the authenticated client token as the primary identifier. For unauthenticated
+    requests, falls back to a stable client identity based on IP address.
+    This ensures cross-wrapper compatibility for previous_response_id continuity.
+    """
+    token = authenticated_client_token(headers)
+    if token:
+        # Use SHA-256 of the token (first 24 chars) for the principal
+        return hashlib.sha256(token.encode()).hexdigest()[:24]
+    # Fallback: stable client identity based on IP
+    client_ip = getattr(request_client, 'host', 'unknown') if request_client else 'unknown'
+    return hashlib.sha256(f"anon|{client_ip}".encode()).hexdigest()[:24]

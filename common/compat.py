@@ -139,7 +139,6 @@ async def initialize_upstream_compatibility(base_url: str) -> str:
     Explicit layer 1/2 never opens a probe session.
     """
     global _resolved_auto_layer
-    _resolved_auto_layer = LAYER_OPENAI
     configured = validate_compat_layer()
     if configured != LAYER_AUTO:
         return configured
@@ -150,8 +149,11 @@ async def initialize_upstream_compatibility(base_url: str) -> str:
             layer = await probe_upstream_compatibility(session, base_url)
         if layer in (LAYER_OPENAI, LAYER_ANTHROPIC):
             _resolved_auto_layer = layer
+        else:
+            _resolved_auto_layer = LAYER_OPENAI
     except Exception as exc:
         logger.warning('[compat] auto discovery unavailable (%s); using OpenAI', type(exc).__name__)
+        _resolved_auto_layer = LAYER_OPENAI
     return _resolved_auto_layer
 
 
@@ -164,9 +166,12 @@ async def probe_upstream_compatibility(session: Any, base_url: str) -> str:
       3. POST {base}/v1/chat/completions (minimal) status != 404   -> OpenAI
       4. otherwise                                                 -> OpenAI (default)
 
-    Result is cached per base_url with COMPATIBILITY_PROBE_TTL_SEC (default
-    300s) so the probe runs once. The probe never sends credentials and uses
+    Result is cached per full base_url (including path) with COMPATIBILITY_PROBE_TTL_SEC
+    (default 300s) so the probe runs once. The probe never sends credentials and uses
     minimal bodies, so it never burns upstream quota.
+
+    The cache key includes the full URL path to avoid collisions between upstreams
+    sharing the same host but different paths (e.g., /v1 vs /v2).
     """
     base = (base_url or '').rstrip('/')
     now = time.time()
@@ -295,10 +300,18 @@ async def _chunks_with_heartbeat(src, hb_interval: float):
         await close_stream(chunks)
 
 
-async def passthrough_anthropic_sse(src, hb_interval: float):
+async def passthrough_anthropic_sse(src, hb_interval: float, add_heartbeats: bool = True):
     """Forward Anthropic Messages SSE verbatim (no [DONE] appended) with
-    heartbeats — used by the layer-2 `/v1/messages` surface."""
-    chunks = _chunks_with_heartbeat(src, hb_interval)
+    heartbeats — used by the layer-2 `/v1/messages` surface.
+
+    When `add_heartbeats=False` (for COMPATIBILITY_LAYER=2 native Anthropic
+    passthrough), heartbeats are NOT injected since Anthropic Messages SSE
+    does not expect heartbeat comments between events.
+    """
+    if add_heartbeats:
+        chunks = _chunks_with_heartbeat(src, hb_interval)
+    else:
+        chunks = src
     try:
         async for chunk in chunks:
             yield chunk

@@ -23,6 +23,7 @@ from common.sse import ClosingStreamingResponse as StreamingResponse
 
 from common.compat import passthrough_anthropic_sse
 from common.model import classify_upstream_error
+from common.translations.shared import openai_to_anthropic_response
 from test_active_native_passthrough import _Upstream, _collect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,7 @@ def _server(peers, records, *, native=False, keys=1):
         'anthropic_to_openai': COMPAT.anthropic_to_openai,
         'anthropic_error': COMPAT.anthropic_error,
         'openai_to_anthropic': COMPAT.openai_to_anthropic,
+        'openai_to_anthropic_response': openai_to_anthropic_response,
         'stream_openai_to_anthropic': COMPAT.stream_openai_to_anthropic,
         'estimate_input_tokens': COMPAT.estimate_input_tokens,
         'resolve_target_model': lambda model: model, 'is_model_unavailable': lambda model: False,
