@@ -3096,6 +3096,28 @@ class Server:
         cache[model_id] = (now, reason)
         return reason
 
+    def _dead_model_404(self, model_id: str, n_misses: int, attempts: int) -> dict:
+        """R-DEAD3: same verdict and shape as the R-DEAD1 fast-fail 404, but for
+        the request that itself discovered the dead state (stale TTL window).
+
+        Without this, the first request after the fast-fail TTL expires returns
+        the raw upstream JSON:API error body — the wrong shape for every client
+        surface (OpenAI SDKs cannot parse {'status','title','detail'}; Anthropic
+        surfaces embed the upstream account hash verbatim) — while every later
+        request fast-fails cleanly off the fresh negatives this request just
+        recorded. The just-finished rotation across every key IS the freshest
+        possible evidence, so the client gets the actionable verdict immediately.
+        """
+        return {'status': 404,
+                'data': {'error': {'message': (
+                    f'Model {model_id} is not deployed on any configured account '
+                    f'({n_misses} distinct credentials just returned 404 Not Found '
+                    f'in this request). It cannot be served by this endpoint — '
+                    f'pick a model with available=true in /v1/models.'),
+                    'type': 'not_found_error',
+                    'code': 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'}},
+                'headers': {'x-wrapper-attempts': str(attempts)}}
+
     def _headers_deadline_sec(self, is_streaming: bool, body: dict) -> Optional[float]:
         """R-HDR1: cap the wait for upstream response headers.
 
@@ -3218,12 +3240,18 @@ class Server:
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
         attempted_keys = set()
+        _miss404 = 0          # R-DEAD3: account-scoped 404 misses this request
+        _upstream_tries = 0   # R-DEAD3: upstream attempts made this request
         while attempt < max_attempts:
-            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
-            attempt_start = time.time()
             # R-TMO1: bound the whole cascade. A hanging upstream (evidence:
             # deepseek-v4.1-flash 2026-10-15, no headers at all) otherwise
             # burns every key x full timeout before the client sees anything.
+            # The check runs BEFORE pool.acquire(): acquire() takes a
+            # key.in_flight reservation that only release_attempt() returns,
+            # and the 504 path never reaches it — checking after the acquire
+            # leaked one reservation per wallclock event (line-review finding
+            # 2026-10-15: _pick_key/peek_key load skew; ~5 leaks make a key
+            # probe-ineligible via in_flight >= 5).
             if attempt > 0 and _wallclock_cap > 0 and (time.time() - _req_t0) > _wallclock_cap:
                 _elapsed = int(time.time() - _req_t0)
                 logger.info('[wallclock] model=%s attempts=%d elapsed=%ds cap=%ds — stop rotating, return 504',
@@ -3232,6 +3260,8 @@ class Server:
                     'message': f'Upstream timeout: model {model_id} did not respond within {_elapsed}s across {attempt} attempt(s). The provider endpoint appears unresponsive right now.',
                     'type': 'api_error', 'code': 'UPSTREAM_WALLCLOCK'}},
                     'headers': {'x-wrapper-attempts': str(attempt)}}
+            key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
+            attempt_start = time.time()
             if not key_result:
                 # Return 429 (not 503) so client SDKs (Anthropic/OpenAI) auto-retry with backoff.
                 # 503 is treated as non-retryable fatal server error by most SDKs.
@@ -3240,6 +3270,7 @@ class Server:
             key = key_result['key']
             self._in_flight += 1
             attempted_keys.add(key.api_key)
+            _upstream_tries += 1  # R-DEAD3: every acquired attempt counts; 429/timeout/5xx break all-miss synthesis
             resp = None
             transferred = False
             released_attempt = False
@@ -3294,6 +3325,13 @@ class Server:
                             norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
                         release_attempt()
                         self._log_attempt(model_id, key, attempt, max_attempts, 'stream-post', f'upstream-{norm_status}', attempt_start)
+                        # R-DEAD3: an account-scoped 404 is a hard deployability
+                        # verdict. When every attempt this request was such a miss,
+                        # the exhaustion return synthesizes the clean local 404
+                        # (same shape as R-DEAD1) instead of leaking the raw
+                        # upstream JSON:API body to OpenAI-native clients.
+                        if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
+                            _miss404 += 1
                         # Retry only failures that may change with time/key.
                         # Account-scoped deployment, capability and route
                         # errors must not be retried across identical keys.
@@ -3301,6 +3339,8 @@ class Server:
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
+                        if resp.status == 404 and _upstream_tries and _miss404 == _upstream_tries:
+                            return self._dead_model_404(model_id, _miss404, _upstream_tries)
                         return {'status': norm_status, 'data': resp_body, 'headers': upstream_response_headers(resp)}
 
                     # Keep in-flight until the stream consumer finishes. The wrapper
@@ -3392,10 +3432,16 @@ class Server:
                     self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'upstream-{norm_status}', attempt_start)
 
                     if norm_status >= 400:
+                        # R-DEAD3: account-scoped 404 miss tracking (see the
+                        # streaming branch above for the full rationale).
+                        if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
+                            _miss404 += 1
                         retryable = self._classify_retry(resp.status, classification)
                         if retryable and attempt < max_attempts - 1:
                             attempt += 1
                             continue
+                        if resp.status == 404 and _upstream_tries and _miss404 == _upstream_tries:
+                            return self._dead_model_404(model_id, _miss404, _upstream_tries)
                         return {'status': norm_status, 'data': resp_data, 'headers': upstream_response_headers(resp)}
 
                     self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'done-{resp.status}', attempt_start)
@@ -3454,6 +3500,8 @@ class Server:
             return JSONResponse(status_code=404, content={'error': {'message': ff_reason, 'type': 'not_found_error', 'code': 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'}}, headers={'x-wrapper-fastfail': '1'})
 
         attempted_keys = set()
+        _miss404 = 0          # R-DEAD3: account-scoped 404 misses this request
+        _upstream_tries = 0   # R-DEAD3: upstream attempts made this request
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             attempt_start = time.time()
@@ -3463,6 +3511,7 @@ class Server:
             key = key_result['key']
             self._in_flight += 1
             attempted_keys.add(key.api_key)
+            _upstream_tries += 1  # R-DEAD3: every acquired attempt counts
             resp = None
             transferred = False
             released_attempt = False
@@ -3544,10 +3593,17 @@ class Server:
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     await self._record_model_response(model_id, key, resp.status, err_data, path)
                     classification = classify_upstream_error(resp.status, err_data)
+                    # R-DEAD3: synthesize the clean local 404 when every attempt
+                    # this request was an account-scoped not-deployed miss.
+                    if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
+                        _miss404 += 1
                     retryable = self._classify_retry(resp.status, classification)
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
+                    if resp.status == 404 and _upstream_tries and _miss404 == _upstream_tries:
+                        dead = self._dead_model_404(model_id, _miss404, _upstream_tries)
+                        return JSONResponse(status_code=404, content=dead['data'], headers=dead['headers'])
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
                 if self.metrics:
@@ -3658,7 +3714,18 @@ class Server:
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
+        # R-DEAD1: same zero-upstream-call fast-fail as proxy_openai. The
+        # catch-all serves /v1/responses (the Codex surface, native upstream
+        # mode auto) — without the gate a dead model burns the full key
+        # rotation on every harness retry exactly like the 13:20 /v1/messages
+        # incident did.
+        ff_reason = await self._fastfail_dead_model_reason(model_id)
+        if ff_reason:
+            return JSONResponse(status_code=404, content={'error': {'message': ff_reason, 'type': 'not_found_error', 'code': 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'}}, headers={'x-wrapper-fastfail': '1'})
+
         attempted_keys = set()
+        _miss404 = 0          # R-DEAD3: account-scoped 404 misses this request
+        _upstream_tries = 0   # R-DEAD3: upstream attempts made this request
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
             attempt_start = time.time()
@@ -3668,6 +3735,7 @@ class Server:
             key = key_result['key']
             self._in_flight += 1
             attempted_keys.add(key.api_key)
+            _upstream_tries += 1  # R-DEAD3: every acquired attempt counts
             resp = None
             transferred = False
             released_attempt = False
@@ -3756,10 +3824,17 @@ class Server:
                         if responses_chat_fallback_allowed(resp.status, err_data):
                             return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
                     classification = classify_upstream_error(resp.status, err_data)
+                    # R-DEAD3: synthesize the clean local 404 when every attempt
+                    # this request was an account-scoped not-deployed miss.
+                    if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
+                        _miss404 += 1
                     retryable = self._classify_retry(resp.status, classification)
                     if retryable and attempt < max_attempts - 1:
                         attempt += 1
                         continue
+                    if resp.status == 404 and _upstream_tries and _miss404 == _upstream_tries:
+                        dead = self._dead_model_404(model_id, _miss404, _upstream_tries)
+                        return JSONResponse(status_code=404, content=dead['data'], headers=dead['headers'])
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
                 if self.metrics:
