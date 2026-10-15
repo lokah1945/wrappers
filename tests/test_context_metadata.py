@@ -297,6 +297,7 @@ async def test_nvidia_models_route_consumes_ngc_instead_of_losing_context():
         registry=SimpleNamespace(get_official_context=lambda mid: official if mid == model else None),
         metrics=SimpleNamespace(get_model_status=statuses), _model_status_view=lambda x: x)
     namespace = {'self': server, 'build_catalog': caps.build_catalog, 'BASE_LLM': 'https://integrate.api.nvidia.com',
+                 '_env_flag': lambda *args: False,
                  'BASE_GENAI': 'http://fake', 'get_dynamic_alias_target': lambda: ''}
     future = ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)
     exec(compile(ast.fix_missing_locations(ast.Module(body=[future, *nodes], type_ignores=[])), str(path), 'exec'), namespace)

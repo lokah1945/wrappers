@@ -1,6 +1,7 @@
 """Cancellation before headers must release each native NVIDIA reservation."""
 import ast
 import asyncio
+import os
 import json
 import logging
 import importlib.util
@@ -20,7 +21,7 @@ def load_server():
     names = {'proxy_openai', '_compat2_proxy', '_proxy_post', '_handle_catch_all'}
     original.body = [node for node in original.body if isinstance(node, ast.AsyncFunctionDef) and node.name in names]
     namespace = {
-        'Request': object, 'json': json, 'time': time, 'asyncio': asyncio,
+        'Request': object, 'json': json, 'time': time, 'asyncio': asyncio, 'os': os,
         'logger': logging.getLogger(__name__), 'JSONResponse': JSONResponse,
         'Response': Response, 'StreamingResponse': StreamingResponse,
         'BASE_LLM': 'http://controlled.invalid', 'MAX_RETRIES': 0,
@@ -66,6 +67,12 @@ async def test_cancel_during_header_wait_releases_once(method):
     server.metrics = None
     server._client_timeout = lambda *args: None
     server._normalize_path = lambda path: path
+
+    async def _fastfail_none(model_id):
+        return None
+    server._fastfail_dead_model_reason = _fastfail_none
+    server._log_attempt = lambda *args, **kwargs: None
+    server._headers_deadline_sec = lambda *args, **kwargs: None
 
     async def prepare(body, model, metric_path=None):
         return dict(body)

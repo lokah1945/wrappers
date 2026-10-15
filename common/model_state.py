@@ -367,6 +367,48 @@ class ModelStateStore:
         finally:
             conn.close()
 
+    def recent_negative_scopes(self, model_id: str, ttl_sec: float) -> dict[str, float]:
+        """R-DEAD1: hard-negative coverage per account scope for fast-fail routing.
+
+        Returns {account_scope: age_sec} for scopes whose LATEST observation
+        for this model is a hard negative (HTTP 404/410 — not deployed / EOL)
+        recorded within ttl_sec. Rate limits (429), transient 5xx, and
+        capability 4xx are never hard negatives: a model that failed with
+        those for one account may be perfectly usable, so they must not
+        fast-fail anything. A scope that later observed ANY fresher result
+        (e.g. a success after the account gained the deployment) drops out
+        of the map, which is what makes the fast-fail self-healing.
+        """
+        if ttl_sec <= 0:
+            return {}
+        conn = self._connect()
+        try:
+            cutoff = time.time() - float(ttl_sec)
+            rows = conn.execute(
+                """SELECT account_scope,
+                              MAX(CASE WHEN http_status IN (404, 410)
+                                        AND state IN ('account_unavailable','globally_retired')
+                                   THEN checked_at END) AS neg_at,
+                              MAX(checked_at) AS newest_any
+                   FROM model_account_status
+                   WHERE provider=? AND model_id=? AND checked_at > ?
+                   GROUP BY account_scope""",
+                (self.provider, model_id, cutoff),
+            ).fetchall()
+            now = time.time()
+            out: dict[str, float] = {}
+            for row in rows:
+                neg_at = row["neg_at"]
+                if neg_at is None:
+                    continue
+                newest_any = row["newest_any"] or neg_at
+                if float(newest_any) > float(neg_at) + 1e-6:
+                    continue  # a fresher non-negative observation exists
+                out[row["account_scope"]] = max(0.0, now - float(neg_at))
+            return out
+        finally:
+            conn.close()
+
     async def record_status_async(self, *args, **kwargs) -> dict[str, Any]:
         """Run SQLite status persistence off the wrapper event loop."""
         return await asyncio.to_thread(self.record_status, *args, **kwargs)

@@ -2239,6 +2239,18 @@ class Server:
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
+            # R-DEAD2: advertise deployability, not just existence. The catalog
+            # lists the full upstream model set (~94); on these accounts ~65 are
+            # not deployed — marking them prevents clients/harnesses from picking
+            # a dead entry (root cause of the 13:20:16 404 retry storm).
+            if _env_flag('MODELS_MARK_UNAVAILABLE', '1'):
+                for e in enriched:
+                    mid = e.get('id') or ''
+                    if mid and await self._fastfail_dead_model_reason(mid):
+                        e['available'] = False
+                        e['unavailable_reason'] = 'not_deployed_on_any_configured_account'
+                    else:
+                        e.setdefault('available', True)
             # Dynamic aliases: expose short names bound to current concrete target (if any)
             tgt = get_dynamic_alias_target()
             if tgt:
@@ -2966,14 +2978,47 @@ class Server:
             return GEN_TIMEOUT_SEC
         return REQUEST_TIMEOUT_SEC
 
-    def _client_timeout(self, is_streaming: bool, metric_path: str) -> 'aiohttp.ClientTimeout':
+    def _client_timeout(self, is_streaming: bool, metric_path: str, body: dict = None) -> 'aiohttp.ClientTimeout':
         """V-09 fix: streamed responses must not be killed by a hard total
         timeout mid-generation. Streams use a read-idle (sock_read) timeout so
-        a dead upstream is detected quickly while long generations survive."""
+        a dead upstream is detected quickly while long generations survive.
+
+        R-TMO1: non-streaming totals are additionally capped by the request's
+        own size profile — a 20-token 'hallo' no longer inherits the 600s
+        ceiling meant for 1M-context generations (evidence: a hanging upstream
+        burned 6 keys x 600s per request)."""
         if is_streaming:
             return aiohttp.ClientTimeout(total=None, sock_connect=30,
                                          sock_read=STREAM_SOCK_READ_TIMEOUT_SEC)
-        return aiohttp.ClientTimeout(total=self._select_timeout(False, metric_path))
+        total = self._select_timeout(False, metric_path)
+        if body is not None:
+            scaled = self._body_scaled_timeout_sec(body)
+            if scaled and scaled < total:
+                total = scaled
+        return aiohttp.ClientTimeout(total=total)
+
+    def _body_scaled_timeout_sec(self, body: dict) -> Optional[int]:
+        """R-TMO1: per-request non-streaming timeout from size profile.
+
+        prefill ~13k tok/s (empirical: 978k tokens = 76s) + generation ~30
+        tok/s for the requested max_tokens + 30s slack, clamped to
+        [NONSTREAM_TIMEOUT_FLOOR_SEC, REQUEST_TIMEOUT_SEC]. Env floor 0
+        disables scaling (operator override)."""
+        floor_sec = int(os.environ.get('NONSTREAM_TIMEOUT_FLOOR_SEC', '120') or 0)
+        if floor_sec <= 0:
+            return None
+        try:
+            est_tokens = len(json.dumps(body)) / 4.0
+        except (TypeError, ValueError):
+            est_tokens = 4096.0
+        prefill = est_tokens / 13000.0
+        try:
+            mt = int(body.get('max_tokens') or body.get('max_completion_tokens') or 4096)
+        except (TypeError, ValueError):
+            mt = 4096
+        gen = max(0, mt) / 30.0
+        scaled = int(prefill + gen + 30.0)
+        return max(floor_sec, min(scaled, REQUEST_TIMEOUT_SEC))
 
     def _classify_retry(self, status: int, classification: dict) -> bool:
         """Determine if a failed request should be retried with another key.
@@ -2992,6 +3037,106 @@ class Server:
             'transient_failure', 'account_forbidden',
             'network_timeout',
         )
+
+    async def _fastfail_dead_model_reason(self, model_id: str) -> Optional[str]:
+        """R-DEAD1: fast-fail models known undeployable on EVERY live credential.
+
+        Evidence source is real-time model_account_status (rows written by
+        actual upstream 404/410 responses and by verify sweeps). A model is
+        fast-failed only when every live key scope's latest observation is a
+        hard negative newer than MODEL_FASTFAIL_TTL_SEC (default 300s). A
+        model without fresh full coverage still goes upstream, so a newly
+        deployed model becomes usable after at most one failing request (or
+        a sweep) plus the TTL. Kill switch: MODEL_FASTFAIL_ENABLED=0.
+        """
+        if not model_id:
+            return None
+        if not _env_flag('MODEL_FASTFAIL_ENABLED', '1'):
+            return None
+        cache = self.__dict__.setdefault('_fastfail_cache', {})
+        now = time.time()
+        hit = cache.get(model_id)
+        if hit is not None and now - hit[0] < 2.0:
+            return hit[1]
+        ttl = float(os.environ.get('MODEL_FASTFAIL_TTL_SEC', '300') or 0)
+        reason: Optional[str] = None
+        store = getattr(self, 'model_state', None)
+        pool = getattr(self, 'pool', None)
+        if store is not None and pool is not None and ttl > 0:
+            try:
+                live_scopes = set()
+                for _k in (getattr(pool, 'keys', []) or []):
+                    _fp = credential_fingerprint(getattr(_k, 'api_key', None))
+                    if _fp:
+                        live_scopes.add(_fp)
+                if live_scopes:
+                    negatives = await asyncio.to_thread(
+                        store.recent_negative_scopes, model_id, ttl)
+                    if negatives:
+                        logger.info('[fastfail] model=%s live=%d negative_scopes=%d',
+                                    model_id, len(live_scopes), len(negatives))
+                    # Coverage is count-based: request-path evidence records
+                    # provider-account scopes (account-hint namespace), sweep
+                    # evidence records credential scopes — exact set matching
+                    # across namespaces is impossible by design. A fresh hard
+                    # negative on >= every live credential (either namespace)
+                    # means every account we own just refused this model.
+                    # Stale-scope false positives are bounded by the TTL.
+                    if negatives and len(negatives) >= len(live_scopes):
+                        newest_age = min(negatives.values())
+                        reason = (
+                            f'Model {model_id} is not deployed on any configured '
+                            f'account ({len(negatives)} distinct credentials/accounts '
+                            f'returned 404 Not Found, newest observation '
+                            f'{int(newest_age)}s ago). It cannot be served by this '
+                            f'endpoint — pick a model with available=true in /v1/models.'
+                        )
+            except Exception as e:
+                logger.warning(f'[fastfail] state lookup failed: {type(e).__name__}: {e}')
+        cache[model_id] = (now, reason)
+        return reason
+
+    def _headers_deadline_sec(self, is_streaming: bool, body: dict) -> Optional[float]:
+        """R-HDR1: cap the wait for upstream response headers.
+
+        Healthy upstreams return headers in <1s (empirical: 0.3-0.6s). A long
+        headers wait means the request is queued at the provider edge, and
+        NVIDIA's edge has been observed to drop such connections at ~79s
+        (log evidence 2026-10-15 13:43:59: 79s stall -> Server disconnected
+        -> retry 31s = the 110s 'hallo' incident). Abandoning at the deadline
+        and rotating to another key bounds that stall. The deadline scales
+        with estimated prefill (~13k tokens/s empirical: 978k tokens = 76s)
+        so 1M-context streams are not cut early, and is disabled for
+        non-streaming requests whose headers legitimately arrive only with
+        the completed body. STREAM_HEADERS_TIMEOUT_SEC=0 disables entirely.
+        """
+        if not is_streaming:
+            return None
+        base = float(os.environ.get('STREAM_HEADERS_TIMEOUT_SEC', '60') or 0)
+        if base <= 0:
+            return None
+        try:
+            est_tokens = len(json.dumps(body)) / 4.0
+        except (TypeError, ValueError):
+            est_tokens = 4096.0
+        prefill_sec = est_tokens / 13000.0
+        cap = max(PRE_RESPONSE_TIMEOUT_MS / 1000.0, 1.0)
+        return min(max(base, prefill_sec + 20.0), cap)
+
+    def _log_attempt(self, model_id: str, key, attempt: int, max_attempts: int,
+                     phase: str, outcome: str, started: float) -> None:
+        """R-OBS1: one line per upstream attempt for post-hoc forensics.
+
+        Without this, a 110s request was unattributable — nothing recorded
+        how many keys were tried, which failed, or how long each took.
+        """
+        try:
+            dur = (time.time() - started) * 1000.0 if started else 0.0
+            logger.info('[attempt] model=%s key=%s n=%d/%d phase=%s outcome=%s dur=%.0fms',
+                        model_id, getattr(key, 'label', '?'), attempt + 1, max_attempts,
+                        phase, outcome, dur)
+        except Exception:
+            pass
 
     async def _prepare_proxy_body(self, body: dict, model_id: str, metric_path: str = '/v1/chat/completions') -> dict:
         """Prepare request body for upstream (P2: extracted from proxy_openai)."""
@@ -3022,6 +3167,16 @@ class Server:
         model_id = body.get('model') or model or ''
         if is_model_unavailable(model_id):
             return {'status': 404, 'data': {'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}}}
+
+        # R-DEAD1: zero upstream calls for a model every live credential
+        # recently hard-404'd (was: 6 guaranteed-fail round trips per request,
+        # amplified x10 by harness retries — the 13:20:16 'API error' storm).
+        ff_reason = await self._fastfail_dead_model_reason(model_id)
+        if ff_reason:
+            return {'status': 404,
+                    'data': {'error': {'message': ff_reason, 'type': 'not_found_error',
+                                       'code': 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'}},
+                    'headers': {'x-wrapper-fastfail': '1'}}
 
         stream_guard = guard_stream_unsupported(body, model_id)
         if stream_guard:
@@ -3057,12 +3212,26 @@ class Server:
         target_url = f"{route_upstream(call_plan.path)}{call_plan.path}"
 
         start_ms = time.time() * 1000
+        _req_t0 = time.time()
+        _wallclock_cap = float(os.environ.get('REQUEST_RETRY_WALLCLOCK_SEC', '600') or 0)
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
 
         attempted_keys = set()
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
+            attempt_start = time.time()
+            # R-TMO1: bound the whole cascade. A hanging upstream (evidence:
+            # deepseek-v4.1-flash 2026-10-15, no headers at all) otherwise
+            # burns every key x full timeout before the client sees anything.
+            if attempt > 0 and _wallclock_cap > 0 and (time.time() - _req_t0) > _wallclock_cap:
+                _elapsed = int(time.time() - _req_t0)
+                logger.info('[wallclock] model=%s attempts=%d elapsed=%ds cap=%ds — stop rotating, return 504',
+                            model_id, attempt, _elapsed, int(_wallclock_cap))
+                return {'status': 504, 'data': {'error': {
+                    'message': f'Upstream timeout: model {model_id} did not respond within {_elapsed}s across {attempt} attempt(s). The provider endpoint appears unresponsive right now.',
+                    'type': 'api_error', 'code': 'UPSTREAM_WALLCLOCK'}},
+                    'headers': {'x-wrapper-attempts': str(attempt)}}
             if not key_result:
                 # Return 429 (not 503) so client SDKs (Anthropic/OpenAI) auto-retry with backoff.
                 # 503 is treated as non-retryable fatal server error by most SDKs.
@@ -3090,14 +3259,20 @@ class Server:
                 }
 
                 is_streaming = bool(body.get('stream'))
-                req_timeout = self._client_timeout(is_streaming, metric_path)  # V-09 fix
+                req_timeout = self._client_timeout(is_streaming, metric_path, body)  # V-09 fix
 
                 if body.get('stream'):
-                    resp = await context_request(
+                    _hdr_deadline = self._headers_deadline_sec(is_streaming, body)
+                    _upstream_call = context_request(
                         lambda payload: self._session.post(target_url, json=payload,
                             headers=fwd_headers, timeout=req_timeout), body,
                         state=context_state, store=getattr(self, 'model_state', None),
                         credential=key.api_key, endpoint=target_url)
+                    # R-HDR1: bound the headers wait; a queued edge request is
+                    # abandoned and rotated instead of stalling until the
+                    # provider's own idle cut. None => plain await (V-09 governs).
+                    resp = await (asyncio.wait_for(_upstream_call, timeout=_hdr_deadline)
+                                  if _hdr_deadline else _upstream_call)
                     if resp.status == 429:
                         ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                         release_attempt()
@@ -3107,6 +3282,7 @@ class Server:
                         if self.metrics:
                             # F2 fix: DB write off the hot path
                             _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                        self._log_attempt(model_id, key, attempt, max_attempts, 'stream-post', f'429 retry_after={ra}s', attempt_start)
                         attempt += 1
                         continue
                     if resp.status >= 400:
@@ -3117,6 +3293,7 @@ class Server:
                         if metric_path != '/v1/chat/completions':
                             norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
                         release_attempt()
+                        self._log_attempt(model_id, key, attempt, max_attempts, 'stream-post', f'upstream-{norm_status}', attempt_start)
                         # Retry only failures that may change with time/key.
                         # Account-scoped deployment, capability and route
                         # errors must not be retried across identical keys.
@@ -3141,25 +3318,55 @@ class Server:
                         finally:
                             release_attempt()
 
-                    async def stream_wrapper(resp=resp, key=key):
+                    async def stream_wrapper(resp=resp, key=key, attempt=attempt,
+                                             model_id=model_id, metric_path=metric_path):
                         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
+                        _sw_t0 = time.time()
+                        _sw_ttft_ms = None
                         source = _passthrough_anthropic_sse(resp, hb_interval)
                         try:
                             async for chunk in source:
+                                if _sw_ttft_ms is None:
+                                    _sw_ttft_ms = (time.time() - _sw_t0) * 1000.0
                                 yield chunk
                         finally:
+                            # R-OBS2: streaming completions were invisible in
+                            # metrics.db (record_request only ran on the non-
+                            # streaming path) — exactly the requests Claude
+                            # Code makes had no model/latency/ttft trail.
+                            try:
+                                if self.metrics:
+                                    _fire_and_forget(self.metrics.record_request(
+                                        model=model_id, key_label=key.label,
+                                        status=resp.status,
+                                        latency_ms=int((time.time() - _sw_t0) * 1000),
+                                        streaming=1, ttft_ms=int(_sw_ttft_ms or 0),
+                                        retries=attempt, path=metric_path,
+                                    ), 'metrics')
+                            except Exception:
+                                pass
                             from common.sse import close_stream
                             await close_stream(source, close_upstream)
 
                     transferred = True
+                    self._log_attempt(model_id, key, attempt, max_attempts, 'stream-open', f'headers-{resp.status}', attempt_start)
                     return {'stream': stream_wrapper(), 'on_close': close_upstream,
-                            'key': key, 'start_ms': start_ms, 'status': resp.status, 'headers': upstream_response_headers(resp)}
+                            'key': key, 'start_ms': start_ms, 'status': resp.status,
+                            'headers': {**upstream_response_headers(resp),
+                                        'x-wrapper-model': model_id,
+                                        'x-wrapper-attempts': str(attempt + 1)}}
                 else:
-                    resp = await context_request(
+                    _hdr_deadline = self._headers_deadline_sec(is_streaming, body)
+                    _upstream_call = context_request(
                         lambda payload: self._session.post(target_url, json=payload,
                             headers=fwd_headers, timeout=req_timeout), body,
                         state=context_state, store=getattr(self, 'model_state', None),
                         credential=key.api_key, endpoint=target_url)
+                    # R-HDR1: bound the headers wait; a queued edge request is
+                    # abandoned and rotated instead of stalling until the
+                    # provider's own idle cut. None => plain await (V-09 governs).
+                    resp = await (asyncio.wait_for(_upstream_call, timeout=_hdr_deadline)
+                                  if _hdr_deadline else _upstream_call)
 
                     if resp.status == 429:
                         ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
@@ -3170,6 +3377,7 @@ class Server:
                         if self.metrics:
                             # F2 fix: DB write off the hot path
                             _fire_and_forget(self.metrics.record_rate_limit_event(key_label=key.label, model=model_id, retry_after_s=ra), 'metrics')
+                        self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'429 retry_after={ra}s', attempt_start)
                         attempt += 1
                         continue
 
@@ -3181,6 +3389,7 @@ class Server:
                     if metric_path != '/v1/chat/completions':
                         norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
                     release_attempt()
+                    self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'upstream-{norm_status}', attempt_start)
 
                     if norm_status >= 400:
                         retryable = self._classify_retry(resp.status, classification)
@@ -3189,6 +3398,7 @@ class Server:
                             continue
                         return {'status': norm_status, 'data': resp_data, 'headers': upstream_response_headers(resp)}
 
+                    self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'done-{resp.status}', attempt_start)
                     if self.metrics:
                         # F2 fix: DB write off the hot path
                         _fire_and_forget(self.metrics.record_request(
@@ -3198,15 +3408,20 @@ class Server:
                             completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
                             path=metric_path,
                         ), 'metrics')
-                    return {'status': resp.status, 'data': resp_data, 'headers': upstream_response_headers(resp)}
+                    return {'status': resp.status, 'data': resp_data,
+                            'headers': {**upstream_response_headers(resp),
+                                        'x-wrapper-model': model_id,
+                                        'x-wrapper-attempts': str(attempt + 1)}}
 
             except asyncio.TimeoutError:
                 release_attempt()
+                self._log_attempt(model_id, key, attempt, max_attempts, 'post', 'timeout', attempt_start)
                 attempt += 1
                 continue
             except Exception as e:
                 release_attempt()
-                logger.error(f'[proxy_openai] error: {e}')
+                logger.error(f'[proxy_openai] error: {e} (model={model_id} key={getattr(key, "label", "?")} attempt={attempt + 1}/{max_attempts} dur={(time.time() - attempt_start) * 1000:.0f}ms)')
+                self._log_attempt(model_id, key, attempt, max_attempts, 'post', f'exc:{type(e).__name__}', attempt_start)
                 attempt += 1
                 continue
 
@@ -3233,9 +3448,15 @@ class Server:
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
         is_streaming = bool(body.get('stream'))
 
+        # R-DEAD1: same zero-upstream-call fast-fail as proxy_openai.
+        ff_reason = await self._fastfail_dead_model_reason(model_id)
+        if ff_reason:
+            return JSONResponse(status_code=404, content={'error': {'message': ff_reason, 'type': 'not_found_error', 'code': 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'}}, headers={'x-wrapper-fastfail': '1'})
+
         attempted_keys = set()
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
+            attempt_start = time.time()
             if not key_result:
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
@@ -3264,7 +3485,7 @@ class Server:
                 }
 
                 # P2/V-09: streaming uses read-idle timeout instead of total
-                req_timeout = self._client_timeout(is_streaming, path)
+                req_timeout = self._client_timeout(is_streaming, path, body)
 
                 resp = await context_request(
                     lambda payload: self._session.post(target_url, json=payload,
@@ -3440,6 +3661,7 @@ class Server:
         attempted_keys = set()
         while attempt < max_attempts:
             key_result = await self.pool.acquire(model_id, exclude=attempted_keys)
+            attempt_start = time.time()
             if not key_result:
                 return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
@@ -3468,7 +3690,7 @@ class Server:
                     fwd_headers['Content-Type'] = 'application/json'
 
                 # P2/V-09: streaming uses read-idle timeout instead of total
-                req_timeout = self._client_timeout(is_streaming, path)
+                req_timeout = self._client_timeout(is_streaming, path, body)
 
                 resp = await context_request(
                     lambda payload: self._session.request(method, target_url,

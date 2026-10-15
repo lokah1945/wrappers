@@ -107,6 +107,14 @@ def _server(peers, records, *, native=False, keys=1):
     server._normalize_path = lambda path: path
     server._classify_retry = lambda status, classification: classification['retry_same_model']
 
+    # R-DEAD1/R-HDR1/R-OBS1 seams: fast-fail, per-attempt logging and the
+    # headers deadline are stubbed — they are exercised by their own tests.
+    async def _fastfail_none(model_id):
+        return None
+    server._fastfail_dead_model_reason = _fastfail_none
+    server._log_attempt = lambda *args, **kwargs: None
+    server._headers_deadline_sec = lambda *args, **kwargs: None
+
     async def record(*args):
         pass
 
