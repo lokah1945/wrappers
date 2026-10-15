@@ -25,6 +25,7 @@ Design:
 """
 from __future__ import annotations
 
+import base64
 import re
 
 THINK_OPENERS = ('<think>', '<thinking>')
@@ -259,3 +260,31 @@ def contains_think_tags(text) -> bool:
     if not isinstance(text, str):
         return False
     return bool(_THINK_TAG_RE.search(text))
+
+
+# ---------------------------------------------------------------------------
+# Anthropic thinking-block signature (contract completeness)
+# ---------------------------------------------------------------------------
+# The Anthropic contract requires every `thinking` content block to carry a
+# `signature` (streamed as a `signature_delta` immediately before
+# `content_block_stop`, present as a field on non-stream blocks). Real
+# Anthropic signatures are opaque server-signed tokens; the wrapper emits a
+# deterministic synthetic token so strict SDKs and Claude Code round-trips
+# (interleaved thinking blocks are passed back verbatim on tool
+# continuation) always see a structurally valid block. The token is opaque
+# to clients and accepted verbatim on the way back in.
+_THINKING_SIGNATURE = base64.b64encode(b"wrapper-thinking-v1").decode("ascii")
+
+
+def thinking_signature() -> str:
+    """Synthetic opaque signature for thinking content blocks."""
+    return _THINKING_SIGNATURE
+
+
+def signature_delta_event(index: int) -> dict:
+    """Ready-to-emit content_block_delta payload for a thinking block."""
+    return {
+        "type": "content_block_delta",
+        "index": index,
+        "delta": {"type": "signature_delta", "signature": _THINKING_SIGNATURE},
+    }

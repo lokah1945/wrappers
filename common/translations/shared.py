@@ -22,9 +22,9 @@ except Exception:  # pragma: no cover - fallback for standalone use
 
 
 try:
-    from .think_tags import extract_inline_thinking, strip_trailing_think_tags
+    from .think_tags import extract_inline_thinking, strip_trailing_think_tags, thinking_signature
 except ImportError:  # pragma: no cover - standalone use outside the package
-    from think_tags import extract_inline_thinking, strip_trailing_think_tags
+    from think_tags import extract_inline_thinking, strip_trailing_think_tags, thinking_signature
 
 
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
@@ -646,7 +646,7 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
     # Reasoning
     reasoning = msg.get("reasoning_content") or msg.get("reasoning")
     if reasoning and isinstance(reasoning, str):
-        content.append({"type": "thinking", "thinking": reasoning})
+        content.append({"type": "thinking", "thinking": reasoning, "signature": thinking_signature()})
     # CRIT-03 + anti-trace (2026-10-15 forensics): inline thinking
     # extraction is START-ANCHORED (only when the content begins with an
     # opener tag), the extracted span is REMOVED from the visible text,
@@ -659,7 +659,7 @@ def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str 
             inline_thinking, raw_text = extract_inline_thinking(raw_text)
             if inline_thinking:
                 reasoning = inline_thinking
-                content.append({"type": "thinking", "thinking": reasoning})
+                content.append({"type": "thinking", "thinking": reasoning, "signature": thinking_signature()})
         else:
             raw_text = strip_trailing_think_tags(raw_text)
 

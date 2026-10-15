@@ -171,6 +171,7 @@ try:
         ThinkTagStreamFilter as _ThinkTagStreamFilter,
         extract_inline_thinking as _extract_inline_thinking,
         strip_trailing_think_tags as _strip_think_tags,
+        thinking_signature as _thinking_signature,
     )
     from common.model.context_probe import ContextProbeService, ProbeOutcome
     from common.model.metadata import merge_observed_context, positive_int as _probe_pos_int
@@ -2749,7 +2750,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
     # silently removes part of the model's output.
     reasoning = message.get("reasoning_content") or message.get("reasoning") or ""
     if reasoning:
-        content_blocks.append({"type": "thinking", "thinking": reasoning})
+        content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": _thinking_signature()})
     _or_text = message.get("content")
     if isinstance(_or_text, str):
         # Anti-trace (2026-10-15 forensics): start-anchored inline
@@ -2759,7 +2760,7 @@ def _openai_to_anthropic_response(openai_resp: dict, request_body: dict) -> dict
             _inline, _or_text = _extract_inline_thinking(_or_text)
             if _inline:
                 reasoning = _inline
-                content_blocks.append({"type": "thinking", "thinking": reasoning})
+                content_blocks.append({"type": "thinking", "thinking": reasoning, "signature": _thinking_signature()})
         else:
             _or_text = _strip_think_tags(_or_text)
     if _or_text:
@@ -2867,6 +2868,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                     continue
                 if not text_started:
                     if block_open and thinking_started:
+                        yield _sse('content_block_delta', {
+                            'type': 'content_block_delta', 'index': thinking_index,
+                            'delta': {'type': 'signature_delta', 'signature': _thinking_signature()},
+                        })
                         yield _sse('content_block_stop', {
                             'type': 'content_block_stop', 'index': thinking_index,
                         })
@@ -3045,6 +3050,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                             text_started = False
                             block_open = False
                         elif block_open and thinking_started:
+                            yield _sse('content_block_delta', {
+                                'type': 'content_block_delta', 'index': thinking_index,
+                                'delta': {'type': 'signature_delta', 'signature': _thinking_signature()},
+                            })
                             yield _sse('content_block_stop', {
                                 'type': 'content_block_stop', 'index': thinking_index,
                             })
@@ -3087,6 +3096,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
             })
             text_started = False
         if block_open and thinking_started:
+            yield _sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': thinking_index,
+                'delta': {'type': 'signature_delta', 'signature': _thinking_signature()},
+            })
             yield _sse('content_block_stop', {
                 'type': 'content_block_stop', 'index': thinking_index,
             })
@@ -3131,6 +3144,10 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
             if block_open and text_started:
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': block_index})
             if block_open and thinking_started:
+                yield _sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': thinking_index,
+                    'delta': {'type': 'signature_delta', 'signature': _thinking_signature()},
+                })
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': thinking_index})
             for _ti in sorted(open_tool_blocks):
                 yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': _ti})

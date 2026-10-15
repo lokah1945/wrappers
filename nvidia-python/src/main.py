@@ -543,7 +543,18 @@ class AnthropicStreamState:
     def _close_block(self):
         if self.current_block is None:
             return []
-        ev = [self._sse('content_block_stop', {'type': 'content_block_stop', 'index': self.index})]
+        ev = []
+        if self.current_block == 'thinking':
+            # Anthropic contract: thinking blocks carry a signature. The
+            # canonical helper lives in common.translations.think_tags;
+            # this test-path state machine keeps a local constant so it
+            # stays importable without the common package.
+            sig = 'd3JhcHBlci10aGlua2luZy12MQ=='  # b64('wrapper-thinking-v1')
+            ev.append(self._sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': self.index,
+                'delta': {'type': 'signature_delta', 'signature': sig},
+            }))
+        ev.append(self._sse('content_block_stop', {'type': 'content_block_stop', 'index': self.index}))
         self.current_block = None
         return ev
 

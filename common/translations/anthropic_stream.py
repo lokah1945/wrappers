@@ -20,6 +20,11 @@ import logging
 import time
 from typing import List, Optional
 
+try:
+    from .think_tags import thinking_signature
+except ImportError:  # pragma: no cover - standalone use outside the package
+    from think_tags import thinking_signature
+
 _log = logging.getLogger("wrapper-anthropic-stream")
 
 # B-06 fix: strict OpenAI finish_reason → Anthropic stop_reason mapping.
@@ -107,10 +112,19 @@ class AnthropicStreamState:
         """
         if self.current_block is None or self.current_block == "tool_use":
             return []
-        ev = [self._sse("content_block_stop", {
+        ev = []
+        if self.current_block == "thinking":
+            # Anthropic contract: thinking blocks carry a signature
+            # (signature_delta immediately before content_block_stop).
+            ev.append(self._sse("content_block_delta", {
+                "type": "content_block_delta",
+                "index": self.index,
+                "delta": {"type": "signature_delta", "signature": thinking_signature()},
+            }))
+        ev.append(self._sse("content_block_stop", {
             "type": "content_block_stop",
             "index": self.index,
-        })]
+        }))
         self.current_block = None
         return ev
 

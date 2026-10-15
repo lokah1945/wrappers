@@ -35,6 +35,7 @@ from common.translations import (
 )
 from common.translations.think_tags import (
     ThinkTagStreamFilter, extract_inline_thinking, strip_trailing_think_tags,
+    thinking_signature,
 )
 from common.translations import parse_dsml_from_text
 
@@ -55,6 +56,7 @@ def _load(path, names, **globals_):
     # built namespace (as **globals_) never hit duplicate keywords, and
     # explicit caller overrides always win.
     namespace.setdefault('_ThinkTagStreamFilter', ThinkTagStreamFilter)
+    namespace.setdefault('_thinking_signature', thinking_signature)
     namespace.setdefault('_extract_inline_thinking', extract_inline_thinking)
     namespace.setdefault('_strip_think_tags', strip_trailing_think_tags)
     namespace.setdefault('_parse_dsml_from_text', parse_dsml_from_text)

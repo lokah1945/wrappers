@@ -17,7 +17,7 @@ import asyncio
 from typing import Optional, AsyncGenerator
 
 from .capabilities import get_context_window
-from common.translations.think_tags import ThinkTagStreamFilter, strip_trailing_think_tags
+from common.translations.think_tags import ThinkTagStreamFilter, strip_trailing_think_tags, thinking_signature
 
 
 def _env_flag(name: str, default: str = '0') -> bool:
@@ -570,7 +570,7 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     raw_content = _nr['content'] or ''
 
     if reasoning:
-        content.append({'type': 'thinking', 'thinking': reasoning})
+        content.append({'type': 'thinking', 'thinking': reasoning, 'signature': thinking_signature()})
 
     # Parse DSML tool calls from content
     normalized_raw = raw_content.replace('\uff5c', '|').replace('<|DSML|', '|DSML|')
@@ -630,7 +630,7 @@ def openai_to_anthropic(o: dict, model: str, request_id: str = None,
     # opt-in via WRAPPER_SYNTHETIC_THINKING. Default OFF: omit the block.
     if (expect_thinking and _env_flag('WRAPPER_SYNTHETIC_THINKING', '0')
             and not any(c.get('type') == 'thinking' for c in content) and content):
-        content.insert(0, {'type': 'thinking', 'thinking': '[Reasoning not supported by this model; responding directly.]'})
+        content.insert(0, {'type': 'thinking', 'thinking': '[Reasoning not supported by this model; responding directly.]', 'signature': thinking_signature()})
 
     if not any(c.get('type') in ('text', 'tool_use') for c in content):
         content.append({'type': 'text', 'text': ''})
@@ -716,6 +716,13 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         """
         nonlocal open_idx, text_index, thinking_index
         if open_idx is not None and open_idx not in set(tool_map.values()):
+            if open_idx == thinking_index:
+                # Anthropic contract: thinking blocks carry a signature
+                # (signature_delta immediately before content_block_stop).
+                yield _sse('content_block_delta', {
+                    'type': 'content_block_delta', 'index': open_idx,
+                    'delta': {'type': 'signature_delta', 'signature': thinking_signature()},
+                })
             yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
             if open_idx == text_index:
                 text_index = None
@@ -790,6 +797,10 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         yield _sse('content_block_delta', {
             'type': 'content_block_delta', 'index': thinking_index,
             'delta': {'type': 'thinking_delta', 'thinking': '[Reasoning not supported by this model; responding directly.]'},
+        })
+        yield _sse('content_block_delta', {
+            'type': 'content_block_delta', 'index': thinking_index,
+            'delta': {'type': 'signature_delta', 'signature': thinking_signature()},
         })
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': thinking_index})
         completed_thinking = True
@@ -1162,6 +1173,11 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 pass
             if open_idx is not None and open_idx not in set(tool_map.values()):
                 try:
+                    if open_idx == thinking_index:
+                        yield _sse('content_block_delta', {
+                            'type': 'content_block_delta', 'index': open_idx,
+                            'delta': {'type': 'signature_delta', 'signature': thinking_signature()},
+                        })
                     yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
                 except Exception:
                     pass
@@ -1190,6 +1206,11 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
         _finalize_capture(capture, usage, input_tokens, generated_chars, last_usage_chunk, final_stop)
 
     if open_idx is not None and open_idx not in set(tool_map.values()):
+        if open_idx == thinking_index:
+            yield _sse('content_block_delta', {
+                'type': 'content_block_delta', 'index': open_idx,
+                'delta': {'type': 'signature_delta', 'signature': thinking_signature()},
+            })
         yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': open_idx})
         open_idx = None
     # R-02: ensure no tool_use block is left unclosed.

@@ -88,6 +88,7 @@ try:
         ThinkTagStreamFilter as _ThinkTagStreamFilter,
         extract_inline_thinking as _extract_inline_thinking,
         strip_trailing_think_tags as _strip_think_tags,
+        thinking_signature as _thinking_signature,
     )
     from common.model.context_probe import ContextProbeService, ProbeOutcome
     from common.model.metadata import merge_observed_context, positive_int as _probe_pos_int
@@ -1499,7 +1500,7 @@ def openai_to_anthropic(model: str, chat: dict) -> dict:
     content = []
     # Keep thinking SEPARATE — never concatenate into text (Claude Code contract)
     if reasoning:
-        content.append({"type": "thinking", "thinking": reasoning})
+        content.append({"type": "thinking", "thinking": reasoning, "signature": _thinking_signature()})
 
     tool_calls = list(msg.get("tool_calls") or [])
     dsml_tools = []
@@ -1820,6 +1821,11 @@ class AnthropicStreamState:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
             self.open_tool_blocks.clear()
             if self.current_block and self.current_block != "tool_use":
+                if self.current_block == "thinking":
+                    events.append({"type": "content_block_delta", "data": {
+                        "type": "content_block_delta", "index": self.index,
+                        "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                    }})
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             self.index += 1
             events.append({"type": "content_block_start", "data": {
@@ -1842,6 +1848,11 @@ class AnthropicStreamState:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
             self.open_tool_blocks.clear()
             if self.current_block and self.current_block != "tool_use":
+                if self.current_block == "thinking":
+                    events.append({"type": "content_block_delta", "data": {
+                        "type": "content_block_delta", "index": self.index,
+                        "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                    }})
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             self.index += 1
             events.append({"type": "content_block_start", "data": {
@@ -1876,6 +1887,11 @@ class AnthropicStreamState:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
             self.open_tool_blocks.clear()
             if self.current_block is not None and self.current_block != "tool_use":
+                if self.current_block == "thinking":
+                    events.append({"type": "content_block_delta", "data": {
+                        "type": "content_block_delta", "index": self.index,
+                        "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                    }})
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             self.current_block = None
             events.append({"type": "error", "data": {
@@ -1903,6 +1919,11 @@ class AnthropicStreamState:
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
                 self.open_tool_blocks.clear()
                 if self.current_block and self.current_block != "tool_use":
+                    if self.current_block == "thinking":
+                        events.append({"type": "content_block_delta", "data": {
+                            "type": "content_block_delta", "index": self.index,
+                            "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                        }})
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                 self.index += 1
                 events.append({"type": "content_block_start", "data": {
@@ -1956,6 +1977,11 @@ class AnthropicStreamState:
                 # (content_block_delta on a closed index -> Claude Code drops
                 # the tool call and the agent turn stalls).
                 if self.current_block and self.current_block != "tool_use":
+                    if self.current_block == "thinking":
+                        events.append({"type": "content_block_delta", "data": {
+                            "type": "content_block_delta", "index": self.index,
+                            "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                        }})
                     events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
                     self.current_block = None
                 self.index += 1
@@ -1990,6 +2016,11 @@ class AnthropicStreamState:
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
             self.open_tool_blocks.clear()
             if self.current_block is not None and self.current_block != "tool_use":
+                if self.current_block == "thinking":
+                    events.append({"type": "content_block_delta", "data": {
+                        "type": "content_block_delta", "index": self.index,
+                        "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                    }})
                 events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
             fr = ch.get("finish_reason")
             # B-06 fix: map STRICTLY from finish_reason. Forcing tool_use
@@ -2037,6 +2068,11 @@ class AnthropicStreamState:
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": _ti}})
         self.open_tool_blocks.clear()
         if self.current_block is not None and self.current_block != "tool_use":
+            if self.current_block == "thinking":
+                events.append({"type": "content_block_delta", "data": {
+                    "type": "content_block_delta", "index": self.index,
+                    "delta": {"type": "signature_delta", "signature": _thinking_signature()},
+                }})
             events.append({"type": "content_block_stop", "data": {"type": "content_block_stop", "index": self.index}})
         self.current_block = None
         # B-06: this is the no-finish_reason path, so inferring from tool state
