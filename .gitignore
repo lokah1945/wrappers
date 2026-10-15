@@ -86,3 +86,12 @@ ngc-featured-cache.json
 # own deploy commit (git pull clobbers it). Trust /health git_commit instead.
 runtime/
 .deployed_commit
+
+# Timestamped session backup files (hotfix snapshots, never push)
+*.bak-*
+
+# Root dot-directory backups from hotfix sessions
+.*-backup-*/
+
+# Raw audit model dump (local artifact, regenerated on demand)
+.audit_models_raw.json
