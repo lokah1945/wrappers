@@ -83,3 +83,33 @@ def test_unscoped_status_does_not_collapse_conflicting_accounts(tmp_path: Path):
     assert state["reason_code"] == "MULTIPLE_ACCOUNT_OR_ENDPOINT_STATES"
     assert store.status_for("vendor/model-a", "account-a")["state"] == "available"
     assert store.status_for("vendor/model-a", "account-b")["state"] == "account_unavailable"
+
+
+def test_provider_manifest_loads_from_model_registry():
+    """2026-10-17 regression: the loader path must actually find the manifests
+    under <repo>/model-registry/manifests/errors/ (parents[1] pointed at
+    common/ which never contained them — every manifest silently loaded {},
+    so provider rules never ran)."""
+    manifest = load_provider_error_manifest("nvidia")
+    assert isinstance(manifest, dict)
+    assert manifest.get("rules"), (
+        "nvidia manifest failed to load from model-registry/manifests/errors/"
+    )
+
+
+def test_nvidia_function_not_found_404_is_account_scoped():
+    """NVIDIA's real not-deployed 404 phrasing (observed 2026-10-17 on
+    nvidia/nemotron-3-ultra-550b-a55b) must classify account-scoped and
+    retriable across keys — not generic UNKNOWN with no rotation."""
+    payload = {
+        "status": 404,
+        "title": "Not Found",
+        "detail": "Function id '948fe171-ce7a-4332-8bc0-5e14e90259f9' version "
+                  "'null': Specified function in account 'SVfYs4' is not found",
+    }
+    manifest = load_provider_error_manifest("nvidia")
+    result = classify_provider_error("nvidia", 404, payload, manifest)
+    assert result["state"] == "account_unavailable"
+    assert result["reason_code"] == "NOT_DEPLOYED_FOR_ACCOUNT"
+    assert result["account_scoped"] is True
+    assert result["retry_same_model"] is True

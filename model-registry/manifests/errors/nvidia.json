@@ -17,6 +17,15 @@
       "status": 404,
       "body_contains": "not found for account",
       "state": "account_unavailable",
+      "reason_code": "NOT_DEPLOYED_FOR_ACCOUNT",
+      "retry_same_model": true,
+      "rotate_key": true
+    },
+    {
+      "status": 404,
+      "body_contains": "specified function in account",
+      "state": "account_unavailable",
+      "reason_code": "NOT_DEPLOYED_FOR_ACCOUNT",
       "retry_same_model": true,
       "rotate_key": true
     },

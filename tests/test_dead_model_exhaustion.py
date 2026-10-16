@@ -35,6 +35,8 @@ from common.sse import ClosingStreamingResponse as StreamingResponse
 
 from common.compat import passthrough_anthropic_sse
 from common.model import classify_upstream_error
+from common.model.errors import load_provider_error_manifest
+from common.model_state import classify_provider_error
 from test_active_native_passthrough import _Upstream, _collect
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,7 +73,7 @@ def _server(peers, records, *, keys=2, fastfail=None):
     tree = ast.parse(SOURCE.read_text())
     server_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Server')
     methods = {'proxy_openai', '_prepare_proxy_body', '_proxy_post',
-               '_handle_catch_all', '_stream_proxy', '_dead_model_404'}
+               '_handle_catch_all', '_stream_proxy', '_classify_upstream', '_dead_model_404'}
     server_class.body = [node for node in server_class.body if getattr(node, 'name', None) in methods]
     nodes = [server_class]
 
@@ -89,6 +91,7 @@ def _server(peers, records, *, keys=2, fastfail=None):
         'BASE_LLM': 'http://synthetic.invalid', 'route_upstream': lambda path: 'http://synthetic.invalid',
         '_safe_response_body': safe_body, '_normalize_upstream_error': lambda status, body, model: (status, body),
         'classify_upstream_error': classify_upstream_error,
+        'classify_provider_error': classify_provider_error,
         'same_provider_model_id': lambda provider, first, second: first == second,
         'MODEL_REGISTRY': SimpleNamespace(call_plan=lambda model, surface: SimpleNamespace(
             model=SimpleNamespace(provider_model_id=model), path='/v1/chat/completions')),
@@ -258,3 +261,32 @@ async def test_dead_model_404_helper_shape_matches_fastfail_contract():
     assert '6 distinct credentials just returned 404 Not Found' in verdict['data']['error']['message']
     assert 'raw' not in verdict['data']['error']['message']
     assert verdict['headers'] == {'x-wrapper-attempts': '6'}
+
+
+# NVIDIA's verbatim not-deployed 404 (2026-10-17, nvidia/nemotron-3-ultra-550b-a55b).
+NVIDIA_DEAD = {'status': 404, 'title': 'Not Found',
+               'detail': "Function id '948fe171' version 'null': "
+                         "Specified function in account 'SVfYs4' is not found"}
+
+
+@pytest.mark.parametrize('stream', [False, True])
+async def test_nvidia_function_404_rotates_and_synthesizes_clean_verdict(stream):
+    """2026-10-17 incident regression: NVIDIA's real account-scoped 404
+    phrasing must classify via the provider manifest, rotate every key, and
+    return the R-DEAD3 verdict. Pre-fix: UNKNOWN classification, exactly one
+    upstream attempt, and the raw JSON:API body leaked to Claude Code."""
+    peers = [Peer(status=404, reply=NVIDIA_DEAD) for _ in range(3)]
+    records = []
+    server, _ = _server(peers, records, keys=3)
+    server.model_state = SimpleNamespace(
+        provider_error_manifest=load_provider_error_manifest('nvidia'))
+    body = _body({'stream': stream})
+    response = await server.proxy_openai(body, {}, MODEL, _request(body))
+    assert response['status'] == 404
+    error = response['data']['error']
+    assert error['type'] == 'not_found_error'
+    assert error['code'] == 'MODEL_NOT_DEPLOYED_ON_ANY_ACCOUNT'
+    assert '3 distinct credentials just returned 404 Not Found' in error['message']
+    assert len(records) == 3  # full rotation — pre-fix this was 1
+    assert server._in_flight == 0 and all(key.in_flight == 0 for key in server.pool.keys)
+    assert all(peer.release_count == 1 for peer in peers)

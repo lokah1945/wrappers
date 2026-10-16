@@ -23,6 +23,7 @@ from common.sse import ClosingStreamingResponse as StreamingResponse
 
 from common.compat import passthrough_anthropic_sse
 from common.model import classify_upstream_error
+from common.model_state import classify_provider_error
 from common.translations.shared import openai_to_anthropic_response
 from test_active_native_passthrough import _Upstream, _collect
 
@@ -62,7 +63,8 @@ def _server(peers, records, *, native=False, keys=1):
         isinstance(target, ast.Name) and target.id == 'REASONING_CONFIGS' for target in node.targets)]
     server_class = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'Server')
     methods = {'_handle_anthropic_messages', 'proxy_openai', '_prepare_proxy_body',
-               '_compat2_proxy', '_proxy_post', '_handle_catch_all', '_stream_proxy'}
+               '_compat2_proxy', '_proxy_post', '_handle_catch_all', '_stream_proxy',
+               '_classify_upstream'}
     server_class.body = [node for node in server_class.body if getattr(node, 'name', None) in methods]
     nodes.append(server_class)
 
@@ -88,6 +90,7 @@ def _server(peers, records, *, native=False, keys=1):
         'BASE_LLM': 'http://synthetic.invalid', 'route_upstream': lambda path: 'http://synthetic.invalid',
         '_safe_response_body': safe_body, '_normalize_upstream_error': lambda status, body, model: (status, body),
         'classify_upstream_error': classify_upstream_error,
+        'classify_provider_error': classify_provider_error,
         'same_provider_model_id': lambda provider, first, second: first == second,
         'MODEL_REGISTRY': SimpleNamespace(call_plan=lambda model, surface: SimpleNamespace(
             model=SimpleNamespace(provider_model_id=model), path='/v1/chat/completions')),

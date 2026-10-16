@@ -92,7 +92,15 @@ def classify_provider_error(provider: str, status: int, payload: Any = "", manif
 
 
 def load_provider_error_manifest(provider: str) -> dict[str, Any]:
-    path = Path(__file__).resolve().parents[1] / "model-registry" / "manifests" / "errors" / f"{provider}.json"
+    # Repo layout: this file lives at <repo>/common/model/errors.py while the
+    # git-tracked provider manifests live at <repo>/model-registry/manifests/
+    # errors/. parents[1] resolved to <repo>/common/ — a location that has
+    # never contained model-registry/ — so every manifest silently loaded as
+    # {} and provider rules never ran (root cause of the 2026-10-17 Claude
+    # Code dead-model 404 storm: NVIDIA's account-scoped 404 phrasing fell
+    # through to the generic UNKNOWN classifier and the R-DEAD machinery
+    # never fired).
+    path = Path(__file__).resolve().parents[2] / "model-registry" / "manifests" / "errors" / f"{provider}.json"
     try:
         data = json.loads(path.read_text())
         return data if isinstance(data, dict) else {}

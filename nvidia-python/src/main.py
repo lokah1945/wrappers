@@ -91,6 +91,7 @@ from contextlib import asynccontextmanager
 try:
     from common.model_state import (
         ModelStateStore,
+        classify_provider_error,
         classify_upstream_error,
         credential_fingerprint,
         error_text,
@@ -100,6 +101,7 @@ except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model_state import (
         ModelStateStore,
+        classify_provider_error,
         classify_upstream_error,
         credential_fingerprint,
         error_text,
@@ -220,7 +222,10 @@ async def verify_models(pool):
         async with sem:
             res = await probe_model(pool, mid, TTFT_TIMEOUT_MS, key=key)
             res["ts"] = time.time()  # V-20 fix: track probe recency
-            classification = classify_upstream_error(res.get("status", 0), res.get("reason", ""))
+            # Manifest-aware so provider rules (account-scoped 404 phrasings)
+            # record the correct deployability state during sweeps too.
+            _probe_manifest = getattr(globals().get('_model_state_store'), 'provider_error_manifest', None)
+            classification = classify_provider_error('nvidia', res.get("status", 0), res.get("reason", ""), _probe_manifest)
             res["state"] = classification["state"]
             res["reason_code"] = classification["reason_code"]
             observations.setdefault(mid, []).append(res)
@@ -2246,7 +2251,8 @@ class Server:
             if _env_flag('MODELS_MARK_UNAVAILABLE', '1'):
                 for e in enriched:
                     mid = e.get('id') or ''
-                    if mid and await self._fastfail_dead_model_reason(mid):
+                    if mid and (await self._fastfail_dead_model_reason(mid)
+                                or await self._advert_dead_model_reason(mid)):
                         e['available'] = False
                         e['unavailable_reason'] = 'not_deployed_on_any_configured_account'
                     else:
@@ -3020,6 +3026,18 @@ class Server:
         scaled = int(prefill + gen + 30.0)
         return max(floor_sec, min(scaled, REQUEST_TIMEOUT_SEC))
 
+    def _classify_upstream(self, status: int, payload: Any) -> dict:
+        """Manifest-aware upstream classification for retry decisions.
+
+        The retry loops historically called classify_upstream_error() directly,
+        which skips the provider error manifest — so account-scoped
+        deployability verdicts (NVIDIA's 'Specified function in account ...
+        is not found' 404) classified as UNKNOWN, never rotated keys, and
+        never fed the R-DEAD3 dead-model synthesis. Manifest rules apply
+        first; the shared taxonomy remains the fallback."""
+        manifest = getattr(getattr(self, 'model_state', None), 'provider_error_manifest', None)
+        return classify_provider_error('nvidia', status, payload, manifest)
+
     def _classify_retry(self, status: int, classification: dict) -> bool:
         """Determine if a failed request should be retried with another key.
         
@@ -3038,7 +3056,7 @@ class Server:
             'network_timeout',
         )
 
-    async def _fastfail_dead_model_reason(self, model_id: str) -> Optional[str]:
+    async def _fastfail_dead_model_reason(self, model_id: str, horizon_sec: Optional[float] = None) -> Optional[str]:
         """R-DEAD1: fast-fail models known undeployable on EVERY live credential.
 
         Evidence source is real-time model_account_status (rows written by
@@ -3048,17 +3066,24 @@ class Server:
         model without fresh full coverage still goes upstream, so a newly
         deployed model becomes usable after at most one failing request (or
         a sweep) plus the TTL. Kill switch: MODEL_FASTFAIL_ENABLED=0.
+
+        horizon_sec overrides the evidence window: the R-DEAD2b advertisement
+        consults a longer horizon so /v1/models stays honest between TTL
+        windows, while the request path keeps the short self-healing TTL.
         """
         if not model_id:
             return None
         if not _env_flag('MODEL_FASTFAIL_ENABLED', '1'):
             return None
         cache = self.__dict__.setdefault('_fastfail_cache', {})
+        cache_key = model_id if horizon_sec is None else f'{model_id}|advert'
         now = time.time()
-        hit = cache.get(model_id)
+        hit = cache.get(cache_key)
         if hit is not None and now - hit[0] < 2.0:
             return hit[1]
-        ttl = float(os.environ.get('MODEL_FASTFAIL_TTL_SEC', '300') or 0)
+        ttl = (float(horizon_sec)
+               if horizon_sec is not None
+               else float(os.environ.get('MODEL_FASTFAIL_TTL_SEC', '300') or 0))
         reason: Optional[str] = None
         store = getattr(self, 'model_state', None)
         pool = getattr(self, 'pool', None)
@@ -3093,8 +3118,25 @@ class Server:
                         )
             except Exception as e:
                 logger.warning(f'[fastfail] state lookup failed: {type(e).__name__}: {e}')
-        cache[model_id] = (now, reason)
+        cache[cache_key] = (now, reason)
         return reason
+
+    async def _advert_dead_model_reason(self, model_id: str) -> Optional[str]:
+        """R-DEAD2b: sticky deployability verdict for the /v1/models listing.
+
+        R-DEAD2 marks a model unavailable only while the fast-fail TTL window
+        holds fresh full-scope coverage; between windows the listing flips
+        back to available=true even though every account's latest observation
+        is a hard 404, so clients re-pick the dead model (2026-10-17 Claude
+        Code incident). Same all-scopes-negative evidence over a longer
+        horizon (MODEL_ADVERT_DEAD_HORIZON_SEC, default 24h; 0 disables) so
+        the advertisement stays false until any scope observes a success.
+        The request path keeps the short TTL: self-healing is never blocked
+        by an advertisement."""
+        horizon = float(os.environ.get('MODEL_ADVERT_DEAD_HORIZON_SEC', '86400') or 0)
+        if horizon <= 0:
+            return None
+        return await self._fastfail_dead_model_reason(model_id, horizon_sec=horizon)
 
     def _dead_model_404(self, model_id: str, n_misses: int, attempts: int) -> dict:
         """R-DEAD3: same verdict and shape as the R-DEAD1 fast-fail 404, but for
@@ -3319,7 +3361,7 @@ class Server:
                     if resp.status >= 400:
                         resp_body = await _safe_response_body(resp)
                         await self._record_model_response(model_id, key, resp.status, resp_body, metric_path)
-                        classification = classify_upstream_error(resp.status, resp_body)
+                        classification = self._classify_upstream(resp.status, resp_body)
                         norm_status = resp.status
                         if metric_path != '/v1/chat/completions':
                             norm_status, resp_body = _normalize_upstream_error(resp.status, resp_body, model_id)
@@ -3422,7 +3464,7 @@ class Server:
                         continue
 
                     resp_data = await _safe_response_body(resp)
-                    classification = classify_upstream_error(resp.status, resp_data)
+                    classification = self._classify_upstream(resp.status, resp_data)
                     if resp.status >= 400:
                         await self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
                     norm_status = resp.status
@@ -3592,7 +3634,7 @@ class Server:
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
                     await self._record_model_response(model_id, key, resp.status, err_data, path)
-                    classification = classify_upstream_error(resp.status, err_data)
+                    classification = self._classify_upstream(resp.status, err_data)
                     # R-DEAD3: synthesize the clean local 404 when every attempt
                     # this request was an account-scoped not-deployed miss.
                     if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
@@ -3823,7 +3865,7 @@ class Server:
                         from common.compat import responses_chat_fallback_allowed
                         if responses_chat_fallback_allowed(resp.status, err_data):
                             return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
-                    classification = classify_upstream_error(resp.status, err_data)
+                    classification = self._classify_upstream(resp.status, err_data)
                     # R-DEAD3: synthesize the clean local 404 when every attempt
                     # this request was an account-scoped not-deployed miss.
                     if classification['reason_code'] == 'NOT_DEPLOYED_FOR_ACCOUNT':
