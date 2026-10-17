@@ -104,8 +104,11 @@ async def test_status_orders_active_ports_then_frozen_and_reports_endpoint_cover
     assert data["wrappers"][1]["realtime"] == "polling"
     assert data["wrappers"][0]["endpoint_status"] == {
         "health": 200, "ready": 200, "stats": 200, "metrics": None,
-        "models": 200, "capabilities": 200,
+        "models": 200, "capabilities": 200, "usage": 404,
+        "activity": 404, "chart_hourly": 404,
     }
+    assert data["model_planes"]["model_fetcher"]["port"] == 8787
+    assert data["model_planes"]["model_registry"]["port"] == 9200
     assert data["counts"]["inference_active"] == 2
 
 
@@ -126,8 +129,10 @@ async def test_status_refresh_is_single_flight_and_does_not_probe_pending(repo):
     async with gateway(repo, responses()) as (_, client, session):
         one, two = await asyncio.gather(client.get("/api/status"), client.get("/api/status"))
     assert one.status_code == two.status_code == 200
-    assert len(session.calls) == 10  # five read probes per active wrapper, not doubled
-    assert all(urlsplit(url).port in (19811, 19812) for url, _ in session.calls)
+    wrapper_calls = [(url, kwargs) for url, kwargs in session.calls if urlsplit(url).port in (19811, 19812)]
+    assert len(wrapper_calls) == 16  # eight telemetry probes per active wrapper, not doubled
+    assert all(urlsplit(url).port in (19811, 19812) for url, _ in wrapper_calls)
+    assert len(session.calls) < 2 * (16 + 16)  # model-plane probes also share the flight
 
 
 @pytest.mark.asyncio
@@ -154,3 +159,59 @@ async def test_status_sse_emits_retry_and_live_snapshot_then_closes_cleanly(repo
         assert second.startswith(b"event: status\ndata: {")
         assert b'"port":19811' in second and b'"port":19812' in second
         await response.aclose()
+
+@pytest.mark.asyncio
+async def test_registry_models_are_provider_derived_bounded_and_redacted(tmp_path):
+    entries = {
+        "nvidia-python": {"status": "production", "port": 19811, "upstream": "NVIDIA", "supports": ["openai_chat"]},
+        "model-registry": {"status": "production", "port": 19200, "upstream": "internal", "service_kind": "internal"},
+    }
+    (tmp_path / "wrappers.json").write_text(json.dumps({"wrappers": entries}))
+    record = {
+        "canonical_id": "nvidia/demo",
+        "provider": "nvidia",
+        "provider_model_id": "demo",
+        "lifecycle_state": "active",
+        "capabilities": {"input_modalities": ["text"], "streaming": True},
+        "limits": {"context_window": 4096},
+        "protocols": [{"client_surface": "openai_chat", "path": "/v1/chat/completions"}],
+        "provenance": {"source": "provider_catalog", "retrieved_at": "2026-10-17", "metadata": {"token": "PRIVATE_TOKEN", "blob": "x" * 300000}},
+    }
+    registry = {"object": "list", "provider": "nvidia", "data": [record]}
+    data_responses = {
+        (19811, "/health"): Response({"status": "ok"}),
+        (19811, "/ready"): Response({"ready": True}),
+        (19811, "/v1/models"): Response({"data": [{"id": "demo"}]}),
+        (19811, "/v1/capabilities"): Response({"models": [{"id": "demo"}]}),
+        (19200, "/health"): Response({"status": "ok"}),
+        (19200, "/ready"): Response({"ready": True}),
+        (19200, "/stats"): Response({"models": 1}),
+        (19200, "/v1/models"): Response(registry),
+    }
+    async with gateway(tmp_path, data_responses) as (_, client, _):
+        response = await client.get("/api/status")
+    assert response.status_code == 200
+    assert "PRIVATE_TOKEN" not in response.text
+    assert len(response.content) < 250_000
+    models = response.json()["model_planes"]["model_registry"]["providers"]["nvidia"]["models"]
+    assert models[0]["canonical_id"] == "nvidia/demo"
+    assert "metadata" not in models[0].get("provenance", {})
+
+
+@pytest.mark.asyncio
+async def test_model_plane_failure_is_isolated_from_wrapper_status(tmp_path):
+    entries = {
+        "nvidia-python": {"status": "production", "port": 19811, "upstream": "NVIDIA", "supports": ["openai_chat"]},
+    }
+    (tmp_path / "wrappers.json").write_text(json.dumps({"wrappers": entries}))
+    responses_map = {
+        (19811, "/health"): Response({"status": "ok"}),
+        (19811, "/ready"): Response({"ready": True}),
+    }
+    async with gateway(tmp_path, responses_map) as (_, client, _):
+        response = await client.get("/api/status")
+    assert response.status_code == 200
+    data = response.json()
+    assert next(item for item in data["wrappers"] if item["name"] == "nvidia-python")["status"] == "online"
+    assert data["model_planes"]["model_fetcher"]["status"] in ("offline", "degraded")
+    assert data["model_planes"]["model_registry"]["status"] in ("offline", "degraded")

@@ -92,6 +92,7 @@ try:
     )
     from common.model.context_probe import ContextProbeService, ProbeOutcome
     from common.model.metadata import merge_observed_context, positive_int as _probe_pos_int
+    from common.model.routing import enrich_openai_catalog_entry
     from common.compat import (
         is_anthropic_upstream as _is_anthropic_upstream,
         responses_use_native_upstream as _responses_use_native_upstream,
@@ -795,6 +796,14 @@ def get_model_meta(mid, upstream=None):
     if is_alias_name(mid) and concrete:
         base["rooted_model"] = concrete
         base["dynamic_alias"] = True
+    # Nous exposes one exact OpenAI-compatible upstream surface for every
+    # catalog model. Keep this explicit so clients do not need to infer the
+    # endpoint from the provider name or model id.
+    _route_enricher = globals().get("enrich_openai_catalog_entry")
+    if _route_enricher is not None:
+        base = _route_enricher(
+            base, "nous", globals().get("NOUS_BASE", "https://inference-api.nousresearch.com"),
+            client_path="/v1/chat/completions", kind="chat", streaming=True)
     return base
 
 
@@ -1705,6 +1714,12 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
                     yield ev
                 else:
                     yield serialize_fn(ev) if callable(serialize_fn) else ev
+            # A surfaced upstream error is terminal. Stop reading/heartbeating
+            # immediately instead of waiting for a provider that may keep the
+            # socket open after sending its error frame.
+            if getattr(state, "upstream_error", None):
+                terminated = True
+                return
         else:
             # B-10 fix (second leak path): re-serialise the PARSED object rather
             # than echoing raw upstream bytes, so a non-OpenAI frame can never
@@ -1920,11 +1935,8 @@ class AnthropicStreamState:
             events.append({"type": "error", "data": {
                 "type": "error",
                 "error": {"type": etype, "message": str(msg)[:2000]}}})
-            events.append({"type": "message_delta", "data": {
-                "type": "message_delta",
-                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
-                "usage": self._usage()}})
-            events.append({"type": "message_stop", "data": {"type": "message_stop"}})
+            # An error event is terminal; never turn a failed upstream stream
+            # into a fabricated successful end_turn for Claude Code.
             self.finished = True
             return events
 
@@ -3300,6 +3312,25 @@ async def models():
     return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
 
 
+@app.get("/v1/models/{model_id:path}")
+async def model_detail(model_id: str):
+    """Return one enriched model descriptor with the exact wrapper route."""
+    entries = await MODEL_CATALOG.get(_fetch_model_catalog)
+    target = resolve_model(model_id)
+    model = next((m for m in entries if isinstance(m, dict) and m.get("id") == target), None)
+    if model is None:
+        return JSONResponse(status_code=404, content={"error": {
+            "type": "invalid_request_error",
+            "message": f"Model {model_id} is absent from the cached provider catalog",
+        }})
+    if free_only_enabled() and not model_allowed(target):
+        return JSONResponse(status_code=404, content={"error": {
+            "type": "invalid_request_error",
+            "message": f"Model {model_id} is blocked by FREE_ONLY=yes",
+        }})
+    return get_model_meta(model_id, model)
+
+
 @app.get("/api/tags")
 async def api_tags():
     """Ollama-compatible model discovery — PUBLIC (no auth).
@@ -3348,6 +3379,10 @@ async def capabilities():
             "id": mid,
             "capabilities": ["chat", "completion"],
             "streaming": True,
+            "endpoints": meta.get("endpoints", []),
+            "routing_metadata": meta.get("routing_metadata", {}),
+            "input_modalities": meta.get("input_modalities", ["text"]),
+            "output_modalities": meta.get("output_modalities", ["text"]),
             **discovery_limits(meta),
         })
     tgt = get_dynamic_alias_target()
@@ -3837,20 +3872,9 @@ async def metrics_chart_hourly(request: Request):
 @app.get("/dashboard")
 @app.get("/dashboard.html")
 async def dashboard(request: Request):
-    """Serve the wrapper dashboard HTML.
-
-    N-03 round-2 fix: the HTML shell is secret-free (the BEARER_TOKEN is never
-    injected), so it is served WITHOUT auth — a browser cannot attach a bearer
-    header on plain navigation, which made the auth-gated page unreachable.
-    Auth stays enforced on every API endpoint the page calls; the token is
-    entered client-side via the existing sessionStorage prompt.
-    """
-    from pathlib import Path
-    from fastapi.responses import HTMLResponse
-    dashboard_path = Path(__file__).parent.parent / "dashboard.html"
-    if not dashboard_path.exists():
-        return HTMLResponse(content="<html><body><h1>Dashboard not found</h1></body></html>")
-    return HTMLResponse(content=dashboard_path.read_text())
+    return JSONResponse(status_code=410, content={
+        "error": "Per-wrapper dashboards are disabled; use unified dashboard on port 9106"
+    })
 
 @app.get("/healthz")
 async def healthz(): return await health()

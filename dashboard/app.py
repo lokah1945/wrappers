@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 HTML = Path(__file__).with_name("index.html")
 MAX_BODY = 4 * 1024 * 1024
 PROXY_PATHS = frozenset({
-    "/dashboard", "/dashboard.html", "/health", "/ready", "/stats", "/version",
+    "/health", "/ready", "/stats", "/version",
     "/api/version", "/events", "/metrics", "/metrics/prom", "/metrics/tokens",
     "/metrics/models", "/metrics/models/timeseries", "/metrics/keys",
     "/metrics/activity", "/metrics/rate-limits", "/metrics/model-status",
@@ -73,6 +73,88 @@ def collection_count(body: object, *keys: str) -> int | None:
         if isinstance(value, list):
             return len(value)
     return None
+
+
+# The unified feed may contain provider model metadata and activity records, but
+# it must never turn a dashboard into a credential or prompt exfiltration path.
+SENSITIVE_FIELDS = frozenset({
+    "token", "tokens", "live_keys", "api_key", "api_keys", "key_pool",
+    "authorization", "credentials", "password", "secret", "source_root",
+    "prompt", "messages", "request_headers", "response_headers",
+    "error", "errors", "detail", "message", "last_error", "reason_detail",
+})
+
+
+def public_json(value: object, *, depth: int = 0, max_items: int = 250) -> object:
+    """Bound and redact JSON-shaped provider metadata for the global feed."""
+    if depth > 5:
+        return None
+    if isinstance(value, dict):
+        result = {}
+        for key, item in list(value.items())[:100]:
+            key_text = str(key)
+            if key_text.lower() in SENSITIVE_FIELDS:
+                # Numeric aggregate counters remain useful telemetry; string,
+                # mapping, and list values under these names are redacted.
+                if not (key_text.lower() in {"error", "errors", "tokens"}
+                        and isinstance(item, (int, float))
+                        and not isinstance(item, bool)):
+                    continue
+            result[key_text] = public_json(item, depth=depth + 1, max_items=max_items)
+        return result
+    if isinstance(value, list):
+        return [public_json(item, depth=depth + 1, max_items=max_items)
+                for item in value[:max_items]]
+    if isinstance(value, str):
+        return value[:2000]
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)[:500]
+
+
+def public_collection(body: object, *keys: str, max_items: int = 250) -> list:
+    if isinstance(body, list):
+        value = body
+    elif isinstance(body, dict):
+        value = next((body.get(key) for key in keys if isinstance(body.get(key), list)), [])
+    else:
+        value = []
+    result = public_json(value[:max_items], max_items=max_items)
+    return result if isinstance(result, list) else []
+
+
+def public_model_collection(body: object, *keys: str, max_items: int = 150) -> list:
+    """Expose provider-derived model identity/capability metadata without huge provenance blobs."""
+    if isinstance(body, list):
+        rows = body
+    elif isinstance(body, dict):
+        rows = next((body.get(key) for key in keys if isinstance(body.get(key), list)), [])
+    else:
+        rows = []
+    allowed = (
+        "id", "canonical_id", "provider", "provider_model_id", "name", "display_name",
+        "lifecycle_state", "profile_revision", "catalog_revision", "capabilities",
+        "limits", "protocols", "request_rules", "policy",
+    )
+    result = []
+    for row in rows[:max_items]:
+        if not isinstance(row, dict):
+            result.append(public_json(row, max_items=30))
+            continue
+        clean = {}
+        for key in allowed:
+            if key in row:
+                clean[key] = public_json(row[key], max_items=30)
+        provenance = row.get("provenance")
+        if isinstance(provenance, dict):
+            # Preserve attribution and timing, not the full upstream record/blob.
+            clean["provenance"] = {
+                key: public_json(provenance[key], max_items=10)
+                for key in ("source", "retrieved_at", "fetched_at", "catalog_age_sec")
+                if key in provenance
+            }
+        result.append(clean)
+    return result
 
 
 def metadata(repo: Path) -> tuple[dict, tuple[str, ...]]:
@@ -238,9 +320,14 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             probe(name, port, "/stats", headers),
             probe(name, port, "/v1/models", headers, limit=2 * 1024 * 1024),
             probe(name, port, "/v1/capabilities", headers, limit=2 * 1024 * 1024),
+            probe(name, port, "/metrics/models", headers, limit=1024 * 1024),
+            probe(name, port, "/metrics/activity?limit=50", headers, limit=512 * 1024),
+            probe(name, port, "/metrics/chart/hourly?hours=24", headers, limit=512 * 1024),
         )
-        (health_code, health_body), (ready_code, ready_body), (stats_code, stats_body), \
-        (models_code, models_body), (capabilities_code, capabilities_body) = results
+        ((health_code, health_body), (ready_code, ready_body),
+         (stats_code, stats_body), (models_code, models_body),
+         (capabilities_code, capabilities_body), (usage_code, usage_body),
+         (activity_code, activity_body), (chart_code, chart_body)) = results
         metrics_code = None
         if stats_code == 404:
             metrics_code, metrics_body = await probe(name, port, "/metrics", headers)
@@ -254,11 +341,16 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             status = "protected"
         elif not reachable:
             status = "offline"
-        elif health_code != 200 or (isinstance(health_body, dict) and health_body.get("status") in ("degraded", "error", "unhealthy")) or ready is False:
+        elif (health_code != 200
+              or (isinstance(health_body, dict)
+                  and health_body.get("status") in ("degraded", "error", "unhealthy"))
+              or ready is False):
             status = "degraded"
         else:
             status = "online"
         qualification = entry.get("client_qualification", {})
+        if not isinstance(qualification, dict):
+            qualification = {}
         endpoint_status = {
             "health": health_code,
             "ready": ready_code,
@@ -266,6 +358,9 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             "metrics": metrics_code,
             "models": models_code,
             "capabilities": capabilities_code,
+            "usage": usage_code,
+            "activity": activity_code,
+            "chart_hourly": chart_code,
         }
         return {
             "name": name, "upstream": entry.get("upstream", name), "port": port,
@@ -280,15 +375,134 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             "realtime": entry.get("dashboard_stream", "polling"),
             "service_kind": entry.get("service_kind"),
             "verified_model": qualification.get("verified_model"),
-            "dashboard_available": "model_registry" not in entry.get("supports", []),
+            "dashboard_available": False,
+            "telemetry": {
+                "health": public_json(health_body),
+                "ready": public_json(ready_body),
+                "stats": public_json(stats_body),
+                "models": public_collection(models_body, "data", "models"),
+                "capabilities": public_collection(capabilities_body, "models", "data"),
+                "usage": public_json(usage_body),
+                "activity": public_json(activity_body),
+                "chart_hourly": public_json(chart_body),
+            },
+        }
+
+    async def model_plane_snapshot(entries: dict,
+                                   headers: dict[str, str] | None = None) -> dict:
+        """Read the two model knowledge planes into the same live snapshot.
+
+        The catalog/MCP service and the registry have different contracts and
+        databases. The dashboard unifies their read view, but deliberately does
+        not merge or write either store from the public dashboard process.
+        """
+        registry_port = int(entries.get("model-registry", {}).get("port", 9200))
+        fetcher_results = await asyncio.gather(
+            probe("model-fetcher-api", 8787, "/health", headers),
+            probe("model-fetcher-api", 8787, "/ready", headers),
+            probe("model-fetcher-api", 8787, "/stats", headers),
+            probe("model-fetcher-api", 8787, "/providers", headers),
+            probe("model-fetcher-api", 8787, "/models?limit=250", headers, limit=4 * 1024 * 1024),
+            probe("model-fetcher-mcp", 9100, "/health", headers),
+            probe("model-fetcher-mcp", 9100, "/ready", headers),
+            probe("model-fetcher-mcp", 9100, "/mcp", headers),
+            probe("model-registry", registry_port, "/health", headers),
+            probe("model-registry", registry_port, "/ready", headers),
+            probe("model-registry", registry_port, "/stats", headers),
+        )
+        (f_health_code, f_health), (f_ready_code, f_ready), (f_stats_code, f_stats), \
+        (f_providers_code, f_providers), (f_models_code, f_models), \
+        (mcp_health_code, mcp_health), (mcp_ready_code, mcp_ready), (mcp_protocol_code, mcp_protocol), \
+        (r_health_code, r_health), (r_ready_code, r_ready), \
+        (r_stats_code, r_stats) = fetcher_results
+
+        registry_provider_names = {
+            "nvidia-python": "nvidia",
+            "nous": "nous",
+            "openrouter": "openrouter",
+        }
+        registry_provider_results = await asyncio.gather(*(
+            probe("model-registry", registry_port,
+                  "/v1/models?" + urlencode({"provider": provider}), headers,
+                  limit=4 * 1024 * 1024)
+            for name, provider in registry_provider_names.items()
+            if name in entries and entries[name].get("status") == "production"
+        ))
+        registry_models = {}
+        result_index = 0
+        for name, provider in registry_provider_names.items():
+            if name not in entries or entries[name].get("status") != "production":
+                continue
+            code, body = registry_provider_results[result_index]
+            result_index += 1
+            registry_models[provider] = {
+                "http_status": code,
+                "models": public_model_collection(body, "data", "models"),
+                "models_count": collection_count(body, "data", "models"),
+            }
+
+        def source_state(health_code, health_body, ready_code, ready_body):
+            if health_code is None:
+                return "offline"
+            if health_code in (401, 403) or ready_code in (401, 403):
+                return "protected"
+            if health_code != 200 or (ready_code is not None and ready_code != 200):
+                return "degraded"
+            if isinstance(ready_body, dict) and ready_body.get("ready") is False:
+                return "degraded"
+            return "online"
+
+        return {
+            "stream_transport": "server_poll_to_sse",
+            "refresh_interval_sec": 5,
+            "model_fetcher": {
+                "service": "model-fetcher-catalog-api",
+                "port": 8787,
+                "status": source_state(f_health_code, f_health, f_ready_code, f_ready),
+                "endpoint_status": {
+                    "health": f_health_code, "ready": f_ready_code,
+                    "stats": f_stats_code, "providers": f_providers_code,
+                    "models": f_models_code,
+                },
+                "health": public_json(f_health), "ready": public_json(f_ready),
+                "stats": public_json(f_stats),
+                "providers": public_collection(f_providers, "providers"),
+                "models": public_collection(f_models, "models", "data"),
+                "models_count": collection_count(f_models, "models", "data"),
+                "dashboard_available": False,
+            },
+            "model_fetcher_mcp": {
+                "service": "model-fetcher-mcp",
+                "port": 9100,
+                "status": source_state(mcp_health_code, mcp_health, mcp_ready_code, mcp_ready),
+                "endpoint_status": {"health": mcp_health_code, "ready": mcp_ready_code, "mcp": mcp_protocol_code},
+                "health": public_json(mcp_health), "ready": public_json(mcp_ready),
+                "protocol": {"http_status": mcp_protocol_code, "transport": "streamable_http"},
+                "dashboard_available": False,
+                "note": "MCP transport remains available; its local dashboard is disabled.",
+            },
+            "model_registry": {
+                "service": "model-registry",
+                "port": registry_port,
+                "status": source_state(r_health_code, r_health, r_ready_code, r_ready),
+                "endpoint_status": {"health": r_health_code, "ready": r_ready_code, "stats": r_stats_code},
+                "health": public_json(r_health), "ready": public_json(r_ready),
+                "stats": public_json(r_stats),
+                "providers": registry_models,
+                "models_count": sum((item["models_count"] or 0) for item in registry_models.values()),
+                "dashboard_available": False,
+                "note": "Central knowledge plane; model substitution is disabled.",
+            },
         }
 
     async def build_status(entries: dict, active: tuple[str, ...],
                            headers: dict[str, str] | None = None) -> dict:
         """Probe wrappers without holding the cache mutex during network I/O."""
-        statuses = list(await asyncio.gather(
-            *(service_status(name, entries[name], headers) for name in active)
-        ))
+        statuses, model_planes = await asyncio.gather(
+            asyncio.gather(*(service_status(name, entries[name], headers) for name in active)),
+            model_plane_snapshot(entries, headers),
+        )
+        statuses = list(statuses)
         pending = sorted((
             {
                 "name": name, "upstream": entry.get("upstream", name), "port": entry.get("port"),
@@ -314,7 +528,14 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
         return {
             "checked_at": int(time.time()),
             "read_only": True,
+            "stream": {
+                "transport": "sse",
+                "source": "bounded server-side snapshots",
+                "interval_sec": 5,
+                "authenticated": bool(headers),
+            },
             "wrappers": statuses,
+            "model_planes": model_planes,
             "counts": {
                 "active": len(active),
                 "inference_active": inference_active,
@@ -397,7 +618,7 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
                         disconnected = False
                     if disconnected:
                         return
-                    payload = await collect_status()
+                    payload = await collect_status(forwarded_auth(request))
                     yield ("event: status\ndata: " + json.dumps(
                         payload, separators=(",", ":"), ensure_ascii=False
                     ) + "\n\n").encode("utf-8")
@@ -424,6 +645,8 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
         if name not in active:
             raise HTTPException(409, "Pending wrapper is frozen; dashboard access is disabled")
         upstream_path = "/" + path
+        if upstream_path in ("/dashboard", "/dashboard.html"):
+            raise HTTPException(410, "Per-wrapper dashboards are disabled; use the unified dashboard")
         if upstream_path not in PROXY_PATHS:
             raise HTTPException(404, "Dashboard proxy permits only selected read-only endpoints")
         query = urlencode([(key, value) for key, value in request.query_params.multi_items()

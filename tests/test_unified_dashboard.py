@@ -97,7 +97,8 @@ async def test_home_and_dashboard_service_readiness(repo):
         home = await client.get("/")
         assert home.status_code == 200
         assert 'id="wrapper-select"' in home.text
-        assert 'id="wrapper-frame"' in home.text
+        assert 'Per-wrapper dashboards are disabled' in home.text
+        assert 'wrapper-frame' not in home.text
         assert '<header class="topbar">' in home.text
         assert (await client.get("/ready")).json() == {"ready": True, "service": "wrapper-dashboard", "scope": "dashboard_service"}
         assert (await client.get("/health")).json()["read_only"] is True
@@ -125,7 +126,10 @@ async def test_global_status_preserves_offline_and_unknown_without_secrets(repo)
         assert services["blackbox"]["status"] == "pending"
         assert services["opencode"]["readiness"] == "not_probed"
         assert data["counts"] == {"active": 2, "inference_active": 2, "internal_active": 0, "online": 1, "ready": 0, "inference_online": 1, "inference_ready": 0, "internal_online": 0, "pending": 2}
-        assert {urlsplit(url).port for url, _ in session.calls} == {19811, 19812}
+        assert {urlsplit(url).port for url, _ in session.calls} == {19811, 19812, 8787, 9100, 9200}
+        assert set(services["alpha"]["endpoint_status"]) == {"health", "ready", "stats", "metrics", "models", "capabilities", "usage", "activity", "chart_hourly"}
+        assert data["model_planes"]["model_fetcher"]["port"] == 8787
+        assert data["model_planes"]["model_registry"]["port"] == 9200
         call_count = len(session.calls)
         assert (await client.get("/api/status")).json() == data
         assert len(session.calls) == call_count
@@ -187,15 +191,12 @@ async def test_redirects_and_oversized_responses_close_reservation(repo):
         assert app.state.slots._value == 8
 
 
-async def test_html_bridge_precedes_original_script_and_never_injects_credentials(repo):
-    original = b'<html><head><script>originalDashboard()</script></head><body>Existing layout</body></html>'
-    async with gateway(repo, {(19811, "/dashboard"): Upstream(original, content_type="text/html; charset=utf-8")}) as (_, client, _):
+async def test_wrapper_dashboard_is_disabled_in_favor_of_unified_home(repo):
+    async with gateway(repo, {(19811, "/dashboard"): Upstream(b"should-not-be-read")}) as (_, client, session):
         response = await client.get("/wrappers/alpha/dashboard")
-        assert response.status_code == 200
-        assert response.text.index("data-unified-dashboard-bridge") < response.text.index("originalDashboard")
-        assert 'const prefix = "/wrappers/alpha"' in response.text
-        assert "Existing layout" in response.text
-        assert "PRIVATE_TOKEN" not in response.text
+        assert response.status_code == 410
+        assert "unified dashboard" in response.text.lower()
+        assert session.calls == []
 
 
 async def test_stream_bytes_and_disconnect_cleanup_are_transparent(repo):

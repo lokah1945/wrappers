@@ -46,6 +46,7 @@ try:
         classify_upstream_error,
         credential_fingerprint,
     )
+    from common.model.routing import enrich_openai_catalog_entry
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
     from common.model import (
@@ -55,6 +56,7 @@ except ImportError:
     from common.model_state import (
         ModelStateStore,
     )
+    from common.model.routing import enrich_openai_catalog_entry
 
 # ── Catalog MCP integration ──────────────────────────────────────────────
 CATALOG_REPO = os.environ.get('CATALOG_REPO', str(Path(__file__).resolve().parents[2] / 'model_fetcher'))
@@ -105,7 +107,7 @@ except ImportError:
 # ── FastAPI + deps ───────────────────────────────────────────────────────
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import JSONResponse
 
 try:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -838,7 +840,7 @@ PUBLIC_PATHS_ANY = frozenset({
 # Public model discovery (Ollama + OpenAI compatible) — agents need to list
 # models before authenticating. GET only. MCP POST messages are deliberately
 # absent here so every POST surface remains authenticated (B-31 parity).
-PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/version', '/mcp/sse', '/mcp', '/metrics/models'})
+PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/v1/capabilities', '/v1/capabilities/params', '/version', '/mcp/sse', '/mcp', '/metrics/models'})
 # DASH fix: /metrics/models is a read-only per-model counter (no key material,
 # no secrets) consumed by the dashboard's Models card. Public GET matches the
 # project principle that telemetry is accessible without token.
@@ -864,7 +866,7 @@ def _is_public_path(path: str, method: str) -> bool:
     """Exact-match public-path test (B-27)."""
     if path in PUBLIC_PATHS_ANY:
         return True
-    if method == 'GET' and path in PUBLIC_PATHS_GET:
+    if method == 'GET' and (path in PUBLIC_PATHS_GET or path.startswith('/v1/models/')):
         return True
     # Read-only catalog browsing stays public (GET only).
     if method == 'GET' and path.startswith('/catalog/'):
@@ -1886,7 +1888,7 @@ async def _translate_openai_stream_to_responses(openai_gen, model: str):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
             # Parity fix: tolerate CRLF SSE framing (nous N-08).
-            buffer = _normalize_sse_newlines(buffer)
+            buffer = (_normalize_sse_newlines(buffer) if '_normalize_sse_newlines' in globals() else buffer.replace(b'\r\n', b'\n').replace(b'\r', b'\n'))
             # Split on \n, process complete lines, retain tail in buffer
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
@@ -2123,8 +2125,31 @@ async def list_models(request: Request):
         except Exception:
             pass
         return m
-    return JSONResponse({'object': 'list',
-                        'data': [{**_with_observations(m), **discovery_limits(_with_observations(m))} for m in entries]})
+    _model_store = globals().get("MODEL_STORE")
+    status_map = _model_store.status_map() if _model_store is not None else {}
+    enriched = []
+    for raw in entries:
+        observed = _with_observations(raw)
+        status = status_map.get(str(observed.get("id") or ""), {}) if isinstance(observed, dict) else {}
+        # OpenRouter's catalog describes model capabilities, while this
+        # wrapper owns the exact public route. Make model → endpoint matching
+        # explicit and keep the provider metadata untouched.
+        _route_enricher = globals().get("enrich_openai_catalog_entry")
+        if _route_enricher is not None:
+            observed = _route_enricher(
+                observed, "openrouter", globals().get("OPENROUTER_BASE", "https://openrouter.ai/api/v1"),
+                client_path="/v1/chat/completions", kind="chat", streaming=True)
+        observed.update(discovery_limits(observed))
+        if isinstance(observed, dict):
+            observed.update({
+                "catalog_listed": True,
+                "availability_state": status.get("state", "unknown"),
+                "availability_scope": "account",
+                "reason_code": status.get("reason_code", ""),
+                "checked_at": status.get("checked_at"),
+            })
+        enriched.append(observed)
+    return JSONResponse({'object': 'list', 'data': enriched})
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -2151,6 +2176,21 @@ async def get_model_detail(model_id: str, request: Request):
             model = merge_observed_context(model, _obs)
     except Exception:
         pass
+    _route_enricher = globals().get("enrich_openai_catalog_entry")
+    if _route_enricher is not None:
+        model = _route_enricher(
+            model, "openrouter", globals().get("OPENROUTER_BASE", "https://openrouter.ai/api/v1"),
+            client_path="/v1/chat/completions", kind="chat", streaming=True)
+    _model_store = globals().get("MODEL_STORE")
+    status = (_model_store.status_map().get(str(model.get("id") or ""), {})
+              if _model_store is not None else {})
+    model.update({
+        "catalog_listed": True,
+        "availability_state": status.get("state", "unknown"),
+        "availability_scope": "account",
+        "reason_code": status.get("reason_code", ""),
+        "checked_at": status.get("checked_at"),
+    })
     return JSONResponse({**model, **discovery_limits(model)})
 
 
@@ -2220,6 +2260,10 @@ async def capabilities(request: Request):
                 "id": m.get("id") if isinstance(m, dict) else m,
                 "capabilities": ["chat", "completion"],
                 "streaming": True,
+                "endpoints": (m.get("endpoints") or m.get("wrapper_endpoints") or []) if isinstance(m, dict) else [],
+                "routing_metadata": m.get("routing_metadata", {}) if isinstance(m, dict) else {},
+                "input_modalities": (m.get("architecture") or {}).get("input_modalities", []) if isinstance(m, dict) and isinstance(m.get("architecture"), dict) else [],
+                "output_modalities": (m.get("architecture") or {}).get("output_modalities", []) if isinstance(m, dict) and isinstance(m.get("architecture"), dict) else [],
                 **discovery_limits(m if isinstance(m, dict) else {}),
             }
             for m in models_list
@@ -2946,7 +2990,7 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 raw = raw.encode('utf-8', errors='replace')
             buffer += raw
             # Parity fix: tolerate CRLF SSE framing (nous N-08).
-            buffer = _normalize_sse_newlines(buffer)
+            buffer = (_normalize_sse_newlines(buffer) if '_normalize_sse_newlines' in globals() else buffer.replace(b'\r\n', b'\n').replace(b'\r', b'\n'))
             while b'\n' in buffer:
                 line_bytes, buffer = buffer.split(b'\n', 1)
                 line = line_bytes.decode('utf-8', errors='replace').strip()
@@ -3142,6 +3186,9 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'type': 'error',
                 'error': {'type': 'api_error', 'message': str(upstream_error)[:2000]},
             })
+            # An error event is terminal. Do not fabricate message_delta /
+            # message_stop with end_turn after a failed upstream turn.
+            return
 
         # B-06 parity: map strictly from finish_reason; never infer tool_use
         # merely because a tool was seen earlier in the turn.
@@ -3183,12 +3230,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'error': {'type': 'api_error',
                           'message': f'upstream stream error: {str(e)[:2000]}'},
             })
-            yield _sse('message_delta', {
-                'type': 'message_delta',
-                'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-                'usage': {'input_tokens': input_tokens, 'output_tokens': output_tokens},
-            })
-            yield _sse('message_stop', {'type': 'message_stop'})
+            # The error event is terminal; never fabricate end_turn after it.
+            return
         except Exception:
             pass
     finally:
@@ -3517,55 +3560,9 @@ async def stats():
 
 @app.get("/dashboard")
 async def dashboard():
-    """Simple built-in dashboard HTML."""
-    try:
-        dash_path = ROOT / 'dashboard.html'
-        if dash_path.exists():
-            content = dash_path.read_text(encoding='utf-8')
-            return HTMLResponse(content)
-    except Exception:
-        pass
-
-    # Fallback: inline minimal dashboard
-    stats_data = await metrics.summary()
-    html = f"""<!DOCTYPE html>
-<html lang="en">
-<head><meta charset="UTF-8"><title>OpenRouter Wrapper Dashboard</title>
-<style>
-  body {{ font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 2rem; }}
-  .card {{ background: #1a1a2e; border-radius: 12px; padding: 1.5rem; margin: 1rem 0; }}
-  h1 {{ color: #ff6b35; }}
-  .stat {{ display: inline-block; margin: 0.5rem 1rem 0.5rem 0; }}
-  .label {{ color: #888; font-size: 0.85rem; }}
-  .value {{ font-size: 1.5rem; font-weight: bold; color: #fff; }}
-  .ok {{ color: #4caf50; }} .degraded {{ color: #ff9800; }}
-</style></head>
-<body>
-  <h1>🔌 OpenRouter Wrapper</h1>
-  <div class="card">
-    <h2>Status</h2>
-    <div class="stat"><div class="label">Version</div><div class="value">{VERSION}</div></div>
-    <div class="stat"><div class="label">Uptime</div><div class="value">{stats_data['uptime_seconds']}s</div></div>
-    <div class="stat"><div class="label">Requests</div><div class="value">{stats_data['total_requests']}</div></div>
-    <div class="stat"><div class="label">Tokens</div><div class="value">{stats_data['total_tokens']}</div></div>
-    <div class="stat"><div class="label">Error Rate</div><div class="value">{stats_data['error_rate']}</div></div>
-    <div class="stat"><div class="label">Keys</div><div class="value">{pool.total_keys} ({pool.available_keys} available)</div></div>
-    <div class="stat"><div class="label">FREE_ONLY</div><div class="value">{'✅ ON' if free_only_enabled() else 'OFF'}</div></div>
-    <div class="stat"><div class="label">Catalog</div><div class="value">{'✅ Available' if _HAS_CATALOG else '❌ N/A'}</div></div>
-  </div>
-  <div class="card">
-    <h2>Endpoints</h2>
-    <ul>
-      <li><code>POST /v1/chat/completions</code> — OpenAI Chat</li>
-      <li><code>POST /v1/responses</code> — OpenAI Responses API</li>
-      <li><code>POST /v1/messages</code> — Anthropic Messages</li>
-      <li><code>GET /v1/models</code> — Model listing</li>
-      <li><code>GET /catalog/models</code> — NIM Catalog models</li>
-      <li><code>GET /mcp/sse</code> — MCP SSE transport</li>
-    </ul>
-  </div>
-</body></html>"""
-    return HTMLResponse(html)
+    return _error_response({
+        "error": "Per-wrapper dashboards are disabled; use unified dashboard on port 9106"
+    }, status_code=410)
 
 
 @app.get("/version")

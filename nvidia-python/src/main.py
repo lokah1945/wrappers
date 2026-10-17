@@ -31,7 +31,7 @@ Routes:
   POST /metrics/reset
   POST /admin/heal-in-flight
   GET  /events (SSE)
-  GET  /dashboard
+  GET  /dashboard  -> 410; use unified dashboard on port 9106
   GET  /api/tags
   GET  /version
   GET  /props
@@ -56,7 +56,7 @@ from typing import Optional, Any, Set
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 try:
@@ -1367,7 +1367,7 @@ def clamp_max_tokens_for_model(body: dict, model_id: str) -> None:
 
 
 def route_upstream(path: str) -> str:
-    if path.startswith('/v1/images') or path.startswith('/v1/audio') or path.startswith('/v1/video') or path.startswith('/v1/ranking') or path.startswith('/v1/infer'):
+    if path.startswith('/v1/images') or path.startswith('/v1/audio') or path.startswith('/v1/video') or path.startswith('/v1/ranking') or path.startswith('/v1/infer') or path.startswith('/v1/genai'):
         return BASE_GENAI
     return BASE_LLM
 
@@ -2014,7 +2014,7 @@ class Server:
                     # D11: unknown paths return 404, not 401 (don't leak route info)
                     known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
                                    '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
-                                   '/v1/moderations', '/v1/responses', '/v1/files',
+                                   '/v1/moderations', '/v1/responses', '/v1/files', '/v1/genai',
                                    '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
                                    '/v1/messages', '/v1/messages/count_tokens',
                                    '/v1/capabilities', '/v1/capabilities/params',
@@ -2348,28 +2348,17 @@ class Server:
         async def favicon():
             return Response(status_code=204)
 
-        def _serve_dashboard_html() -> HTMLResponse:
-            """Serve dashboard.html WITHOUT embedding any secret.
-
-            V-06 round-2 fix (mirrors nous N-03): the bearer token is never
-            injected into the HTML — a client that can reach the port must not
-            be able to read the proxy credential out of the page. The route
-            itself now requires auth (removed from public_paths), and the page
-            obtains the token client-side via a sessionStorage prompt.
-            """
-            dashboard_path = Path(__file__).parent.parent / 'dashboard.html'
-            if not dashboard_path.exists():
-                return HTMLResponse(content='<html><body><h1>wrapper-nvidia</h1>'
-                                            '<p>See /metrics, /metrics/prom, /v1/models</p></body></html>')
-            return HTMLResponse(content=dashboard_path.read_text())
-
         @app.get('/dashboard')
         async def dashboard():
-            return _serve_dashboard_html()
+            return JSONResponse(status_code=410, content={
+                'error': 'Per-wrapper dashboards are disabled; use unified dashboard on port 9106'
+            })
 
         @app.get('/dashboard.html')
         async def dashboard_html():
-            return _serve_dashboard_html()
+            return JSONResponse(status_code=410, content={
+                'error': 'Per-wrapper dashboards are disabled; use unified dashboard on port 9106'
+            })
         @app.post('/v1/chat/completions')
         async def chat_completions(request: Request):
             raw = await request.body()
@@ -2532,9 +2521,9 @@ class Server:
             body['model'] = model_id
             if is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
-            # BUG-ROUTE1 fix: /v1/embeddings routes to BASE_GENAI, not BASE_LLM.
-            # resolve_base(model_id) always returned BASE_LLM because a model_id
-            # never starts with '/v1/embeddings'. Use route_upstream directly.
+            # Embeddings use the NVIDIA LLM base. The endpoint path is not
+            # encoded in a model id, so route by the client surface explicitly
+            # rather than by resolve_base(model_id).
             return await self._proxy_post(request, body, raw, model_id, '/v1/embeddings', lambda key: f"{route_upstream('/v1/embeddings')}/v1/embeddings")
 
         @app.post('/v1/ranking')
@@ -3744,7 +3733,7 @@ class Server:
             
         known_stems = ('/v1/chat/completions', '/v1/completions', '/v1/embeddings',
                        '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
-                       '/v1/moderations', '/v1/responses', '/v1/files',
+                       '/v1/moderations', '/v1/responses', '/v1/files', '/v1/genai',
                        '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
                        '/v1/messages', '/v1/messages/count_tokens',
                        '/v1/capabilities', '/v1/capabilities/params',
