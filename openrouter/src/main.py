@@ -2061,7 +2061,7 @@ async def list_models(request: Request):
             pass
         return m
     _model_store = globals().get("MODEL_STORE")
-    status_map = _model_store.status_map() if _model_store is not None else {}
+    status_map = _model_store.effective_status_map() if _model_store is not None else {}
     enriched = []
     for raw in entries:
         observed = _with_observations(raw)
@@ -2107,7 +2107,7 @@ async def get_model_detail(model_id: str, request: Request):
             model, "openrouter", globals().get("OPENROUTER_BASE", "https://openrouter.ai/api/v1"),
             client_path="/v1/chat/completions", kind="chat", streaming=True)
     _model_store = globals().get("MODEL_STORE")
-    status = (_model_store.status_map().get(str(model.get("id") or ""), {})
+    status = (_model_store.effective_status_map().get(str(model.get("id") or ""), {})
               if _model_store is not None else {})
     model.update({
         "catalog_listed": True,

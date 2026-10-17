@@ -3297,7 +3297,7 @@ async def models():
     upstream_by_id = {m['id']: m for m in upstream_models if isinstance(m, dict) and m.get('id')}
     enriched = [get_model_meta(m.get("id", ""),
                 upstream_by_id.get(resolve_model(m.get('id', '')), m)) for m in deduped]
-    status_map = MODEL_STORE.status_map()
+    status_map = MODEL_STORE.effective_status_map()
     # Preserve original id on meta and expose account-scoped state without
     # pretending that a catalog entry is globally deployable.
     for i, m in enumerate(deduped):

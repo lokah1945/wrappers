@@ -12,7 +12,8 @@ def test_sanitizer_redacts_credentials_and_request_content():
     assert "super-secret-token" not in text
     assert "nvapi-secret" not in text
     assert "private prompt" not in text
-    assert "Function not found for account acct" in text
+    assert "Function not found for account [REDACTED]" in text
+    assert "account acct" not in text
 
 
 def test_sanitizer_is_bounded():

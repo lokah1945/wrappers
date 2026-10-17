@@ -26,6 +26,8 @@ DEFAULT_CONTEXT_WINDOW = None
 # ── Capability type constants ─────────────────────────────────────────────
 LLM = 'llm'
 GENAI = 'genai'
+NVCF = 'nvcf'
+NVIDIA_MAXINE_GRPC_URL = 'grpc://grpc.nvcf.nvidia.com:443'
 
 # ── Curated GenAI models (image/audio/video not in /v1/models) ──────────
 CURATED_GENAI = [
@@ -140,6 +142,20 @@ CAPABILITY_DEFS: Dict[str, dict] = {
         'endpoints': [{'path': '/v1/infer', 'host': GENAI, 'kind': 'native_infer_async'}],
         'streaming': False,
     },
+    'video_analysis': {
+        'type': 'video_analysis',
+        'input': ['video'],
+        'output': ['classification'],
+        'capabilities': ['video_analysis', 'grpc', 'nvidia_maxine'],
+        'endpoints': [{
+            'path': NVIDIA_MAXINE_GRPC_URL,
+            'host': NVCF,
+            'kind': 'grpc',
+            'protocol': 'grpc',
+            'client': 'NVIDIA Maxine generated protobuf client',
+        }],
+        'streaming': False,
+    },
     'ocr': {
         'type': 'ocr',
         'input': ['image'],
@@ -160,9 +176,13 @@ CAPABILITY_DEFS: Dict[str, dict] = {
 
 # ── Classification rules (ordered by specificity, most specific first) ──
 CLASSIFICATION_RULES: List[Tuple[List[str], str, Optional[List[str]]]] = [
+    # This hosted service is video analysis over NVIDIA Maxine gRPC, not a
+    # REST video-generation or generic chat model.
+    (['ai-synthetic-video-detector'], 'video_analysis', None),
+
     # Vision/Chat models with vision capabilities
     (['vila', 'neva', '-vision', 'vision-', 'paligemma', 'kosmos', 'llava', 'florence',
-      'phi-3-vision', 'phi-3.5-vision', 'phi-4-multimodal', 'nvclip', 'fuyu', 'deplot',
+      'phi-3-vision', 'phi-3.5-vision', 'phi-4-multimodal', 'fuyu', 'deplot',
       'pix2struct', 'git-base', 'git-large', 'mm-reasoner', 'qwen2-vl', 'qwen-vl',
       'internvl', 'cogvlm', 'internlm-xcomposer', 'gemma-3', 'llama-3.2-vision',
       'pixtral', 'molmo', 'aria', 'nemotron-3-vision', 'nemotron-vision'], 'vision_chat', None),
@@ -172,7 +192,7 @@ CLASSIFICATION_RULES: List[Tuple[List[str], str, Optional[List[str]]]] = [
      'chat', ['code_generation', 'code_completion']),
 
     # Embedding models
-    (['embed', 'embedqa', 'nv-embed', 'bge-', 'e5-', 'gte-'], 'embedding', None),
+    (['embed', 'embedqa', 'nv-embed', 'nvclip', 'bge-', 'e5-', 'gte-'], 'embedding', None),
 
     # Image generation models
     (['flux', 'sdxl', 'stable-diffusion', 'sd3', 'sd3.5', 'stable-diffusion-3', 'qwen-image',
@@ -282,6 +302,12 @@ CAPABILITY_PARAMS: Dict[str, dict] = {
         'optional': ['prompt', 'image', 'seed', 'duration', 'fps', 'width', 'height'],
         'nvidia': ['duration', 'fps', 'width', 'height', 'cfg_scale', 'steps', 'seed'],
         'defaults': {'duration': 4, 'fps': 8, 'width': 512, 'height': 512},
+    },
+    'video_analysis': {
+        'required': ['model', 'video'],
+        'optional': ['threshold', 'output_format'],
+        'nvidia': ['protobuf_method', 'video_codec'],
+        'defaults': {'output_format': 'json'},
     },
     'audio': {
         'required': ['model', 'prompt'],
@@ -395,10 +421,40 @@ def classify(model_id: str) -> dict:
 
 
 def _resolve_hosts(desc: dict, base_llm: str, base_genai: str) -> dict:
-    """Resolve endpoint base_url from host labels."""
+    """Resolve exact wrapper/upstream route metadata from host labels.
+
+    Image generation is model-suffixed upstream even though the client calls
+    ``/v1/images/generations``; expose that as a URL template instead of
+    forcing clients to reverse-engineer the handler.
+    """
     hosts = {LLM: base_llm.rstrip('/'), GENAI: base_genai.rstrip('/')}
     for ep in (desc.get('endpoints') or []):
-        ep['base_url'] = hosts.get(ep['host'], base_llm.rstrip('/'))
+        path = str(ep.get('path') or '')
+        if ep.get('protocol') == 'grpc' or ep.get('kind') == 'grpc':
+            # There is no HTTP path to synthesize for a generated-protobuf
+            # service. Preserve the native gRPC target and tell clients which
+            # protocol/client they need instead of advertising a false REST URL.
+            target = str(ep.get('url') or path)
+            ep['base_url'] = target
+            ep['client_path'] = None
+            ep['upstream_path'] = ''
+            ep['url'] = target
+            ep['route_source'] = 'provider_contract'
+            ep['route_confidence'] = 'exact'
+            ep['model_field'] = None
+            continue
+        base = hosts.get(ep['host'], base_llm.rstrip('/'))
+        ep['base_url'] = base
+        ep['client_path'] = path
+        ep['upstream_path'] = path
+        ep['route_source'] = 'wrapper_contract'
+        ep['route_confidence'] = 'exact'
+        ep['model_field'] = 'model'
+        if ep.get('kind') == 'openai_image':
+            ep['upstream_path_template'] = '/v1/genai/{model}'
+            ep['url_template'] = f'{base}/v1/genai/{{model}}'
+        else:
+            ep['url'] = f'{base}{path}'
     return desc
 
 

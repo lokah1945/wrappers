@@ -9,6 +9,15 @@ from typing import Any
 _SECRET_VALUE = re.compile(
     r"(?i)(bearer\s+|(?:nvapi|sk|ghp|github_pat)[_\-])[A-Za-z0-9_\-\.]+"
 )
+# Provider diagnostics may include account/tenant identifiers and deployment
+# function IDs. They are useful for provider-side logs but are not safe to
+# publish through the dashboard or central registry. Preserve the surrounding
+# reason while replacing only the identifier value.
+_ACCOUNT_VALUE = re.compile(
+    r"(?i)(\b(?:account|tenant|project)\b\s*(?:[:=]\s*)?['\"]?)[A-Za-z0-9][A-Za-z0-9._:-]{2,127}"
+)
+_FUNCTION_VALUE = re.compile(
+    r"(?i)(\bfunction(?:\s+id)?\s*['\"])[^'\"]{3,256}(['\"])")
 _SENSITIVE_KEY = re.compile(
     r"(?i)(authorization|api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|credential|prompt|messages?|request[_-]?body|input|content)"
 )
@@ -16,6 +25,12 @@ _ALLOWED_TOP_LEVEL = {
     "status", "title", "detail", "message", "code", "type", "error",
     "request_id", "requestId", "trace_id", "traceId", "retry_after",
 }
+
+
+def _redact_identifiers(value: str) -> str:
+    value = _ACCOUNT_VALUE.sub(r"\1[REDACTED]", value)
+    value = _FUNCTION_VALUE.sub(r"\1[REDACTED]\2", value)
+    return value
 
 
 def _scrub(value: Any, top_level: bool = False) -> Any:
@@ -38,7 +53,7 @@ def _scrub(value: Any, top_level: bool = False) -> Any:
             return None
         return value
     if isinstance(value, str):
-        return _SECRET_VALUE.sub(r"\1[REDACTED]", value[:4000])
+        return _redact_identifiers(_SECRET_VALUE.sub(r"\1[REDACTED]", value[:4000]))
     if isinstance(value, (int, bool)) or value is None:
         return value
     return str(value)[:4000]
@@ -51,7 +66,7 @@ def sanitize_error_detail(payload: Any, max_chars: int = 4000) -> str:
             parsed = json.loads(payload)
             scrubbed = _scrub(parsed, top_level=True)
         except (TypeError, ValueError):
-            scrubbed = _SECRET_VALUE.sub(r"\1[REDACTED]", payload[:max_chars])
+            scrubbed = _redact_identifiers(_SECRET_VALUE.sub(r"\1[REDACTED]", payload[:max_chars]))
     else:
         scrubbed = _scrub(payload, top_level=True)
     try:

@@ -53,6 +53,7 @@ import re as re_module
 import threading
 from pathlib import Path
 from typing import Optional, Any, Set
+from urllib.parse import quote as _url_quote
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
@@ -127,18 +128,126 @@ _model_status: dict = {}
 _model_state_store: Optional[ModelStateStore] = None
 _verify_cursor: int = 0
 
+def _probe_spec(model_id: str) -> dict:
+    """Return the provider-correct, low-cost verification request.
+
+    NVIDIA publishes several APIs behind different hosts and payload contracts.
+    The old verifier sent every catalog id to chat completions with a plain
+    string. That made embeddings look like 404s and document parsers look like
+    400s even when the model was callable with its documented request shape.
+    """
+    descriptor = classify(model_id)
+    model_type = descriptor.get("type") if isinstance(descriptor, dict) else "chat"
+    if model_type == "video_analysis":
+        # The hosted synthetic-video-detector is a generated-protobuf NVIDIA
+        # Maxine service. This wrapper is REST-only, so never send it a fake
+        # chat or /v1/infer request.
+        return {
+            "url": "",
+            "endpoint": "grpc://grpc.nvcf.nvidia.com:443",
+            "unsupported": True,
+            "body": {},
+        }
+    if model_type == "embedding":
+        return {
+            "url": f"{BASE_LLM}/v1/embeddings",
+            "endpoint": "/v1/embeddings",
+            "body": {
+                "model": model_id,
+                "input": ["health check"],
+                "input_type": "query",
+                "encoding_format": "float",
+            },
+        }
+    if model_type == "rerank":
+        publisher, _, name = model_id.partition("/")
+        if publisher and name:
+            path = f"/v1/retrieval/{_url_quote(publisher, safe='')}/{_url_quote(name, safe='')}/reranking"
+            return {
+                "url": f"{BASE_GENAI}{path}",
+                "endpoint": path,
+                "body": {
+                    "model": model_id,
+                    "query": {"text": "health check"},
+                    "passages": [{"text": "health check passage"}],
+                },
+            }
+    if model_type == "parse":
+        # The parser rejects plain text. A 1x1 PNG data URL is accepted by the
+        # hosted NIM and avoids a dependency on an external image host.
+        tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
+        return {
+            "url": f"{BASE_LLM}/v1/chat/completions",
+            "endpoint": "/v1/chat/completions",
+            "body": {
+                "model": model_id,
+                "messages": [{"role": "user", "content": [
+                    {"type": "image_url", "image_url": {"url": tiny_png}},
+                ]}],
+                "max_tokens": 1,
+                "stream": False,
+            },
+        }
+    if model_type in ("image", "audio", "video"):
+        # Curated GenAI entries are not part of the normal /v1/models sweep.
+        # If a provider begins publishing one there, use its native GenAI
+        # route instead of incorrectly probing chat. Specialized gRPC services
+        # are intentionally not guessed as REST endpoints.
+        if model_id == "nvidia/ai-synthetic-video-detector":
+            return {
+                "url": "",
+                "endpoint": "grpc://grpc.nvcf.nvidia.com:443",
+                "unsupported": True,
+                "body": {},
+            }
+        # GenAI routes encode the model in the URL; their native schemas do
+        # not use the OpenAI `model` field. Keep probes identical to the
+        # provider request rather than adding a chat-shaped field.
+        body = {"prompt": "health check"}
+        if model_type == "image":
+            body.update({"width": 1024, "height": 1024, "samples": 1, "seed": 0})
+            if "flux.1-schnell" in model_id.lower():
+                body.update({"cfg_scale": 0, "mode": "base", "image": None, "steps": 4})
+            elif "flux.1-dev" in model_id.lower():
+                body.update({"cfg_scale": 5, "mode": "base", "steps": 5})
+            else:
+                body.update({"steps": 5})
+        elif model_type == "video":
+            body.update({"width": 512, "height": 512, "duration": 1, "fps": 1, "seed": 0})
+        return {
+            "url": f"{BASE_GENAI}/v1/genai/{model_id}",
+            "endpoint": f"/v1/genai/{model_id}",
+            "body": body,
+        }
+    return {
+        "url": f"{BASE_LLM}/v1/chat/completions",
+        "endpoint": "/v1/chat/completions",
+        "body": {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False},
+    }
+
+
 async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -> dict:
-    """Probe one model for one credential/account scope."""
+    """Probe one model for one credential/account scope using its API contract."""
+    spec = _probe_spec(model_id)
+    if spec.get("unsupported"):
+        return {
+            "ok": False,
+            "status": 0,
+            "reason": "specialized gRPC service requires the NVIDIA Maxine client",
+            "reason_code": "UNSUPPORTED_PROTOCOL",
+            "unsupported": True,
+            "account_scope": "unknown",
+            "endpoint": spec.get("endpoint"),
+        }
     try:
         key = key or pool.peek_key()
         if not key:
-            return {"ok": False, "status": 0, "reason": "no_key", "account_scope": "unknown"}
+            return {"ok": False, "status": 0, "reason": "no_key", "account_scope": "unknown", "endpoint": spec["endpoint"]}
 
-        body = {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False}
         headers = {"Authorization": f"Bearer {key.api_key}"}
         account_scope = credential_fingerprint(key.api_key)
-        # V-13 fix: probes consume real upstream RPM — record the timestamp on
-        # the key so the pool's rate view includes verification traffic.
+        # Verification traffic is real provider traffic; include it in key RPM
+        # accounting so a sweep cannot silently exceed the operator limit.
         try:
             key.timestamps.append(time.time())
         except Exception:
@@ -149,25 +258,26 @@ async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -
             session = aiohttp.ClientSession()
         try:
             async with session.post(
-                f"{BASE_LLM}/v1/chat/completions",
-                json=body,
+                spec["url"],
+                json=spec["body"],
                 headers=headers,
                 timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000),
             ) as resp:
                 if 200 <= resp.status < 300:
-                    return {"ok": True, "status": resp.status, "reason": "", "account_scope": account_scope}
+                    return {"ok": True, "status": resp.status, "reason": "", "account_scope": account_scope, "endpoint": spec["endpoint"]}
                 text = await resp.text()
                 return {
                     "ok": False,
                     "status": resp.status,
                     "reason": text[:4000],
                     "account_scope": account_scope,
+                    "endpoint": spec["endpoint"],
                 }
         finally:
             if owns_session:
                 await session.close()
     except Exception as exc:
-        return {"ok": False, "status": 0, "reason": str(exc)[:4000], "account_scope": "unknown"}
+        return {"ok": False, "status": 0, "reason": str(exc)[:4000], "account_scope": "unknown", "endpoint": spec["endpoint"]}
 
 
 async def verify_models(pool):
@@ -225,9 +335,17 @@ async def verify_models(pool):
             # Manifest-aware so provider rules (account-scoped 404 phrasings)
             # record the correct deployability state during sweeps too.
             _probe_manifest = getattr(globals().get('_model_state_store'), 'provider_error_manifest', None)
-            classification = classify_provider_error('nvidia', res.get("status", 0), res.get("reason", ""), _probe_manifest)
-            res["state"] = classification["state"]
-            res["reason_code"] = classification["reason_code"]
+            if res.get("unsupported"):
+                # A known provider protocol that this REST wrapper cannot
+                # implement is a capability/protocol mismatch, not a network
+                # timeout. Keep the native endpoint visible so clients can use
+                # the NVIDIA Maxine gRPC client or choose a supported model.
+                res["state"] = "capability_mismatch"
+                res["reason_code"] = res.get("reason_code", "UNSUPPORTED_PROTOCOL")
+            else:
+                classification = classify_provider_error('nvidia', res.get("status", 0), res.get("reason", ""), _probe_manifest)
+                res["state"] = classification["state"]
+                res["reason_code"] = classification["reason_code"]
             observations.setdefault(mid, []).append(res)
 
             if res["state"] == "globally_retired":
@@ -243,13 +361,13 @@ async def verify_models(pool):
                     status_code=res.get("status", 0),
                     reason_code=res.get("reason_code", "OK" if res.get("ok") else ""),
                     reason_detail=res.get("reason", ""),
-                    endpoint="/v1/chat/completions",
+                    endpoint=res.get("endpoint", "/v1/chat/completions"),
                 )
                 MODEL_REGISTRY_CLIENT.schedule_observation(
                     "nvidia", mid, stored.get("account_scope", "unknown"),
                     stored.get("state", res["state"]), res.get("status", 0),
                     stored.get("reason_code", ""), stored.get("reason_detail", ""),
-                    "/v1/chat/completions",
+                    res.get("endpoint", "/v1/chat/completions"),
                 )
 
     await asyncio.gather(*[_probe(mid, key) for mid in probe_ids for key in probe_keys])
@@ -1372,6 +1490,28 @@ def route_upstream(path: str) -> str:
     return BASE_LLM
 
 
+def nvidia_reranking_url(model_id: str) -> str:
+    """Build NVIDIA NeMo Retriever's model-specific reranking route."""
+    publisher, separator, name = str(model_id or '').partition('/')
+    if not separator or not publisher or not name:
+        return ''
+    return (f"{BASE_GENAI}/v1/retrieval/{_url_quote(publisher, safe='')}/"
+            f"{_url_quote(name, safe='')}/reranking")
+
+
+def normalize_nvidia_ranking_body(body: dict, model_id: str) -> dict:
+    """Accept common ranking shapes and emit NVIDIA's documented payload."""
+    out = dict(body or {})
+    out['model'] = model_id
+    query = out.get('query')
+    if isinstance(query, str):
+        out['query'] = {'text': query}
+    passages = out.get('passages')
+    if isinstance(passages, list):
+        out['passages'] = [p if isinstance(p, dict) else {'text': str(p)} for p in passages]
+    return out
+
+
 def model_from_path(path: str) -> str:
     """Extract model ID from a URL path, preserving org/model-name structure.
 
@@ -1886,7 +2026,7 @@ class Server:
         """Merge persistent account-scoped state into discovery metadata."""
         result = dict(metrics_status or {})
         try:
-            for mid, state in self.model_state.status_map().items():
+            for mid, state in self.model_state.effective_status_map().items():
                 result[mid] = {
                     'last_status': state.get('http_status', 0),
                     'ok': state.get('state') == 'available',
@@ -1895,6 +2035,8 @@ class Server:
                     'availability_state': state.get('state', 'unknown'),
                     'availability_scope': 'account',
                     'reason_code': state.get('reason_code', ''),
+                    'endpoint': state.get('endpoint'),
+                    'observed_state': state.get('observed_state'),
                     'checked_at': state.get('checked_at'),
                         }
         except Exception as e:
@@ -2278,12 +2420,26 @@ class Server:
             if _env_flag('MODELS_MARK_UNAVAILABLE', '1'):
                 for e in enriched:
                     mid = e.get('id') or ''
-                    if mid and (await self._fastfail_dead_model_reason(mid)
-                                or await self._advert_dead_model_reason(mid)):
+                    state = e.get('availability_state')
+                    hard_reason = await self._fastfail_dead_model_reason(mid) if mid else None
+                    if not hard_reason and mid:
+                        hard_reason = await self._advert_dead_model_reason(mid)
+                    if hard_reason:
                         e['available'] = False
                         e['unavailable_reason'] = 'not_deployed_on_any_configured_account'
+                    elif state in ('available',):
+                        e['available'] = True
+                    elif state in ('account_unavailable', 'globally_retired', 'wrong_route'):
+                        # Do not advertise a model that the last valid route
+                        # observation proved unusable. It remains in the
+                        # provider catalog with the diagnostic state intact.
+                        e['available'] = False
+                        e['unavailable_reason'] = e.get('reason_code') or state
                     else:
-                        e.setdefault('available', True)
+                        # Unknown, transient, rate-limited, and capability
+                        # mismatches are not proof of availability or death.
+                        # Omit the boolean rather than fabricating one.
+                        e.pop('available', None)
             # Dynamic aliases: expose short names bound to current concrete target (if any)
             tgt = get_dynamic_alias_target()
             if tgt:
@@ -2537,14 +2693,15 @@ class Server:
             except (json.JSONDecodeError, ValueError):
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             model_id = resolve_target_model(body.get('model', ''))
-            body['model'] = model_id
+            body = normalize_nvidia_ranking_body(body, model_id)
             if is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Model {model_id} is retired or unavailable', 'type': 'invalid_request_error'}})
-            # BUG-ROUTE1 fix: /v1/ranking must route to BASE_GENAI (image/audio/
-            # video/ranking/infer family), not BASE_LLM. resolve_base(model_id)
-            # always returned BASE_LLM because a model_id never starts with
-            # '/v1/ranking'. Use the endpoint path for routing.
-            return await self._proxy_post(request, body, raw, model_id, '/v1/ranking', lambda key: f"{route_upstream('/v1/ranking')}/v1/ranking")
+            target = nvidia_reranking_url(model_id)
+            if not target:
+                return JSONResponse(status_code=400, content={'error': {'message': 'NVIDIA reranking requires a publisher/model id', 'type': 'invalid_request_error'}})
+            # NVIDIA NeMo Retriever does not expose a generic /v1/ranking route.
+            # Each ranker uses /v1/retrieval/{publisher}/{model}/reranking.
+            return await self._proxy_post(request, body, raw, model_id, '/v1/ranking', lambda key: target)
 
         @app.post('/v1/images/generations')
         async def image_generations(request: Request):
@@ -3402,9 +3559,11 @@ class Server:
                             return self._dead_model_404(model_id, _miss404, _upstream_tries)
                         return {'status': norm_status, 'data': resp_body, 'headers': upstream_response_headers(resp)}
 
-                    # Keep in-flight until the stream consumer finishes. The wrapper
-                    # owns release/decrement so every streaming surface (/chat,
-                    # /messages, /responses) closes capacity exactly once.
+                    # Record a successful route observation before handing the
+                    # stream to the client. The wrapper owns release/decrement so
+                    # every streaming surface closes capacity exactly once.
+                    await self._record_model_response(model_id, key, resp.status, {}, metric_path)
+                    # Keep in-flight until the stream consumer finishes.
                     released = False
 
                     def close_upstream():
@@ -3482,8 +3641,7 @@ class Server:
 
                     resp_data = await _safe_response_body(resp)
                     classification = self._classify_upstream(resp.status, resp_data)
-                    if resp.status >= 400:
-                        await self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
+                    await self._record_model_response(model_id, key, resp.status, resp_data, metric_path)
                     norm_status = resp.status
                     if metric_path != '/v1/chat/completions':
                         norm_status, resp_data = _normalize_upstream_error(resp.status, resp_data, model_id)
@@ -3614,6 +3772,7 @@ class Server:
                     continue
 
                 if is_streaming and resp.status < 400:
+                    await self._record_model_response(model_id, key, resp.status, {}, path)
                     if self.metrics:
                         # F2 fix: DB write off the hot path
                         _fire_and_forget(self.metrics.record_request(
@@ -3665,6 +3824,7 @@ class Server:
                         return JSONResponse(status_code=404, content=dead['data'], headers=dead['headers'])
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
+                await self._record_model_response(model_id, key, resp.status, {}, path)
                 if self.metrics:
                     # F2 fix: DB write off the hot path
                     _fire_and_forget(self.metrics.record_request(
@@ -3937,6 +4097,8 @@ def enrich_model_metadata(model_id: str, desc: dict, status: dict) -> dict:
     result['ok'] = st.get('ok', True)
     result['reason'] = st.get('reason', '')
     result['reason_code'] = st.get('reason_code', '')
+    result['endpoint'] = st.get('endpoint')
+    result['observed_state'] = st.get('observed_state')
     result['verified'] = st.get('verified', False)
     result['availability_state'] = st.get('availability_state', 'unknown')
     result['availability_scope'] = st.get('availability_scope', 'account')

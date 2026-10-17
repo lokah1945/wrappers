@@ -467,6 +467,9 @@ class ModelStateStore:
                                 "account_scope": entry.get("account_scope"),
                                 "endpoint": entry.get("endpoint"),
                                 "state": entry.get("state"),
+                                "reason_code": entry.get("reason_code"),
+                                "reason_detail": entry.get("reason_detail"),
+                                "http_status": entry.get("http_status", 0),
                                 "checked_at": entry.get("checked_at"),
                             }
                             for entry in entries
@@ -481,6 +484,63 @@ class ModelStateStore:
             return result
         finally:
             conn.close()
+
+    def effective_status_map(self, account_scope: str | None = None,
+                            endpoint: str | None = None) -> dict[str, dict[str, Any]]:
+        """Return request-usable availability without hiding scoped conflicts.
+
+        ``status_map`` is intentionally diagnostic: it reports ``mixed`` when
+        one account or endpoint failed while another succeeded. That is useful
+        forensic information but it is the wrong public availability verdict
+        for a multi-key wrapper. A model is usable when at least one configured
+        account/endpoint has a recent successful observation; the request
+        router can rotate to that credential. Keep the detailed observations in
+        ``scoped_states`` and expose the effective state as ``available``.
+        """
+        detailed = self.status_map(account_scope=account_scope, endpoint=endpoint)
+        effective: dict[str, dict[str, Any]] = {}
+        for model_id, status in detailed.items():
+            scoped = status.get("scoped_states") if isinstance(status, dict) else None
+            available_rows = [row for row in (scoped or [])
+                              if isinstance(row, dict) and row.get("state") == "available"]
+            if status.get("state") == "mixed" and scoped:
+                if available_rows:
+                    winner = max(available_rows, key=lambda row: row.get("checked_at", 0) or 0)
+                    merged = dict(status)
+                    merged.update({
+                        "state": "available",
+                        "reason_code": "OK",
+                        "reason_detail": "At least one configured account/endpoint accepted the model",
+                        "http_status": 200,
+                        "endpoint": winner.get("endpoint", status.get("endpoint", "")),
+                        "checked_at": winner.get("checked_at", status.get("checked_at", 0)),
+                        "effective_state": "available",
+                        "observed_state": "mixed",
+                    })
+                else:
+                    # No successful observation exists. Surface the newest
+                    # concrete failure rather than the diagnostic aggregate so
+                    # public metadata does not claim an unexplained mixed state.
+                    winner = max(scoped, key=lambda row: row.get("checked_at", 0) or 0)
+                    merged = dict(status)
+                    merged.update({
+                        "state": winner.get("state", "unknown"),
+                        "reason_code": winner.get("reason_code") or status.get("reason_code", ""),
+                        "reason_detail": winner.get("reason_detail") or status.get("reason_detail", ""),
+                        "http_status": winner.get("http_status", 0),
+                        "endpoint": winner.get("endpoint", status.get("endpoint", "")),
+                        "checked_at": winner.get("checked_at", status.get("checked_at", 0)),
+                        "effective_state": winner.get("state", "unknown"),
+                        "observed_state": "mixed",
+                    })
+                effective[model_id] = merged
+            else:
+                effective[model_id] = dict(status)
+        return effective
+
+    def effective_status_for(self, model_id: str,
+                             account_scope: str | None = None) -> Optional[dict[str, Any]]:
+        return self.effective_status_map(account_scope).get(model_id)
 
     def status_for(self, model_id: str, account_scope: str | None = None) -> Optional[dict[str, Any]]:
         return self.status_map(account_scope).get(model_id)

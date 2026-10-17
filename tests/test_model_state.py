@@ -85,6 +85,28 @@ def test_unscoped_status_does_not_collapse_conflicting_accounts(tmp_path: Path):
     assert store.status_for("vendor/model-a", "account-b")["state"] == "account_unavailable"
 
 
+def test_effective_status_is_available_when_one_account_can_serve(tmp_path: Path):
+    db = tmp_path / "model-state.db"
+    store = ModelStateStore("test-provider", db)
+    store.record_status("vendor/model-a", "account-a", "available", 200, "OK", endpoint="/v1/chat/completions")
+    store.record_status("vendor/model-a", "account-b", "account_unavailable", 404, "NOT_DEPLOYED_FOR_ACCOUNT", endpoint="/v1/chat/completions")
+    state = store.effective_status_for("vendor/model-a")
+    assert state["state"] == "available"
+    assert state["http_status"] == 200
+    assert state["endpoint"] == "/v1/chat/completions"
+    assert state["observed_state"] == "mixed"
+    assert len(state["scoped_states"]) == 2
+
+
+def test_effective_status_keeps_route_failure_unavailable_without_success(tmp_path: Path):
+    db = tmp_path / "model-state.db"
+    store = ModelStateStore("test-provider", db)
+    store.record_status("vendor/model-a", "account-a", "wrong_route", 404, "UPSTREAM_ROUTE_NOT_FOUND", endpoint="/v1/chat/completions")
+    state = store.effective_status_for("vendor/model-a")
+    assert state["state"] == "wrong_route"
+    assert state["http_status"] == 404
+
+
 def test_provider_manifest_loads_from_model_registry():
     """2026-10-17 regression: the loader path must actually find the manifests
     under <repo>/model-registry/manifests/errors/ (parents[1] pointed at
