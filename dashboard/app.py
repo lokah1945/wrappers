@@ -457,6 +457,9 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             "model_fetcher": {
                 "service": "model-fetcher-catalog-api",
                 "port": 8787,
+                "role": "auxiliary_metadata_only",
+                "public_model_feed": False,
+                "backend_uplink": False,
                 "status": source_state(f_health_code, f_health, f_ready_code, f_ready),
                 "endpoint_status": {
                     "health": f_health_code, "ready": f_ready_code,
@@ -469,6 +472,7 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
                 "models": public_collection(f_models, "models", "data"),
                 "models_count": collection_count(f_models, "models", "data"),
                 "dashboard_available": False,
+                "note": "Reference metadata only; live wrapper /v1/models remains the public model feed and inference backend.",
             },
             "model_fetcher_mcp": {
                 "service": "model-fetcher-mcp",

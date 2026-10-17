@@ -1018,12 +1018,37 @@ function modelAllowedByPolicy(model, service) {
   if (modelHasFreeSuffix(model)) return true;
   return false;
 }
+function auxiliaryModelMap(snapshot) {
+  const models=snapshot && snapshot.model_planes && snapshot.model_planes.model_fetcher && snapshot.model_planes.model_fetcher.models || [];
+  const byId=new Map();
+  for (const item of models) {
+    if (!item || typeof item !== 'object') continue;
+    for (const id of [item.id,item.catalog_id,item.served_model_id,item.model,item.slug]) {
+      if (id) byId.set(String(id),item);
+    }
+  }
+  return byId;
+}
+function hasModelValue(value) {
+  return value !== undefined && value !== null && value !== '' && !(Array.isArray(value) && !value.length);
+}
+function enrichAuxiliaryModel(model, snapshot) {
+  if (!model || typeof model !== 'object') return model;
+  const helper=auxiliaryModelMap(snapshot).get(String(modelId(model)));
+  if (!helper) return model;
+  const out=Object.assign({},model); const auxiliary={};
+  // Only fill absent live-wrapper fields. The wrapper remains authoritative for
+  // identity, availability, routing, pricing, capabilities, and request state.
+  for (const key of ['title','name','description','publisher','context_length','context_window','max_context_window','max_output_tokens','modalities','free_endpoint','availability','verification_tier','working_eligible']) {
+    if (!hasModelValue(out[key]) && hasModelValue(helper[key])) { out[key]=helper[key]; auxiliary[key]=helper[key]; }
+  }
+  out._auxiliary_metadata_source='model-fetcher catalog';
+  out._auxiliary_metadata=auxiliary;
+  return out;
+}
 function filteredServiceModels(service) {
   const raw=service && service.telemetry && Array.isArray(service.telemetry.models) ? service.telemetry.models : [];
-  return raw.filter(model=>modelAllowedByPolicy(model,service));
-}
-function modelFetcherIsFree(model) {
-  return !!(model && (model.free_endpoint === true || modelHasFreeSuffix(model)));
+  return raw.map(model=>enrichAuxiliaryModel(model,UNIFIED_SNAPSHOT)).filter(model=>modelAllowedByPolicy(model,service));
 }
 function serviceView(service) {
   if (service && !service.telemetry && service.models && service.health && service.stats) return service;
@@ -1063,11 +1088,6 @@ function globalService() {
   for (const s of services) for (const [key, val] of Object.entries(s.counters || {})) if (typeof val === 'number') counters[key] = (counters[key] || 0) + val;
   const models = [];
   for (const s of services) for (const m of filteredServiceModels(s)) models.push(Object.assign({_unified_source:s.upstream || s.name}, m));
-  const catalog = UNIFIED_SNAPSHOT && UNIFIED_SNAPSHOT.model_planes && UNIFIED_SNAPSHOT.model_planes.model_fetcher;
-  // The fetcher catalog is broader than any one wrapper. When the active fleet
-  // is free-only, only explicit free-endpoint/suffix-free rows may enter the
-  // public global feed; paid catalog rows stay available to the internal plane.
-  for (const m of (catalog && catalog.models || [])) if (!services.some(s=>s.free_only===true) || modelFetcherIsFree(m)) models.push(Object.assign({_unified_source:'model-fetcher catalog'}, m));
   const keyTotal = services.reduce((n,s)=>n + (Number(s.key_summary && s.key_summary.total) || 0),0);
   const keyAvailable = services.reduce((n,s)=>n + (Number(s.key_summary && s.key_summary.available) || 0),0);
   const chartMap = new Map();
