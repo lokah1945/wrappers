@@ -840,7 +840,27 @@ def _resolve_git_commit():
     except Exception:
         return 'unknown'
 
+def _resolve_git_dirty():
+    """True if the working tree was dirty when this process loaded the code.
+
+    git_commit alone is misleading: code is typically edited, restarted and
+    verified live *before* the fix is committed, so the commit resolved at
+    process start lags the actually-running code. git_dirty=true is the honest
+    signal that the running code differs from the reported commit; the exact
+    running state is then identified by commit+dirty captured at import time.
+    """
+    try:
+        import subprocess
+        out = subprocess.check_output(
+            ['git', 'status', '--porcelain'],
+            cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3
+        ).decode().strip()
+        return bool(out)
+    except Exception:
+        return None
+
 GIT_COMMIT = _resolve_git_commit()
+GIT_DIRTY = _resolve_git_dirty()
 SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))  # .../nvidia-python (up from src/)
 
 REASONING_CONFIGS = [
@@ -2014,6 +2034,7 @@ class Server:
                 'status': 'ok' if self.pool.available_keys > 0 else 'degraded',
                 'version': VERSION,
                 'git_commit': GIT_COMMIT,
+                'git_dirty': GIT_DIRTY,
                 'source_root': SOURCE_ROOT,
                 'pid': os.getpid(),
                 'keys': self.pool.total_keys,
@@ -2038,7 +2059,7 @@ class Server:
 
         @app.get('/version')
         async def version():
-            return {'version': VERSION, 'git_commit': GIT_COMMIT, 'source_root': SOURCE_ROOT, 'pid': os.getpid()}
+            return {'version': VERSION, 'git_commit': GIT_COMMIT, 'git_dirty': GIT_DIRTY, 'source_root': SOURCE_ROOT, 'pid': os.getpid()}
 
         @app.get('/api/version')
         async def api_version():

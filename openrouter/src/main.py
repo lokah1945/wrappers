@@ -319,8 +319,26 @@ def _resolve_git_commit():
     except Exception:
         return 'unknown'
 
+def _resolve_git_dirty():
+    """True if the working tree was dirty when this process loaded the code.
+
+    git_commit alone is misleading: code is typically edited, restarted and
+    verified live *before* the fix is committed, so the commit resolved at
+    process start lags the actually-running code. git_dirty=true is the honest
+    signal that the running code differs from the reported commit; the exact
+    running state is then identified by commit+dirty captured at import time.
+    """
+    try:
+        import subprocess
+        out = subprocess.check_output(['git', 'status', '--porcelain'], cwd=_resolve_git_root(),
+                                      stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+        return bool(out)
+    except Exception:
+        return None
+
 
 GIT_COMMIT = _resolve_git_commit()
+GIT_DIRTY = _resolve_git_dirty()
 SOURCE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -3449,6 +3467,7 @@ async def health():
         "status": "ok",
         "version": VERSION,
         "git_commit": GIT_COMMIT,
+        "git_dirty": GIT_DIRTY,
         "keys": pool.available_keys,
         "uptime_seconds": int(time.time() - metrics.start),
         "catalog": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
@@ -3550,6 +3569,7 @@ async def version():
         "app": "wrapper-openrouter",
         "version": VERSION,
         "git_commit": GIT_COMMIT,
+        "git_dirty": GIT_DIRTY,
         "upstream": "OpenRouter",
         "source_root": SOURCE_ROOT,
     }

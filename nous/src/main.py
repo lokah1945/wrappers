@@ -533,7 +533,24 @@ def _resolve_git_commit():
     except Exception:
         return 'unknown'
 
+def _resolve_git_dirty():
+    """True if the working tree was dirty when this process loaded the code.
+
+    git_commit alone is misleading: code is typically edited, restarted and
+    verified live *before* the fix is committed, so the commit resolved at
+    process start lags the actually-running code. git_dirty=true is the honest
+    signal that the running code differs from the reported commit; the exact
+    running state is then identified by commit+dirty captured at import time.
+    """
+    try:
+        import subprocess
+        out = subprocess.check_output(['git', 'status', '--porcelain'], cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3).decode().strip()
+        return bool(out)
+    except Exception:
+        return None
+
 GIT_COMMIT = _resolve_git_commit()
+GIT_DIRTY = _resolve_git_dirty()
 SOURCE_ROOT = os.path.dirname(os.path.abspath(__file__))
 # No DEFAULT_MODEL/REASONING_MODEL - all model selection is transparent (client chooses)
 
@@ -3060,6 +3077,7 @@ async def health():
         "status": "ok" if KEY_POOL.available_keys > 0 or bool(_read_token_from_auth_path()) else "degraded",
         "version": VERSION,
         "git_commit": GIT_COMMIT,
+        "git_dirty": GIT_DIRTY,
         "source_root": SOURCE_ROOT,
         "pid": os.getpid(),
         "port": LISTEN_PORT,
@@ -3119,7 +3137,7 @@ async def ready():
         return JSONResponse(status_code=503, content={"ready": False, "upstream_ok": False, "last_error": str(e), "keys": KEY_POOL.total_keys, "available": KEY_POOL.available_keys})
 
 @app.get("/version")
-async def version(): return {"version": VERSION, "git_commit": GIT_COMMIT, "source_root": SOURCE_ROOT, "pid": os.getpid()}
+async def version(): return {"version": VERSION, "git_commit": GIT_COMMIT, "git_dirty": GIT_DIRTY, "source_root": SOURCE_ROOT, "pid": os.getpid()}
 
 # Curated discovery manifest for stale/upstream-unavailable catalog responses
 CURATED_FREE_MODELS = [
