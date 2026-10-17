@@ -328,12 +328,25 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             "activity": activity_code,
             "chart_hourly": chart_code,
         }
+        counter_values = {**safe_numbers(health_body), **safe_numbers(stats_body)}
+        key_total = counter_values.get("keys", counter_values.get("total_keys", counter_values.get("keys_loaded")))
+        key_available = counter_values.get("available", counter_values.get("available_keys"))
+        key_summary = {
+            "total": key_total if isinstance(key_total, (int, float)) else None,
+            "available": key_available if isinstance(key_available, (int, float)) else None,
+            "blocked": (key_total - key_available
+                        if isinstance(key_total, (int, float))
+                        and isinstance(key_available, (int, float))
+                        else None),
+            "labels_redacted": True,
+        }
         return {
             "name": name, "upstream": entry.get("upstream", name), "port": port,
             "lifecycle": "production", "status": status, "reachable": reachable,
             "health_http_status": health_code, "ready_http_status": ready_code, "ready": ready,
             "readiness": "ready" if ready is True else "not_ready" if ready is False else "protected" if ready_code in (401, 403) else "unknown",
-            "counters": {**safe_numbers(health_body), **safe_numbers(stats_body)},
+            "counters": counter_values,
+            "key_summary": key_summary,
             "models_count": collection_count(models_body, "data", "models"),
             "capabilities_count": collection_count(capabilities_body, "models", "data"),
             "endpoint_status": endpoint_status,
