@@ -1006,19 +1006,45 @@ function serviceKeyRows(service) {
     total_requests: null, total_429s: null, current_rpm: null,
   }));
 }
+function modelHasFreeSuffix(model) {
+  const id=modelId(model).toLowerCase().trim();
+  return id.endsWith(':free') || id.endsWith('-free');
+}
+function modelHasExactZeroPricing(model) {
+  const p=model && typeof model === 'object' ? model.pricing : null;
+  if (!p || p.prompt == null || p.completion == null) return false;
+  const prompt=Number(p.prompt), completion=Number(p.completion);
+  return isFinite(prompt) && isFinite(completion) && prompt === 0 && completion === 0;
+}
+function modelAllowedByPolicy(model, service) {
+  if (!service || service.free_only !== true) return true;
+  const policy=service.free_policy || '';
+  if (policy === 'provider_inherent_free') return true;
+  if (modelHasFreeSuffix(model)) return true;
+  if (policy === 'provider_pricing_zero_or_free_suffix') return modelHasExactZeroPricing(model);
+  return false;
+}
+function filteredServiceModels(service) {
+  const raw=service && service.telemetry && Array.isArray(service.telemetry.models) ? service.telemetry.models : [];
+  return raw.filter(model=>modelAllowedByPolicy(model,service));
+}
+function modelFetcherIsFree(model) {
+  return !!(model && (model.free_endpoint === true || modelHasFreeSuffix(model) || modelHasExactZeroPricing(model)));
+}
 function serviceView(service) {
   if (service && !service.telemetry && service.models && service.health && service.stats) return service;
   const t = service && service.telemetry || {};
   const health = Object.assign({}, t.health || {});
   const ready = Object.assign({}, t.ready || {});
   const stats = Object.assign({}, t.stats || {});
-  const models = Array.isArray(t.models) ? t.models : [];
+  const models = filteredServiceModels(service);
   const caps = Array.isArray(t.capabilities) ? t.capabilities : [];
   const usage = t.usage && typeof t.usage === 'object' ? t.usage : {};
   const activity = t.activity && typeof t.activity === 'object' ? t.activity : {rows: []};
   const chart = t.chart_hourly && typeof t.chart_hourly === 'object' ? t.chart_hourly : {data: []};
   health.keys_list = serviceKeyRows(service);
-  health.free_only = health.free_only;
+  if (service.free_only !== undefined) health.free_only = service.free_only;
+  if (service.free_policy) health.free_policy = service.free_policy;
   return Object.assign({}, service, {health, ready, stats, models, caps, usage, activity, chart});
 }
 function mergeUsage(services) {
@@ -1042,9 +1068,12 @@ function globalService() {
   const counters = {};
   for (const s of services) for (const [key, val] of Object.entries(s.counters || {})) if (typeof val === 'number') counters[key] = (counters[key] || 0) + val;
   const models = [];
-  for (const s of services) for (const m of (s.telemetry && s.telemetry.models || [])) models.push(Object.assign({_unified_source:s.upstream || s.name}, m));
+  for (const s of services) for (const m of filteredServiceModels(s)) models.push(Object.assign({_unified_source:s.upstream || s.name}, m));
   const catalog = UNIFIED_SNAPSHOT && UNIFIED_SNAPSHOT.model_planes && UNIFIED_SNAPSHOT.model_planes.model_fetcher;
-  for (const m of (catalog && catalog.models || [])) models.push(Object.assign({_unified_source:'model-fetcher catalog'}, m));
+  // The fetcher catalog is broader than any one wrapper. When the active fleet
+  // is free-only, only explicit free-endpoint/zero-priced rows may enter the
+  // public global feed; paid catalog rows stay available to the internal plane.
+  for (const m of (catalog && catalog.models || [])) if (!services.some(s=>s.free_only===true) || modelFetcherIsFree(m)) models.push(Object.assign({_unified_source:'model-fetcher catalog'}, m));
   const keyTotal = services.reduce((n,s)=>n + (Number(s.key_summary && s.key_summary.total) || 0),0);
   const keyAvailable = services.reduce((n,s)=>n + (Number(s.key_summary && s.key_summary.available) || 0),0);
   const chartMap = new Map();

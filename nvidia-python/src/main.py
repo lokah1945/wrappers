@@ -2045,6 +2045,8 @@ class Server:
                 'available': self.pool.available_keys,
                 'live_keys': self.pool.all_stats(),
                 'models_cached': len(self.pool.models_cached),
+                'free_only': True,
+                'free_policy': 'provider_inherent_free',
                 'model_registry': MODEL_REGISTRY_CLIENT.stats(),
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
@@ -2292,7 +2294,8 @@ class Server:
                             'id': alias, 'object': 'model', 'owned_by': 'alias',
                             'rooted_model': tgt, 'dynamic_alias': True,
                         })
-            return {'object': 'list', 'data': enriched, 'dynamic_alias_target': tgt or None}
+            return {'object': 'list', 'data': enriched, 'dynamic_alias_target': tgt or None,
+                    'free_only': True, 'free_policy': 'provider_inherent_free'}
 
         @app.get('/v1/models/{model_id:path}')
         async def model_info(model_id: str, request: Request):

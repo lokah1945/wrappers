@@ -3100,6 +3100,7 @@ async def health():
         "pid": os.getpid(),
         "port": LISTEN_PORT,
         "free_only": free_only_enabled(),
+        "free_policy": "free_suffix_or_allowlist",
         "dynamic_alias_target": get_dynamic_alias_target() or None,
         "keys": KEY_POOL.total_keys,
         "available": KEY_POOL.available_keys,
@@ -3309,7 +3310,7 @@ async def models():
             enriched[i]["availability_scope"] = "account"
             enriched[i]["reason_code"] = st.get("reason_code", "")
             enriched[i]["checked_at"] = st.get("checked_at")
-    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
+    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "free_policy": "free_suffix_or_allowlist", "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
 
 
 @app.get("/v1/models/{model_id:path}")

@@ -85,8 +85,15 @@ SENSITIVE_FIELDS = frozenset({
 })
 
 
-def public_json(value: object, *, depth: int = 0, max_items: int = 250) -> object:
-    """Bound and redact JSON-shaped provider metadata for the global feed."""
+def public_json(value: object, *, depth: int = 0, max_items: int = 250,
+                parent_key: str = "") -> object:
+    """Bound and redact JSON-shaped provider metadata for the global feed.
+
+    Provider pricing is safe model metadata, not a user prompt. Preserve its
+    numeric/string ``prompt`` price so FREE_ONLY wrappers can distinguish a
+    suffix-less zero-priced model from a paid or unknown-pricing model while
+    still redacting actual request prompts everywhere else.
+    """
     if depth > 5:
         return None
     if isinstance(value, dict):
@@ -96,11 +103,17 @@ def public_json(value: object, *, depth: int = 0, max_items: int = 250) -> objec
             if key_text.lower() in SENSITIVE_FIELDS:
                 # Numeric aggregate counters remain useful telemetry; string,
                 # mapping, and list values under these names are redacted.
-                if not (key_text.lower() in {"error", "errors", "tokens"}
-                        and isinstance(item, (int, float))
-                        and not isinstance(item, bool)):
+                pricing_field = (parent_key.lower() == "pricing"
+                                 and key_text.lower() in {"prompt", "completion", "input", "output"}
+                                 and isinstance(item, (int, float, str))
+                                 and not isinstance(item, bool))
+                if not (pricing_field
+                        or (key_text.lower() in {"error", "errors", "tokens"}
+                            and isinstance(item, (int, float))
+                            and not isinstance(item, bool))):
                     continue
-            result[key_text] = public_json(item, depth=depth + 1, max_items=max_items)
+            result[key_text] = public_json(item, depth=depth + 1,
+                                           max_items=max_items, parent_key=key_text)
         return result
     if isinstance(value, list):
         return [public_json(item, depth=depth + 1, max_items=max_items)
@@ -153,6 +166,34 @@ def safe_numbers(body: object) -> dict:
             if isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value):
                 out[key] = value
     return out
+
+
+def model_policy(name: str, entry: dict, *bodies: object) -> dict:
+    """Describe the live wrapper's FREE_ONLY display/request policy.
+
+    The dashboard must not infer that a catalog row is allowed merely because
+    it exists in the broad model-fetcher catalog. NVIDIA's wrapper is an
+    inherently free provider surface; Nous uses its suffix/allowlist policy;
+    OpenRouter reports exact zero pricing for some suffix-less free models.
+    """
+    reported = None
+    for body in bodies:
+        if isinstance(body, dict) and isinstance(body.get("free_only"), bool):
+            reported = body["free_only"]
+            break
+    upstream = str(entry.get("upstream", ""))
+    if name == "nvidia-python" or upstream.lower() == "nvidia nim":
+        return {
+            "free_only": True,
+            "mode": "provider_inherent_free",
+            "source": "NVIDIA NIM wrapper contract",
+        }
+    if reported is True:
+        mode = "provider_pricing_zero_or_free_suffix" if name == "openrouter" else "free_suffix_or_allowlist"
+        return {"free_only": True, "mode": mode, "source": "live wrapper policy"}
+    if reported is False:
+        return {"free_only": False, "mode": "paid_and_free_allowed", "source": "live wrapper policy"}
+    return {"free_only": None, "mode": "not_reported", "source": "wrapper did not report policy"}
 
 
 def bridge_html(body: str, name: str) -> str:
@@ -340,6 +381,7 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
                         else None),
             "labels_redacted": True,
         }
+        policy = model_policy(name, entry, health_body, ready_body, stats_body)
         return {
             "name": name, "upstream": entry.get("upstream", name), "port": port,
             "lifecycle": "production", "status": status, "reachable": reachable,
@@ -347,6 +389,9 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             "readiness": "ready" if ready is True else "not_ready" if ready is False else "protected" if ready_code in (401, 403) else "unknown",
             "counters": counter_values,
             "key_summary": key_summary,
+            "free_only": policy["free_only"],
+            "free_policy": policy["mode"],
+            "model_policy": policy,
             "models_count": collection_count(models_body, "data", "models"),
             "capabilities_count": collection_count(capabilities_body, "models", "data"),
             "endpoint_status": endpoint_status,
@@ -464,6 +509,7 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
                 "lifecycle": entry["status"], "status": "pending", "reachable": None,
                 "ready": None, "readiness": "not_probed", "counters": {},
                 "models_count": None, "capabilities_count": None,
+                "free_only": None, "free_policy": "not_probed",
                 "endpoint_status": {}, "auth_required": False,
                 "realtime": entry.get("dashboard_stream", "polling"),
                 "service_kind": entry.get("service_kind"),
