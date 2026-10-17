@@ -99,6 +99,10 @@ async def test_home_and_dashboard_service_readiness(repo):
         assert 'id="wrapper-select"' in home.text
         assert 'Per-wrapper dashboards are disabled' in home.text
         assert 'wrapper-frame' not in home.text
+        assert 'id="models-section"' in home.text
+        assert 'id="model-detail"' in home.text
+        assert 'data-target="models-section"' in home.text
+        assert 'registry:' not in home.text
         assert '<header class="topbar">' in home.text
         assert (await client.get("/ready")).json() == {"ready": True, "service": "wrapper-dashboard", "scope": "dashboard_service"}
         assert (await client.get("/health")).json()["read_only"] is True

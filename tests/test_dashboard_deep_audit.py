@@ -161,41 +161,34 @@ async def test_status_sse_emits_retry_and_live_snapshot_then_closes_cleanly(repo
         await response.aclose()
 
 @pytest.mark.asyncio
-async def test_registry_models_are_provider_derived_bounded_and_redacted(tmp_path):
+async def test_catalog_models_are_bounded_redacted_and_registry_rows_excluded(tmp_path):
     entries = {
         "nvidia-python": {"status": "production", "port": 19811, "upstream": "NVIDIA", "supports": ["openai_chat"]},
         "model-registry": {"status": "production", "port": 19200, "upstream": "internal", "service_kind": "internal"},
     }
     (tmp_path / "wrappers.json").write_text(json.dumps({"wrappers": entries}))
-    record = {
-        "canonical_id": "nvidia/demo",
-        "provider": "nvidia",
-        "provider_model_id": "demo",
-        "lifecycle_state": "active",
-        "capabilities": {"input_modalities": ["text"], "streaming": True},
-        "limits": {"context_window": 4096},
-        "protocols": [{"client_surface": "openai_chat", "path": "/v1/chat/completions"}],
-        "provenance": {"source": "provider_catalog", "retrieved_at": "2026-10-17", "metadata": {"token": "PRIVATE_TOKEN", "blob": "x" * 300000}},
-    }
-    registry = {"object": "list", "provider": "nvidia", "data": [record]}
+    catalog = {"models": [{"catalog_id": "nvidia/demo", "served_model_id": "demo", "title": "Demo", "secret": "PRIVATE_TOKEN", "description": "x" * 300000}]}
     data_responses = {
         (19811, "/health"): Response({"status": "ok"}),
         (19811, "/ready"): Response({"ready": True}),
         (19811, "/v1/models"): Response({"data": [{"id": "demo"}]}),
         (19811, "/v1/capabilities"): Response({"models": [{"id": "demo"}]}),
+        (8787, "/health"): Response({"ok": True}),
+        (8787, "/ready"): Response({"ready": True}),
+        (8787, "/models"): Response(catalog),
         (19200, "/health"): Response({"status": "ok"}),
         (19200, "/ready"): Response({"ready": True}),
         (19200, "/stats"): Response({"models": 1}),
-        (19200, "/v1/models"): Response(registry),
     }
     async with gateway(tmp_path, data_responses) as (_, client, _):
         response = await client.get("/api/status")
     assert response.status_code == 200
     assert "PRIVATE_TOKEN" not in response.text
     assert len(response.content) < 250_000
-    models = response.json()["model_planes"]["model_registry"]["providers"]["nvidia"]["models"]
-    assert models[0]["canonical_id"] == "nvidia/demo"
-    assert "metadata" not in models[0].get("provenance", {})
+    data = response.json()
+    assert data["model_planes"]["model_fetcher"]["models"][0]["catalog_id"] == "nvidia/demo"
+    assert data["model_planes"]["model_registry"]["providers"] == {}
+    assert data["model_planes"]["model_registry"]["model_feed"] == "excluded"
 
 
 @pytest.mark.asyncio

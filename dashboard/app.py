@@ -123,40 +123,6 @@ def public_collection(body: object, *keys: str, max_items: int = 250) -> list:
     return result if isinstance(result, list) else []
 
 
-def public_model_collection(body: object, *keys: str, max_items: int = 150) -> list:
-    """Expose provider-derived model identity/capability metadata without huge provenance blobs."""
-    if isinstance(body, list):
-        rows = body
-    elif isinstance(body, dict):
-        rows = next((body.get(key) for key in keys if isinstance(body.get(key), list)), [])
-    else:
-        rows = []
-    allowed = (
-        "id", "canonical_id", "provider", "provider_model_id", "name", "display_name",
-        "lifecycle_state", "profile_revision", "catalog_revision", "capabilities",
-        "limits", "protocols", "request_rules", "policy",
-    )
-    result = []
-    for row in rows[:max_items]:
-        if not isinstance(row, dict):
-            result.append(public_json(row, max_items=30))
-            continue
-        clean = {}
-        for key in allowed:
-            if key in row:
-                clean[key] = public_json(row[key], max_items=30)
-        provenance = row.get("provenance")
-        if isinstance(provenance, dict):
-            # Preserve attribution and timing, not the full upstream record/blob.
-            clean["provenance"] = {
-                key: public_json(provenance[key], max_items=10)
-                for key in ("source", "retrieved_at", "fetched_at", "catalog_age_sec")
-                if key in provenance
-            }
-        result.append(clean)
-    return result
-
-
 def metadata(repo: Path) -> tuple[dict, tuple[str, ...]]:
     try:
         entries = load_wrappers(repo)
@@ -416,31 +382,6 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
         (r_health_code, r_health), (r_ready_code, r_ready), \
         (r_stats_code, r_stats) = fetcher_results
 
-        registry_provider_names = {
-            "nvidia-python": "nvidia",
-            "nous": "nous",
-            "openrouter": "openrouter",
-        }
-        registry_provider_results = await asyncio.gather(*(
-            probe("model-registry", registry_port,
-                  "/v1/models?" + urlencode({"provider": provider}), headers,
-                  limit=4 * 1024 * 1024)
-            for name, provider in registry_provider_names.items()
-            if name in entries and entries[name].get("status") == "production"
-        ))
-        registry_models = {}
-        result_index = 0
-        for name, provider in registry_provider_names.items():
-            if name not in entries or entries[name].get("status") != "production":
-                continue
-            code, body = registry_provider_results[result_index]
-            result_index += 1
-            registry_models[provider] = {
-                "http_status": code,
-                "models": public_model_collection(body, "data", "models"),
-                "models_count": collection_count(body, "data", "models"),
-            }
-
         def source_state(health_code, health_body, ready_code, ready_body):
             if health_code is None:
                 return "offline"
@@ -488,10 +429,11 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
                 "endpoint_status": {"health": r_health_code, "ready": r_ready_code, "stats": r_stats_code},
                 "health": public_json(r_health), "ready": public_json(r_ready),
                 "stats": public_json(r_stats),
-                "providers": registry_models,
-                "models_count": sum((item["models_count"] or 0) for item in registry_models.values()),
+                "providers": {},
+                "models_count": 0,
                 "dashboard_available": False,
-                "note": "Central knowledge plane; model substitution is disabled.",
+                "model_feed": "excluded",
+                "note": "Control-plane dependency only; provider model rows are excluded from the dashboard feed. Runtime wrappers own their live model metadata and call plans.",
             },
         }
 
