@@ -1010,18 +1010,12 @@ function modelHasFreeSuffix(model) {
   const id=modelId(model).toLowerCase().trim();
   return id.endsWith(':free') || id.endsWith('-free');
 }
-function modelHasExactZeroPricing(model) {
-  const p=model && typeof model === 'object' ? model.pricing : null;
-  if (!p || p.prompt == null || p.completion == null) return false;
-  const prompt=Number(p.prompt), completion=Number(p.completion);
-  return isFinite(prompt) && isFinite(completion) && prompt === 0 && completion === 0;
-}
 function modelAllowedByPolicy(model, service) {
   if (!service || service.free_only !== true) return true;
   const policy=service.free_policy || '';
   if (policy === 'provider_inherent_free') return true;
+  if (policy === 'provider_free_suffix_only') return modelHasFreeSuffix(model);
   if (modelHasFreeSuffix(model)) return true;
-  if (policy === 'provider_pricing_zero_or_free_suffix') return modelHasExactZeroPricing(model);
   return false;
 }
 function filteredServiceModels(service) {
@@ -1029,7 +1023,7 @@ function filteredServiceModels(service) {
   return raw.filter(model=>modelAllowedByPolicy(model,service));
 }
 function modelFetcherIsFree(model) {
-  return !!(model && (model.free_endpoint === true || modelHasFreeSuffix(model) || modelHasExactZeroPricing(model)));
+  return !!(model && (model.free_endpoint === true || modelHasFreeSuffix(model)));
 }
 function serviceView(service) {
   if (service && !service.telemetry && service.models && service.health && service.stats) return service;
@@ -1071,7 +1065,7 @@ function globalService() {
   for (const s of services) for (const m of filteredServiceModels(s)) models.push(Object.assign({_unified_source:s.upstream || s.name}, m));
   const catalog = UNIFIED_SNAPSHOT && UNIFIED_SNAPSHOT.model_planes && UNIFIED_SNAPSHOT.model_planes.model_fetcher;
   // The fetcher catalog is broader than any one wrapper. When the active fleet
-  // is free-only, only explicit free-endpoint/zero-priced rows may enter the
+  // is free-only, only explicit free-endpoint/suffix-free rows may enter the
   // public global feed; paid catalog rows stay available to the internal plane.
   for (const m of (catalog && catalog.models || [])) if (!services.some(s=>s.free_only===true) || modelFetcherIsFree(m)) models.push(Object.assign({_unified_source:'model-fetcher catalog'}, m));
   const keyTotal = services.reduce((n,s)=>n + (Number(s.key_summary && s.key_summary.total) || 0),0);

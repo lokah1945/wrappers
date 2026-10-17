@@ -90,9 +90,9 @@ def public_json(value: object, *, depth: int = 0, max_items: int = 250,
     """Bound and redact JSON-shaped provider metadata for the global feed.
 
     Provider pricing is safe model metadata, not a user prompt. Preserve its
-    numeric/string ``prompt`` price so FREE_ONLY wrappers can distinguish a
-    suffix-less zero-priced model from a paid or unknown-pricing model while
-    still redacting actual request prompts everywhere else.
+    numeric/string ``prompt`` price for honest model-detail reporting, but do
+    not treat a zero text price as proof that every modality is free; wrappers
+    apply their own explicit model policy.
     """
     if depth > 5:
         return None
@@ -189,7 +189,7 @@ def model_policy(name: str, entry: dict, *bodies: object) -> dict:
             "source": "NVIDIA NIM wrapper contract",
         }
     if reported is True:
-        mode = "provider_pricing_zero_or_free_suffix" if name == "openrouter" else "free_suffix_or_allowlist"
+        mode = "provider_free_suffix_only" if name == "openrouter" else "free_suffix_or_allowlist"
         return {"free_only": True, "mode": mode, "source": "live wrapper policy"}
     if reported is False:
         return {"free_only": False, "mode": "paid_and_free_allowed", "source": "live wrapper policy"}

@@ -236,32 +236,10 @@ MODEL_CATALOG = CachedModelCatalog(MODEL_STORE, MODEL_REGISTRY, MODEL_REGISTRY_C
                                   f"{OPENROUTER_BASE}/models", ttl_sec=MODEL_CATALOG_TTL_SEC)
 _MODEL_REFRESH_TASK = None
 
-# FREE_ONLY truth set: model ids the provider itself prices at zero
-# (prompt AND completion). The ':free'/'-free' suffix convention is not the
-# provider's own signal — real zero-cost models can carry no suffix
-# (google/lyria-3-*-preview, openrouter/free). Recomputed on catalog refresh
-# so request gating matches the listing filter.
-_FREE_PRICED_IDS: set = set()
-
-
-def _recompute_free_priced_ids(models) -> None:
-    """Synchronize the request allowlist with the exact catalog snapshot."""
-    global _FREE_PRICED_IDS
-    ids = set()
-    for m in models or []:
-        if not isinstance(m, dict):
-            continue
-        pricing = m.get("pricing") or {}
-        if not isinstance(pricing, dict):
-            continue
-        try:
-            free = (float(pricing.get("prompt", "1") or "1") == 0.0
-                    and float(pricing.get("completion", "1") or "1") == 0.0)
-        except (TypeError, ValueError):
-            free = False
-        if free and m.get("id"):
-            ids.add(str(m["id"]).strip().lower())
-    _FREE_PRICED_IDS = ids
+# FREE_ONLY truth: OpenRouter free model ids carry the explicit ``:free``
+# (or legacy ``-free``) suffix. Pricing is intentionally not used here:
+# zero prompt/completion text pricing does not prove that every modality or
+# billing unit is free (for example per-song audio pricing).
 HEARTBEAT_MS = int(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000'))
 VERSION = '1.0.0'
 
@@ -364,34 +342,19 @@ def free_only_enabled() -> bool:
 
 
 def is_free_model(model_id: str) -> bool:
-    """Return the canonical FREE_ONLY decision for a model id.
-
-    The suffix is the safe fallback for ids without a catalog record. Once the
-    provider catalog is loaded, its explicit zero prompt and completion price
-    is also authoritative for suffix-less free entries such as ``openrouter/free``.
-    No substring matching is used, so names such as ``freemium`` never pass.
-    """
+    """Return True only for OpenRouter's explicit free-id suffix."""
     if not model_id:
         return False
     mid = str(model_id).lower().strip()
-    return bool(mid.endswith((':free', '-free')) or mid in _FREE_PRICED_IDS)
+    return bool(mid.endswith((':free', '-free')))
 
 
 def _model_entry_is_free(model: object) -> bool:
-    """Evaluate one provider catalog entry using suffix OR exact zero pricing."""
+    """Evaluate an OpenRouter catalog entry by id, never by price alone."""
     if not isinstance(model, dict):
         return False
     model_id = model.get("id") or model.get("model") or model.get("slug")
-    if is_free_model(model_id):
-        return True
-    pricing = model.get("pricing")
-    if not isinstance(pricing, dict):
-        return False
-    try:
-        return (float(pricing.get("prompt", "1") or "1") == 0.0
-                and float(pricing.get("completion", "1") or "1") == 0.0)
-    except (TypeError, ValueError):
-        return False
+    return is_free_model(model_id)
 
 
 def _bearer_token() -> str:
@@ -646,7 +609,6 @@ async def _fetch_model_catalog():
 
 async def _refresh_models(force: bool = False) -> list:
     models = await MODEL_CATALOG.refresh(_fetch_model_catalog, force=force)
-    _recompute_free_priced_ids(models)
     return [m['id'] for m in models]
 
 
@@ -1383,18 +1345,12 @@ def _check_free_only(model: str) -> JSONResponse | None:
     """Check FREE_ONLY constraint. Returns error response if blocked.
     Returns 400 (not 403) for consistency with nous/opencode/blackbox wrappers."""
     if free_only_enabled() and model and not is_free_model(model):
-        # A request can race the first background catalog refresh. Consult the
-        # current in-memory catalog before rejecting a suffix-less zero-priced
-        # model so listing and request authorization cannot disagree.
-        cached = next((m for m in MODEL_CATALOG.snapshot()
-                       if isinstance(m, dict) and m.get("id") == model), None)
-        if cached is None or not _model_entry_is_free(cached):
-            return _error_response(
-                {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
-                                      "Use a zero-priced model or the :free suffix.",
-                           "type": "invalid_request_error"}},
-                status_code=400,
-            )
+        return _error_response(
+            {"error": {"message": f"FREE_ONLY mode: model '{model}' is not a free model. "
+                                  "Only OpenRouter ids ending in :free or -free are allowed.",
+                       "type": "invalid_request_error"}},
+            status_code=400,
+        )
     return None
 
 
@@ -2088,11 +2044,9 @@ async def images_generations(request: Request):
 async def list_models(request: Request):
     """Serve persistent provider metadata; stale catalogs refresh once in background."""
     entries = await MODEL_CATALOG.get(_fetch_model_catalog)
-    _recompute_free_priced_ids(entries)
     if free_only_enabled():
-        # Keep the public catalog and request gate on the exact same rule:
-        # conventional free suffix OR provider-reported zero prompt and
-        # completion pricing. Unknown pricing is not assumed to be free.
+        # OpenRouter's explicit free suffix is authoritative. Do not infer
+        # free access from text pricing because some modalities bill separately.
         entries = [m for m in entries if _model_entry_is_free(m)]
     def _with_observations(m):
         # Empirical reinforcement (2026-10-15): account-scoped context
@@ -2130,13 +2084,12 @@ async def list_models(request: Request):
                 "checked_at": status.get("checked_at"),
             })
         enriched.append(observed)
-    return JSONResponse({'object': 'list', 'data': enriched, 'free_only': free_only_enabled(), 'free_policy': 'provider_pricing_zero_or_free_suffix'})
+    return JSONResponse({'object': 'list', 'data': enriched, 'free_only': free_only_enabled(), 'free_policy': 'provider_free_suffix_only'})
 
 
 @app.get("/v1/models/{model_id:path}")
 async def get_model_detail(model_id: str, request: Request):
     entries = await MODEL_CATALOG.get(_fetch_model_catalog)
-    _recompute_free_priced_ids(entries)
     model = next((m for m in entries if m.get('id') == model_id), None)
     blocked = free_only_enabled() and not _model_entry_is_free(model or {"id": model_id})
     if model is None or blocked:
@@ -3492,7 +3445,7 @@ async def health():
         "uptime_seconds": int(time.time() - metrics.start),
         "catalog": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
         "free_only": free_only_enabled(),
-        "free_policy": "provider_pricing_zero_or_free_suffix",
+        "free_policy": "provider_free_suffix_only",
         "management": _HAS_MANAGEMENT,
         "keys_status": mgmt_status,
     }
@@ -3505,7 +3458,7 @@ async def ready():
         "keys_loaded": pool.total_keys,
         "catalog_ready": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
         "free_only": free_only_enabled(),
-        "free_policy": "provider_pricing_zero_or_free_suffix",
+        "free_policy": "provider_free_suffix_only",
     }
 
 
