@@ -5,7 +5,7 @@
 **Status:** ✅ **Verified compatible** (2026-08-01 matrix audit: 240/240 checks)
 **Version:** 1.0.0-audit-hardening
 **Implementation:** Python (FastAPI + aiohttp)
-**Port:** 9106
+**Port:** 9103
 
 ---
 
@@ -67,17 +67,17 @@ cp .env.example .env
 ### 3. Run
 
 ```bash
-uvicorn src.main:app --host 0.0.0.0 --port 9106
+uvicorn src.main:app --host 0.0.0.0 --port 9103
 # or
-python -m uvicorn src.main:app --host 127.0.0.1 --port 9106
+python -m uvicorn src.main:app --host 127.0.0.1 --port 9103
 ```
 
 ### 4. Verify
 
 ```bash
-curl http://localhost:9106/health
-curl http://localhost:9106/v1/models | jq '.data | length'
-curl http://localhost:9106/catalog/health
+curl http://localhost:9103/health
+curl http://localhost:9103/v1/models | jq '.data | length'
+curl http://localhost:9103/catalog/health
 ```
 
 ---
@@ -136,7 +136,7 @@ curl http://localhost:9106/catalog/health
 from openai import OpenAI
 
 client = OpenAI(
-    base_url="http://localhost:9106/v1",
+    base_url="http://localhost:9103/v1",
     api_key="your-bearer-token",
 )
 
@@ -153,7 +153,7 @@ print(response.choices[0].message.content)
 from anthropic import Anthropic
 
 client = Anthropic(
-    base_url="http://localhost:9106",
+    base_url="http://localhost:9103",
     api_key="your-bearer-token",
 )
 
@@ -168,7 +168,7 @@ print(message.content)
 ### Claude Code CLI
 
 ```bash
-export ANTHROPIC_BASE_URL="http://localhost:9106"
+export ANTHROPIC_BASE_URL="http://localhost:9103"
 export ANTHROPIC_API_KEY="your-bearer-token"
 claude code chat "Hello, what is 2+2?"
 ```
@@ -179,7 +179,7 @@ claude code chat "Hello, what is 2+2?"
 {
   "mcpServers": {
     "openrouter-catalog": {
-      "url": "http://localhost:9106/mcp/sse"
+      "url": "http://localhost:9103/mcp/sse"
     }
   }
 }
@@ -196,7 +196,7 @@ claude code chat "Hello, what is 2+2?"
 | `OPENROUTER_API_KEY_1` | — | Primary API key |
 | `OPENROUTER_API_KEY_2+` | — | Additional keys for rotation |
 | `BEARER_TOKEN` | — | Client auth token |
-| `LISTEN_PORT` | 9106 | Listen port |
+| `LISTEN_PORT` | 9103 | Listen port |
 | `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1` | Upstream base URL |
 | `FREE_ONLY` | no | Restrict to free models only |
 | `CATALOG_DB` | — | Path to shared catalog SQLite DB |

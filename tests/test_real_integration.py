@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Real Integration Test — SDK Compatibility Across All Wrappers
+Real Integration Test — SDK Compatibility Across Active Wrappers
 
 This test connects to ACTUAL running wrapper services and verifies:
 1. OpenAI SDK compatibility
@@ -11,7 +11,7 @@ This test connects to ACTUAL running wrapper services and verifies:
 6. Error handling
 
 Prerequisites:
-  - All 4 wrappers must be running on ports 9101-9104
+  - The 3 active inference wrappers must be running on ports 9101-9103
   - Model registry must be running on port 9200
   - Valid API keys configured in each wrapper
 
@@ -20,7 +20,7 @@ Usage:
   python3 tests/test_real_integration.py
 
   # Run with custom ports
-  python3 tests/test_real_integration.py --ports 9101,9102,9103,9104
+  python3 tests/test_real_integration.py --ports 9101,9102,9103
 
   # Run specific wrappers
   python3 tests/test_real_integration.py --wrappers nvidia,nous

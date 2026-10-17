@@ -1720,8 +1720,10 @@ function connectSSE() {
 /* ── Init ──────────────────────────────────────────── */
 (async () => {
   await refresh();
-  // Try SSE for real-time push (only nvidia-python)
-  connectSSE();
+  // Only NVIDIA currently exposes the native /events SSE endpoint.
+  // Nous and OpenRouter use polling; opening a guaranteed-404/401 EventSource
+  // made their dashboards look like real-time streaming had failed.
+  if (WRAPPER_NAME === 'nvidia-python') connectSSE();
   // Live ticker: refresh relative timestamps every second
   setInterval(() => {
     document.querySelectorAll('[data-ts]').forEach(el => {

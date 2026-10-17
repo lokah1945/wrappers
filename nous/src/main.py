@@ -3893,7 +3893,7 @@ async def embeddings(request: Request):
                             status_code=400)
     return JSONResponse({
         "error": {
-            "message": "Embeddings not supported by this provider. Use nvidia-python (port 9101) or openrouter (port 9106) for embeddings.",
+            "message": "Embeddings not supported by this provider. Use nvidia-python (port 9101) or openrouter (port 9103) for embeddings.",
             "type": "not_implemented_error",
             "code": 501,
         }

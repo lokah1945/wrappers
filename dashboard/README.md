@@ -1,6 +1,6 @@
 # Unified wrapper dashboard
 
-Run from the repository root with `python3 -m uvicorn dashboard.app:app --host 127.0.0.1 --port 9105`.
+Run from the repository root with `python3 -m uvicorn dashboard.app:app --host 127.0.0.1 --port 9106`.
 The global page reports lifecycle-active services using their ports in `wrappers.json`.
 The dropdown sits above the dashboard content. Selecting an inference wrapper displays
 its existing dashboard without changing that dashboard's layout. The registry selection
@@ -18,5 +18,5 @@ publishes only selected numeric counters and metadata, not raw health responses 
 The status cache lasts five seconds. Independent bounded probes allow offline services to
 appear without preventing the other cards from rendering.
 
-The supplied user-systemd unit listens on `0.0.0.0:9105`, consistent with the existing
+The supplied user-systemd unit listens on `0.0.0.0:9106`, consistent with the existing
 host deployment. Choose `127.0.0.1` when access is provided through a reverse proxy.

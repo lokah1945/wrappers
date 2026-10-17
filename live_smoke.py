@@ -22,7 +22,7 @@ ROOT = Path('/root/wrapper')
 WRAPPERS = {
     'nvidia-python': (9101, 'nvidia/nemotron-3-super-120b-a12b'),
     'nous': (9102, 'poolside/laguna-s-2.1:free'),
-    'openrouter': (9106, 'nvidia/nemotron-3.5-lightning:free'),
+    'openrouter': (9103, 'nvidia/nemotron-3.5-lightning:free'),
 }
 RESULTS = []
 

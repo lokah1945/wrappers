@@ -23,7 +23,7 @@ requested model and release capacity on disconnect.
 ## Production review (2026-10-11)
 
 See [the current production review](productions/PRODUCTION_READINESS_2026-10-11.md)
-for the unified dashboard on port 9105, architecture, current release gates,
+for the unified dashboard on port 9106, architecture, current release gates,
 deployment evidence and model-specific limits. **All eight current controlled
 gates pass**, including 954 unit tests on each Python environment, acceptance
 141/141 and soak 6,204/6,204. Final rollout passes 31/31 on the frozen db1a89e7
@@ -56,9 +56,9 @@ and its linked reports; pending providers remain frozen.
 |---------|--------|------|----------|-------------|
 | **nvidia-python** | Production verified: Nemotron model, three CLI versions and SDK/read-tool loops on 2026-10-11 | 9101 | NVIDIA NIM | `src.main:app` |
 | **nous** | Production verified: Laguna model, three CLI versions and SDK/read-tool loops on 2026-10-11 | 9102 | Nous Research | `src.main:app` |
-| **opencode** | Pending — frozen | 9103 | OpenCode Zen | `src.main:app` |
-| **blackbox** | Pending — frozen | 9104 | BLACKBOX AI | `src.main:app` |
-| **openrouter** | Production verified: LFM model, three CLI versions and SDK/read-tool loops on 2026-10-11 | 9106 | OpenRouter | `src.main:app` |
+| **opencode** | Pending — frozen | 9104 | OpenCode Zen | `src.main:app` |
+| **blackbox** | Pending — frozen | 9105 | BLACKBOX AI | `src.main:app` |
+| **openrouter** | Production verified: LFM model, three CLI versions and SDK/read-tool loops on 2026-10-11 | 9103 | OpenRouter | `src.main:app` |
 | **model-registry** | Active dependency; no inference client surface | 9200 | internal | `service:app` |
 
 The explicit qualified models are `nvidia/nemotron-3-super-120b-a12b` on
@@ -242,7 +242,7 @@ uvicorn src.main:app --host 127.0.0.1 --port 9101 --workers 1
 
 # 4. Access the wrapper's local dashboard
 # Visit http://127.0.0.1:9101/dashboard in your browser
-# The unified dashboard, installed separately, is http://127.0.0.1:9105/
+# The unified dashboard, installed separately, is http://127.0.0.1:9106/
 ```
 
 ### Production Deployment
@@ -285,7 +285,7 @@ wrappers/
 │       ├── __init__.py
 │       └── main.py
 │
-├── opencode/                        # OpenCode Zen proxy (Port 9103)
+├── opencode/                        # OpenCode Zen proxy (Port 9104)
 │   ├── __init__.py
 │   ├── README.md
 │   ├── .env.example
@@ -294,7 +294,7 @@ wrappers/
 │       ├── __init__.py
 │       └── main.py
 │
-├── blackbox/                        # BLACKBOX AI proxy (Port 9104)
+├── blackbox/                        # BLACKBOX AI proxy (Port 9105)
 │   ├── __init__.py
 │   ├── README.md
 │   ├── .env.example
@@ -371,7 +371,7 @@ wrappers/
 
 ## 📊 Dashboard
 
-The unified dashboard is at **`http://127.0.0.1:9105/`**. Its home page
+The unified dashboard is at **`http://127.0.0.1:9106/`**. Its home page
 shows the global status of active wrappers. A dropdown in the separate top
 navigation selects an individual wrapper dashboard without covering its
 existing controls. Pending providers appear only as frozen metadata;
@@ -386,13 +386,13 @@ Active wrappers retain their local **monitoring dashboard** at `/dashboard`:
 - **Auto-refresh** - Every 10 seconds
 - **Auth prompt** - Token entered client-side (not embedded in HTML)
 
-The port plan is the existing external catalog/MCP service **9100**,
-NVIDIA **9101**, Nous **9102**, reserved pending providers **9103–9104**,
-the unified dashboard **9105**, and OpenRouter **9106**. Port 9105 is the
-lowest available dashboard slot; the unrelated service already using 9100
+The port plan is the existing model-fetcher MCP HTTP service **9100**,
+NVIDIA **9101**, Nous **9102**, OpenRouter **9103**, reserved pending
+providers **9104–9105**, and the unified dashboard **9106**. Port 9100 is
+not reused because the unrelated model-fetcher MCP service already owns it; that service
 is preserved. The internal model-registry remains on **9200**. Reserved
-ports remain untouched while their providers are frozen, and existing
-backend client URLs stay the same.
+ports remain untouched while their providers are frozen. Client configurations
+must use the migrated allocation in `wrappers.json`.
 
 ---
 

@@ -60,7 +60,8 @@
           "responses_sdk_stream_accumulation_openai_2_54",
           "responses_function_call_and_full_explicit_history_function_result"
         ]
-      }
+      },
+      "dashboard_stream": "native_sse"
     },
     "nous": {
       "port": 9102,
@@ -120,46 +121,11 @@
           "responses_sdk_stream_accumulation_openai_2_54",
           "responses_function_call_and_full_explicit_history_function_result"
         ]
-      }
-    },
-    "opencode": {
-      "port": 9103,
-      "module": "src.main",
-      "entry_point": "src.main:app",
-      "upstream": "OpenCode",
-      "status": "pending",
-      "maintenance": "frozen",
-      "pending_since": "2026-10-07",
-      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it. OpenCode clients remain supported by active wrappers.",
-      "structure": "standardized",
-      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9103",
-      "env_prefix": "OPENCODE_",
-      "supports": [
-        "openai_chat",
-        "openai_responses",
-        "anthropic_messages"
-      ]
-    },
-    "blackbox": {
-      "port": 9104,
-      "module": "src.main",
-      "entry_point": "src.main:app",
-      "upstream": "BLACKBOX AI",
-      "status": "pending",
-      "maintenance": "frozen",
-      "pending_since": "2026-10-07",
-      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it.",
-      "structure": "standardized",
-      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9104",
-      "env_prefix": "BLACKBOX_",
-      "supports": [
-        "openai_chat",
-        "openai_responses",
-        "anthropic_messages"
-      ]
+      },
+      "dashboard_stream": "polling"
     },
     "openrouter": {
-      "port": 9106,
+      "port": 9103,
       "module": "src.main",
       "entry_point": "src.main:app",
       "upstream": "OpenRouter",
@@ -167,7 +133,7 @@
       "structure": "standardized",
       "catalog_integrated": true,
       "management_api": true,
-      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9106",
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9103",
       "env_prefix": "OPENROUTER_",
       "supports": [
         "openai_chat",
@@ -215,7 +181,44 @@
             "evidence": "productions/reports/live-client-qualification-attempt1-20261011.json"
           }
         ]
-      }
+      },
+      "dashboard_stream": "polling"
+    },
+    "opencode": {
+      "port": 9104,
+      "module": "src.main",
+      "entry_point": "src.main:app",
+      "upstream": "OpenCode",
+      "status": "pending",
+      "maintenance": "frozen",
+      "pending_since": "2026-10-07",
+      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it. OpenCode clients remain supported by active wrappers.",
+      "structure": "standardized",
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9104",
+      "env_prefix": "OPENCODE_",
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ]
+    },
+    "blackbox": {
+      "port": 9105,
+      "module": "src.main",
+      "entry_point": "src.main:app",
+      "upstream": "BLACKBOX AI",
+      "status": "pending",
+      "maintenance": "frozen",
+      "pending_since": "2026-10-07",
+      "pending_policy": "Do not read, analyze, edit, test, deploy, or patch this provider wrapper until the owner explicitly reactivates it.",
+      "structure": "standardized",
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9105",
+      "env_prefix": "BLACKBOX_",
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ]
     },
     "model-registry": {
       "port": 9200,
@@ -230,7 +233,9 @@
         "model_registry",
         "call_plan",
         "catalog_sync"
-      ]
+      ],
+      "dashboard_stream": "polling",
+      "service_kind": "internal"
     }
   },
   "metadata": {
@@ -259,16 +264,17 @@
       "openrouter"
     ],
     "qualification_policy": "Lifecycle production selects eligible maintenance scope; it is not proof of every model/client feature. Check per-wrapper client_qualification and current real upstream evidence before rollout.",
-    "dashboard_url": "http://127.0.0.1:9105",
-    "port_allocation": "9100 external catalog MCP, 9101 NVIDIA, 9102 Nous, 9103-9104 frozen reserved providers, 9105 unified dashboard, 9106 OpenRouter; model-registry internal9200"
+    "dashboard_url": "http://127.0.0.1:9106",
+    "port_allocation": "9100 model-fetcher MCP HTTP server, 9101 NVIDIA, 9102 Nous, 9103 OpenRouter, 9104-9105 frozen reserved providers, 9106 unified dashboard; model-registry internal9200",
+    "port_9100_owner": "model-fetcher MCP HTTP server (model_fetcher/mcp_server.py), bound to 127.0.0.1:9100; unchanged"
   },
   "dashboard": {
     "status": "production",
-    "port": 9105,
+    "port": 9106,
     "module": "app",
     "entry_point": "app:app",
     "structure": "control_service",
-    "run_command": "uvicorn dashboard.app:app --host 127.0.0.1 --port 9105",
-    "lowest_available_port_reason": "9100 is occupied by an unrelated AI catalog MCP service; 9101-9104 belong to active or frozen provider slots. No unrelated or frozen service is changed."
+    "run_command": "uvicorn dashboard.app:app --host 127.0.0.1 --port 9106",
+    "lowest_available_port_reason": "9100 is owned by the unrelated model-fetcher MCP HTTP server; active inference wrappers are ordered 9101-9103, frozen providers are reserved at 9104-9105, and the unified dashboard uses 9106. The model-fetcher service and its port are unchanged."
   }
 }

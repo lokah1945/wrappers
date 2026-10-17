@@ -40,7 +40,8 @@
 </style>
 </head>
 <body>
-  <h1>🔌 OpenRouter Wrapper — Port 9106</h1>
+  <h1>🔌 OpenRouter Wrapper — Live monitoring</h1>
+  <div id="refresh-status" style="color:var(--muted);font-size:.8rem;margin-bottom:1rem">Polling every 5s</div>
   <div class="grid">
     <div class="card" id="status-card">
       <h2>Status</h2>
@@ -75,7 +76,26 @@
     </div>
   </div>
   <script>
+    const TOKEN_KEY = 'openrouter-wrapper-token';
+    let tokenPrompted = false;
     function esc(s) { return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;'); }
+    function authHeaders() {
+      try { const token = sessionStorage.getItem(TOKEN_KEY); return token ? {'Authorization':'Bearer '+token} : {}; } catch { return {}; }
+    }
+    function requestToken() {
+      if (tokenPrompted) return false;
+      tokenPrompted = true;
+      const token = window.prompt('This OpenRouter dashboard endpoint requires the wrapper token:');
+      if (!token) return false;
+      try { sessionStorage.setItem(TOKEN_KEY, token.trim()); } catch {}
+      return true;
+    }
+    async function apiGet(path, optional=false) {
+      let response = await fetch(path, {headers: authHeaders()});
+      if (response.status === 401 && requestToken()) response = await fetch(path, {headers: authHeaders()});
+      if (!response.ok) { if (optional) return null; throw new Error(path + ' HTTP ' + response.status); }
+      return response.json();
+    }
     function fmtCtx(n) {
       if (n == null) return '—';
       if (n >= 1000000) { const v = n / 1000000; return (v >= 10 ? Math.round(v) : Math.round(v * 100) / 100) + 'M'; }
@@ -88,13 +108,16 @@
     }
     async function refresh() {
       try {
-        const [health, stats, cHealth, models, perModel] = await Promise.all([
-          fetch('/health').then(r => r.json()),
-          fetch('/stats').then(r => r.json()),
-          fetch('/catalog/health').then(r => r.json()),
-          fetch('/v1/models').then(r => r.json()).catch(() => null),
-          fetch('/metrics/models').then(r => r.json()).catch(() => null),
+        const [healthRaw, statsRaw, cHealthRaw, models, perModel] = await Promise.all([
+          apiGet('/health'),
+          apiGet('/stats'),
+          apiGet('/catalog/health', true),
+          apiGet('/v1/models', true),
+          apiGet('/metrics/models', true),
         ]);
+        const health = healthRaw || {};
+        const stats = statsRaw || {};
+        const cHealth = cHealthRaw || {};
 
         document.getElementById('status-content').innerHTML = `
           <div class="stat"><span class="label">Version</span><div class="value">${health.version || '?'}</div></div>
@@ -130,12 +153,15 @@
         if (perModel && Array.isArray(perModel.models)) {
           for (const m of perModel.models) if (m && m.model) usage[m.model] = m;
         }
+        const usageWarning = perModel === null
+          ? '<div class="stat err">Per-model usage unavailable; enter the wrapper token if this endpoint is protected.</div>'
+          : '';
         if (!catalog.length) {
-          modelsEl.innerHTML = '<div class="stat err">Model list unavailable</div>';
+          modelsEl.innerHTML = usageWarning + '<div class="stat err">Model list unavailable</div>';
           countEl.textContent = '';
         } else {
           countEl.textContent = `(${catalog.length} models, ${Object.keys(usage).length} with traffic)`;
-          modelsEl.innerHTML = catalog.map(m => {
+          modelsEl.innerHTML = usageWarning + catalog.map(m => {
             const id = typeof m === 'string' ? m : (m.id || m.model || '?');
             const mo = (typeof m === 'object' && m) ? m : {};
             const u = usage[id] || null;
@@ -173,12 +199,16 @@
             ${hasMgmt ? 'Endpoints: <code>POST /openrouter/keys/list</code> <code>POST /openrouter/keys/create</code>' : 'Set OPENROUTER_MANAGEMENT_KEY in .env.local'}
           </div>
         `;
+        document.getElementById('refresh-status').textContent = 'Updated ' + new Date().toLocaleTimeString() + ' · polling';
+        document.getElementById('refresh-status').className = 'ok';
       } catch(e) {
         document.getElementById('status-content').innerHTML = `<div class="err">Error fetching: ${e.message}</div>`;
+        document.getElementById('refresh-status').textContent = 'Update failed · retrying';
+        document.getElementById('refresh-status').className = 'err';
       }
     }
     refresh();
-    setInterval(refresh, 10000);
+    setInterval(refresh, 5000);
   </script>
 </body>
 </html>

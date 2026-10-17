@@ -6,7 +6,7 @@
 # Production services use the same layout/contract:
 #   nvidia-python  -> port 9101
 #   nous           -> port 9102
-#   openrouter     -> port 9106
+#   openrouter     -> port 9103
 #   model-registry -> port 9200
 #
 # Usage:

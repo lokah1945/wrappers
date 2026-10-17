@@ -1050,12 +1050,12 @@ def test_contract_all_wrappers_expose_required_surfaces():
 def test_contract_ports_match_wrappers_json():
     """§9.1: wrappers.json is the machine-readable source of truth for ports."""
     cfg = json.loads((ROOT / 'wrappers.json').read_text())['wrappers']
-    expected = {'nvidia-python': 9101, 'nous': 9102, 'opencode': 9103,
-                'blackbox': 9104, 'openrouter': 9106, 'model-registry': 9200}
+    expected = {'nvidia-python': 9101, 'nous': 9102, 'openrouter': 9103,
+                'opencode': 9104, 'blackbox': 9105, 'model-registry': 9200}
     for name, port in expected.items():
         assert cfg[name]['port'] == port, f'{name}: wrappers.json port drifted'
-    # The contract states 9105 is intentionally unused.
-    assert 9105 not in {w['port'] for w in cfg.values()}
+    # The unified dashboard is deliberately separated from inference slots on 9106.
+    assert 9106 not in {w['port'] for w in cfg.values()}
 
 
 def test_contract_entry_points_match_systemd():

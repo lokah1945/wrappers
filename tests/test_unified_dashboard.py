@@ -124,7 +124,7 @@ async def test_global_status_preserves_offline_and_unknown_without_secrets(repo)
         assert services["beta"]["status"] == "offline"
         assert services["blackbox"]["status"] == "pending"
         assert services["opencode"]["readiness"] == "not_probed"
-        assert data["counts"] == {"active": 2, "online": 1, "ready": 0, "pending": 2}
+        assert data["counts"] == {"active": 2, "inference_active": 2, "internal_active": 0, "online": 1, "ready": 0, "inference_online": 1, "inference_ready": 0, "internal_online": 0, "pending": 2}
         assert {urlsplit(url).port for url, _ in session.calls} == {19811, 19812}
         call_count = len(session.calls)
         assert (await client.get("/api/status")).json() == data

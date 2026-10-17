@@ -217,7 +217,7 @@ except ImportError:
                         handlers=[_log_file_handler, logging.StreamHandler()])
 
 # ── Configuration ────────────────────────────────────────────────────────
-LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9106'))
+LISTEN_PORT = int(os.environ.get('LISTEN_PORT', '9103'))
 BIND_HOST = os.environ.get('LISTEN_HOST', '0.0.0.0')
 OPENROUTER_BASE = os.environ.get('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1').rstrip('/')
 CATALOG_DB_PATH = os.environ.get('CATALOG_DB', os.path.join(os.path.dirname(CATALOG_REPO) if _HAS_CATALOG else '/dev/null',
@@ -286,7 +286,7 @@ def validate_config():
         sys.exit(1)
 
     try:
-        port = int(os.environ.get('LISTEN_PORT', '9106'))
+        port = int(os.environ.get('LISTEN_PORT', '9103'))
         if not (1024 <= port <= 65535):
             print(f"❌ ERROR: Invalid port {port}")
             sys.exit(1)

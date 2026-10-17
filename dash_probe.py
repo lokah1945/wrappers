@@ -13,10 +13,10 @@ import urllib.error
 WRAPPERS = {
     "nvidia-python": 9101,
     "nous": 9102,
-    "openrouter": 9106,
+    "openrouter": 9103,
     "model-registry": 9200,
 }
-GATEWAY = 9105
+GATEWAY = 9106
 
 # Endpoints consumed by dashboards (template + openrouter variant + gateway status page)
 ENDPOINTS = [

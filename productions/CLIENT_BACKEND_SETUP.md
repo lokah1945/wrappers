@@ -6,9 +6,9 @@ Scope mengikuti `wrappers.json`: NVIDIA, Nous, OpenRouter dan dependency model-r
 | --- | --- | --- | --- |
 | NVIDIA | `http://127.0.0.1:9101` | `http://127.0.0.1:9101/v1` | `/v1/messages` |
 | Nous | `http://127.0.0.1:9102` | `http://127.0.0.1:9102/v1` | `/v1/messages` |
-| OpenRouter | `http://127.0.0.1:9106` | `http://127.0.0.1:9106/v1` | `/v1/messages` |
+| OpenRouter | `http://127.0.0.1:9103` | `http://127.0.0.1:9103/v1` | `/v1/messages` |
 
-Dashboard tunggal berada di **`http://127.0.0.1:9105/`**: halaman home
+Dashboard tunggal berada di **`http://127.0.0.1:9106/`**: halaman home
 menampilkan status global, lalu dropdown di navigasi atas membuka dashboard
 wrapper pilihan. Dashboard bukan endpoint inferensi; gunakan origin backend
 di tabel untuk konfigurasi agent. Port 9103–9104 tetap dicadangkan untuk
@@ -54,7 +54,7 @@ export WRAPPER_MODEL='poolside/laguna-xs-2.1:free'
 
 ```bash
 # OpenRouter
-export WRAPPER_ORIGIN='http://127.0.0.1:9106'
+export WRAPPER_ORIGIN='http://127.0.0.1:9103'
 export WRAPPER_MODEL='liquid/lfm-2.5-2.6b:free'
 ```
 
@@ -113,7 +113,7 @@ model = "ID_MODEL_PERSIS"
 
 [model_providers.wrapper_active]
 name = "Wrapper aktif"
-base_url = "http://127.0.0.1:9106/v1"
+base_url = "http://127.0.0.1:9103/v1"
 wire_api = "responses"
 env_key = "WRAPPER_API_KEY"
 requires_openai_auth = false
@@ -166,7 +166,7 @@ Simpan contoh berikut sebagai `$WRAPPER_CLIENT_DIR/opencode.json`. Ganti kedua `
       "npm": "@ai-sdk/openai-compatible",
       "name": "Wrapper aktif",
       "options": {
-        "baseURL": "http://127.0.0.1:9106/v1",
+        "baseURL": "http://127.0.0.1:9103/v1",
         "apiKey": "{env:WRAPPER_API_KEY}"
       },
       "models": {"ID_MODEL_PERSIS": {"name": "ID_MODEL_PERSIS", "limit": {"context": 8192, "output": 256}}}

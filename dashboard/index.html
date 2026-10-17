@@ -10,48 +10,73 @@
     *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--text);font:14px/1.5 system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}button,select{font:inherit}button,select,a{touch-action:manipulation}button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid var(--accent);outline-offset:4px}
     .topbar{height:76px;display:flex;align-items:center;gap:20px;padding:0 32px;background:var(--surface);border-bottom:1px solid var(--line)}.brand{display:flex;align-items:center;gap:12px;white-space:nowrap}.mark{width:35px;height:35px;border:1px solid var(--line);border-radius:11px;display:grid;place-items:center;color:var(--accent);font-size:19px;background:var(--surface2)}.brand strong{font-size:16px;letter-spacing:-.3px}.brand small{display:block;font-size:11px;color:var(--muted)}.navigation{display:flex;align-items:center;gap:10px;margin-left:auto}.navigation label{color:var(--muted);font-size:12px}.select-wrap{position:relative}select{max-width:250px;min-width:185px;padding:10px 35px 10px 13px;border:1px solid var(--line);border-radius:9px;background:var(--surface2);color:var(--text);cursor:pointer}.theme{width:38px;height:38px;border:1px solid var(--line);border-radius:9px;background:var(--surface2);color:var(--text);cursor:pointer;font-size:17px}
     main{max-width:1400px;margin:auto;padding:36px 32px 52px}.heading{display:flex;justify-content:space-between;gap:20px;align-items:flex-start;margin-bottom:27px}.eyebrow{font-size:11px;font-weight:650;text-transform:uppercase;letter-spacing:1.5px;color:var(--accent);margin-bottom:6px}h1{margin:0 0 7px;font-size:30px;font-weight:650;letter-spacing:-1px}.description{margin:0;color:var(--muted);max-width:630px}.live{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);white-space:nowrap;margin-top:9px}.dot{width:7px;height:7px;border-radius:50%;background:var(--green)}.live.failed .dot{background:var(--red)}
-    .counts{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:31px}.count{border:1px solid var(--line);background:var(--surface);padding:19px 22px;border-radius:12px}.count span{color:var(--muted);font-size:12px}.count strong{display:block;font-size:30px;font-weight:600;margin-top:4px;letter-spacing:-1px}.section-label{display:flex;align-items:center;justify-content:space-between;margin:0 0 13px}.section-label h2{font-size:14px;letter-spacing:.1px;margin:0}.section-label span{font-size:12px;color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.card{background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:22px;box-shadow:var(--shadow);min-width:0}.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}.name{font-weight:650;font-size:16px}.port{font-size:11px;color:var(--muted);margin-top:2px}.badge{padding:4px 9px;border-radius:6px;font-size:11px;font-weight:600;border:1px solid var(--line);white-space:nowrap;background:var(--surface2);color:var(--muted)}.badge.online{color:var(--green)}.badge.degraded,.badge.protected{color:var(--orange)}.badge.offline{color:var(--red)}.readiness{font-size:12px;color:var(--muted);margin-bottom:15px}.values{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding:15px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.values dt{font-size:10px;color:var(--muted)}.values dd{margin:3px 0 0;font-size:17px;font-weight:600;overflow-wrap:anywhere}.model{padding:14px 0;font-size:11px;color:var(--muted);overflow-wrap:anywhere;min-height:60px}.model strong{font-weight:500;color:var(--text);display:block;margin-top:3px}.card-button{display:block;width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--surface2);color:var(--accent);font-size:12px;text-align:left;cursor:pointer}.card-button:hover{border-color:var(--accent)}.card.pending{box-shadow:none;opacity:.75}.pending-note{font-size:12px;color:var(--muted);padding:4px 0 0;min-height:114px}.pending .card-button{color:var(--muted);cursor:default}.footnote{font-size:11px;color:var(--muted);margin-top:24px;max-width:780px}.error-banner{padding:13px 16px;border:1px solid var(--red);border-radius:9px;color:var(--red);margin-bottom:20px}.wrapper-frame{display:block;border:0;width:100%;height:calc(100dvh - 76px);background:var(--bg)}[hidden]{display:none!important}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:12px}.registry-detail{max-width:650px}.registry-detail .cards{grid-template-columns:1fr}
+    .counts{display:grid;grid-template-columns:repeat(4,1fr);gap:15px;margin-bottom:31px}.count{border:1px solid var(--line);background:var(--surface);padding:19px 22px;border-radius:12px}.count span{color:var(--muted);font-size:12px}.count strong{display:block;font-size:30px;font-weight:600;margin-top:4px;letter-spacing:-1px}.section-label{display:flex;align-items:center;justify-content:space-between;margin:0 0 13px}.section-label h2{font-size:14px;letter-spacing:.1px;margin:0}.section-label span{font-size:12px;color:var(--muted)}.cards{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:18px}.card{background:var(--surface);border:1px solid var(--line);border-radius:13px;padding:22px;box-shadow:var(--shadow);min-width:0}.card-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:20px}.name{font-weight:650;font-size:16px}.port{font-size:11px;color:var(--muted);margin-top:2px}.badge{padding:4px 9px;border-radius:6px;font-size:11px;font-weight:600;border:1px solid var(--line);white-space:nowrap;background:var(--surface2);color:var(--muted)}.badge.online{color:var(--green)}.badge.degraded,.badge.protected{color:var(--orange)}.badge.offline{color:var(--red)}.readiness{font-size:12px;color:var(--muted);margin-bottom:15px}.values{display:grid;grid-template-columns:repeat(4,1fr);gap:10px;padding:15px 0;border-top:1px solid var(--line);border-bottom:1px solid var(--line)}.values dt{font-size:10px;color:var(--muted)}.values dd{margin:3px 0 0;font-size:17px;font-weight:600;overflow-wrap:anywhere}.model{padding:14px 0;font-size:11px;color:var(--muted);overflow-wrap:anywhere;min-height:60px}.model strong{font-weight:500;color:var(--text);display:block;margin-top:3px}.endpoint-list{font-size:10px;color:var(--muted);line-height:1.45;margin:0 0 14px;word-break:break-word}.endpoint-list .ok{color:var(--green)}.endpoint-list .bad{color:var(--red)}.auth-wrap{display:flex;align-items:center;gap:6px}.auth-wrap input{width:150px;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--text);font-size:12px}.auth-wrap button{padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--surface2);color:var(--accent);cursor:pointer;font-size:12px}.card-button{display:block;width:100%;border:1px solid var(--line);border-radius:8px;padding:9px 12px;background:var(--surface2);color:var(--accent);font-size:12px;text-align:left;cursor:pointer}.card-button:hover{border-color:var(--accent)}.card.pending{box-shadow:none;opacity:.75}.pending-note{font-size:12px;color:var(--muted);padding:4px 0 0;min-height:114px}.pending .card-button{color:var(--muted);cursor:default}.footnote{font-size:11px;color:var(--muted);margin-top:24px;max-width:780px}.error-banner{padding:13px 16px;border:1px solid var(--red);border-radius:9px;color:var(--red);margin-bottom:20px}.wrapper-frame{display:block;border:0;width:100%;height:calc(100dvh - 76px);background:var(--bg)}[hidden]{display:none!important}.empty{color:var(--muted);border:1px dashed var(--line);padding:24px;border-radius:12px}.registry-detail{max-width:650px}.registry-detail .cards{grid-template-columns:1fr}
     @media(max-width:1050px){.cards{grid-template-columns:repeat(2,minmax(0,1fr))}.topbar{padding:0 24px}main{padding:28px 24px 40px}}@media(max-width:620px){.topbar{height:auto;min-height:112px;flex-wrap:wrap;padding:13px 18px;gap:10px}.brand{flex:1}.brand small{display:none}.navigation{width:100%;margin-left:0}.navigation label{display:none}select{max-width:none;width:100%}.select-wrap{flex:1}.theme{position:absolute;right:18px;top:13px}.heading{display:block}.live{margin-top:16px}main{padding:25px 18px}.counts{grid-template-columns:repeat(2,1fr);gap:10px;margin-bottom:24px}.count{padding:14px 16px}.count strong{font-size:25px}.cards{grid-template-columns:1fr}.card{padding:20px}.section-label span{font-size:10px}h1{font-size:26px}.wrapper-frame{height:calc(100dvh - 112px)}}
   </style>
 </head>
 <body>
   <header class="topbar">
     <div class="brand"><span class="mark" aria-hidden="true">◈</span><div><strong>Wrapper control room</strong><small>One place for your AI backends</small></div></div>
-    <nav class="navigation" aria-label="Dashboard selection"><label for="wrapper-select">Viewing</label><div class="select-wrap"><select id="wrapper-select" aria-label="Choose wrapper dashboard"><option value="">Global overview</option></select></div><button id="theme" class="theme" title="Switch theme" aria-label="Switch theme">◐</button></nav>
+    <nav class="navigation" aria-label="Dashboard selection"><label for="wrapper-select">Viewing</label><div class="select-wrap"><select id="wrapper-select" aria-label="Choose wrapper dashboard"><option value="">Global overview</option></select></div><div class="auth-wrap"><input id="global-token" type="password" autocomplete="off" placeholder="optional token" aria-label="Optional wrapper token"><button id="global-token-save" type="button">Use</button></div><button id="theme" class="theme" title="Switch theme" aria-label="Switch theme">◐</button></nav>
   </header>
   <main id="overview">
-    <div class="heading"><div><div class="eyebrow">Global overview</div><h1>Every backend, at a glance.</h1><p class="description">Live service health and readiness across your active wrappers. Select a wrapper to open its full dashboard.</p></div><div id="live" class="live" role="status"><span class="dot"></span><span id="checked">Checking services…</span></div></div>
+    <div class="heading"><div><div class="eyebrow">Global overview</div><h1>Every backend, at a glance.</h1><p class="description">Live health, readiness, catalog coverage, counters, and endpoint reachability across the three active inference wrappers. The internal model registry is shown separately; select an active wrapper to open its full dashboard.</p></div><div id="live" class="live" role="status"><span class="dot"></span><span id="checked">Connecting to live status…</span></div></div>
     <div id="error" class="error-banner" role="alert" hidden></div>
-    <section class="counts" aria-label="Global status totals"><div class="count"><span>Active services</span><strong id="count-active">—</strong></div><div class="count"><span>Online</span><strong id="count-online">—</strong></div><div class="count"><span>Confirmed ready</span><strong id="count-ready">—</strong></div><div class="count"><span>Pending · frozen</span><strong id="count-pending">—</strong></div></section>
-    <div class="section-label"><h2>Wrapper status</h2><span>Read-only monitoring · refreshes every 15s</span></div>
+    <section class="counts" aria-label="Global status totals"><div class="count"><span>Active inference wrappers</span><strong id="count-active">—</strong></div><div class="count"><span>Online wrappers</span><strong id="count-online">—</strong></div><div class="count"><span>Wrappers ready</span><strong id="count-ready">—</strong></div><div class="count"><span>Pending · frozen</span><strong id="count-pending">—</strong></div></section>
+    <div class="section-label"><h2>Wrapper status</h2><span>Read-only monitoring · SSE snapshots every 5s · polling fallback</span></div>
     <section id="cards" class="cards" aria-label="Wrapper service status"><div class="empty">Loading wrapper status…</div></section>
-    <p class="footnote">Readiness reflects each service's reported state. Protected or unavailable readiness is shown as unknown. Pending providers are listed from metadata only and are never probed. Monitoring does not prove inference availability for every model.</p>
+    <p class="footnote">Readiness reflects each service's reported state. Protected or unavailable readiness is shown as unknown. Pending providers are listed from metadata only and are never probed. The internal model registry is monitored but excluded from inference-wrapper totals. Monitoring does not prove inference availability for every model.</p>
   </main>
   <main id="registry" class="registry-detail" hidden><div class="heading"><div><div class="eyebrow">Service detail</div><h1 id="detail-title"></h1><p class="description">This service has no standalone dashboard. Its live status is shown below.</p></div></div><section id="detail-card" class="cards"></section></main>
   <iframe id="wrapper-frame" class="wrapper-frame" title="Selected wrapper dashboard" sandbox="allow-scripts allow-same-origin allow-forms" hidden></iframe>
   <script>
     const $ = id => document.getElementById(id);
-    let statusData = null, refreshing = false;
+    let statusData = null, refreshing = false, statusStream = null;
     const initialWrapper = new URL(location.href).searchParams.get('wrapper') || '';
     const number = value => typeof value === 'number' ? new Intl.NumberFormat(undefined,{maximumFractionDigits:1,notation:value>=100000?'compact':'standard'}).format(value) : '—';
     const themeKey = 'unified-dashboard-theme';
+    const tokenKey = 'unified-dashboard-token';
     let theme = localStorage.getItem(themeKey) || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
     document.documentElement.dataset.theme = theme;
     $('theme').onclick = () => {theme = theme === 'dark' ? 'light' : 'dark';document.documentElement.dataset.theme = theme;localStorage.setItem(themeKey,theme);};
+    try { $('global-token').value = sessionStorage.getItem(tokenKey) || ''; } catch {}
+    function authHeaders() {
+      try { const token = sessionStorage.getItem(tokenKey); return token ? {'Authorization':'Bearer '+token} : {}; } catch { return {}; }
+    }
+    $('global-token-save').onclick = () => {
+      const value = $('global-token').value.trim();
+      try { if (value) sessionStorage.setItem(tokenKey,value); else sessionStorage.removeItem(tokenKey); } catch {}
+      if (statusStream) { statusStream.close(); statusStream = null; }
+      if (!value) connectStatusStream();
+      refresh();
+    };
+    function endpointSummary(service) {
+      const statuses = service.endpoint_status || {};
+      const labels = Object.entries(statuses).map(([key,value]) => {
+        const good = value === 200;
+        return '<span class="'+(good?'ok':'bad')+'">'+key+': '+(value == null ? 'offline' : value)+'</span>';
+      });
+      const events = service.realtime || 'polling';
+      labels.push('<span class="'+(events==='native_sse'?'ok':'')+'">stream: '+events+'</span>');
+      return labels.join(' · ');
+    }
     function card(service, detail=false) {
       const node = document.createElement('article');node.className='card'+(service.status==='pending'?' pending':'');
       node.innerHTML='<div class="card-head"><div><div class="name"></div><div class="port"></div></div><span class="badge"></span></div><div class="card-content"></div><button class="card-button"></button>';
       node.querySelector('.name').textContent=service.upstream || service.name;
-      node.querySelector('.port').textContent=service.name+' · port '+service.port;
+      node.querySelector('.port').textContent=service.name+' · port '+service.port+(service.service_kind==='internal'?' · internal':'');
       const badge=node.querySelector('.badge');badge.classList.add(service.status);badge.textContent=service.status==='pending'?'Pending · frozen':service.status.charAt(0).toUpperCase()+service.status.slice(1);
       const content=node.querySelector('.card-content');const button=node.querySelector('button');
-      if(service.status==='pending') {const note=document.createElement('p');note.className='pending-note';note.textContent='On hold by the project owner. Runtime, credentials and provider code are excluded from monitoring and maintenance.';content.append(note);button.textContent='Monitoring disabled';button.disabled=true;}
-      else {
-        content.innerHTML='<div class="readiness"></div><dl class="values"><div><dt>Keys reported</dt><dd></dd></div><div><dt>Available keys</dt><dd></dd></div><div><dt>Requests</dt><dd></dd></div></dl><div class="model">Qualified model<strong></strong></div>';
-        const readiness={ready:'Confirmed ready',not_ready:'Not ready',protected:'Readiness protected · enter token in wrapper dashboard',unknown:'Readiness unknown'};
+      if(service.status==='pending') {
+        const note=document.createElement('p');note.className='pending-note';note.textContent='On hold by the project owner. Runtime, credentials and provider code are excluded from monitoring and maintenance.';content.append(note);button.textContent='Monitoring disabled';button.disabled=true;
+      } else {
+        content.innerHTML='<div class="readiness"></div><dl class="values"><div><dt>Keys reported</dt><dd></dd></div><div><dt>Available keys</dt><dd></dd></div><div><dt>Requests</dt><dd></dd></div><div><dt>Models</dt><dd></dd></div></dl><div class="model">Qualified model<strong></strong></div><div class="endpoint-list"></div>';
+        const readiness={ready:'Confirmed ready',not_ready:'Not ready',protected:'Readiness protected · enter token above',unknown:'Readiness unknown'};
         content.querySelector('.readiness').textContent=readiness[service.readiness] || 'Readiness unknown';
-        const c=service.counters;const values=content.querySelectorAll('dd');values[0].textContent=number(c.keys_loaded??c.total_keys??c.keys);values[1].textContent=number(c.available??c.available_keys);values[2].textContent=number(c.total_requests??c.requests_total??c.requests);
+        const c=service.counters || {};const values=content.querySelectorAll('dd');
+        values[0].textContent=number(c.keys_loaded??c.total_keys??c.keys);values[1].textContent=number(c.available??c.available_keys);values[2].textContent=number(c.total_requests??c.requests_total??c.requests);values[3].textContent=number(service.models_count ?? c.models_cached);
         content.querySelector('.model strong').textContent=service.verified_model || 'Service only · no model qualification';
+        content.querySelector('.endpoint-list').innerHTML=endpointSummary(service);
         button.textContent=detail?'Back to global overview':service.dashboard_available?'Open wrapper dashboard →':'View service status →';
         button.onclick=()=>selectWrapper(detail?'':service.name);
       }
@@ -68,9 +93,12 @@
       else {$('wrapper-frame').removeAttribute('src');$('detail-title').textContent=service.upstream;$('detail-card').replaceChildren(card(service,true));$('registry').hidden=false;}
     }
     $('wrapper-select').onchange=event=>selectWrapper(event.target.value);
-    function render(data) {
+    function render(data, source='polling') {
       const first=!statusData;const selection=first?initialWrapper:$('wrapper-select').value;statusData=data;
-      for(const name of ['active','online','ready','pending']) $('count-'+name).textContent=data.counts[name];
+      $('count-active').textContent=data.counts.inference_active ?? 0;
+      $('count-online').textContent=data.counts.inference_online ?? 0;
+      $('count-ready').textContent=data.counts.inference_ready ?? 0;
+      $('count-pending').textContent=data.counts.pending ?? 0;
       $('cards').replaceChildren(...data.wrappers.map(s=>card(s)));
       const options=[new Option('Global overview','')];
       for(const s of data.wrappers) {const option=new Option((s.upstream||s.name)+(s.status==='pending'?' · pending':''),s.name);option.disabled=s.status==='pending';options.push(option);}
@@ -79,15 +107,33 @@
       $('wrapper-select').value=current?selection:'';
       if(first || (selection && !current)) selectWrapper(current?selection:'');
       else if(current && !current.dashboard_available) $('detail-card').replaceChildren(card(current,true));
-      $('checked').textContent='Updated '+new Date(data.checked_at*1000).toLocaleTimeString();$('live').classList.remove('failed');$('error').hidden=true;
+      $('checked').textContent='Updated '+new Date(data.checked_at*1000).toLocaleTimeString()+' · '+source;
+      $('live').classList.remove('failed');$('error').hidden=true;
     }
     async function refresh() {
       if(refreshing) return;refreshing=true;
-      try {const response=await fetch('/api/status',{signal:AbortSignal.timeout(15000)});if(!response.ok) throw new Error('Status unavailable');render(await response.json());}
+      try {const response=await fetch('/api/status',{headers:authHeaders(),signal:AbortSignal.timeout(15000)});if(!response.ok) throw new Error('Status unavailable');render(await response.json(),'polling');}
       catch { $('live').classList.add('failed');$('checked').textContent='Status update failed';$('error').textContent='Could not refresh service status. Last results may be stale; retrying automatically.';$('error').hidden=false;}
       finally {refreshing=false;}
     }
-    refresh();setInterval(refresh,15000);
+    function connectStatusStream() {
+      // Native EventSource cannot carry Authorization; authenticated mode is
+      // intentionally polling-only so anonymous SSE cannot overwrite it.
+      if (Object.keys(authHeaders()).length) return;
+      try {
+        statusStream = new EventSource('/api/status/stream');
+        statusStream.addEventListener('status', event => {
+          try { render(JSON.parse(event.data),'realtime SSE'); } catch { /* polling remains available */ }
+        });
+        statusStream.onerror = () => {
+          if (statusStream) { statusStream.close(); statusStream = null; }
+          $('checked').textContent='Realtime stream unavailable · polling fallback';
+        };
+      } catch { statusStream = null; }
+    }
+    refresh();
+    connectStatusStream();
+    setInterval(refresh,15000);
   </script>
 </body>
 </html>

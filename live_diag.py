@@ -46,18 +46,18 @@ async def main():
         'model': 'poolside/laguna-s-2.1:free', 'max_output_tokens': 48, 'stream': True,
         'input': 'Reply with exactly: WRAP-OK'}))
     # 5. openrouter messages tools - raw body
-    cases.append(('openrouter messages tools', 9106, 'openrouter', '/v1/messages', {
+    cases.append(('openrouter messages tools', 9103, 'openrouter', '/v1/messages', {
         'model': 'nvidia/nemotron-3.5-lightning:free', 'max_tokens': 128,
         'tools': [{'name': 'get_weather', 'description': 'weather lookup',
                    'input_schema': {'type': 'object', 'properties': {'city': {'type': 'string'}},
                                     'required': ['city']}}],
         'messages': [{'role': 'user', 'content': 'Use get_weather for Jakarta.'}]}))
     # 6. openrouter responses nonstream - raw body
-    cases.append(('openrouter responses nonstream', 9106, 'openrouter', '/v1/responses', {
+    cases.append(('openrouter responses nonstream', 9103, 'openrouter', '/v1/responses', {
         'model': 'nvidia/nemotron-3.5-lightning:free', 'max_output_tokens': 48,
         'input': 'Reply with exactly: WRAP-OK'}))
     # 7. openrouter responses stream - raw tail
-    cases.append(('openrouter responses stream', 9106, 'openrouter', '/v1/responses', {
+    cases.append(('openrouter responses stream', 9103, 'openrouter', '/v1/responses', {
         'model': 'nvidia/nemotron-3.5-lightning:free', 'max_output_tokens': 48, 'stream': True,
         'input': 'Reply with exactly: WRAP-OK'}))
 

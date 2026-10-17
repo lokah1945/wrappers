@@ -16,7 +16,7 @@ ROOT = Path('/root/wrapper')
 WRAPPERS = {
     'nvidia-python': 9101,
     'nous': 9102,
-    'openrouter': 9106,
+    'openrouter': 9103,
 }
 # How many models to probe per wrapper (spread across the list)
 SAMPLE_SIZES = {'nvidia-python': 12, 'nous': 7, 'openrouter': 8}

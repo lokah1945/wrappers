@@ -12,7 +12,7 @@ import urllib.request
 
 ROOT = Path("/root/wrapper")
 WRAPPERS = ["nvidia-python", "nous", "openrouter"]
-PORTS = {"nvidia-python": 9101, "nous": 9102, "openrouter": 9106}
+PORTS = {"nvidia-python": 9101, "nous": 9102, "openrouter": 9103}
 
 
 def token_for(name):

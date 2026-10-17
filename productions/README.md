@@ -8,13 +8,13 @@ BLACKBOX and the OpenCode provider are pending and frozen; do not inspect,
 test, probe, edit, install or deploy them. Read root `AGENTS.md` and
 `wrappers.json` first. Explicit selection cannot bypass pending status.
 
-The unified dashboard is `http://127.0.0.1:9105/`: home shows global status,
+The unified dashboard is `http://127.0.0.1:9106/`: home shows global status,
 and the top dropdown selects an active wrapper dashboard. Pending providers
 are shown only from metadata and are never queried. Current inference ports
-are NVIDIA 9101, Nous 9102, and OpenRouter 9106; ports 9103–9104 remain
-reserved for frozen providers. Port 9100 is occupied by an external catalog/MCP
-service and preserved; 9105 is the lowest free dashboard slot. Model-registry
-remains on 9200. Existing inference client URLs stay the same.
+are NVIDIA 9101, Nous 9102, and OpenRouter 9103; ports 9104–9105 remain
+reserved for frozen providers. Port 9100 is occupied by the model-fetcher MCP
+service and preserved; 9106 is the unified dashboard slot. Model-registry
+remains on 9200. Client configurations must use the allocation in `wrappers.json`.
 
 NVIDIA, Nous and OpenRouter were verified on production endpoints with their
 explicit tested models and three CLI clients on **2026-10-11**, including real

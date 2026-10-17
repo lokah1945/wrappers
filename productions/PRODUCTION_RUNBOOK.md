@@ -87,14 +87,14 @@ Required production concepts:
 
 ## 3. Service and endpoint gate
 
-Current port allocation is the existing external catalog/MCP service 9100,
-NVIDIA 9101, Nous 9102, reserved pending providers 9103–9104, unified
-dashboard 9105, and OpenRouter 9106. The internal model-registry remains
-on 9200. Port 9105 is the lowest free dashboard slot: preserve the unrelated
-service on 9100 and never probe or move the reserved pending services.
-Existing inference client URLs stay the same.
+Current port allocation is the model-fetcher MCP service 9100, NVIDIA
+9101, Nous 9102, OpenRouter 9103, reserved pending providers 9104–9105,
+unified dashboard 9106, and internal model-registry 9200. Preserve the
+model-fetcher service on 9100 and never probe or move the reserved pending
+services.
+Inference client configurations must use the migrated ports in `wrappers.json`.
 
-Open the unified dashboard at `http://127.0.0.1:9105/`. Home shows the
+Open the unified dashboard at `http://127.0.0.1:9106/`. Home shows the
 global status, and the top dropdown selects each active wrapper's existing
 dashboard. Pending entries are metadata-only and never trigger requests.
 

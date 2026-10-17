@@ -280,12 +280,12 @@ Four parity guards run in CI and fail the build on regression:
 |---|---|---|---|---|
 | `nvidia-python` | 9101 | `src.main:app` | `NVIDIA_` | NVIDIA NIM |
 | `nous` | 9102 | `src.main:app` | `NOUS_` | Nous Research |
-| `opencode` | 9103 | `src.main:app` | `OPENCODE_` | OpenCode Zen |
-| `blackbox` | 9104 | `src.main:app` | `BLACKBOX_` | BLACKBOX AI |
-| `openrouter` | 9106 | `src.main:app` | `OPENROUTER_` | OpenRouter |
+| `opencode` | 9104 | `src.main:app` | `OPENCODE_` | OpenCode Zen |
+| `blackbox` | 9105 | `src.main:app` | `BLACKBOX_` | BLACKBOX AI |
+| `openrouter` | 9103 | `src.main:app` | `OPENROUTER_` | OpenRouter |
 | `model-registry` | 9200 | `service:app` | `MODEL_REGISTRY_` | internal |
 
-Port 9105 is intentionally unused.
+Port 9100 belongs to the model-fetcher MCP service and remains untouched. Port 9106 is reserved for the unified dashboard.
 
 ### 9.2 Shared environment variables
 

@@ -6,7 +6,7 @@ After=network.target
 Type=simple
 WorkingDirectory=/root/wrapper
 Environment=PYTHONPATH=/root/wrapper
-ExecStart=/usr/bin/python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 9105
+ExecStart=/usr/bin/python3 -m uvicorn dashboard.app:app --host 0.0.0.0 --port 9106
 Restart=on-failure
 RestartSec=3
 TimeoutStopSec=15
