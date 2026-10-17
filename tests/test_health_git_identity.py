@@ -146,6 +146,31 @@ def test_resolver_reports_dirty_tree(wrapper, path, clean_repo):
 
 
 @pytest.mark.parametrize('wrapper,path', ACTIVE_WRAPPERS)
+def test_resolver_ignores_runtime_marker_changes(wrapper, path, clean_repo):
+    """systemd ExecStartPre rewrites runtime/<name>.commit on every start;
+    that bookkeeping must not flip git_dirty or the signal is useless."""
+    runtime = clean_repo / 'runtime'
+    runtime.mkdir()
+    (runtime / 'nvidia-python.commit').write_text('deadbeef\n')
+    _git(clean_repo, 'add', '-A')
+    _git(clean_repo, 'commit', '-m', 'add markers')
+    (runtime / 'nvidia-python.commit').write_text('cafebabe\n')
+    fake_file = str(clean_repo / 'src' / 'main.py')
+    resolvers = _load_resolvers(ROOT / wrapper / path, fake_file)
+    assert resolvers['_resolve_git_dirty']() is False
+
+
+@pytest.mark.parametrize('wrapper,path', ACTIVE_WRAPPERS)
+def test_resolver_ignores_untracked_runtime_files(wrapper, path, clean_repo):
+    runtime = clean_repo / 'runtime'
+    runtime.mkdir()
+    (runtime / 'untracked-state.json').write_text('{"x": 1}\n')
+    fake_file = str(clean_repo / 'src' / 'main.py')
+    resolvers = _load_resolvers(ROOT / wrapper / path, fake_file)
+    assert resolvers['_resolve_git_dirty']() is False
+
+
+@pytest.mark.parametrize('wrapper,path', ACTIVE_WRAPPERS)
 def test_resolver_never_raises_outside_git(wrapper, path, tmp_path):
     outside = tmp_path / 'plain' / 'src'
     outside.mkdir(parents=True)

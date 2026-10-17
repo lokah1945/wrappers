@@ -841,18 +841,22 @@ def _resolve_git_commit():
         return 'unknown'
 
 def _resolve_git_dirty():
-    """True if the working tree was dirty when this process loaded the code.
+    """True if the SOURCE tree was dirty when this process loaded the code.
 
     git_commit alone is misleading: code is typically edited, restarted and
     verified live *before* the fix is committed, so the commit resolved at
     process start lags the actually-running code. git_dirty=true is the honest
     signal that the running code differs from the reported commit; the exact
     running state is then identified by commit+dirty captured at import time.
+
+    The runtime/ deployment markers are excluded: systemd ExecStartPre writes
+    them on every start (bookkeeping, not source), so counting them would make
+    git_dirty permanently true and the signal useless.
     """
     try:
         import subprocess
         out = subprocess.check_output(
-            ['git', 'status', '--porcelain'],
+            ['git', 'status', '--porcelain', '--', '.', ':(exclude)runtime'],
             cwd=_resolve_git_root(), stderr=subprocess.DEVNULL, timeout=3
         ).decode().strip()
         return bool(out)
