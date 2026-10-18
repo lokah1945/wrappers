@@ -11,6 +11,11 @@ class ErrorState(str, Enum):
     AVAILABLE = "available"
     CATALOG_LISTED = "catalog_listed"
     UNKNOWN = "unknown"
+    # Native Build/NIM verification outcomes are observations, not provider
+    # errors and not evidence that a downloadable model is unusable.
+    NATIVE_PROTOCOL = "native_protocol"
+    DEPLOYMENT_REQUIRED = "deployment_required"
+    CONTRACT_UNVERIFIED = "contract_unverified"
     ACCOUNT_UNAVAILABLE = "account_unavailable"
     ACCOUNT_FORBIDDEN = "account_forbidden"
     INVALID_CREDENTIAL = "invalid_credential"

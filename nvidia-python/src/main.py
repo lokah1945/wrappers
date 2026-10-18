@@ -53,7 +53,7 @@ import re as re_module
 import threading
 from pathlib import Path
 from typing import Optional, Any, Set
-from urllib.parse import quote as _url_quote
+from urllib.parse import quote as _url_quote, urlparse as _urlparse
 
 import aiohttp
 from fastapi import FastAPI, Request, Response
@@ -111,6 +111,7 @@ except ImportError:
 
 from common.model.context_probe import ContextProbeService, ProbeOutcome
 from common.model.metadata import merge_observed_context, positive_int
+from common.nvidia_build_catalog import BUILD_MODEL_IDS, get_build_contract
 
 try:
     from watchdog.observers import Observer
@@ -127,19 +128,156 @@ _retired_models: set = set()
 _model_status: dict = {}
 _model_state_store: Optional[ModelStateStore] = None
 _verify_cursor: int = 0
+# A contract audit changes the meaning of old probe observations. Until this
+# process records a fresh observation on the current Build route, persisted
+# pre-audit availability must not be advertised as verified.
+_BUILD_AUDIT_EPOCH: float = time.time()
+
+def _contract_probe_url(contract: dict) -> str:
+    """Resolve a documented Build server/path without changing the route."""
+    host = str(contract.get('host') or '')
+    path = str(contract.get('path') or '')
+    if host.startswith('http'):
+        # Build references use these canonical hosts. Respect wrapper base URL
+        # overrides while retaining the documented server prefix (/v1 is part
+        # of some NVIDIA API Reference servers, but not BASE_*).
+        documented = _urlparse(host)
+        if 'integrate.api.nvidia.com' in host:
+            host = BASE_LLM
+            if documented.path and documented.path != '/' and not host.rstrip('/').endswith(documented.path.rstrip('/')):
+                host = host.rstrip('/') + documented.path.rstrip('/')
+        elif 'ai.api.nvidia.com' in host:
+            host = BASE_GENAI
+            if documented.path and documented.path != '/' and not host.rstrip('/').endswith(documented.path.rstrip('/')):
+                host = host.rstrip('/') + documented.path.rstrip('/')
+        elif host.startswith('https://climate.api.nvidia.com'):
+            host = os.environ.get('NVIDIA_CLIMATE_URL', host.rstrip('/'))
+        elif host.startswith('https://health.api.nvidia.com'):
+            host = os.environ.get('NVIDIA_HEALTH_URL', host.rstrip('/'))
+        else:
+            host = host.rstrip('/')
+    elif contract.get('host_class') == 'llm':
+        host = BASE_LLM
+    elif contract.get('host_class') in ('ai', 'genai'):
+        host = BASE_GENAI
+    elif contract.get('host_class') == 'climate':
+        host = os.environ.get('NVIDIA_CLIMATE_URL', 'https://climate.api.nvidia.com/v1')
+    elif contract.get('host_class') == 'health':
+        host = os.environ.get('NVIDIA_HEALTH_URL', 'https://health.api.nvidia.com/v1')
+    elif contract.get('nvcf_function_id'):
+        # Build free endpoints whose OpenAPI server omits a hostname use the
+        # documented NVCF function invocation subdomain. The function ID is a
+        # route identifier, not evidence that this API key can invoke it.
+        template = os.environ.get(
+            'NVIDIA_NVCF_INVOKE_URL_TEMPLATE',
+            'https://{function_id}.invocation.api.nvcf.nvidia.com',
+        )
+        host = template.format(function_id=contract.get('nvcf_function_id')).rstrip('/')
+    else:
+        return ''
+    if not host:
+        return ''
+    host = host.rstrip('/')
+    if not path.startswith('/'):
+        path = '/' + path
+    if host.endswith('/v1') and path.startswith('/v1/'):
+        path = path[3:]
+    return host + path
+
+
+def _contract_endpoint_candidates(model_id: str) -> set[str]:
+    """Return persisted endpoint labels valid for the Build contract."""
+    row = get_build_contract(model_id)
+    if not row:
+        return set()
+    contract = row.get('contract') or {}
+    path = str(contract.get('path') or '')
+    if contract.get('kind') == 'grpc':
+        return {'grpc://grpc.nvcf.nvidia.com:443'}
+    candidates = set()
+    if path:
+        if not path.startswith('/'):
+            path = '/' + path
+        host = str(contract.get('host') or '')
+        if '/v1' in host and not path.startswith('/v1/'):
+            candidates.add('/v1' + path)
+        candidates.add(path)
+    # A downloadable NIM may expose a model-family route inside the
+    # container that differs from the hosted Build gateway operation (for
+    # example OCR /v1/ocr versus the hosted /v1/cv/... route). Persisted
+    # observations from either exact contract are valid, but never a generic
+    # /v1/infer fallback unless the matrix explicitly documents it.
+    deployment_path = str(contract.get('deployment_path') or '')
+    if deployment_path:
+        if not deployment_path.startswith('/'):
+            deployment_path = '/' + deployment_path
+        candidates.add(deployment_path)
+    client = str(contract.get('client_surface') or '')
+    if client:
+        candidates.add(client.replace('{model}', model_id))
+    kind = str(contract.get('kind') or '')
+    if kind in ('native_json', 'openapi', 'chat', 'riva', 'visual_nim', 'native_multipart', 'deployment_native'):
+        candidates.add('/v1/native/' + model_id)
+    return {x for x in candidates if x}
+
+
+def _contract_endpoint_is_current(model_id: str, endpoint: str | None) -> bool:
+    endpoint = str(endpoint or '')
+    if not endpoint or endpoint == 'multiple':
+        return False
+    candidates = _contract_endpoint_candidates(model_id)
+    if endpoint in candidates:
+        return True
+    # A response recorder may persist the full target URL for a native call;
+    # compare its path while keeping the exact Build operation authoritative.
+    try:
+        parsed_path = _urlparse(endpoint).path
+    except Exception:
+        parsed_path = ''
+    return bool(parsed_path and parsed_path in candidates)
+
+
+def _contract_deferred(model_id: str, row: dict, reason: str | None = None) -> dict:
+    contract = row.get('contract') or {}
+    path = str(contract.get('path') or '')
+    deployment_path = str(contract.get('deployment_path') or '')
+    endpoint = (
+        deployment_path if (contract.get('verification') == 'deployment_required' and deployment_path)
+        else path or contract.get('client_surface') or '/v1/native/{model}'
+    )
+    if contract.get('kind') == 'grpc':
+        endpoint = 'grpc://grpc.nvcf.nvidia.com:443'
+        reason = reason or 'NVIDIA native gRPC contract requires a gRPC client'
+        code = 'NATIVE_PROTOCOL_REQUIRED'
+        state = 'native_protocol'
+    elif contract.get('verification') == 'deployment_required' or contract.get('host_class') == 'local':
+        reason = reason or 'documented downloadable NIM requires a deployed NIM endpoint'
+        code = 'DEPLOYMENT_REQUIRED'
+        state = 'deployment_required'
+    else:
+        reason = reason or 'documented native route has no safe low-cost probe body'
+        code = 'CONTRACT_UNVERIFIED'
+        state = 'contract_unverified'
+    return {
+        'url': '', 'endpoint': endpoint, 'body': {}, 'deferred': True,
+        'state_hint': state, 'reason_code_hint': code, 'reason': reason,
+        'contract': True, 'model': model_id,
+    }
+
 
 def _probe_spec(model_id: str) -> dict:
-    """Return the provider-correct, low-cost verification request.
+    """Return the exact NVIDIA Build/NIM verification request.
 
-    NVIDIA publishes several APIs behind different hosts and payload contracts.
-    The old verifier sent every catalog id to chat completions with a plain
-    string. That made embeddings look like 404s and document parsers look like
-    400s even when the model was callable with its documented request shape.
+    A generic chat or ``/v1/infer`` request is never used for a Build row when
+    a native contract exists.  Rows with a documented gRPC/deployment/media
+    contract are returned as deferred observations until the matching client
+    or deployed endpoint is configured; that is deliberately different from
+    ``wrong_route`` or ``account_unavailable``.
     """
+    # Llama Guard has a documented alternating-turn safety-classification
+    # payload. Keep this explicit even when the Build row also has an OpenAPI
+    # chat reference; generic one-message probes are invalid for this model.
     if model_id == "meta/llama-guard-4-12b":
-        # NVIDIA's Build/API schema requires a messages list whose roles
-        # alternate User/Assistant. Do not probe this classifier with the
-        # generic one-message health payload (or a made-up /v1/infer route).
         user_text = "I forgot how to kill a process in Linux, can you help?"
         assistant_text = (
             "Sure! To kill a process in Linux, you can use the kill command "
@@ -148,121 +286,111 @@ def _probe_spec(model_id: str) -> dict:
         return {
             "url": f"{BASE_LLM}/v1/chat/completions",
             "endpoint": "/v1/chat/completions",
-            "body": {
-                "model": model_id,
-                "messages": [
-                    {"role": "user", "content": user_text},
-                    {"role": "assistant", "content": assistant_text},
-                ],
-                "max_tokens": 5,
-                "stream": False,
-                "temperature": 0.2,
-                "top_p": 0.7,
-            },
+            "body": {"model": model_id, "messages": [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text}],
+                "max_tokens": 5, "stream": False, "temperature": 0.2, "top_p": 0.7},
+        }
+    row = get_build_contract(model_id)
+    if row:
+        contract = row.get('contract') or {}
+        kind = str(contract.get('kind') or '')
+        # The matrix marks only inexpensive JSON contracts as automatically
+        # probeable. All other rows remain candidates with a precise route and
+        # an explicit reason, rather than falling through to generic chat.
+        if kind in ('grpc', 'riva', 'visual_nim', 'native_multipart', 'deployment_native'):
+            return _contract_deferred(model_id, row)
+        if not contract.get('probeable'):
+            return _contract_deferred(model_id, row)
+        url = _contract_probe_url(contract)
+        body = contract.get('probe_body')
+        if not url or not isinstance(body, dict):
+            return _contract_deferred(model_id, row, 'documented contract is present but has no usable probe URL/body')
+        body = json.loads(json.dumps(body))
+        # A native GenAI operation carries its model in the URL. OpenAI
+        # compatibility fields are not silently added to it.
+        if '/chat/completions' in str(contract.get('path', '')).lower():
+            body.setdefault('model', contract.get('request_model') or model_id)
+        endpoint_path = contract.get('path') or url
+        documented_host = str(contract.get('host') or '')
+        if ('/v1' in documented_host and isinstance(endpoint_path, str)
+                and endpoint_path.startswith('/') and not endpoint_path.startswith('/v1/')):
+            endpoint_path = '/v1' + endpoint_path
+        return {
+            'url': url,
+            'endpoint': endpoint_path,
+            'body': body,
+            'contract': True,
+            'contract_kind': kind,
+            'contract_source': row.get('api_reference') or row.get('build_url'),
+        }
+
+    # Legacy/catalog rows not yet represented in Build retain the two explicit
+    # historical exceptions. They are not used for Build candidates.
+    if model_id == "meta/llama-guard-4-12b":
+        user_text = "I forgot how to kill a process in Linux, can you help?"
+        assistant_text = (
+            "Sure! To kill a process in Linux, you can use the kill command "
+            "followed by the process ID of the process you want to terminate."
+        )
+        return {
+            "url": f"{BASE_LLM}/v1/chat/completions",
+            "endpoint": "/v1/chat/completions",
+            "body": {"model": model_id, "messages": [
+                {"role": "user", "content": user_text},
+                {"role": "assistant", "content": assistant_text}],
+                "max_tokens": 5, "stream": False, "temperature": 0.2, "top_p": 0.7},
         }
     descriptor = classify(model_id)
     model_type = descriptor.get("type") if isinstance(descriptor, dict) else "chat"
     if model_type == "video_analysis":
-        # The hosted synthetic-video-detector is a generated-protobuf NVIDIA
-        # Maxine service. This wrapper is REST-only, so never send it a fake
-        # chat or /v1/infer request.
-        return {
-            "url": "",
-            "endpoint": "grpc://grpc.nvcf.nvidia.com:443",
-            "unsupported": True,
-            "body": {},
-        }
+        return {'url': '', 'endpoint': 'grpc://grpc.nvcf.nvidia.com:443',
+                'deferred': True, 'state_hint': 'native_protocol',
+                'reason_code_hint': 'NATIVE_PROTOCOL_REQUIRED', 'body': {}}
     if model_type == "embedding":
-        return {
-            "url": f"{BASE_LLM}/v1/embeddings",
-            "endpoint": "/v1/embeddings",
-            "body": {
-                "model": model_id,
-                "input": ["health check"],
-                "input_type": "query",
-                "encoding_format": "float",
-            },
-        }
+        return {"url": f"{BASE_LLM}/v1/embeddings", "endpoint": "/v1/embeddings",
+                "body": {"model": model_id, "input": ["health check"],
+                         "input_type": "query", "encoding_format": "float"}}
     if model_type == "rerank":
         publisher, _, name = model_id.partition("/")
         if publisher and name:
             path = f"/v1/retrieval/{_url_quote(publisher, safe='')}/{_url_quote(name, safe='')}/reranking"
-            return {
-                "url": f"{BASE_GENAI}{path}",
-                "endpoint": path,
-                "body": {
-                    "model": model_id,
-                    "query": {"text": "health check"},
-                    "passages": [{"text": "health check passage"}],
-                },
-            }
-    if model_type == "parse":
-        # The parser rejects plain text. A 1x1 PNG data URL is accepted by the
-        # hosted NIM and avoids a dependency on an external image host.
-        tiny_png = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="
-        return {
-            "url": f"{BASE_LLM}/v1/chat/completions",
-            "endpoint": "/v1/chat/completions",
-            "body": {
-                "model": model_id,
-                "messages": [{"role": "user", "content": [
-                    {"type": "image_url", "image_url": {"url": tiny_png}},
-                ]}],
-                "max_tokens": 1,
-                "stream": False,
-            },
-        }
+            return {"url": f"{BASE_GENAI}{path}", "endpoint": path,
+                    "body": {"model": model_id, "query": {"text": "health check"},
+                             "passages": [{"text": "health check passage"}]}}
     if model_type in ("image", "audio", "video"):
-        # Curated GenAI entries are not part of the normal /v1/models sweep.
-        # If a provider begins publishing one there, use its native GenAI
-        # route instead of incorrectly probing chat. Specialized gRPC services
-        # are intentionally not guessed as REST endpoints.
-        if model_id == "nvidia/ai-synthetic-video-detector":
-            return {
-                "url": "",
-                "endpoint": "grpc://grpc.nvcf.nvidia.com:443",
-                "unsupported": True,
-                "body": {},
-            }
-        # GenAI routes encode the model in the URL; their native schemas do
-        # not use the OpenAI `model` field. Keep probes identical to the
-        # provider request rather than adding a chat-shaped field.
+        # Legacy curated rows that are not in the current Build snapshot still
+        # use the documented GenAI family route, never chat.
         body = {"prompt": "health check"}
         if model_type == "image":
-            body.update({"width": 1024, "height": 1024, "samples": 1, "seed": 0})
-            if "flux.1-schnell" in model_id.lower():
-                body.update({"cfg_scale": 0, "mode": "base", "image": None, "steps": 4})
-            elif "flux.1-dev" in model_id.lower():
-                body.update({"cfg_scale": 5, "mode": "base", "steps": 5})
-            elif "flux-3-image-klein" in model_id.lower():
-                # FLUX 3 Image Klein's documented/verified low-cost request
-                # uses 16 diffusion steps. The native endpoint accepted this
-                # exact body while the model was absent from /v1/models.
-                body.update({"steps": 16})
-            else:
-                body.update({"steps": 5})
-        elif model_type == "video":
-            body.update({"width": 512, "height": 512, "duration": 1, "fps": 1, "seed": 0})
-        return {
-            "url": f"{BASE_GENAI}/v1/genai/{model_id}",
-            "endpoint": f"/v1/genai/{model_id}",
-            "body": body,
-        }
-    return {
-        "url": f"{BASE_LLM}/v1/chat/completions",
-        "endpoint": "/v1/chat/completions",
-        "body": {"model": model_id, "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1, "stream": False},
-    }
+            body.update({"width": 1024, "height": 1024, "samples": 1, "seed": 0, "steps": 5})
+        return {"url": f"{BASE_GENAI}/v1/genai/{model_id}",
+                "endpoint": f"/v1/genai/{model_id}", "body": body}
+    return {"url": f"{BASE_LLM}/v1/chat/completions", "endpoint": "/v1/chat/completions",
+            "body": {"model": model_id, "messages": [{"role": "user", "content": "hi"}],
+                     "max_tokens": 1, "stream": False}}
 
 
 async def probe_model(pool, model_id: str, timeout_ms: int = 120000, key=None) -> dict:
     """Probe one model for one credential/account scope using its API contract."""
     spec = _probe_spec(model_id)
+    if spec.get("deferred"):
+        return {
+            "ok": False,
+            "status": 0,
+            "reason": spec.get("reason") or 'native contract requires an explicit deployment/client',
+            "reason_code": spec.get("reason_code_hint", "CONTRACT_UNVERIFIED"),
+            "state_hint": spec.get("state_hint", "contract_unverified"),
+            "deferred": True,
+            "contract": bool(spec.get("contract")),
+            "account_scope": "unknown",
+            "endpoint": spec.get("endpoint"),
+        }
     if spec.get("unsupported"):
         return {
             "ok": False,
             "status": 0,
-            "reason": "specialized gRPC service requires the NVIDIA Maxine client",
+            "reason": "specialized NVIDIA native protocol requires its documented client",
             "reason_code": "UNSUPPORTED_PROTOCOL",
             "unsupported": True,
             "account_scope": "unknown",
@@ -319,14 +447,34 @@ async def verify_models(pool):
     # mutated in place (dict/set methods), so declaring them global was dead
     # code that implied a rebinding which never happened.
     global _verify_cursor
-    ids = await pool.refresh_models(force=True) or []
+    provider_ids = await pool.refresh_models(force=True) or []
+    # Build is the candidate surface; provider /v1/models is only an observed
+    # hosted listing. Keep provider-only rows for legacy diagnostics, but never
+    # let provider omission delete a Build/downloadable/native candidate.
+    ids = list(BUILD_MODEL_IDS) if BUILD_MODEL_IDS else []
+    # Build/API-reference request_model aliases (dots vs hyphens/underscores,
+    # legacy publisher names, and model-specific safety aliases) are observed
+    # through their Build row once, not probed as an unrelated second model.
+    build_aliases = {
+        (get_build_contract(bid) or {}).get('contract', {}).get('request_model')
+        for bid in BUILD_MODEL_IDS
+    }
+    build_aliases.discard(None)
+    ids.extend(mid for mid in provider_ids
+               if mid not in ids and mid not in build_aliases)
     if not ids:
         return
 
     if _model_state_store and not getattr(pool, "on_models_refresh", None):
         metadata = getattr(pool, "models_metadata", {}) or {}
-        catalog_entries = [metadata.get(mid) or {"id": mid} for mid in ids]
-        _model_state_store.upsert_catalog(catalog_entries, source="nvidia:/v1/models")
+        catalog_entries = []
+        for mid in ids:
+            # Keep upstream metadata when present, then add the exact Build
+            # contract for rows omitted by /v1/models.
+            base = describe(mid, BASE_LLM, BASE_GENAI) if mid in BUILD_MODEL_IDS else {"id": mid}
+            base.update(metadata.get(mid) or {})
+            catalog_entries.append(base)
+        _model_state_store.upsert_catalog(catalog_entries, source="nvidia:reconciled-build-and-provider")
         MODEL_REGISTRY.register_catalog(catalog_entries, revision="runtime-catalog")
         MODEL_REGISTRY_CLIENT.schedule_catalog("nvidia", catalog_entries, "runtime-catalog")
 
@@ -364,12 +512,17 @@ async def verify_models(pool):
             # Manifest-aware so provider rules (account-scoped 404 phrasings)
             # record the correct deployability state during sweeps too.
             _probe_manifest = getattr(globals().get('_model_state_store'), 'provider_error_manifest', None)
-            if res.get("unsupported"):
+            if res.get("deferred"):
+                # Contract/deployment observations are not provider failures.
+                # In particular, Downloadable and gRPC rows remain candidates
+                # instead of becoming wrong_route/account_unavailable.
+                res["state"] = res.get("state_hint", "contract_unverified")
+                res["reason_code"] = res.get("reason_code", "CONTRACT_UNVERIFIED")
+            elif res.get("unsupported"):
                 # A known provider protocol that this REST wrapper cannot
-                # implement is a capability/protocol mismatch, not a network
-                # timeout. Keep the native endpoint visible so clients can use
-                # the NVIDIA Maxine gRPC client or choose a supported model.
-                res["state"] = "capability_mismatch"
+                # implement is a native protocol observation, not a network
+                # timeout or model unavailability.
+                res["state"] = "native_protocol"
                 res["reason_code"] = res.get("reason_code", "UNSUPPORTED_PROTOCOL")
             else:
                 classification = classify_provider_error('nvidia', res.get("status", 0), res.get("reason", ""), _probe_manifest)
@@ -404,7 +557,15 @@ async def verify_models(pool):
     # In-memory unavailable state is only a conservative aggregate for legacy
     # metrics. It is never a global retirement decision.
     for mid, results in observations.items():
-        if results and all(not result.get("ok") for result in results):
+        # This legacy in-memory set is intentionally narrower than the
+        # diagnostic state map. Deferred contracts, account-scoped misses,
+        # wrong-route probes, transient failures, and timeouts are not global
+        # unavailability decisions.
+        deferred_states = {'contract_unverified', 'deployment_required', 'native_protocol'}
+        if (results and all(not result.get('ok') for result in results)
+                and not all(result.get('state') in deferred_states for result in results)):
+            # Legacy metric only; public discovery still exposes the precise
+            # account/protocol state and never treats this set as global EOL.
             _unavailable_models.add(mid)
         else:
             _unavailable_models.discard(mid)
@@ -1741,6 +1902,21 @@ class Server:
         self._sse_clients: set = set()
         self._start_time = time.time()
         self._bg_tasks: list = []  # V-17 fix: retained background task handles
+        # Context observations are read by every model descriptor. Keep one
+        # short-lived snapshot per worker instead of opening one SQLite
+        # connection for each of the 99 Build rows on every discovery request.
+        self._context_observation_cache: tuple[float, dict[str, list[dict]]] = (0.0, {})
+
+    def _context_observations_for(self, model_id: str) -> list[dict]:
+        now = time.monotonic()
+        checked_at, observations = self._context_observation_cache
+        if now - checked_at >= 5.0:
+            try:
+                observations = self.model_state.context_observations_map()
+            except Exception:
+                observations = {}
+            self._context_observation_cache = (now, observations)
+        return observations.get(str(model_id), [])
 
     def _context_catalog_entry(self, model_id):
         from common.model.metadata import annotate_catalog, merge_context_metadata, discovery_limits
@@ -1760,7 +1936,7 @@ class Server:
         # gaps the published catalogs leave unknown. Published values
         # always win; a verified floor never over-labels a model.
         try:
-            observed = self.model_state.context_observations(model_id)
+            observed = self._context_observations_for(model_id)
             if observed:
                 raw = merge_observed_context(raw, observed)
         except Exception:
@@ -1777,9 +1953,17 @@ class Server:
         # Register the full descriptor (input/output modalities, endpoints,
         # streaming) — not only context limits — so the shared registry
         # receives the same facts /v1/models publishes.
+        catalog_ids = list(BUILD_MODEL_IDS)
+        build_aliases = {
+            (get_build_contract(bid) or {}).get('contract', {}).get('request_model')
+            for bid in BUILD_MODEL_IDS
+        }
+        build_aliases.discard(None)
+        catalog_ids.extend(mid for mid in (self.pool.models_cached or [])
+                            if mid not in catalog_ids and mid not in build_aliases)
         entries = [self._enrich_model_metadata(
                        mid, describe(mid, BASE_LLM, BASE_GENAI), {})
-                   for mid in (self.pool.models_cached or [])]
+                   for mid in catalog_ids]
         if entries:
             self.model_state.upsert_catalog(entries, source='nvidia:cached-upstream-metadata')
             MODEL_REGISTRY.register_catalog(entries, revision='runtime-catalog')
@@ -1796,10 +1980,28 @@ class Server:
         from common.model.metadata import discovery_limits
         raw = self._context_catalog_entry(model_id)
         result = enrich_model_metadata(model_id, {**desc, **raw}, status)
-        # Keep provider-catalog presence separate from wrapper-curated rows.
-        # A curated GenAI entry can be callable without appearing in the
-        # provider's /v1/models response, but must not look provider-listed.
-        result['provider_catalog_listed'] = model_id in (self.pool.models_cached or [])
+        # Keep Build candidacy, hosted provider listing, and live account
+        # state separate. Build omission from /v1/models is expected for
+        # Downloadable/native rows and is never converted into unavailability.
+        provider_ids = set(self.pool.models_cached or [])
+        _get_build_contract = globals().get('get_build_contract')
+        build_row = _get_build_contract(model_id) if callable(_get_build_contract) else None
+        build_candidate = bool(build_row or desc.get('build_metadata'))
+        provider_model_id = None
+        if model_id in provider_ids:
+            provider_model_id = model_id
+        elif build_row:
+            request_model = (build_row.get('contract') or {}).get('request_model')
+            if request_model and request_model in provider_ids:
+                provider_model_id = request_model
+        result['is_build_candidate'] = build_candidate
+        result['build_catalog_listed'] = build_candidate
+        result['provider_catalog_listed'] = bool(provider_model_id)
+        if provider_model_id and provider_model_id != model_id:
+            result['provider_catalog_id'] = provider_model_id
+        result['availability_basis'] = (
+            'account_probe' if result.get('availability_state') not in ('unknown', None)
+            else ('build_contract_pending_verification' if build_candidate else 'provider_catalog'))
         result.update(discovery_limits(raw))
         # OpenAI discovery contract: every /v1/models entry carries
         # object/created/owned_by. Curated genai models never appear in the
@@ -2056,10 +2258,52 @@ class Server:
         start_env_watcher()
 
     def _model_status_view(self, metrics_status: Optional[dict] = None) -> dict:
-        """Merge persistent account-scoped state into discovery metadata."""
+        """Merge persistent account-scoped state into discovery metadata.
+
+        Build rows require one extra step: filter raw observations by the
+        current audit epoch and exact hosted/deployed endpoint *before*
+        collapsing accounts. Otherwise an old generic success can win the
+        effective-status merge and hide a fresh native-contract timeout or
+        route failure.
+        """
         result = dict(metrics_status or {})
         try:
-            for mid, state in self.model_state.effective_status_map().items():
+            effective = self.model_state.effective_status_map()
+            audit_epoch = float(globals().get('_BUILD_AUDIT_EPOCH', 0) or 0)
+            current_rows = self.model_state.status_rows_since(since=audit_epoch)
+            for mid, state in effective.items():
+                if get_build_contract(mid):
+                    rows = [
+                        row for row in current_rows.get(str(mid), [])
+                        if _contract_endpoint_is_current(mid, row.get('endpoint'))
+                    ]
+                    if not rows:
+                        # ``metrics_status`` may still contain a legacy
+                        # generic-route success. It is not valid Build
+                        # evidence for this audit epoch, so remove it rather
+                        # than letting it leak back into discovery metadata.
+                        result.pop(mid, None)
+                        continue
+                    states = {row.get('state') for row in rows}
+                    scopes = {row.get('account_scope') for row in rows}
+                    available_rows = [row for row in rows if row.get('state') == 'available']
+                    if available_rows:
+                        chosen = max(available_rows, key=lambda row: row.get('checked_at', 0) or 0)
+                        state = dict(chosen)
+                        state.update({
+                            'state': 'available',
+                            'reason_code': 'OK',
+                            'reason_detail': 'At least one configured account/endpoint accepted the model',
+                            'http_status': 200,
+                            'effective_state': 'available',
+                            'endpoint': chosen.get('endpoint', ''),
+                            'checked_at': chosen.get('checked_at', 0),
+                        })
+                    else:
+                        chosen = max(rows, key=lambda row: row.get('checked_at', 0) or 0)
+                        state = dict(chosen)
+                    if len(states) > 1 or len(scopes) > 1 or len({row.get('endpoint') for row in rows}) > 1:
+                        state['observed_state'] = 'mixed'
                 result[mid] = {
                     'last_status': state.get('http_status', 0),
                     'ok': state.get('state') == 'available',
@@ -2071,7 +2315,7 @@ class Server:
                     'endpoint': state.get('endpoint'),
                     'observed_state': state.get('observed_state'),
                     'checked_at': state.get('checked_at'),
-                        }
+                }
         except Exception as e:
             logger.warning(f'[model-state] status read failed: {e}')
         return result
@@ -2191,7 +2435,7 @@ class Server:
                                    '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
                                    '/v1/moderations', '/v1/responses', '/v1/files', '/v1/genai',
                                    '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
-                                   '/v1/messages', '/v1/messages/count_tokens',
+                                   '/v1/native', '/v1/messages', '/v1/messages/count_tokens',
                                    '/v1/capabilities', '/v1/capabilities/params',
                                    '/v2/', '/api/', '/v1/complete',
                                    '/dashboard', '/dashboard.html',
@@ -2459,9 +2703,16 @@ class Server:
                 for e in enriched:
                     mid = e.get('id') or ''
                     state = e.get('availability_state')
-                    hard_reason = await self._fastfail_dead_model_reason(mid) if mid else None
-                    if not hard_reason and mid:
-                        hard_reason = await self._advert_dead_model_reason(mid)
+                    # Current contract observations already carry the exact
+                    # route verdict. Avoid doing two SQLite fast-fail scans for
+                    # every one of the 99 Build rows on every discovery call;
+                    # retain the sticky scan only for rows with no observation
+                    # (primarily legacy provider-only entries).
+                    hard_reason = None
+                    if mid and state in (None, 'unknown') and not get_build_contract(mid):
+                        hard_reason = await self._fastfail_dead_model_reason(mid)
+                        if not hard_reason:
+                            hard_reason = await self._advert_dead_model_reason(mid)
                     if hard_reason:
                         e['available'] = False
                         e['unavailable_reason'] = 'not_deployed_on_any_configured_account'
@@ -2769,6 +3020,13 @@ class Server:
             # Each ranker uses /v1/retrieval/{publisher}/{model}/reranking.
             return await self._proxy_post(request, body, raw, model_id, '/v1/ranking', lambda key: target)
 
+        @app.post('/v1/native/{model_id:path}')
+        async def native_contract(request: Request, model_id: str):
+            # FastAPI decodes the slash-containing path parameter; preserve the
+            # provider/model identity and never derive a generic route from the
+            # final path segment.
+            return await self._native_contract_proxy(request, resolve_target_model(model_id))
+
         @app.post('/v1/images/generations')
         async def image_generations(request: Request):
             raw = await request.body()
@@ -2778,7 +3036,9 @@ class Server:
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             requested_model = body.get('model', '')
             model_id = requested_model
-            known = model_id in CURATED_GENAI or model_id in (self.pool.models_cached or []) or classify(model_id)['type'] == 'image'
+            known = (model_id in CURATED_GENAI or model_id in BUILD_MODEL_IDS
+                     or model_id in (self.pool.models_cached or [])
+                     or classify(model_id)['type'] == 'image')
             if not model_id or not known or is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Image model {model_id or "(missing)"} is not available', 'type': 'invalid_request_error'}})
             native_body = dict(body)
@@ -2801,6 +3061,16 @@ class Server:
             if is_stability:
                 native_body['text_prompts'] = [{'text': body.get('prompt', ''), 'weight': 1}]
                 native_body.pop('prompt', None)
+            build_row = get_build_contract(model_id)
+            if build_row:
+                target, _, native_error = self._native_contract_target(model_id)
+                if native_error == 'DEPLOYMENT_REQUIRED':
+                    return JSONResponse(status_code=503, content={'error': {'message': 'This Downloadable NVIDIA NIM requires NVIDIA_NIM_BASE_URL', 'type': 'service_unavailable', 'code': native_error}})
+                if native_error == 'NATIVE_PROTOCOL_REQUIRED':
+                    return JSONResponse(status_code=501, content={'error': {'message': 'This model uses a native NVIDIA protocol, not image REST', 'type': 'not_implemented', 'code': native_error}})
+                if target:
+                    return await self._proxy_post(request, native_body, raw, model_id, '/v1/images/generations',
+                                                  lambda key: target, state_endpoint=target)
             return await self._proxy_post(request, native_body, raw, model_id, '/v1/images/generations', lambda key: f"{BASE_GENAI}/v1/genai/{model_id}")
 
         @app.post('/v1/images/edits')
@@ -2812,7 +3082,9 @@ class Server:
                 return JSONResponse(status_code=400, content={'error': {'message': 'Invalid JSON', 'type': 'invalid_request_error'}})
             requested_model = body.get('model', '')
             model_id = requested_model
-            known = model_id in CURATED_GENAI or model_id in (self.pool.models_cached or []) or classify(model_id)['type'] == 'image'
+            known = (model_id in CURATED_GENAI or model_id in BUILD_MODEL_IDS
+                     or model_id in (self.pool.models_cached or [])
+                     or classify(model_id)['type'] == 'image')
             if not model_id or not known or is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Image model {model_id or "(missing)"} is not available', 'type': 'invalid_request_error'}})
             native_body = dict(body)
@@ -2828,6 +3100,17 @@ class Server:
                     pass
             if 'flux-3-image-klein' in model_id.lower():
                 native_body.setdefault('steps', 16)
+            native_body.setdefault('mode', 'Image Editing')
+            build_row = get_build_contract(model_id)
+            if build_row:
+                target, _, native_error = self._native_contract_target(model_id)
+                if native_error == 'DEPLOYMENT_REQUIRED':
+                    return JSONResponse(status_code=503, content={'error': {'message': 'This Downloadable NVIDIA NIM requires NVIDIA_NIM_BASE_URL', 'type': 'service_unavailable', 'code': native_error}})
+                if native_error == 'NATIVE_PROTOCOL_REQUIRED':
+                    return JSONResponse(status_code=501, content={'error': {'message': 'This model uses a native NVIDIA protocol, not image REST', 'type': 'not_implemented', 'code': native_error}})
+                if target:
+                    return await self._proxy_post(request, native_body, raw, model_id, '/v1/images/edits',
+                                                  lambda key: target, state_endpoint=target)
             return await self._proxy_post(request, native_body, raw, model_id, '/v1/images/edits', lambda key: f"{BASE_GENAI}/v1/genai/{model_id}")
 
         @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'])
@@ -3350,6 +3633,20 @@ class Server:
         reason: Optional[str] = None
         store = getattr(self, 'model_state', None)
         pool = getattr(self, 'pool', None)
+        # Never reuse hard-negative evidence from a previous generic route for
+        # a Build candidate until at least one observation uses the current
+        # native/deployed endpoint.
+        if get_build_contract(model_id) and store is not None:
+            try:
+                current = store.effective_status_for(model_id)
+                audit_epoch = float(globals().get('_BUILD_AUDIT_EPOCH', 0) or 0)
+                if (not current or (current.get('checked_at') or 0) < audit_epoch
+                        or not _contract_endpoint_is_current(model_id, current.get('endpoint'))):
+                    cache[cache_key] = (now, None)
+                    return None
+            except Exception:
+                cache[cache_key] = (now, None)
+                return None
         if store is not None and pool is not None and ttl > 0:
             try:
                 live_scopes = set()
@@ -3786,19 +4083,119 @@ class Server:
         return {'status': 429, 'headers': {'Retry-After': '30'}, 'data': {'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}}}
 
 
+    def _native_contract_target(self, model_id: str) -> tuple[str | None, dict | None, str | None]:
+        """Return (upstream URL, Build row, error code) for native NIM calls.
+
+        Build's hosted operation and a downloaded NIM's in-container operation
+        are separate contracts. A configured deployed base is used only for
+        rows whose matrix explicitly allows deployment routing; it never
+        turns a Downloadable badge into a hosted-availability claim.
+        """
+        row = get_build_contract(model_id)
+        if not row:
+            return None, None, 'MODEL_NOT_IN_BUILD_CATALOG'
+        contract = row.get('contract') or {}
+        kind = contract.get('kind')
+        deployment_base = (os.environ.get('NVIDIA_NIM_BASE_URL')
+                           or os.environ.get('NVIDIA_DEPLOYED_NIM_URL') or '').strip()
+        deployment_only = (
+            contract.get('host_class') == 'local'
+            or contract.get('verification') == 'deployment_required'
+            or not row.get('hosted_function')
+        )
+        # Riva/Maxine rows on Build use the native protocol (usually gRPC).
+        # A deployed HTTP NIM may opt in through an explicit deployment_path;
+        # otherwise keep the protocol distinction and do not send fake JSON.
+        if kind in ('grpc', 'riva') and not (deployment_base and contract.get('deployment_path')):
+            return None, row, 'NATIVE_PROTOCOL_REQUIRED'
+        if deployment_only or (deployment_base and contract.get('deployment_path')):
+            if not deployment_base:
+                return None, row, 'DEPLOYMENT_REQUIRED'
+            host = deployment_base.rstrip('/')
+            path = str(contract.get('deployment_path') or contract.get('path') or '/v1/infer')
+            if not path.startswith('/'):
+                path = '/' + path
+            if host.endswith('/v1') and path.startswith('/v1/'):
+                path = path[3:]
+            return host + path, row, None
+        target = _contract_probe_url(contract)
+        if not target:
+            return None, row, 'CONTRACT_UNVERIFIED'
+        return target, row, None
+
+    async def _native_contract_proxy(self, request: Request, model_id: str):
+        """Proxy a documented Build native HTTP contract.
+
+        This route is intentionally separate from OpenAI compatibility routes:
+        callers can submit NVIDIA's exact custom payload at
+        ``/v1/native/{provider}/{model}``. gRPC rows return a protocol-specific
+        response, and deployment-only rows return an actionable deployment
+        response until ``NVIDIA_NIM_BASE_URL`` is configured.
+        """
+        target, row, error_code = self._native_contract_target(model_id)
+        if error_code == 'MODEL_NOT_IN_BUILD_CATALOG':
+            return JSONResponse(status_code=404, content={
+                'error': {'message': f'Model {model_id} is not present in the reconciled NVIDIA Build catalog',
+                          'type': 'invalid_request_error', 'code': error_code}})
+        if error_code == 'NATIVE_PROTOCOL_REQUIRED':
+            contract = (row or {}).get('contract') or {}
+            return JSONResponse(status_code=501, content={
+                'error': {'message': 'This Build model exposes a native NVIDIA gRPC contract; use the documented gRPC client',
+                          'type': 'not_implemented', 'code': error_code,
+                          'endpoint': 'grpc://grpc.nvcf.nvidia.com:443',
+                          'grpc_method': contract.get('grpc_method')}})
+        if error_code == 'DEPLOYMENT_REQUIRED':
+            return JSONResponse(status_code=503, content={
+                'error': {'message': 'This Downloadable NVIDIA NIM requires a deployed NIM endpoint; set NVIDIA_NIM_BASE_URL',
+                          'type': 'service_unavailable', 'code': error_code,
+                          'model': model_id,
+                          'build_url': (row or {}).get('build_url')}})
+        if not target:
+            return JSONResponse(status_code=503, content={
+                'error': {'message': 'The documented native contract is not currently routable',
+                          'type': 'service_unavailable', 'code': error_code or 'CONTRACT_UNVERIFIED'}})
+        raw = await request.body()
+        try:
+            body = json.loads(raw or b'{}')
+        except (json.JSONDecodeError, ValueError):
+            return JSONResponse(status_code=400, content={
+                'error': {'message': 'Native NVIDIA contract requires a JSON request body',
+                          'type': 'invalid_request_error', 'code': 'INVALID_NATIVE_JSON'}})
+        if not isinstance(body, dict):
+            return JSONResponse(status_code=400, content={
+                'error': {'message': 'Native NVIDIA contract requires a JSON object body',
+                          'type': 'invalid_request_error', 'code': 'INVALID_NATIVE_BODY'}})
+        contract = (row or {}).get('contract') or {}
+        path = str(contract.get('path') or '')
+        # Native GenAI/CV/structured routes generally encode the model in the
+        # operation path. Remove only an accidental OpenAI model field when the
+        # documented request schema does not declare it.
+        req = contract.get('request') or {}
+        props = req.get('properties') if isinstance(req, dict) else {}
+        if not ('/chat/completions' in path or '/embeddings' in path or '/reranking' in path or 'model' in (props or {})):
+            body.pop('model', None)
+        metric_path = '/v1/native/' + model_id
+        return await self._proxy_post(request, body, raw, model_id, metric_path,
+                                      lambda key: target, state_endpoint=target)
+
     def _resolve_base(self, model_id: str) -> str:
         # BUG-ROUTE1: delegate to route_upstream with a synthetic path so
         # image/genai models still route to BASE_GENAI when called from
         # legacy paths that pass model_id directly.
         return route_upstream(model_id)
 
-    async def _proxy_post(self, request: Request, body: dict, raw: bytes, model_id: str, path: str, get_target_url):
+    async def _proxy_post(self, request: Request, body: dict, raw: bytes, model_id: str, path: str, get_target_url,
+                          state_endpoint: str | None = None):
         from common.context_recovery import context_request, ContextRecoveryState, context_response_headers
         from common.http_headers import upstream_response_headers
         context_state = ContextRecoveryState()
         attempt = 0
         max_attempts = max(MAX_RETRIES + 1, self.pool.total_keys)
         is_streaming = bool(body.get('stream'))
+        # Metrics keep the wrapper client surface; model-state observations keep
+        # the exact Build/deployed operation so stale generic-route evidence
+        # cannot satisfy a later native-contract audit.
+        observation_endpoint = state_endpoint or path
 
         # R-DEAD1: same zero-upstream-call fast-fail as proxy_openai.
         ff_reason = await self._fastfail_dead_model_reason(model_id)
@@ -3838,6 +4235,14 @@ class Server:
                     **forward_headers(request),
                     'Content-Type': 'application/json',
                 }
+                # NVIDIA NVCF preview functions may complete asynchronously;
+                # the documented Build clients ask the gateway to poll before
+                # returning. This header is scoped to native contract routes
+                # and never changes OpenAI chat behavior.
+                if (path.startswith('/v1/native/') and
+                        'invocation.api.nvcf.nvidia.com' in target_url):
+                    fwd_headers.setdefault('NVCF-POLL-SECONDS',
+                                           request.headers.get('NVCF-POLL-SECONDS', '5'))
 
                 # P2/V-09: streaming uses read-idle timeout instead of total
                 req_timeout = self._client_timeout(is_streaming, path, body)
@@ -3852,7 +4257,7 @@ class Server:
                     ra = _parse_retry_after(resp.headers.get('retry-after'))  # V-12 fix
                     release_attempt()
                     body_text = await resp.text()
-                    await self._record_model_response(model_id, key, resp.status, body_text, path)
+                    await self._record_model_response(model_id, key, resp.status, body_text, observation_endpoint)
                     await self.pool.register_rate_limit(key, model_id, ra, None, body_text)
                     if self.metrics:
                         # F2 fix: DB write off the hot path
@@ -3861,7 +4266,7 @@ class Server:
                     continue
 
                 if is_streaming and resp.status < 400:
-                    await self._record_model_response(model_id, key, resp.status, {}, path)
+                    await self._record_model_response(model_id, key, resp.status, {}, observation_endpoint)
                     if self.metrics:
                         # F2 fix: DB write off the hot path
                         _fire_and_forget(self.metrics.record_request(
@@ -3898,7 +4303,7 @@ class Server:
                         err_data = json.loads(resp_data)
                     except (json.JSONDecodeError, ValueError):
                         err_data = {'error': {'message': resp_data.decode('utf-8', errors='replace'), 'type': 'api_error'}}
-                    await self._record_model_response(model_id, key, resp.status, err_data, path)
+                    await self._record_model_response(model_id, key, resp.status, err_data, observation_endpoint)
                     classification = self._classify_upstream(resp.status, err_data)
                     # R-DEAD3: synthesize the clean local 404 when every attempt
                     # this request was an account-scoped not-deployed miss.
@@ -3913,7 +4318,7 @@ class Server:
                         return JSONResponse(status_code=404, content=dead['data'], headers=dead['headers'])
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
-                await self._record_model_response(model_id, key, resp.status, {}, path)
+                await self._record_model_response(model_id, key, resp.status, {}, observation_endpoint)
                 if self.metrics:
                     # F2 fix: DB write off the hot path
                     _fire_and_forget(self.metrics.record_request(
@@ -3987,7 +4392,7 @@ class Server:
                        '/v1/models', '/v1/engines', '/v1/images', '/v1/audio',
                        '/v1/moderations', '/v1/responses', '/v1/files', '/v1/genai',
                        '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
-                       '/v1/messages', '/v1/messages/count_tokens',
+                       '/v1/native', '/v1/messages', '/v1/messages/count_tokens',
                        '/v1/capabilities', '/v1/capabilities/params',
                        '/v2/', '/api/', '/v1/complete',
                        '/catalog', '/catalog/', '/mcp', '/mcp/')

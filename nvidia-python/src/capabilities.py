@@ -14,7 +14,15 @@ Provides:
 """
 
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
+
+from common.nvidia_build_catalog import (
+    BUILD_CATALOG_RETRIEVED,
+    BUILD_CATALOG_SOURCE,
+    BUILD_CONTRACTS,
+    BUILD_MODEL_IDS,
+    get_build_contract,
+)
 
 # ── Constants ────────────────────────────────────────────────────────────
 NVIDIA_BASE_URL = 'https://integrate.api.nvidia.com'
@@ -187,6 +195,22 @@ CAPABILITY_DEFS: Dict[str, dict] = {
         'capabilities': ['document_parsing', 'vision'],
         'endpoints': [{'path': '/v1/chat/completions', 'host': LLM, 'kind': 'chat'}],
         'streaming': True,
+    },
+    'structured': {
+        'type': 'structured',
+        'input': ['tabular', 'text'],
+        'output': ['json', 'scores'],
+        'capabilities': ['structured_prediction', 'tabular'],
+        'endpoints': [{'path': '/v1/native/{model}', 'host': GENAI, 'kind': 'native_structured'}],
+        'streaming': False,
+    },
+    'climate': {
+        'type': 'climate',
+        'input': ['array', 'weather'],
+        'output': ['array', 'forecast'],
+        'capabilities': ['weather_forecasting', 'async_inference'],
+        'endpoints': [{'path': '/v1/native/{model}', 'host': NVCF, 'kind': 'native_climate'}],
+        'streaming': False,
     },
 }
 
@@ -479,23 +503,198 @@ def _resolve_hosts(desc: dict, base_llm: str, base_genai: str) -> dict:
     return desc
 
 
+def _join_contract_url(host: str | None, path: str | None) -> str | None:
+    """Join a documented server and path without changing either contract."""
+    if not host:
+        return None
+    host = str(host).rstrip('/')
+    path = str(path or '')
+    if not path.startswith('/'):
+        path = '/' + path
+    # ReadMe/OpenAPI specs sometimes put /v1 in the server and sometimes in
+    # the operation path.  Preserve the operation path and remove only the
+    # duplicate separator/prefix produced by that documentation convention.
+    if host.endswith('/v1') and path.startswith('/v1/'):
+        path = path[3:]
+    return host + path
+
+
+def _build_contract_descriptor(model_id: str, base_llm: str,
+                               base_genai: str) -> dict | None:
+    row = get_build_contract(model_id)
+    if not row:
+        return None
+    contract = row.get('contract') or {}
+    kind = str(contract.get('kind') or '')
+    documented_host = contract.get('host')
+    if isinstance(documented_host, str) and documented_host.startswith('http'):
+        url = _join_contract_url(documented_host, contract.get('path'))
+    elif contract.get('host_class') == 'llm':
+        url = _join_contract_url(base_llm, contract.get('path'))
+    elif contract.get('host_class') == 'genai':
+        url = _join_contract_url(base_genai, contract.get('path'))
+    elif contract.get('host_class') == 'ai':
+        url = _join_contract_url(base_genai, contract.get('path'))
+    elif contract.get('host_class') == 'health':
+        url = _join_contract_url('https://health.api.nvidia.com/v1', contract.get('path'))
+    elif contract.get('nvcf_function_id'):
+        url = _join_contract_url(
+            'https://' + str(contract.get('nvcf_function_id')) + '.invocation.api.nvcf.nvidia.com',
+            contract.get('path'))
+    elif contract.get('host_class') == 'climate':
+        url = _join_contract_url('https://climate.api.nvidia.com/v1', contract.get('path'))
+    elif contract.get('host_class') == 'optimize':
+        url = _join_contract_url('https://optimize.api.nvidia.com/v1', contract.get('path'))
+    else:
+        url = None
+
+    path = str(contract.get('path') or '')
+    lower_path = path.lower()
+    if kind in ('grpc',):
+        mtype = 'video_analysis'
+        client_path = '/v1/native/{model}'
+        endpoint_kind = 'grpc'
+    elif kind == 'riva':
+        if '/speech' in lower_path or 'tts' in model_id.lower() or 'chatterbox' in model_id.lower() or 'magpie' in model_id.lower():
+            mtype = 'tts'
+        elif 'translation' in lower_path or 'translate' in model_id.lower() or 'megatron' in model_id.lower():
+            mtype = 'chat'
+        else:
+            mtype = 'asr'
+        client_path = path
+        endpoint_kind = 'native_audio'
+    elif kind == 'visual_nim':
+        mtype = 'video' if any(x in model_id.lower() for x in ('wan2', 'cosmos', 'video')) else 'image'
+        client_path = '/v1/native/{model}'
+        endpoint_kind = 'native_infer'
+    elif kind == 'native_multipart':
+        mtype = 'video'
+        client_path = '/v1/native/{model}'
+        endpoint_kind = 'native_multipart'
+    elif 'embedding' in lower_path:
+        mtype = 'embedding'; client_path = '/v1/embeddings'; endpoint_kind = 'embeddings'
+    elif 'retrieval' in lower_path or 'rerank' in model_id.lower():
+        mtype = 'rerank'; client_path = '/v1/ranking'; endpoint_kind = 'ranking'
+    elif 'structured-data/' in lower_path:
+        mtype = 'structured'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_structured'
+    elif 'climate.api' in str(documented_host).lower() or 'fourcastnet' in model_id.lower():
+        mtype = 'climate'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_climate'
+    elif '/cosmos/' in lower_path:
+        mtype = 'video'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_cosmos'
+    elif 'genai/' in lower_path:
+        mtype = 'image' if any(x in model_id.lower() for x in ('flux', 'image', 'trellis', 'stable-diffusion')) else 'video'
+        client_path = '/v1/images/generations' if mtype == 'image' else '/v1/native/{model}'
+        endpoint_kind = 'native_genai'
+    elif '/chat/completions' in lower_path:
+        # A path-qualified vision model is still a chat contract, but it must
+        # not be advertised as the generic route.
+        mtype = 'vision_chat' if any(x in model_id.lower() for x in ('vision', 'vl-', 'super-vl', 'paligemma', 'diffusiongemma', 'parse')) else 'chat'
+        client_path = '/v1/chat/completions'; endpoint_kind = 'chat'
+    elif '/embeddings' in lower_path:
+        mtype = 'embedding'; client_path = '/v1/embeddings'; endpoint_kind = 'embeddings'
+    elif '/cv/' in lower_path:
+        mtype = 'ocr'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_cv'
+    elif '/biology/' in lower_path or '/molecular-docking/' in lower_path:
+        mtype = 'chat'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_biology'
+    elif '/security/' in lower_path:
+        mtype = 'chat'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_security'
+    else:
+        mtype = 'chat'; client_path = '/v1/native/{model}'; endpoint_kind = 'native_nim'
+
+    endpoint = {
+        'path': client_path,
+        'host': 'NVCF' if kind == 'grpc' else ('LLM' if (url or '').startswith(base_llm.rstrip('/')) else 'GENAI'),
+        'kind': endpoint_kind,
+        'client_path': client_path,
+        'upstream_path': path,
+        'route_source': 'nvidia_build_contract',
+        'route_confidence': 'exact' if contract.get('verification') in ('hosted_contract', 'native_protocol') else 'documented',
+        'model_field': 'model' if mtype in ('chat', 'embedding', 'rerank') else None,
+        'nvcf_function_id': contract.get('nvcf_function_id'),
+    }
+    if url:
+        endpoint['url'] = url
+    if kind == 'grpc':
+        endpoint['url'] = 'grpc://grpc.nvcf.nvidia.com:443'
+        endpoint['protocol'] = 'grpc'
+        endpoint['client'] = 'NVIDIA native gRPC client'
+        endpoint['grpc_method'] = contract.get('grpc_method')
+    if '{model}' in client_path:
+        endpoint['url_template'] = url or contract.get('path')
+    if 'genai/' in lower_path:
+        # Compatibility metadata for clients that understand the documented
+        # NVIDIA GenAI family template; ``url``/``upstream_path`` retain the
+        # exact model operation (including punctuation such as flux.3).
+        endpoint.setdefault('url_template', 'https://ai.api.nvidia.com/v1/genai/{model}')
+    return {
+        'id': model_id,
+        'source': 'nvidia_build.com',
+        'type': mtype,
+        'input': list(CAPABILITY_DEFS.get(mtype, CAPABILITY_DEFS['chat'])['input']),
+        'output': list(CAPABILITY_DEFS.get(mtype, CAPABILITY_DEFS['chat'])['output']),
+        'capabilities': list(CAPABILITY_DEFS.get(mtype, CAPABILITY_DEFS['chat'])['capabilities']),
+        'endpoints': [endpoint],
+        'streaming': bool(CAPABILITY_DEFS.get(mtype, CAPABILITY_DEFS['chat'])['streaming']),
+        'supported_params': dict(get_capability_params(mtype)),
+        'build_metadata': {
+            'build_url': row.get('build_url'),
+            'title': row.get('title'),
+            'badges': list(row.get('badges') or []),
+            'downloadable': bool(row.get('downloadable')),
+            'free_endpoint': bool(row.get('free_endpoint')),
+            'deprecated': bool(row.get('deprecated')),
+            'hosted_function': bool(row.get('hosted_function')),
+            'api_reference': row.get('api_reference'),
+            'contract_kind': kind,
+            'hosted_path': contract.get('path'),
+            'deployment_path': contract.get('deployment_path'),
+            'contract_verification': contract.get('verification', 'unknown'),
+            'contract_source': row.get('api_reference') or BUILD_CATALOG_SOURCE,
+            'catalog_retrieved': BUILD_CATALOG_RETRIEVED,
+        },
+    }
+
+
 def describe(model_id: str, base_llm: str = NVIDIA_BASE_URL,
              base_genai: str = NVIDIA_GENAI_URL) -> dict:
-    """Full model descriptor with endpoints."""
-    result = _resolve_hosts(classify(model_id), base_llm, base_genai)
+    """Full model descriptor with the exact Build/NIM route when known."""
+    build_desc = _build_contract_descriptor(model_id, base_llm, base_genai)
+    result = build_desc or _resolve_hosts(classify(model_id), base_llm, base_genai)
     metadata = CURATED_CATALOG_METADATA.get(model_id)
     if metadata:
         result['catalog_metadata'] = dict(metadata)
+    elif model_id == 'black-forest-labs/flux-3-image-klein':
+        # Keep the historical provenance shape while the richer Build contract
+        # is exposed alongside it. This is metadata, not an availability claim.
+        result['catalog_metadata'] = {
+            'source': 'nvidia_build.com',
+            'build_access': 'downloadable',
+            'provider_catalog_presence': 'not_listed_at_reconciliation',
+            'runtime_contract': 'explicit_native_genai_endpoint',
+            'runtime_endpoint': 'https://ai.api.nvidia.com/v1/genai/{model}',
+        }
     return result
 
 
 def build_catalog(model_ids: List[str], base_llm: str = NVIDIA_BASE_URL,
                   base_genai: str = NVIDIA_GENAI_URL) -> List[dict]:
-    """Build full catalog from cached model IDs + curated GenAI models."""
+    """Build the reconciled NVIDIA catalog.
+
+    Build is authoritative for the current NIM surface.  The hosted provider
+    list remains an observation used by the server to annotate each Build row;
+    it is not allowed to delete a Downloadable/native entry.  The small
+    fallback keeps isolated unit callers that pass an ad-hoc list compatible.
+    """
+    supplied = [str(x) for x in (model_ids or []) if x]
+    use_build = bool(BUILD_MODEL_IDS) and (
+        len(supplied) >= 20 or any(x in BUILD_CONTRACTS for x in supplied)
+    )
+    ids = list(BUILD_MODEL_IDS) if use_build else supplied
+    if not use_build:
+        ids.extend(x for x in CURATED_GENAI if x not in ids)
     seen = set()
     out = []
-
-    for mid in model_ids:
+    for mid in ids:
         if not mid or mid in seen:
             continue
         seen.add(mid)
@@ -503,17 +702,6 @@ def build_catalog(model_ids: List[str], base_llm: str = NVIDIA_BASE_URL,
         if mid in RETIRED_MODELS:
             d['availability'] = RETIRED_MODELS[mid]
         out.append(d)
-
-    for mid in CURATED_GENAI:
-        if mid in seen:
-            continue
-        seen.add(mid)
-        d = describe(mid, base_llm, base_genai)
-        d['source'] = 'curated'
-        if mid in RETIRED_MODELS:
-            d['availability'] = RETIRED_MODELS[mid]
-        out.append(d)
-
     return out
 
 

@@ -23,7 +23,7 @@ def test_flux_3_is_explicitly_curated_on_native_genai_surface():
 
 def test_flux_3_probe_does_not_use_generic_chat_or_downloadable_assumption():
     spec = _probe_spec("black-forest-labs/flux-3-image-klein")
-    assert spec["endpoint"] == "/v1/genai/black-forest-labs/flux-3-image-klein"
+    assert spec["endpoint"] == "/v1/genai/black-forest-labs/flux.3-image-klein"
     assert spec["body"] == {
         "prompt": "health check",
         "width": 1024,

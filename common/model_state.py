@@ -260,17 +260,25 @@ class ModelStateStore:
             finally:
                 conn.close()
 
-    def context_observations(self, model_id: str) -> list[dict]:
+    def context_observations_map(self) -> dict[str, list[dict]]:
+        """Return non-expired context observations for all models in one query."""
         conn = self._connect()
         try:
-            rows = conn.execute('''SELECT account_scope,endpoint,limits_json,checked_at,expires_at
-                FROM model_context_observations WHERE provider=? AND model_id=? AND expires_at>?''',
-                (self.provider, model_id, time.time())).fetchall()
-            return [{**dict(row), 'limits': json.loads(row['limits_json']),
-                     'source': 'upstream_context_error', 'scope': 'account_endpoint'}
-                    for row in rows]
+            rows = conn.execute('''SELECT model_id,account_scope,endpoint,limits_json,checked_at,expires_at
+                FROM model_context_observations WHERE provider=? AND expires_at>?''',
+                (self.provider, time.time())).fetchall()
+            grouped: dict[str, list[dict]] = {}
+            for row in rows:
+                item = {**dict(row), 'limits': json.loads(row['limits_json']),
+                        'source': 'upstream_context_error', 'scope': 'account_endpoint'}
+                grouped.setdefault(str(row['model_id']), []).append(item)
+            return grouped
         finally:
             conn.close()
+
+    def context_observations(self, model_id: str) -> list[dict]:
+        """Return non-expired context observations for one model."""
+        return self.context_observations_map().get(str(model_id), [])
 
     def catalog_age_sec(self) -> Optional[float]:
         conn = self._connect()
@@ -420,6 +428,39 @@ class ModelStateStore:
     async def upsert_catalog_async(self, *args, **kwargs) -> list[str]:
         """Run catalog persistence off the wrapper event loop."""
         return await asyncio.to_thread(self.upsert_catalog, *args, **kwargs)
+
+    def status_rows_since(self, since: float = 0.0) -> dict[str, list[dict[str, Any]]]:
+        """Return raw current-epoch observations grouped by model in one query.
+
+        Contract-aware dashboard callers need to discard pre-audit rows before
+        collapsing account/endpoint conflicts. Fetching all current rows at
+        once avoids opening one SQLite connection per Build row on every
+        ``/v1/models`` request.
+        """
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT * FROM model_account_status
+                   WHERE provider=? AND checked_at>=?
+                   ORDER BY checked_at DESC""",
+                (self.provider, float(since or 0.0)),
+            ).fetchall()
+            grouped: dict[str, list[dict[str, Any]]] = {}
+            for row in rows:
+                grouped.setdefault(str(row["model_id"]), []).append(dict(row))
+            return grouped
+        finally:
+            conn.close()
+
+    def status_rows_for(self, model_id: str, since: float = 0.0) -> list[dict[str, Any]]:
+        """Return raw scoped observations for one model, newest first.
+
+        Contract-aware callers need to discard pre-audit rows before collapsing
+        account/endpoint conflicts. ``effective_status_for`` intentionally
+        answers the general multi-key question and can otherwise let an old
+        successful generic route mask a fresh native-contract failure.
+        """
+        return self.status_rows_since(since).get(str(model_id), [])
 
     def status_map(self, account_scope: str | None = None,
                    endpoint: str | None = None) -> dict[str, dict[str, Any]]:
