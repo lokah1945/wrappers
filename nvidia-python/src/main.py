@@ -112,7 +112,12 @@ except ImportError:
 from common.model.context_probe import ContextProbeService, ProbeOutcome
 from common.model.metadata import merge_observed_context, positive_int
 from common.nim_metadata import NimMetadataRegistry, public_metadata
-from common.nvidia_build_catalog import BUILD_MODEL_IDS, get_build_contract
+from common.nvidia_build_catalog import (
+    BUILD_MODEL_IDS,
+    apply_build_website_catalog,
+    get_build_contract,
+)
+from common.nvidia_build_web_catalog import NvidiaBuildWebCatalogRegistry
 
 try:
     from watchdog.observers import Observer
@@ -1945,6 +1950,9 @@ class Server:
         self.nim_metadata_registry: NimMetadataRegistry | None = None
         self._nim_metadata_map: dict[str, dict] = {}
         self._nim_metadata_hardware: dict = {}
+        # The Build website is a live lower-bound catalog. Its snapshot is
+        # independent from NGC metadata and runtime account observations.
+        self.build_web_catalog_registry: NvidiaBuildWebCatalogRegistry | None = None
 
     def _context_observations_for(self, model_id: str) -> list[dict]:
         now = time.monotonic()
@@ -1966,6 +1974,11 @@ class Server:
             'build_url': row.get('build_url'),
             'api_reference': row.get('api_reference'),
             'downloadable': bool(row.get('downloadable')),
+            'download_available': bool(row.get('download_available', row.get('downloadable'))),
+            'free_endpoint': bool(row.get('free_endpoint')),
+            'partner_endpoint': bool(row.get('partner_endpoint')),
+            'website_listed': bool(row.get('website_listed')),
+            'website_access_modes': list(row.get('website_access_modes') or []),
             'hosted_function': bool(row.get('hosted_function')),
             'contract_kind': contract.get('kind'),
             'contract_verification': contract.get('verification'),
@@ -2008,6 +2021,33 @@ class Server:
             result['build'] = self._nim_build_summary(model_id)
             result.update(build_access_metadata(model_id))
         return result
+
+    async def _refresh_build_web_catalog_once(self, *, force: bool = False) -> None:
+        registry = self.build_web_catalog_registry
+        if registry is None or not registry.enabled:
+            return
+        rows = await registry.refresh(force=force)
+        # A failed refresh returns the last-good cache. Applying it is safe and
+        # keeps the website lower bound from shrinking during an outage.
+        if rows:
+            apply_build_website_catalog(rows)
+            try:
+                self._sync_context_catalog()
+            except Exception as exc:
+                logger.warning('[build-web-catalog] context sync failed: %s', type(exc).__name__)
+
+    async def _build_web_catalog_loop(self):
+        registry = self.build_web_catalog_registry
+        if registry is None or not registry.enabled:
+            return
+        while True:
+            try:
+                await self._refresh_build_web_catalog_once(force=False)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('[build-web-catalog] refresh loop failed: %s', type(exc).__name__)
+            await asyncio.sleep(registry.refresh_sec)
 
     async def _refresh_nim_metadata_once(self, *, force: bool = False) -> None:
         registry = self.nim_metadata_registry
@@ -2118,6 +2158,19 @@ class Server:
         result['is_build_candidate'] = build_candidate
         result['build_catalog_listed'] = build_candidate
         result['provider_catalog_listed'] = bool(provider_model_id)
+        if not build_candidate and provider_model_id:
+            # Backend-only rows are additive only after their positive account
+            # observation; retain their provenance and make catalog usability
+            # explicit without inventing website badges or capabilities.
+            result['backend_only'] = True
+            result['catalog_source'] = 'backend_provider'
+            result['website_listed'] = False
+            result['catalog_usable'] = (
+                result.get('availability_state') == 'available'
+                and result.get('available') is not False
+            )
+            if result['catalog_usable']:
+                result['usability_state'] = 'backend_verified'
         if build_candidate:
             access_metadata_builder = globals().get('build_access_metadata')
             if callable(access_metadata_builder):
@@ -2253,6 +2306,23 @@ class Server:
         self._agent = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS)
         self._session = aiohttp.ClientSession(connector=self._agent)
         self.pool.set_external_session(self._session)
+
+        # Build website access labels/counts are a live lower-bound catalog,
+        # separate from the NGC metadata API and account runtime observations.
+        # Load last-good cache first, then perform a bounded refresh so the
+        # first public discovery response reflects the current website when it
+        # is reachable. A failed refresh never shrinks the checked-in surface.
+        self.build_web_catalog_registry = NvidiaBuildWebCatalogRegistry(
+            self._session,
+            cache_file=os.environ.get(
+                'NVIDIA_BUILD_WEB_CATALOG_CACHE_FILE',
+                str(Path(__file__).resolve().parents[1] / 'build-web-catalog-cache.json')))
+        apply_build_website_catalog(self.build_web_catalog_registry.rows())
+        try:
+            await self._refresh_build_web_catalog_once(force=True)
+        except Exception as exc:
+            logger.warning('[build-web-catalog] initial refresh failed: %s', type(exc).__name__)
+
         self._nim_metadata_hardware = _nim_target_hardware()
         self.nim_metadata_registry = NimMetadataRegistry(
             self._session,
@@ -2339,6 +2409,8 @@ class Server:
         # request serving or converting missing metadata into unavailability.
         self._nim_metadata_map = self.nim_metadata_registry.snapshot()
         self._bg_tasks.append(asyncio.create_task(self._nim_metadata_loop()))
+        if self.build_web_catalog_registry and self.build_web_catalog_registry.enabled:
+            self._bg_tasks.append(asyncio.create_task(self._build_web_catalog_loop()))
 
         self.registry.start()
 
@@ -2651,6 +2723,12 @@ class Server:
                                      'source': 'ngc_nim_metadata_api',
                                      'entries': 0,
                                  }),
+                'build_web_catalog': (self.build_web_catalog_registry.status()
+                                      if self.build_web_catalog_registry else {
+                                          'enabled': False,
+                                          'source': 'https://build.nvidia.com/models',
+                                          'entries': 0,
+                                      }),
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
             }
@@ -2875,6 +2953,12 @@ class Server:
                 'visible_count': len(data),
                 'access_filter': access_filter,
                 'source': 'nvidia_build_and_ngc_nim_metadata',
+                'website_catalog': (self.build_web_catalog_registry.status()
+                                    if self.build_web_catalog_registry else {
+                                        'enabled': False,
+                                        'source': 'https://build.nvidia.com/models',
+                                        'entries': 0,
+                                    }),
                 'sync': (self.nim_metadata_registry.status()
                          if self.nim_metadata_registry else {
                              'enabled': False,
@@ -2969,40 +3053,58 @@ class Server:
                         # mismatches are not proof of availability or death.
                         # Omit the boolean rather than fabricating one.
                         e.pop('available', None)
-            # Keep this local as well as in the shared helper: the discovery
-            # route is exercised in isolation by the contract tests.
-            query_visibility = (
-                str(request.query_params.get('availability', 'available') or 'available').strip().lower()
-                if request is not None else 'all'
-            )
-            dashboard_probe = request is not None and request.headers.get('x-wrapper-dashboard', '') == '1'
-            visibility = ('all' if request is None else
-                          ('all' if dashboard_probe and query_visibility in {'all', 'show_all', 'any'}
-                           else 'available'))
-            available_entries = [entry for entry in enriched
-                                 if isinstance(entry, dict)
-                                 and entry.get('availability_state') == 'available'
+            # The public default is the catalog union: all current website
+            # rows plus additive backend rows. ``availability=available`` is
+            # the explicit runtime-only view. Keep an AST-isolated fallback
+            # for contract tests that execute this handler without module
+            # globals.
+            visibility_getter = globals().get('requested_model_visibility')
+            visibility = (visibility_getter(request)
+                          if callable(visibility_getter)
+                          else 'catalog')
+            # Public catalog union: every Build/website row plus only
+            # backend/provider-only rows with a positive runtime observation.
+            # A provider listing alone must not inflate the public "available"
+            # surface, while a website row is retained even when deployment is
+            # required or its account observation is still unknown.
+            catalog_entries = [entry for entry in enriched
+                               if isinstance(entry, dict)
+                               and (entry.get('build_catalog_listed')
+                                    or (entry.get('availability_state') == 'available'
+                                        and entry.get('available') is not False))]
+            available_entries = [entry for entry in catalog_entries
+                                 if entry.get('availability_state') == 'available'
                                  and entry.get('available') is not False]
-            catalog_count = len(enriched)
+            catalog_count = len(catalog_entries)
             available_count = len(available_entries)
+            website_entries = [entry for entry in catalog_entries if entry.get('website_listed')]
+            backend_only_available = [entry for entry in catalog_entries
+                                      if not entry.get('build_catalog_listed')
+                                      and entry.get('availability_state') == 'available'
+                                      and entry.get('available') is not False]
+            website_access_counts = {
+                'free_endpoint': sum(1 for entry in website_entries if entry.get('free_endpoint')),
+                'partner_endpoint': sum(1 for entry in website_entries if entry.get('partner_endpoint')),
+                'download_available': sum(1 for entry in website_entries if entry.get('download_available')),
+            }
             access_filter_getter = globals().get('requested_access_filter')
             access_filter = (access_filter_getter(request)
                              if callable(access_filter_getter) and request is not None else None)
             if access_filter is not None:
                 # NVIDIA Build-style access filters intentionally show the
                 # complete matching catalog, including deployment-required
-                # Downloadable rows. Runtime availability remains explicit in
-                # each row and is never fabricated by this catalog view.
-                visible = filter_access_models(enriched, access_filter)
+                # Download Available rows. Runtime availability remains
+                # explicit in each row and is never fabricated by this view.
+                visible = filter_access_models(catalog_entries, access_filter)
                 effective_visibility = 'catalog'
             else:
-                visible = list(enriched) if visibility == 'all' else available_entries
+                visible = list(catalog_entries) if visibility in {'all', 'catalog'} else available_entries
                 effective_visibility = visibility
 
             # Dynamic aliases are only exposed in the default list when their
             # concrete target is itself currently available.
             tgt = get_dynamic_alias_target()
-            if access_filter is None and tgt and (visibility == 'all' or any(e.get('id') == tgt for e in visible)):
+            if access_filter is None and tgt and (visibility in {'all', 'catalog'} or any(e.get('id') == tgt for e in visible)):
                 seen = {e.get('id') for e in visible}
                 for alias in ('haiku', 'sonnet', 'opus'):
                     if alias not in seen:
@@ -3012,7 +3114,15 @@ class Server:
                             'availability_state': 'available', 'available': True,
                         })
             return {'object': 'list', 'data': visible,
-                    'catalog_count': catalog_count, 'available_count': available_count,
+                    'catalog_count': catalog_count,
+                    # Backward-compatible runtime count plus explicit names
+                    # so catalog usability cannot be mistaken for live health.
+                    'available_count': available_count,
+                    'runtime_available_count': available_count,
+                    'catalog_usable_count': len([entry for entry in catalog_entries if entry.get('catalog_usable')]),
+                    'website_catalog_count': len(website_entries),
+                    'website_access_counts': website_access_counts,
+                    'backend_only_available_count': len(backend_only_available),
                     'visible_count': len(visible),
                     'availability_filter': effective_visibility,
                     'access_filter': access_filter,
@@ -4847,10 +4957,19 @@ _ACCESS_FILTER_ALIASES = {
     'free_endpoint': 'free_endpoint',
     'free-endpoint': 'free_endpoint',
     'free endpoint': 'free_endpoint',
+    'partner': 'partner_endpoint',
+    'partner_endpoint': 'partner_endpoint',
+    'partner-endpoint': 'partner_endpoint',
+    'partner endpoint': 'partner_endpoint',
     'download': 'downloadable',
     'downloadable': 'downloadable',
+    'download_available': 'downloadable',
+    'download-available': 'downloadable',
+    'download available': 'downloadable',
     'self_hosted': 'downloadable',
     'self-hosted': 'downloadable',
+    # This is retained as a legacy/runtime-provider dimension. It is not the
+    # website's Partner Endpoint category.
     'hosted': 'hosted_endpoint',
     'hosted_endpoint': 'hosted_endpoint',
     'hosted-endpoint': 'hosted_endpoint',
@@ -4861,59 +4980,91 @@ _ACCESS_FILTER_ALIASES = {
 
 
 def build_access_metadata(model_id: str) -> dict:
-    """Expose NVIDIA Build-style access badges without claiming runtime health."""
+    """Expose live Build website access labels without claiming runtime health."""
     row = get_build_contract(model_id) or {}
     if not row:
         return {}
     contract = row.get('contract') or {}
+    website = row.get('website') if isinstance(row.get('website'), dict) else {}
+    website_listed = bool(row.get('website_listed') or website.get('website_listed'))
+
+    # For a current website row these flags come from the live nimType labels.
+    # For a static/backend fallback they retain the checked-in contract flags.
     free_endpoint = bool(row.get('free_endpoint'))
-    downloadable = bool(row.get('downloadable'))
+    partner_endpoint = bool(row.get('partner_endpoint'))
+    download_available = bool(row.get('download_available', row.get('downloadable')))
+    downloadable = download_available  # compatibility spelling
     hosted_endpoint = bool(row.get('hosted_function'))
+
+    website_modes = list(row.get('website_access_modes') or website.get('website_access_modes') or [])
     modes = []
     if free_endpoint:
         modes.append('free_endpoint')
-    if downloadable:
-        modes.append('downloadable')
+    if partner_endpoint:
+        modes.append('partner_endpoint')
+    if download_available:
+        modes.extend(['download_available', 'downloadable'])
     if hosted_endpoint:
+        # Explicitly separate from Partner Endpoint. This remains useful to
+        # legacy consumers that need to know a provider function exists.
         modes.append('hosted_endpoint')
     if contract.get('kind') in ('grpc', 'riva') or contract.get('verification') == 'native_protocol':
         modes.append('native_protocol')
-    badges = [str(badge) for badge in (row.get('badges') or []) if str(badge)]
-    if free_endpoint and 'Free Endpoint' not in badges:
-        badges.append('Free Endpoint')
-    if downloadable and 'Downloadable' not in badges:
-        badges.append('Downloadable')
+
+    if website_listed:
+        badges = [str(badge) for badge in (row.get('access_badges') or website.get('access_badges') or []) if str(badge)]
+        for badge in ('Free Endpoint', 'Partner Endpoint', 'Download Available'):
+            if ((badge == 'Free Endpoint' and free_endpoint)
+                    or (badge == 'Partner Endpoint' and partner_endpoint)
+                    or (badge == 'Download Available' and download_available)) and badge not in badges:
+                badges.append(badge)
+    else:
+        badges = [str(badge) for badge in (row.get('badges') or []) if str(badge)]
+        if free_endpoint and 'Free Endpoint' not in badges:
+            badges.append('Free Endpoint')
+        if download_available and 'Downloadable' not in badges and 'Download Available' not in badges:
+            badges.append('Downloadable')
+
     verification = str(contract.get('verification') or '')
-    if verification == 'hosted_contract':
+    if website_listed and (not contract or verification == 'contract_unverified'):
+        usability_state = 'contract_unverified'
+    elif verification == 'hosted_contract':
         usability_state = 'hosted_contract'
-    elif downloadable and verification == 'deployment_required':
+    elif download_available and verification == 'deployment_required':
         usability_state = 'downloadable_requires_deployment'
     elif 'native_protocol' in modes:
         usability_state = 'native_protocol'
-    elif downloadable:
+    elif download_available:
         usability_state = 'downloadable'
     else:
         usability_state = 'documented_contract'
+
     return {
+        'website_listed': website_listed,
+        'website_source': row.get('website_source') or website.get('website_source'),
+        'website_access_modes': list(dict.fromkeys(website_modes)),
+        'website_badges': list(row.get('website_badges') or website.get('website_badges') or []),
+        'website_publisher': row.get('publisher') or website.get('publisher'),
+        'use_cases': list(row.get('use_cases') or website.get('use_cases') or []),
+        'inference_providers': list(row.get('inference_providers') or website.get('inference_providers') or []),
+        'nim_container_gpus': list(row.get('nim_container_gpus') or website.get('nim_container_gpus') or []),
         'free_endpoint': free_endpoint,
+        'partner_endpoint': partner_endpoint,
+        'download_available': download_available,
         'downloadable': downloadable,
         'hosted_endpoint': hosted_endpoint,
         'access_modes': list(dict.fromkeys(modes)),
         'access_badges': badges,
         'usability_state': usability_state,
-        # This means a documented access/deployment contract exists. It is
-        # intentionally different from runtime ``available``.
-        'catalog_usable': bool(contract),
+        # Website publication itself is sufficient for catalog usability. It
+        # does not set runtime ``available``; that remains account/deployment
+        # scoped and is joined by _enrich_model_metadata.
+        'catalog_usable': bool(website_listed or contract),
     }
 
 
 def requested_access_filter(request: Request) -> str | None:
-    """Normalize NVIDIA Build-style access filters.
-
-    An explicit access filter opts into the complete matching catalog. Runtime
-    availability remains visible per row; the filter must not turn a
-    deployment-required NIM into ``available=true``.
-    """
+    """Normalize NVIDIA Build website access filters and compatibility aliases."""
     raw = (request.query_params.get('access') or
            request.query_params.get('mode') or
            request.query_params.get('filter') or '').strip().lower()
@@ -4925,29 +5076,32 @@ def requested_access_filter(request: Request) -> str | None:
 def filter_access_models(entries: list[dict], access: str | None) -> list[dict]:
     if access in (None, 'all'):
         return list(entries)
+    for_entry = {
+        'downloadable': {'downloadable', 'download_available'},
+        'download_available': {'downloadable', 'download_available'},
+    }.get(access, {access})
     return [entry for entry in entries
             if isinstance(entry, dict)
-            and access in set(entry.get('access_modes') or [])]
-
+            and bool(set(entry.get('access_modes') or []) & for_entry)]
 
 def requested_model_visibility(request: Request) -> str:
-    """Return the public model-list view requested by a client.
+    """Return the requested model surface.
 
-    The safe/default view contains only models with an observed available
-    state. Internal dashboards may request ``availability=all`` to render the
-    diagnostic view; this never changes the default client catalog.
+    ``catalog`` is the default: the official Build website lower bound plus
+    additive backend/provider rows is public even when a row is deployment
+    required or its account observation is still unknown.  Clients that need
+    only a currently observed runtime can request ``availability=available``.
     """
-    value = str(request.query_params.get('availability', 'available') or 'available').strip().lower()
-    # The all-model diagnostic view is for the unified dashboard's internal
-    # read probe. Public wrapper clients always receive the safe available-only
-    # model list, even if they add an availability query parameter.
-    dashboard_probe = request.headers.get('x-wrapper-dashboard', '') == '1'
-    return 'all' if dashboard_probe and value in {'all', 'show_all', 'any'} else 'available'
-
+    raw = str(request.query_params.get('availability', '') or '').strip().lower()
+    if raw in {'available', 'runtime', 'runtime_available'}:
+        return 'available'
+    if raw in {'all', 'catalog', 'website', 'show_all', 'any'}:
+        return 'catalog'
+    return str(os.environ.get('NVIDIA_MODELS_DEFAULT_VISIBILITY', 'catalog') or 'catalog').strip().lower() or 'catalog'
 
 def filter_available_models(entries: list[dict], visibility: str = 'available') -> list[dict]:
-    """Filter catalog rows without turning unknown/transient states into OK."""
-    if visibility == 'all':
+    """Filter runtime rows without turning unknown/transient states into OK."""
+    if visibility in {'all', 'catalog'}:
         return list(entries)
     return [entry for entry in entries
             if isinstance(entry, dict)

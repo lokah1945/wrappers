@@ -98,3 +98,6 @@ runtime/
 
 # Public NGC NIM metadata sync cache (runtime artifact)
 nvidia-python/nim-metadata-cache.json
+
+# Live NVIDIA Build website catalog snapshot (runtime artifact)
+nvidia-python/build-web-catalog-cache.json

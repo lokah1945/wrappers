@@ -655,9 +655,54 @@ def _build_contract_descriptor(model_id: str, base_llm: str,
     }
 
 
+def _unverified_build_descriptor(model_id: str, row: dict) -> dict:
+    """Describe a newly listed website row without inventing an endpoint.
+
+    The live Build index can publish a model before this wrapper has captured
+    its model-specific API reference. Keep it in the catalog and expose the
+    official Build URL/access labels, but leave route/capability support
+    explicitly unknown until the exact contract is synchronized.
+    """
+    contract = row.get('contract') or {}
+    website = row.get('website') or {}
+    return {
+        'id': model_id,
+        'source': 'nvidia_build.com',
+        'type': 'unknown',
+        'input': [],
+        'output': [],
+        'capabilities': [],
+        'endpoints': [],
+        'streaming': None,
+        'supported_params': {},
+        'build_metadata': {
+            'build_url': row.get('build_url'),
+            'title': row.get('title'),
+            'badges': list(row.get('badges') or []),
+            'website_badges': list(row.get('website_badges') or []),
+            'free_endpoint': bool(row.get('free_endpoint')),
+            'partner_endpoint': bool(row.get('partner_endpoint')),
+            'download_available': bool(row.get('download_available')),
+            'downloadable': bool(row.get('downloadable')),
+            'contract_kind': contract.get('kind'),
+            'contract_verification': contract.get('verification', 'contract_unverified'),
+            'contract_source': row.get('build_url'),
+            'website_listed': bool(row.get('website_listed')),
+            'website_metadata': dict(website) if isinstance(website, dict) else {},
+        },
+    }
+
+
 def describe(model_id: str, base_llm: str = NVIDIA_BASE_URL,
              base_genai: str = NVIDIA_GENAI_URL) -> dict:
     """Full model descriptor with the exact Build/NIM route when known."""
+    build_row = get_build_contract(model_id)
+    build_contract = (build_row or {}).get('contract') or {}
+    if build_row and (
+        build_contract.get('verification') == 'contract_unverified'
+        or build_contract.get('kind') == 'website_catalog'
+    ):
+        return _unverified_build_descriptor(model_id, build_row)
     build_desc = _build_contract_descriptor(model_id, base_llm, base_genai)
     result = build_desc or _resolve_hosts(classify(model_id), base_llm, base_genai)
     metadata = CURATED_CATALOG_METADATA.get(model_id)
@@ -686,11 +731,16 @@ def build_catalog(model_ids: List[str], base_llm: str = NVIDIA_BASE_URL,
     fallback keeps isolated unit callers that pass an ad-hoc list compatible.
     """
     supplied = [str(x) for x in (model_ids or []) if x]
-    use_build = bool(BUILD_MODEL_IDS) and (
-        len(supplied) >= 20 or any(x in BUILD_CONTRACTS for x in supplied)
-    )
+    # The live/checked-in Build surface is always the lower bound, even when
+    # the hosted provider refresh is empty or temporarily unavailable.
+    use_build = bool(BUILD_MODEL_IDS)
     ids = list(BUILD_MODEL_IDS) if use_build else supplied
-    if not use_build:
+    if use_build:
+        # The official Build index is the lower bound.  Provider/backend-only
+        # models are additive and remain visible when they are present in the
+        # refreshed backend catalog; provider omission never deletes Build.
+        ids.extend(x for x in supplied if x not in ids)
+    else:
         ids.extend(x for x in CURATED_GENAI if x not in ids)
     seen = set()
     out = []
