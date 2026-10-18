@@ -657,8 +657,16 @@
       </div>
     </div>
 
-    <div class="sec">Full Model Catalog
+    <div class="sec">Models
       <span class="sec-sub">live status, last checked</span>
+    </div>
+    <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:0 0 10px">
+      <label for="model-visibility" style="font-size:11px;color:var(--muted)">Display</label>
+      <select id="model-visibility" class="wbtn" style="min-width:150px">
+        <option value="available">Available (default)</option>
+        <option value="all">Show all</option>
+      </select>
+      <span id="model-visibility-note" style="font-size:11px;color:var(--muted)">Only currently available models are shown.</span>
     </div>
     <input type="text" class="search-input" id="mod-search"
            placeholder="Filter models by id, state, or status code…" style="margin-bottom: 10px; width: 100%">
@@ -858,6 +866,7 @@ const X_ICON_SVG          = SVG_WRAP('<path d="M18 6 6 18M6 6l12 12"/>', 12);
 
 let WINDOW = '24h';
 let ACTIVE_TAB = 'overview';
+let MODEL_VISIBILITY = 'available';
 let _modelsCatalog = [];
 let _modelStatusStates = {};
 let _keyData = [];
@@ -1018,6 +1027,14 @@ function modelAllowedByPolicy(model, service) {
   if (modelHasFreeSuffix(model)) return true;
   return false;
 }
+function modelIsAvailable(model) {
+  if (!model || typeof model !== 'object') return false;
+  const state=String(model.availability_state || model.live_status || model.state || '').toLowerCase();
+  return state === 'available' || model.available === true;
+}
+function modelAllowedByVisibility(model) {
+  return MODEL_VISIBILITY === 'all' || modelIsAvailable(model);
+}
 function auxiliaryModelMap(snapshot) {
   const models=snapshot && snapshot.model_planes && snapshot.model_planes.model_fetcher && snapshot.model_planes.model_fetcher.models || [];
   const byId=new Map();
@@ -1048,7 +1065,9 @@ function enrichAuxiliaryModel(model, snapshot) {
 }
 function filteredServiceModels(service) {
   const raw=service && service.telemetry && Array.isArray(service.telemetry.models) ? service.telemetry.models : [];
-  return raw.map(model=>enrichAuxiliaryModel(model,UNIFIED_SNAPSHOT)).filter(model=>modelAllowedByPolicy(model,service));
+  return raw.map(model=>enrichAuxiliaryModel(model,UNIFIED_SNAPSHOT))
+    .filter(model=>modelAllowedByPolicy(model,service))
+    .filter(model=>modelAllowedByVisibility(model));
 }
 function serviceView(service) {
   if (service && !service.telemetry && service.models && service.health && service.stats) return service;
@@ -1540,8 +1559,9 @@ function modelMeta(m) {
 }
 
 async function loadModels() {
-  // Full catalog (/v1/models) is the base list — the dashboard must show
-  // EVERY model the wrapper serves. /metrics/models only contains models
+  // The backend supplies the all-model diagnostic feed; the selected
+  // visibility control decides whether this dashboard renders only available
+  // rows or the full diagnostic catalog. /metrics/models only contains models
   // that received traffic; it enriches rows with usage stats instead of
   // shrinking the list.
   const perModel = await apiFetchSafe('/metrics/models?window=' + WINDOW);
@@ -1878,6 +1898,10 @@ async function loadModels() {
   });
   const counts={available:0,unknown:0,errored:0}; for(const r of rows){if(r.state==='available')counts.available++;else if(r.state==='errored'||r.state==='error')counts.errored++;else counts.unknown++;}
   $('mod-catalog').textContent=rows.length||'—';$('mod-available').textContent=counts.available;$('mod-unknown').textContent=counts.unknown;$('mod-errored').textContent=counts.errored;$('tab-models-count').textContent=rows.length;
+  const visibilityControl=$('model-visibility');
+  if(visibilityControl) visibilityControl.value=MODEL_VISIBILITY;
+  const visibilityNote=$('model-visibility-note');
+  if(visibilityNote) visibilityNote.textContent=MODEL_VISIBILITY==='all'?'Showing all catalog rows, including unavailable diagnostics.':'Only currently available models are shown.';
   renderDonut('mod-donut-segs','mod-donut-legend','mod-donut-total',[{key:'available',label:'Available',value:counts.available},{key:'unknown',label:'Unknown',value:counts.unknown},{key:'errored',label:'Errored',value:counts.errored}]);
   _modelsTableData=rows; renderModelsTable();
 }
@@ -1956,6 +1980,7 @@ async function refreshUnifiedFallback(){if(unifiedStreamConnected)return;try{awa
   const tokenInput=$('global-token');try{tokenInput.value=sessionStorage.getItem(TOKEN_STORAGE_KEY)||'';}catch{}
   $('global-token-save').addEventListener('click',()=>{try{const t=tokenInput.value.trim();if(t)sessionStorage.setItem(TOKEN_STORAGE_KEY,t);else sessionStorage.removeItem(TOKEN_STORAGE_KEY);}catch{};unifiedStreamConnected=false;connectSSE();});
   $('wrapper-select').addEventListener('change',async e=>{SELECTED_WRAPPER=e.target.value;updateUnifiedHeader();await refresh();window.scrollTo({top:0,behavior:'smooth'});});
+  $('model-visibility').addEventListener('change',async e=>{MODEL_VISIBILITY=e.target.value==='all'?'all':'available';await refresh();});
   // The legacy time-window buttons are intentionally replaced by the server's
   // bounded 24h snapshot label; all providers share this same contract.
   await refreshUnifiedFallback();

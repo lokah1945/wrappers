@@ -300,7 +300,7 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
         response = None
         try:
             async with application.state.poll_slots:
-                probe_headers = {"Accept": "application/json"}
+                probe_headers = {"Accept": "application/json", "X-Wrapper-Dashboard": "1"}
                 probe_headers.update(headers or {})
                 response = await application.state.http.get(
                     f"http://127.0.0.1:{port}{path}", allow_redirects=False,
@@ -325,8 +325,8 @@ def create_app(repo: Path = ROOT, *, session_factory=None) -> FastAPI:
             probe(name, port, "/health", headers),
             probe(name, port, "/ready", headers),
             probe(name, port, "/stats", headers),
-            probe(name, port, "/v1/models", headers, limit=2 * 1024 * 1024),
-            probe(name, port, "/v1/capabilities", headers, limit=2 * 1024 * 1024),
+            probe(name, port, "/v1/models?availability=all", headers, limit=2 * 1024 * 1024),
+            probe(name, port, "/v1/capabilities?availability=all", headers, limit=2 * 1024 * 1024),
             probe(name, port, "/metrics/models", headers, limit=1024 * 1024),
             probe(name, port, "/metrics/activity?limit=50", headers, limit=512 * 1024),
             probe(name, port, "/metrics/chart/hourly?hours=24", headers, limit=512 * 1024),

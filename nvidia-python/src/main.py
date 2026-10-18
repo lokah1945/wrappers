@@ -2424,9 +2424,14 @@ class Server:
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
+            visibility = requested_model_visibility(request)
+            visible = filter_available_models(enriched, visibility)
             return {
-                'object': 'list', 'models': enriched,
-                'summary': summarize(catalog),
+                'object': 'list', 'models': visible,
+                'summary': summarize(visible),
+                'catalog_count': len(enriched),
+                'available_count': len(filter_available_models(enriched)),
+                'availability_filter': visibility,
                 'hosts': {'llm': BASE_LLM, 'genai': BASE_GENAI, 'nvcf': BASE_NVCF},
             }
 
@@ -2473,17 +2478,40 @@ class Server:
                         # mismatches are not proof of availability or death.
                         # Omit the boolean rather than fabricating one.
                         e.pop('available', None)
-            # Dynamic aliases: expose short names bound to current concrete target (if any)
+            # Keep this local as well as in the shared helper: the discovery
+            # route is exercised in isolation by the contract tests.
+            query_visibility = (
+                str(request.query_params.get('availability', 'available') or 'available').strip().lower()
+                if request is not None else 'all'
+            )
+            dashboard_probe = request is not None and request.headers.get('x-wrapper-dashboard', '') == '1'
+            visibility = ('all' if request is None else
+                          ('all' if dashboard_probe and query_visibility in {'all', 'show_all', 'any'}
+                           else 'available'))
+            available_entries = [entry for entry in enriched
+                                 if isinstance(entry, dict)
+                                 and entry.get('availability_state') == 'available'
+                                 and entry.get('available') is not False]
+            catalog_count = len(enriched)
+            available_count = len(available_entries)
+            visible = list(enriched) if visibility == 'all' else available_entries
+
+            # Dynamic aliases are only exposed in the default list when their
+            # concrete target is itself currently available.
             tgt = get_dynamic_alias_target()
-            if tgt:
-                seen = {e.get('id') for e in enriched}
+            if tgt and (visibility == 'all' or any(e.get('id') == tgt for e in visible)):
+                seen = {e.get('id') for e in visible}
                 for alias in ('haiku', 'sonnet', 'opus'):
                     if alias not in seen:
-                        enriched.append({
+                        visible.append({
                             'id': alias, 'object': 'model', 'owned_by': 'alias',
                             'rooted_model': tgt, 'dynamic_alias': True,
+                            'availability_state': 'available', 'available': True,
                         })
-            return {'object': 'list', 'data': enriched, 'dynamic_alias_target': tgt or None,
+            return {'object': 'list', 'data': visible,
+                    'catalog_count': catalog_count, 'available_count': available_count,
+                    'availability_filter': visibility,
+                    'dynamic_alias_target': tgt or None,
                     'free_only': True, 'free_policy': 'provider_inherent_free'}
 
         @app.get('/v1/models/{model_id:path}')
@@ -2494,11 +2522,11 @@ class Server:
             return self._enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/v1/engines')
-        async def engines_route():
+        async def engines_route(request: Request):
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
             status_list = self._model_status_view(await self.metrics.get_model_status())
             enriched = [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog]
-            return {'object': 'list', 'data': enriched}
+            return {'object': 'list', 'data': filter_available_models(enriched, requested_model_visibility(request))}
 
         @app.get('/v1/engines/{model_id:path}')
         async def engine_info(model_id: str):
@@ -2508,8 +2536,13 @@ class Server:
             return self._enrich_model_metadata(model_id, d, status_cap)
 
         @app.get('/api/tags')
-        async def api_tags():
+        async def api_tags(request: Request):
             catalog = build_catalog(self.pool.models_cached or [], BASE_LLM, BASE_GENAI)
+            status_list = self._model_status_view(await self.metrics.get_model_status())
+            catalog = filter_available_models(
+                [self._enrich_model_metadata(d['id'], d, status_list) for d in catalog],
+                requested_model_visibility(request),
+            )
             models = []
             for d in catalog:
                 mid = d['id']
@@ -4143,6 +4176,31 @@ class Server:
                     release_attempt()
 
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
+
+
+def requested_model_visibility(request: Request) -> str:
+    """Return the public model-list view requested by a client.
+
+    The safe/default view contains only models with an observed available
+    state. Internal dashboards may request ``availability=all`` to render the
+    diagnostic view; this never changes the default client catalog.
+    """
+    value = str(request.query_params.get('availability', 'available') or 'available').strip().lower()
+    # The all-model diagnostic view is for the unified dashboard's internal
+    # read probe. Public wrapper clients always receive the safe available-only
+    # model list, even if they add an availability query parameter.
+    dashboard_probe = request.headers.get('x-wrapper-dashboard', '') == '1'
+    return 'all' if dashboard_probe and value in {'all', 'show_all', 'any'} else 'available'
+
+
+def filter_available_models(entries: list[dict], visibility: str = 'available') -> list[dict]:
+    """Filter catalog rows without turning unknown/transient states into OK."""
+    if visibility == 'all':
+        return list(entries)
+    return [entry for entry in entries
+            if isinstance(entry, dict)
+            and entry.get('availability_state') == 'available'
+            and entry.get('available') is not False]
 
 
 def enrich_model_metadata(model_id: str, desc: dict, status: dict) -> dict:
