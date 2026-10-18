@@ -38,6 +38,9 @@ CURATED_GENAI = [
     'black-forest-labs/flux.1-kontext-dev',
     'black-forest-labs/flux.1-canny-dev',
     'black-forest-labs/flux.1-depth-dev',
+    # Build lists this model as Downloadable, but its NVIDIA GenAI endpoint
+    # is separately verified and is not present in the LLM /v1/models sweep.
+    'black-forest-labs/flux-3-image-klein',
     'black-forest-labs/flux.2-klein',
     # Image generation — Stability AI
     'stabilityai/stable-diffusion-3.5-large',
@@ -51,6 +54,19 @@ CURATED_GENAI = [
     # Audio generation
     'nvidia/fugatto',
 ]
+
+# Provenance for Build entries that are not part of the LLM model sweep.
+# This metadata intentionally does not claim runtime availability; the
+# account-scoped verifier/live response state remains authoritative.
+CURATED_CATALOG_METADATA: Dict[str, dict] = {
+    'black-forest-labs/flux-3-image-klein': {
+        'source': 'nvidia_build.com',
+        'build_access': 'downloadable',
+        'provider_catalog_presence': 'not_listed_at_reconciliation',
+        'runtime_contract': 'explicit_native_genai_endpoint',
+        'runtime_endpoint': 'https://ai.api.nvidia.com/v1/genai/{model}',
+    },
+}
 
 # ── Retired models ──────────────────────────────────────────────────────
 RETIRED_MODELS: Dict[str, str] = {}
@@ -179,6 +195,11 @@ CLASSIFICATION_RULES: List[Tuple[List[str], str, Optional[List[str]]]] = [
     # This hosted service is video analysis over NVIDIA Maxine gRPC, not a
     # REST video-generation or generic chat model.
     (['ai-synthetic-video-detector'], 'video_analysis', None),
+
+    # Llama Guard 4 is a multimodal chat-completions classifier. Its model
+    # card requires alternating user/assistant messages; keep the vision
+    # capability visible instead of treating it as generic text-only chat.
+    (['llama-guard-4-12b'], 'vision_chat', None),
 
     # Vision/Chat models with vision capabilities
     (['vila', 'neva', '-vision', 'vision-', 'paligemma', 'kosmos', 'llava', 'florence',
@@ -461,7 +482,11 @@ def _resolve_hosts(desc: dict, base_llm: str, base_genai: str) -> dict:
 def describe(model_id: str, base_llm: str = NVIDIA_BASE_URL,
              base_genai: str = NVIDIA_GENAI_URL) -> dict:
     """Full model descriptor with endpoints."""
-    return _resolve_hosts(classify(model_id), base_llm, base_genai)
+    result = _resolve_hosts(classify(model_id), base_llm, base_genai)
+    metadata = CURATED_CATALOG_METADATA.get(model_id)
+    if metadata:
+        result['catalog_metadata'] = dict(metadata)
+    return result
 
 
 def build_catalog(model_ids: List[str], base_llm: str = NVIDIA_BASE_URL,

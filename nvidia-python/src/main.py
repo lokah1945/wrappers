@@ -136,6 +136,30 @@ def _probe_spec(model_id: str) -> dict:
     string. That made embeddings look like 404s and document parsers look like
     400s even when the model was callable with its documented request shape.
     """
+    if model_id == "meta/llama-guard-4-12b":
+        # NVIDIA's Build/API schema requires a messages list whose roles
+        # alternate User/Assistant. Do not probe this classifier with the
+        # generic one-message health payload (or a made-up /v1/infer route).
+        user_text = "I forgot how to kill a process in Linux, can you help?"
+        assistant_text = (
+            "Sure! To kill a process in Linux, you can use the kill command "
+            "followed by the process ID of the process you want to terminate."
+        )
+        return {
+            "url": f"{BASE_LLM}/v1/chat/completions",
+            "endpoint": "/v1/chat/completions",
+            "body": {
+                "model": model_id,
+                "messages": [
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": assistant_text},
+                ],
+                "max_tokens": 5,
+                "stream": False,
+                "temperature": 0.2,
+                "top_p": 0.7,
+            },
+        }
     descriptor = classify(model_id)
     model_type = descriptor.get("type") if isinstance(descriptor, dict) else "chat"
     if model_type == "video_analysis":
@@ -210,6 +234,11 @@ def _probe_spec(model_id: str) -> dict:
                 body.update({"cfg_scale": 0, "mode": "base", "image": None, "steps": 4})
             elif "flux.1-dev" in model_id.lower():
                 body.update({"cfg_scale": 5, "mode": "base", "steps": 5})
+            elif "flux-3-image-klein" in model_id.lower():
+                # FLUX 3 Image Klein's documented/verified low-cost request
+                # uses 16 diffusion steps. The native endpoint accepted this
+                # exact body while the model was absent from /v1/models.
+                body.update({"steps": 16})
             else:
                 body.update({"steps": 5})
         elif model_type == "video":
@@ -1767,6 +1796,10 @@ class Server:
         from common.model.metadata import discovery_limits
         raw = self._context_catalog_entry(model_id)
         result = enrich_model_metadata(model_id, {**desc, **raw}, status)
+        # Keep provider-catalog presence separate from wrapper-curated rows.
+        # A curated GenAI entry can be callable without appearing in the
+        # provider's /v1/models response, but must not look provider-listed.
+        result['provider_catalog_listed'] = model_id in (self.pool.models_cached or [])
         result.update(discovery_limits(raw))
         # OpenAI discovery contract: every /v1/models entry carries
         # object/created/owned_by. Curated genai models never appear in the
@@ -2716,8 +2749,21 @@ class Server:
             if not model_id or not known or is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Image model {model_id or "(missing)"} is not available', 'type': 'invalid_request_error'}})
             native_body = dict(body)
-            for k in ['model', 'n', 'size', 'response_format', 'user', 'width', 'height']:
+            for k in ['model', 'n', 'size', 'response_format', 'user']:
                 native_body.pop(k, None)
+            # NVIDIA GenAI image schemas use native width/height. Preserve
+            # explicit values and translate the OpenAI size convenience field
+            # instead of silently dropping dimensions before proxying.
+            size = body.get('size')
+            if isinstance(size, str) and 'x' in size.lower():
+                try:
+                    width, height = (int(part) for part in size.lower().split('x', 1))
+                    native_body.setdefault('width', width)
+                    native_body.setdefault('height', height)
+                except (TypeError, ValueError):
+                    pass
+            if 'flux-3-image-klein' in model_id.lower():
+                native_body.setdefault('steps', 16)
             is_stability = any(x in model_id.lower() for x in ['stable-diffusion', 'sdxl', 'playground', 'kandinsky'])
             if is_stability:
                 native_body['text_prompts'] = [{'text': body.get('prompt', ''), 'weight': 1}]
@@ -2737,8 +2783,18 @@ class Server:
             if not model_id or not known or is_model_unavailable(model_id):
                 return JSONResponse(status_code=404, content={'error': {'message': f'Image model {model_id or "(missing)"} is not available', 'type': 'invalid_request_error'}})
             native_body = dict(body)
-            for k in ['model', 'n', 'size', 'response_format', 'user', 'width', 'height']:
+            for k in ['model', 'n', 'size', 'response_format', 'user']:
                 native_body.pop(k, None)
+            size = body.get('size')
+            if isinstance(size, str) and 'x' in size.lower():
+                try:
+                    width, height = (int(part) for part in size.lower().split('x', 1))
+                    native_body.setdefault('width', width)
+                    native_body.setdefault('height', height)
+                except (TypeError, ValueError):
+                    pass
+            if 'flux-3-image-klein' in model_id.lower():
+                native_body.setdefault('steps', 16)
             return await self._proxy_post(request, native_body, raw, model_id, '/v1/images/edits', lambda key: f"{BASE_GENAI}/v1/genai/{model_id}")
 
         @app.api_route('/{path:path}', methods=['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD'])
