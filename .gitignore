@@ -95,3 +95,6 @@ runtime/
 
 # Raw audit model dump (local artifact, regenerated on demand)
 .audit_models_raw.json
+
+# Public NGC NIM metadata sync cache (runtime artifact)
+nvidia-python/nim-metadata-cache.json

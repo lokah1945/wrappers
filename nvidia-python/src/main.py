@@ -111,6 +111,7 @@ except ImportError:
 
 from common.model.context_probe import ContextProbeService, ProbeOutcome
 from common.model.metadata import merge_observed_context, positive_int
+from common.nim_metadata import NimMetadataRegistry, public_metadata
 from common.nvidia_build_catalog import BUILD_MODEL_IDS, get_build_contract
 
 try:
@@ -131,7 +132,40 @@ _verify_cursor: int = 0
 # A contract audit changes the meaning of old probe observations. Until this
 # process records a fresh observation on the current Build route, persisted
 # pre-audit availability must not be advertised as verified.
-_BUILD_AUDIT_EPOCH: float = time.time()
+# Persisted observations remain eligible across a process restart when their
+# endpoint still matches the current Build contract. The endpoint check is the
+# audit boundary; a process-start timestamp would hide every last-good model
+# until the next scheduled sweep (VERIFY_ON_BOOT is intentionally optional).
+# Tests and an operator can still override this boundary when a contract audit
+# requires a fresh observation.
+_BUILD_AUDIT_EPOCH: float = 0.0
+
+
+def _nim_target_hardware() -> dict:
+    """Read optional operator-supplied target hardware without guessing.
+
+    NGC profiles describe compatibility, but the wrapper may not run on the
+    same host as the eventual NIM. Only explicit environment values are used;
+    missing hardware facts remain unknown.
+    """
+    result = {}
+    gpu_device = (os.environ.get('NVIDIA_NIM_TARGET_GPU_DEVICE') or '').strip()
+    if gpu_device:
+        result['gpu_device'] = gpu_device
+    gpu_count = (os.environ.get('NVIDIA_NIM_TARGET_GPU_COUNT') or '').strip()
+    if gpu_count.isdigit() and int(gpu_count) > 0:
+        result['gpu_count'] = int(gpu_count)
+    vram = (os.environ.get('NVIDIA_NIM_TARGET_VRAM_GB') or '').strip()
+    try:
+        if vram and float(vram) > 0:
+            result['vram_per_device_gb'] = float(vram)
+    except ValueError:
+        pass
+    driver = (os.environ.get('NVIDIA_NIM_TARGET_DRIVER_VERSION') or '').strip()
+    if driver:
+        result['driver_version'] = driver
+    return result
+
 
 def _contract_probe_url(contract: dict) -> str:
     """Resolve a documented Build server/path without changing the route."""
@@ -1906,6 +1940,11 @@ class Server:
         # short-lived snapshot per worker instead of opening one SQLite
         # connection for each of the 99 Build rows on every discovery request.
         self._context_observation_cache: tuple[float, dict[str, list[dict]]] = (0.0, {})
+        # Public NGC NIM metadata is an independent, cached layer. It enriches
+        # Build rows but never changes account/deployment availability.
+        self.nim_metadata_registry: NimMetadataRegistry | None = None
+        self._nim_metadata_map: dict[str, dict] = {}
+        self._nim_metadata_hardware: dict = {}
 
     def _context_observations_for(self, model_id: str) -> list[dict]:
         now = time.monotonic()
@@ -1917,6 +1956,85 @@ class Server:
                 observations = {}
             self._context_observation_cache = (now, observations)
         return observations.get(str(model_id), [])
+
+    @staticmethod
+    def _nim_build_summary(model_id: str) -> dict:
+        row = get_build_contract(model_id) or {}
+        contract = row.get('contract') or {}
+        return {
+            'id': model_id,
+            'build_url': row.get('build_url'),
+            'api_reference': row.get('api_reference'),
+            'downloadable': bool(row.get('downloadable')),
+            'hosted_function': bool(row.get('hosted_function')),
+            'contract_kind': contract.get('kind'),
+            'contract_verification': contract.get('verification'),
+            'deployment_path': contract.get('deployment_path'),
+        }
+
+    def _nim_entry(self, model_id: str) -> dict | None:
+        entry = self._nim_metadata_map.get(str(model_id))
+        if entry is not None:
+            return entry
+        if self.nim_metadata_registry is not None:
+            return self.nim_metadata_registry.get(str(model_id))
+        return None
+
+    def _nim_descriptor_metadata(self, model_id: str) -> dict:
+        entry = self._nim_entry(model_id)
+        if entry is None:
+            row = get_build_contract(model_id)
+            return {
+                'model_id': model_id,
+                'source': 'ngc_nim_metadata_api',
+                'metadata_status': 'pending' if self.nim_metadata_registry and self.nim_metadata_registry.enabled else 'disabled',
+                'build_downloadable': bool((row or {}).get('downloadable')),
+                'build': self._nim_build_summary(model_id),
+            }
+        result = public_metadata(entry, include_profiles=False,
+                                 hardware=self._nim_metadata_hardware) or {}
+        result['build'] = self._nim_build_summary(model_id)
+        return result
+
+    def _nim_full_metadata(self, model_id: str) -> dict:
+        entry = self._nim_entry(model_id)
+        if entry is None:
+            result = self._nim_descriptor_metadata(model_id)
+        else:
+            result = public_metadata(entry, include_profiles=True,
+                                     hardware=self._nim_metadata_hardware) or {}
+            result['build'] = self._nim_build_summary(model_id)
+        return result
+
+    async def _refresh_nim_metadata_once(self, *, force: bool = False) -> None:
+        registry = self.nim_metadata_registry
+        if registry is None or not registry.enabled:
+            return
+        rows = [get_build_contract(model_id) or {'id': model_id}
+                for model_id in BUILD_MODEL_IDS]
+        self._nim_metadata_map = await registry.refresh(rows, force=force)
+        # Persist the same enriched descriptors used by /v1/models. This is a
+        # metadata join only; account-scoped availability remains in the
+        # model_account_status table and is never overwritten here.
+        try:
+            self._sync_context_catalog()
+        except Exception as exc:
+            logger.warning('[nim-metadata] catalog enrichment failed: %s', type(exc).__name__)
+
+    async def _nim_metadata_loop(self):
+        registry = self.nim_metadata_registry
+        if registry is None or not registry.enabled:
+            return
+        first = True
+        while True:
+            try:
+                await self._refresh_nim_metadata_once(force=first and not bool(self._nim_metadata_map))
+                first = False
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning('[nim-metadata] refresh loop failed: %s', type(exc).__name__)
+            await asyncio.sleep(registry.refresh_sec)
 
     def _context_catalog_entry(self, model_id):
         from common.model.metadata import annotate_catalog, merge_context_metadata, discovery_limits
@@ -2040,6 +2158,30 @@ class Server:
                     if ('image' in merged and 'image' not in current
                             and 'vision' not in caps):
                         result['capabilities'] = sorted(caps | {'vision'})
+        nim_entry_getter = getattr(self, '_nim_entry', None)
+        nim_descriptor_getter = getattr(self, '_nim_descriptor_metadata', None)
+        has_nim_entry = callable(nim_entry_getter) and nim_entry_getter(model_id) is not None
+        if build_candidate or has_nim_entry:
+            if not callable(nim_descriptor_getter):
+                # AST-isolated compatibility tests and minimal callers may
+                # construct a Server-like object without the optional NGC
+                # metadata layer. Preserve their descriptor contract.
+                nim_meta = {}
+            else:
+                nim_meta = nim_descriptor_getter(model_id)
+            result['nim_metadata'] = nim_meta
+            result['nim_metadata_status'] = nim_meta.get('metadata_status', 'unknown')
+            result['nim_resource_id'] = nim_meta.get('resource_id')
+            result['nim_container_tag'] = nim_meta.get('container_tag')
+            result['nim_profile_count'] = nim_meta.get('profile_count', 0)
+            result['nim_deployment'] = {
+                'downloadable': bool((nim_meta.get('build') or {}).get('downloadable', build_candidate)),
+                'resource_id': nim_meta.get('resource_id'),
+                'container_tag': nim_meta.get('container_tag'),
+                'metadata_status': nim_meta.get('metadata_status', 'unknown'),
+                'profile_count': nim_meta.get('profile_count', 0),
+                'profile_fit': nim_meta.get('profile_fit', 'unknown'),
+            }
         return result
 
     async def _probe_context_upstream(self, payload: dict):
@@ -2104,6 +2246,12 @@ class Server:
         self._agent = aiohttp.TCPConnector(limit=MAX_CONNECTIONS, limit_per_host=MAX_CONNECTIONS)
         self._session = aiohttp.ClientSession(connector=self._agent)
         self.pool.set_external_session(self._session)
+        self._nim_metadata_hardware = _nim_target_hardware()
+        self.nim_metadata_registry = NimMetadataRegistry(
+            self._session,
+            cache_file=os.environ.get(
+                'NVIDIA_NIM_METADATA_CACHE_FILE',
+                str(Path(__file__).resolve().parents[1] / 'nim-metadata-cache.json')))
 
         self.metrics = Metrics(DB_PATH)
         await self.metrics.init()
@@ -2177,6 +2325,13 @@ class Server:
             self._sync_context_catalog()
         except Exception as e:
             logger.warning(f'[init] model catalog warm failed: {e}')
+
+        # NGC repository/tag/profile metadata is refreshed independently of
+        # hosted provider discovery. A cache snapshot is available immediately;
+        # the background join then syncs all 99 Build rows without blocking
+        # request serving or converting missing metadata into unavailability.
+        self._nim_metadata_map = self.nim_metadata_registry.snapshot()
+        self._bg_tasks.append(asyncio.create_task(self._nim_metadata_loop()))
 
         self.registry.start()
 
@@ -2271,6 +2426,20 @@ class Server:
             effective = self.model_state.effective_status_map()
             audit_epoch = float(globals().get('_BUILD_AUDIT_EPOCH', 0) or 0)
             current_rows = self.model_state.status_rows_since(since=audit_epoch)
+            # Reuse a last-good exact-contract observation across a process
+            # restart, but do not advertise indefinitely stale availability.
+            # This avoids an empty public catalog when VERIFY_ON_BOOT=false
+            # while preserving unknown for old or route-mismatched evidence.
+            status_ttl = float(os.environ.get('MODEL_DISCOVERY_STATUS_TTL_SEC', '86400') or 0)
+            if status_ttl > 0:
+                cutoff = time.time() - status_ttl
+                current_rows = {
+                    mid: [row for row in rows
+                          if isinstance(row, dict)
+                          and isinstance(row.get('checked_at'), (int, float))
+                          and row.get('checked_at', 0) >= cutoff]
+                    for mid, rows in current_rows.items()
+                }
             for mid, state in effective.items():
                 if get_build_contract(mid):
                     rows = [
@@ -2394,6 +2563,8 @@ class Server:
                          or (method == 'GET' and path in ('/props', '/v1/props'))
                          or (method == 'GET' and path == '/v1/capabilities')
                          or (method == 'GET' and path == '/v1/capabilities/params')
+                         or (method == 'GET' and path == '/v1/nim/metadata')
+                         or (method == 'GET' and path.startswith('/v1/nim/metadata/'))
                          or (method == 'GET' and path.startswith('/catalog/'))
                          or (method == 'GET' and path.startswith('/mcp/')))
 
@@ -2436,7 +2607,7 @@ class Server:
                                    '/v1/moderations', '/v1/responses', '/v1/files', '/v1/genai',
                                    '/v1/fine_tuning', '/v1/batches', '/v1/ranking', '/v1/infer',
                                    '/v1/native', '/v1/messages', '/v1/messages/count_tokens',
-                                   '/v1/capabilities', '/v1/capabilities/params',
+                                   '/v1/capabilities', '/v1/capabilities/params', '/v1/nim',
                                    '/v2/', '/api/', '/v1/complete',
                                    '/dashboard', '/dashboard.html',
                                    '/metrics', '/metrics/prom', '/metrics/models',
@@ -2467,6 +2638,12 @@ class Server:
                 'free_only': True,
                 'free_policy': 'provider_inherent_free',
                 'model_registry': MODEL_REGISTRY_CLIENT.stats(),
+                'nim_metadata': (self.nim_metadata_registry.status()
+                                 if self.nim_metadata_registry else {
+                                     'enabled': False,
+                                     'source': 'ngc_nim_metadata_api',
+                                     'entries': 0,
+                                 }),
                 'uptime': int(time.time() - getattr(self, '_start_time', time.time())),
                 **snap
             }
@@ -2654,6 +2831,57 @@ class Server:
         async def heal_in_flight():
             await self.pool.heal_in_flight()
             return {'status': 'ok', 'message': 'in_flight counters healed'}
+
+        @app.get('/v1/nim/metadata')
+        async def nim_metadata_route(request: Request):
+            """Expose the joined Build -> NGC repository/tag/profile view.
+
+            ``metadata_status`` is intentionally independent from
+            ``availability_state``. A repository without published metadata,
+            an unconfigured deployment, and a hosted account failure are
+            different facts and must remain different to callers.
+            """
+            model_id = str(request.query_params.get('model') or '').strip()
+            include_profiles = str(request.query_params.get('profiles') or
+                                   request.query_params.get('include_profiles') or '').lower() in {
+                                       '1', 'true', 'yes', 'full'}
+            if model_id:
+                model_id = model_id.replace('%2F', '/').replace('%2f', '/')
+                if not get_build_contract(model_id):
+                    return JSONResponse(status_code=404, content={
+                        'error': {'message': f'Model {model_id} is not in the NVIDIA Build catalog',
+                                  'type': 'invalid_request_error', 'code': 'MODEL_NOT_IN_BUILD_CATALOG'}})
+                data = (self._nim_full_metadata(model_id) if include_profiles
+                        else self._nim_descriptor_metadata(model_id))
+                return data
+            data = []
+            for mid in BUILD_MODEL_IDS:
+                data.append(self._nim_full_metadata(mid) if include_profiles
+                            else self._nim_descriptor_metadata(mid))
+            return {
+                'object': 'list',
+                'data': data,
+                'catalog_count': len(data),
+                'source': 'nvidia_build_and_ngc_nim_metadata',
+                'sync': (self.nim_metadata_registry.status()
+                         if self.nim_metadata_registry else {
+                             'enabled': False,
+                             'source': 'ngc_nim_metadata_api',
+                             'entries': 0,
+                         }),
+            }
+
+        @app.get('/v1/nim/metadata/{model_id:path}')
+        async def nim_metadata_model_route(model_id: str, request: Request):
+            model_id = model_id.replace('%2F', '/').replace('%2f', '/')
+            if not get_build_contract(model_id):
+                return JSONResponse(status_code=404, content={
+                    'error': {'message': f'Model {model_id} is not in the NVIDIA Build catalog',
+                              'type': 'invalid_request_error', 'code': 'MODEL_NOT_IN_BUILD_CATALOG'}})
+            include_profiles = str(request.query_params.get('profiles') or '').lower() in {
+                '1', 'true', 'yes', 'full'}
+            return (self._nim_full_metadata(model_id) if include_profiles
+                    else self._nim_descriptor_metadata(model_id))
 
         @app.get('/v1/capabilities')
         async def capabilities_route(request: Request):
@@ -3640,7 +3868,12 @@ class Server:
             try:
                 current = store.effective_status_for(model_id)
                 audit_epoch = float(globals().get('_BUILD_AUDIT_EPOCH', 0) or 0)
+                status_ttl = float(os.environ.get('MODEL_DISCOVERY_STATUS_TTL_SEC', '86400') or 0)
+                stale = (status_ttl > 0 and
+                          (current.get('checked_at') or 0) < time.time() - status_ttl
+                          if current else True)
                 if (not current or (current.get('checked_at') or 0) < audit_epoch
+                        or stale
                         or not _contract_endpoint_is_current(model_id, current.get('endpoint'))):
                     cache[cache_key] = (now, None)
                     return None
