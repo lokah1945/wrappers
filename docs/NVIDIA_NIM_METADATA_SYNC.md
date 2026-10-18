@@ -29,6 +29,25 @@ The standard `/v1/models` response includes a compact `nim_metadata` object for
 Build rows. Its `nim_metadata_status` is informational and is not used as the
 hosted/deployment availability verdict.
 
+Build-style access filters are available on both `/v1/models` and the metadata
+collection route:
+
+```text
+GET /v1/models?access=all
+GET /v1/models?access=free_endpoint
+GET /v1/models?access=downloadable
+GET /v1/models?access=hosted_endpoint
+GET /v1/nim/metadata?access=all
+```
+
+`free_endpoint` and `downloadable` follow the Build catalog badges. A row can
+have both. An explicit access filter shows the complete matching catalog so a
+Downloadable row is not removed just because it is not currently deployed on
+this wrapper. Each row still carries `availability_state`, `available`,
+`usability_state`, and `catalog_usable`; those fields must not be conflated.
+The no-filter `/v1/models` view remains runtime-safe and only returns observed
+available rows.
+
 ## NGC synchronization
 
 The background task uses the public read-only APIs:

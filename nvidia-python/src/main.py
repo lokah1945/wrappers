@@ -1990,10 +1990,12 @@ class Server:
                 'metadata_status': 'pending' if self.nim_metadata_registry and self.nim_metadata_registry.enabled else 'disabled',
                 'build_downloadable': bool((row or {}).get('downloadable')),
                 'build': self._nim_build_summary(model_id),
+                **build_access_metadata(model_id),
             }
         result = public_metadata(entry, include_profiles=False,
                                  hardware=self._nim_metadata_hardware) or {}
         result['build'] = self._nim_build_summary(model_id)
+        result.update(build_access_metadata(model_id))
         return result
 
     def _nim_full_metadata(self, model_id: str) -> dict:
@@ -2004,6 +2006,7 @@ class Server:
             result = public_metadata(entry, include_profiles=True,
                                      hardware=self._nim_metadata_hardware) or {}
             result['build'] = self._nim_build_summary(model_id)
+            result.update(build_access_metadata(model_id))
         return result
 
     async def _refresh_nim_metadata_once(self, *, force: bool = False) -> None:
@@ -2115,6 +2118,10 @@ class Server:
         result['is_build_candidate'] = build_candidate
         result['build_catalog_listed'] = build_candidate
         result['provider_catalog_listed'] = bool(provider_model_id)
+        if build_candidate:
+            access_metadata_builder = globals().get('build_access_metadata')
+            if callable(access_metadata_builder):
+                result.update(access_metadata_builder(model_id))
         if provider_model_id and provider_model_id != model_id:
             result['provider_catalog_id'] = provider_model_id
         result['availability_basis'] = (
@@ -2858,10 +2865,15 @@ class Server:
             for mid in BUILD_MODEL_IDS:
                 data.append(self._nim_full_metadata(mid) if include_profiles
                             else self._nim_descriptor_metadata(mid))
+            access_filter = requested_access_filter(request)
+            if access_filter is not None:
+                data = filter_access_models(data, access_filter)
             return {
                 'object': 'list',
                 'data': data,
-                'catalog_count': len(data),
+                'catalog_count': len(BUILD_MODEL_IDS),
+                'visible_count': len(data),
+                'access_filter': access_filter,
                 'source': 'nvidia_build_and_ngc_nim_metadata',
                 'sync': (self.nim_metadata_registry.status()
                          if self.nim_metadata_registry else {
@@ -2973,12 +2985,24 @@ class Server:
                                  and entry.get('available') is not False]
             catalog_count = len(enriched)
             available_count = len(available_entries)
-            visible = list(enriched) if visibility == 'all' else available_entries
+            access_filter_getter = globals().get('requested_access_filter')
+            access_filter = (access_filter_getter(request)
+                             if callable(access_filter_getter) and request is not None else None)
+            if access_filter is not None:
+                # NVIDIA Build-style access filters intentionally show the
+                # complete matching catalog, including deployment-required
+                # Downloadable rows. Runtime availability remains explicit in
+                # each row and is never fabricated by this catalog view.
+                visible = filter_access_models(enriched, access_filter)
+                effective_visibility = 'catalog'
+            else:
+                visible = list(enriched) if visibility == 'all' else available_entries
+                effective_visibility = visibility
 
             # Dynamic aliases are only exposed in the default list when their
             # concrete target is itself currently available.
             tgt = get_dynamic_alias_target()
-            if tgt and (visibility == 'all' or any(e.get('id') == tgt for e in visible)):
+            if access_filter is None and tgt and (visibility == 'all' or any(e.get('id') == tgt for e in visible)):
                 seen = {e.get('id') for e in visible}
                 for alias in ('haiku', 'sonnet', 'opus'):
                     if alias not in seen:
@@ -2989,7 +3013,9 @@ class Server:
                         })
             return {'object': 'list', 'data': visible,
                     'catalog_count': catalog_count, 'available_count': available_count,
-                    'availability_filter': visibility,
+                    'visible_count': len(visible),
+                    'availability_filter': effective_visibility,
+                    'access_filter': access_filter,
                     'dynamic_alias_target': tgt or None,
                     'free_only': True, 'free_policy': 'provider_inherent_free'}
 
@@ -4814,6 +4840,94 @@ class Server:
                     release_attempt()
 
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
+
+
+_ACCESS_FILTER_ALIASES = {
+    'free': 'free_endpoint',
+    'free_endpoint': 'free_endpoint',
+    'free-endpoint': 'free_endpoint',
+    'free endpoint': 'free_endpoint',
+    'download': 'downloadable',
+    'downloadable': 'downloadable',
+    'self_hosted': 'downloadable',
+    'self-hosted': 'downloadable',
+    'hosted': 'hosted_endpoint',
+    'hosted_endpoint': 'hosted_endpoint',
+    'hosted-endpoint': 'hosted_endpoint',
+    'native': 'native_protocol',
+    'native_protocol': 'native_protocol',
+    'all': 'all',
+}
+
+
+def build_access_metadata(model_id: str) -> dict:
+    """Expose NVIDIA Build-style access badges without claiming runtime health."""
+    row = get_build_contract(model_id) or {}
+    if not row:
+        return {}
+    contract = row.get('contract') or {}
+    free_endpoint = bool(row.get('free_endpoint'))
+    downloadable = bool(row.get('downloadable'))
+    hosted_endpoint = bool(row.get('hosted_function'))
+    modes = []
+    if free_endpoint:
+        modes.append('free_endpoint')
+    if downloadable:
+        modes.append('downloadable')
+    if hosted_endpoint:
+        modes.append('hosted_endpoint')
+    if contract.get('kind') in ('grpc', 'riva') or contract.get('verification') == 'native_protocol':
+        modes.append('native_protocol')
+    badges = [str(badge) for badge in (row.get('badges') or []) if str(badge)]
+    if free_endpoint and 'Free Endpoint' not in badges:
+        badges.append('Free Endpoint')
+    if downloadable and 'Downloadable' not in badges:
+        badges.append('Downloadable')
+    verification = str(contract.get('verification') or '')
+    if verification == 'hosted_contract':
+        usability_state = 'hosted_contract'
+    elif downloadable and verification == 'deployment_required':
+        usability_state = 'downloadable_requires_deployment'
+    elif 'native_protocol' in modes:
+        usability_state = 'native_protocol'
+    elif downloadable:
+        usability_state = 'downloadable'
+    else:
+        usability_state = 'documented_contract'
+    return {
+        'free_endpoint': free_endpoint,
+        'downloadable': downloadable,
+        'hosted_endpoint': hosted_endpoint,
+        'access_modes': list(dict.fromkeys(modes)),
+        'access_badges': badges,
+        'usability_state': usability_state,
+        # This means a documented access/deployment contract exists. It is
+        # intentionally different from runtime ``available``.
+        'catalog_usable': bool(contract),
+    }
+
+
+def requested_access_filter(request: Request) -> str | None:
+    """Normalize NVIDIA Build-style access filters.
+
+    An explicit access filter opts into the complete matching catalog. Runtime
+    availability remains visible per row; the filter must not turn a
+    deployment-required NIM into ``available=true``.
+    """
+    raw = (request.query_params.get('access') or
+           request.query_params.get('mode') or
+           request.query_params.get('filter') or '').strip().lower()
+    if not raw:
+        return None
+    return _ACCESS_FILTER_ALIASES.get(raw)
+
+
+def filter_access_models(entries: list[dict], access: str | None) -> list[dict]:
+    if access in (None, 'all'):
+        return list(entries)
+    return [entry for entry in entries
+            if isinstance(entry, dict)
+            and access in set(entry.get('access_modes') or [])]
 
 
 def requested_model_visibility(request: Request) -> str:
