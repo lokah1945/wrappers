@@ -3097,6 +3097,14 @@ async def lifespan(app: FastAPI):
             await _SESSION.close()
         except Exception:
             pass
+    # Flush the in-memory recent Activity rows even when a deployment restart
+    # happens before the periodic persistence interval elapses. Without this,
+    # a short-lived streamed request could appear in Activity until restart and
+    # then be replaced by the older snapshot.
+    try:
+        metrics._persist()
+    except Exception as exc:
+        logger.warning(f"[metrics] final snapshot flush failed: {exc}")
     logger.info("Shutdown complete")
 
 app = FastAPI(title="wrapper-nous", version=VERSION, lifespan=lifespan)

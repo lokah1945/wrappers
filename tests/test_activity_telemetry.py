@@ -93,6 +93,23 @@ def test_nous_stream_completion_updates_tokens_and_latency(tmp_path, monkeypatch
     assert model['avg_latency_ms'] == 2345
 
 
+def test_nous_activity_snapshot_roundtrip(tmp_path, monkeypatch):
+    monkeypatch.setenv('METRICS_SNAPSHOT_FILE', str(tmp_path / 'nous-roundtrip.json'))
+    Metrics = _class_from_source(ROOT / 'nous/src/main.py', 'Metrics')
+    first = Metrics()
+    first.record(model='test/model', key_label='test-key', status=200,
+                 path='/v1/chat/completions', streaming=True)
+    first.record_stream_usage(model='test/model', key_label='test-key',
+                              prompt_tokens=17, completion_tokens=9,
+                              latency_ms=2345)
+    first._persist()
+    second = Metrics()
+    row = second.recent_activity(1)[0]
+    assert row['prompt_tokens'] == 17
+    assert row['completion_tokens'] == 9
+    assert row['latency_ms'] == 2345
+
+
 def test_openrouter_stream_completion_updates_tokens_and_latency(tmp_path, monkeypatch):
     monkeypatch.setenv('METRICS_SNAPSHOT_FILE', str(tmp_path / 'openrouter.json'))
     Metrics = _class_from_source(ROOT / 'openrouter/src/metrics.py', 'Metrics')
