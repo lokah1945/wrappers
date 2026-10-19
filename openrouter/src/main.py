@@ -817,7 +817,15 @@ PUBLIC_PATHS_ANY = frozenset({
 # Public model discovery (Ollama + OpenAI compatible) — agents need to list
 # models before authenticating. GET only. MCP POST messages are deliberately
 # absent here so every POST surface remains authenticated (B-31 parity).
-PUBLIC_PATHS_GET = frozenset({'/api/tags', '/v1/models', '/v1/capabilities', '/v1/capabilities/params', '/version', '/mcp/sse', '/mcp', '/metrics/models'})
+PUBLIC_PATHS_GET = frozenset({
+    '/api/tags', '/v1/models', '/v1/capabilities', '/v1/capabilities/params',
+    '/version', '/mcp/sse', '/mcp',
+    # Unified dashboard read-only telemetry must remain accessible without
+    # forwarding an inference credential. No provider keys are returned.
+    '/metrics/models', '/metrics/keys', '/metrics/activity',
+    '/metrics/chart/hourly', '/metrics/chart/daily', '/metrics/tokens',
+    '/metrics/rate-limits', '/metrics/model-status',
+})
 # DASH fix: /metrics/models is a read-only per-model counter (no key material,
 # no secrets) consumed by the dashboard's Models card. Public GET matches the
 # project principle that telemetry is accessible without token.
@@ -950,6 +958,10 @@ def _usage_tokens(data) -> tuple:
     if not isinstance(data, dict):
         return 0, 0
     usage = data.get('usage')
+    if not isinstance(usage, dict) and isinstance(data.get('message'), dict):
+        usage = data['message'].get('usage')
+    if not isinstance(usage, dict) and isinstance(data.get('response'), dict):
+        usage = data['response'].get('usage')
     if not isinstance(usage, dict):
         return 0, 0
     try:
@@ -960,7 +972,7 @@ def _usage_tokens(data) -> tuple:
         return 0, 0
 
 
-async def _sniff_stream_usage(source, model: str, key_label: str):
+async def _sniff_stream_usage(source, model: str, key_label: str, started_at: float | None = None):
     """Yield frames UNCHANGED while extracting token usage from SSE frames.
 
     Sniffs both dialects (OpenAI chat chunks with a final usage object and
@@ -1017,7 +1029,10 @@ async def _sniff_stream_usage(source, model: str, key_label: str):
         try:
             _spawn_background(
                 metrics.record_tokens(model=model, key_label=key_label,
-                                      prompt_tokens=in_tok, completion_tokens=out_tok),
+                                      prompt_tokens=in_tok, completion_tokens=out_tok,
+                                      latency_ms=(
+                                          (time.perf_counter() - started_at) * 1000.0
+                                          if started_at is not None else None)),
                 'metrics-stream-usage')
         except Exception:
             pass
@@ -1093,6 +1108,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
         key_obj = acq['key']
         attempted_keys.add(key_obj.api_key)
         key_released = False  # I4: exactly-once release guard
+        attempt_started = time.perf_counter()
 
         url = f"{OPENROUTER_BASE}/{path.lstrip('/')}"
 
@@ -1151,6 +1167,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # B-39 fix: record upstream stream failures.
                     _spawn_background(metrics.record_request(model=model_id, status_code=resp.status,
                                                               key_label=getattr(key_obj, 'label', ''),
+                                                              latency_ms=(time.perf_counter() - attempt_started) * 1000.0,
                                                               path=path),
                                       'metrics-stream-err')
                     if model_id:
@@ -1228,7 +1245,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
                 if native_stream:
                     return StreamingResponse(
-                        _sniff_stream_usage(stream_gen(), model_id, getattr(key_obj, 'label', '')),
+                        _sniff_stream_usage(stream_gen(), model_id, getattr(key_obj, 'label', ''), started_at=attempt_started),
                         on_close=release_stream, status_code=resp.status,
                         media_type="text/event-stream",
                         headers={**upstream_response_headers(resp)})
@@ -1247,7 +1264,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # DASH fix: sniff usage from the raw upstream frames as they
                     # pass through; bytes are yielded UNCHANGED to the client.
                     inner = _sniff_stream_usage(
-                        stream_gen(), model_id, getattr(key_obj, 'label', ''))
+                        stream_gen(), model_id, getattr(key_obj, 'label', ''), started_at=attempt_started)
                     try:
                         async for chunk in _iter_chunks_with_idle(inner, hb_interval):
                             now = time.time()
@@ -1295,7 +1312,11 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 credential=key_obj.api_key, endpoint=url) as resp:
                 response_headers = upstream_response_headers(resp)
                 await metrics.record_request(model=model_id, status_code=resp.status,
-                                             key_label=getattr(key_obj, 'label', ''), path=path)
+                                             key_label=getattr(key_obj, 'label', ''),
+                                             latency_ms=(
+                                                 (time.perf_counter() - attempt_started) * 1000.0
+                                                 if resp.status >= 400 else None),
+                                             path=path)
                 text = await resp.text()
                 if model_id:
                     _spawn_background(
@@ -1333,12 +1354,12 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 # DASH fix: extract usage from the completed non-stream body
                 # so token KPIs reflect real consumption.
                 _tok = _usage_tokens(data) if resp.status == 200 else (0, 0)
-                if _tok[0] or _tok[1]:
-                    _spawn_background(
-                        metrics.record_tokens(model=model_id,
-                                               key_label=getattr(key_obj, 'label', ''),
-                                               prompt_tokens=_tok[0], completion_tokens=_tok[1]),
-                        'metrics-usage')
+                _spawn_background(
+                    metrics.record_tokens(model=model_id,
+                                           key_label=getattr(key_obj, 'label', ''),
+                                           prompt_tokens=_tok[0], completion_tokens=_tok[1],
+                                           latency_ms=(time.perf_counter() - attempt_started) * 1000.0),
+                    'metrics-usage')
                 return JSONResponse(content=data, status_code=resp.status, headers=response_headers)
 
         except asyncio.TimeoutError:
@@ -3629,6 +3650,35 @@ async def prom_metrics():
 async def metrics_models():
     """Per-model request/usage counters for the dashboard Models card (DASH fix)."""
     return {"models": metrics.per_model_summary(), "provider": "openrouter"}
+
+
+@app.get("/metrics/keys")
+async def metrics_keys(request: Request):
+    window = request.query_params.get('window', '24h')
+    return {"window": window, "keys": metrics.per_key_summary(), "provider": "openrouter"}
+
+
+@app.get("/metrics/activity")
+async def metrics_activity(request: Request):
+    try:
+        limit = max(1, min(500, int(request.query_params.get('limit', '50'))))
+    except (TypeError, ValueError):
+        limit = 50
+    try:
+        offset = max(0, int(request.query_params.get('offset', '0')))
+    except (TypeError, ValueError):
+        offset = 0
+    rows = metrics.recent_activity(limit=limit, offset=offset)
+    return {"limit": limit, "offset": offset, "count": len(rows), "rows": rows, "provider": "openrouter"}
+
+
+@app.get("/metrics/chart/hourly")
+async def metrics_chart_hourly(request: Request):
+    try:
+        hours = max(1, min(168, int(request.query_params.get('hours', '24'))))
+    except (TypeError, ValueError):
+        hours = 24
+    return {"hours": hours, "data": metrics.hourly_chart(hours), "provider": "openrouter"}
 
 
 @app.get("/stats")

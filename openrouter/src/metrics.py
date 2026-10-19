@@ -70,6 +70,8 @@ class Metrics:
                     self.per_key = data['per_key']
                 if isinstance(data.get('hourly'), dict):
                     self.hourly = data['hourly']
+                if isinstance(data.get('activity'), list):
+                    self.activity.extend(data['activity'][-self.activity.maxlen:])
         except Exception:
             pass
 
@@ -86,6 +88,7 @@ class Metrics:
                     'per_model': self.per_model,
                     'per_key': self.per_key,
                     'hourly': self.hourly,
+                    'activity': list(self.activity),
                     'saved_at': time.time(),
                 }, f)
         except Exception:
@@ -99,6 +102,11 @@ class Metrics:
         now = time.time()
         status_code = int(kwargs.get('status_code', 200) or 0)
         key_label = str(kwargs.get('key_label', '') or '')
+        raw_latency = kwargs.get('latency_ms')
+        try:
+            latency_ms = max(0.0, float(raw_latency)) if raw_latency is not None else None
+        except (TypeError, ValueError):
+            latency_ms = None
         is_error = status_code >= 400
         with self._lock:
             self.requests += 1
@@ -110,6 +118,8 @@ class Metrics:
                 m = self.per_model.setdefault(model, {
                     'requests': 0, 'errors': 0, 'success_count': 0,
                     'tokens_in': 0, 'tokens_out': 0,
+                    'latency_total_ms': 0.0, 'latency_count': 0,
+                    'last_latency_ms': None, 'max_latency_ms': 0.0,
                     'first_ts': now, 'last_ts': now, 'last_status': status_code,
                 })
                 m['requests'] += 1
@@ -119,6 +129,11 @@ class Metrics:
                     m['success_count'] += 1
                 m['tokens_in'] += prompt_tokens
                 m['tokens_out'] += completion_tokens
+                if latency_ms is not None:
+                    m['latency_total_ms'] = m.get('latency_total_ms', 0.0) + latency_ms
+                    m['latency_count'] = m.get('latency_count', 0) + 1
+                    m['last_latency_ms'] = latency_ms
+                    m['max_latency_ms'] = max(m.get('max_latency_ms', 0.0), latency_ms)
                 m['last_ts'] = now
                 m['last_status'] = status_code
             if key_label:
@@ -145,10 +160,12 @@ class Metrics:
                 h['rate_limited'] += 1
             h['tokens'] += prompt_tokens + completion_tokens
             self.activity.append({
-                'ts': int(now), 'model': model or 'unknown',
+                'ts': int(now), 'id': self.requests,
+                'model': model or 'unknown',
                 'key_label': key_label or '—', 'status_code': status_code,
                 'prompt_tokens': int(prompt_tokens),
                 'completion_tokens': int(completion_tokens),
+                'latency_ms': latency_ms,
                 'streaming': bool(kwargs.get('streaming', False)),
                 'path': str(kwargs.get('path', '') or ''),
             })
@@ -157,15 +174,20 @@ class Metrics:
                 self._persist()
 
     async def record_tokens(self, model: str = "", prompt_tokens: int = 0,
-                            completion_tokens: int = 0, key_label: str = ""):
+                            completion_tokens: int = 0, key_label: str = "",
+                            latency_ms: float | None = None):
         """Add usage tokens without re-counting the request (DASH fix).
 
         record_request already counted the request when the upstream response
         started; tokens for streaming responses only become known at
         end-of-stream, so they are added here."""
-        if prompt_tokens <= 0 and completion_tokens <= 0:
+        if prompt_tokens <= 0 and completion_tokens <= 0 and latency_ms is None:
             return
         now = time.time()
+        try:
+            latency_value = max(0.0, float(latency_ms)) if latency_ms is not None else None
+        except (TypeError, ValueError):
+            latency_value = None
         with self._lock:
             self.tokens_in += prompt_tokens
             self.tokens_out += completion_tokens
@@ -173,10 +195,17 @@ class Metrics:
                 m = self.per_model.setdefault(model, {
                     'requests': 0, 'errors': 0, 'success_count': 0,
                     'tokens_in': 0, 'tokens_out': 0,
+                    'latency_total_ms': 0.0, 'latency_count': 0,
+                    'last_latency_ms': None, 'max_latency_ms': 0.0,
                     'first_ts': now, 'last_ts': now, 'last_status': 200,
                 })
                 m['tokens_in'] += prompt_tokens
                 m['tokens_out'] += completion_tokens
+                if latency_value is not None:
+                    m['latency_total_ms'] = m.get('latency_total_ms', 0.0) + latency_value
+                    m['latency_count'] = m.get('latency_count', 0) + 1
+                    m['last_latency_ms'] = latency_value
+                    m['max_latency_ms'] = max(m.get('max_latency_ms', 0.0), latency_value)
                 m['last_ts'] = now
             if key_label:
                 k = self.per_key.setdefault(key_label, {
@@ -190,11 +219,19 @@ class Metrics:
                 'requests': 0, 'errors': 0, 'rate_limited': 0, 'tokens': 0,
             })
             h['tokens'] += prompt_tokens + completion_tokens
+            wanted_model = model or 'unknown'
+            wanted_key = key_label or '—'
             for row in reversed(self.activity):
-                if (row.get('streaming') and row.get('model') == (model or 'unknown')
-                        and row.get('prompt_tokens', 0) == 0):
-                    row['prompt_tokens'] = int(prompt_tokens)
-                    row['completion_tokens'] = int(completion_tokens)
+                if (row.get('model') == wanted_model
+                        and row.get('key_label', '—') == wanted_key
+                        and (row.get('prompt_tokens', 0) == 0
+                             or row.get('latency_ms') is None)):
+                    if prompt_tokens > 0:
+                        row['prompt_tokens'] = int(prompt_tokens)
+                    if completion_tokens > 0:
+                        row['completion_tokens'] = int(completion_tokens)
+                    if latency_value is not None:
+                        row['latency_ms'] = latency_value
                     break
             if now - self._last_persist >= self._persist_interval:
                 self._last_persist = now
@@ -230,6 +267,10 @@ class Metrics:
                     'prompt_tokens': m.get('tokens_in', 0),
                     'completion_tokens': m.get('tokens_out', 0),
                     'total_tokens': m.get('tokens_in', 0) + m.get('tokens_out', 0),
+                    'avg_latency_ms': (m.get('latency_total_ms', 0.0) / m.get('latency_count', 1)
+                                       if m.get('latency_count', 0) else None),
+                    'max_latency_ms': m.get('max_latency_ms'),
+                    'last_latency_ms': m.get('last_latency_ms'),
                     'first_ts': m.get('first_ts'), 'last_ts': m.get('last_ts'),
                     'last_status': m.get('last_status', 200),
                 })
@@ -243,6 +284,42 @@ class Metrics:
         start = max(0, int(offset))
         end = start + max(1, int(limit))
         return rows[start:end]
+
+    def per_key_summary(self) -> list:
+        now = time.time()
+        with self._lock:
+            rows = []
+            for label, k in self.per_key.items():
+                last_ts = k.get('last_used_ts')
+                rows.append({
+                    'key_label': label, 'requests': k.get('requests', 0),
+                    'rate_limited_count': k.get('rate_limited', 0),
+                    'errors': k.get('errors', 0),
+                    'prompt_tokens': k.get('tokens_in', 0),
+                    'completion_tokens': k.get('tokens_out', 0),
+                    'total_tokens': k.get('tokens_in', 0) + k.get('tokens_out', 0),
+                    'last_used_ago_s': int(now - last_ts) if last_ts else None,
+                })
+        rows.sort(key=lambda row: row.get('requests', 0), reverse=True)
+        return rows
+
+    def hourly_chart(self, hours: int = 24) -> list:
+        hours = max(1, min(168, int(hours)))
+        now = int(time.time())
+        with self._lock:
+            out = []
+            for ago in range(hours - 1, -1, -1):
+                bucket = int((now - ago * 3600) // 3600 * 3600)
+                item = self.hourly.get(bucket, {})
+                out.append({
+                    'ts': bucket, 'hour_ago': ago,
+                    'requests': item.get('requests', 0),
+                    'tokens': item.get('tokens', 0),
+                    'total_tokens': item.get('tokens', 0),
+                    'rate_limited': item.get('rate_limited', 0),
+                    'errors': item.get('errors', 0),
+                })
+            return out
 
     async def close(self):
         self._persist()

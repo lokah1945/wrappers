@@ -57,7 +57,7 @@ class Peer(_Upstream):
 def _server(peers, records, *, native=False, keys=1):
     tree = ast.parse(SOURCE.read_text())
     functions = {'_translate_nemotron_super_controls', 'translate_thinking_to_nim',
-                 'find_reasoning_config'}
+                 'find_reasoning_config', '_usage_pair'}
     nodes = [node for node in tree.body if getattr(node, 'name', None) in functions]
     nodes += [node for node in tree.body if isinstance(node, ast.Assign) and any(
         isinstance(target, ast.Name) and target.id == 'REASONING_CONFIGS' for target in node.targets)]
@@ -184,6 +184,23 @@ async def test_messages_controls_reach_actual_transport(stream, controls, effort
     assert sent['model'] == MODEL and sent['max_tokens'] == 4096
     assert body == original and peer.release_count == 1
     assert server._in_flight == 0 and all(key.in_flight == 0 for key in server.pool.keys)
+
+
+async def test_plain_chat_stream_requests_nim_usage_for_activity():
+    server, _ = _server([], [])
+    prepared = await server._prepare_proxy_body(
+        {'model': MODEL, 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]},
+        MODEL,
+        metric_path='/v1/chat/completions',
+    )
+    assert prepared['stream_options']['include_usage'] is True
+
+    explicit = await server._prepare_proxy_body(
+        {'model': MODEL, 'stream': True, 'stream_options': {'include_usage': False}},
+        MODEL,
+        metric_path='/v1/chat/completions',
+    )
+    assert explicit['stream_options']['include_usage'] is False
 
 
 async def test_mapped_controls_win_conflicts_and_preserve_explicit_extensions():

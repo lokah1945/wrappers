@@ -776,11 +776,12 @@
             <th>Key</th>
             <th>Status</th>
             <th>Tokens (in/out)</th>
+            <th>Latency</th>
             <th>Mode</th>
           </tr>
         </thead>
         <tbody id="act-table-body">
-          <tr><td colspan="6" class="empty">No activity yet.</td></tr>
+          <tr><td colspan="7" class="empty">No activity yet.</td></tr>
         </tbody>
       </table>
     </div>
@@ -1156,7 +1157,11 @@ function unifiedEndpoint(path, service) {
   if (path === '/metrics/model-status') return modelStatusMap(v);
   if (path === '/metrics/models') return {models:(v.usage && v.usage.models)||[]};
   if (path === '/metrics/keys') return {keys:[]};
-  if (path === '/metrics/activity') return v.activity;
+  if (path === '/metrics/activity') {
+    if (v.activity && Array.isArray(v.activity.rows) && v.activity.rows.length) return v.activity;
+    const legacyRows = v.stats && Array.isArray(v.stats.recent_activity) ? v.stats.recent_activity : [];
+    return {rows: legacyRows, count: legacyRows.length, limit: legacyRows.length, offset: 0, fallback: 'unified_snapshot'};
+  }
   if (path === '/metrics/chart/hourly') return v.chart;
   if (path === '/metrics/rate-limits') return {rate_limits:[]};
   if (path === '/version') return {version:v.health.version,port:v.port};
@@ -1779,7 +1784,7 @@ function renderActivityTable() {
 
   if (!rows.length) {
     $('act-table-body').innerHTML =
-      '<tr><td colspan="6" class="empty">' +
+      '<tr><td colspan="7" class="empty">' +
       (_activityData.length === 0
         ? 'No activity recorded yet — or this wrapper does not expose /metrics/activity.'
         : 'No matching rows.') +
@@ -1803,6 +1808,7 @@ function renderActivityTable() {
       '<td><span class="pill info">' + (r.key_label || '—') + '</span></td>' +
       '<td>' + statusPill + '</td>' +
       '<td class="num">' + fmt(tokIn) + (cached ? ' <span style="color:var(--accent)">(' + fmt(cached) + ' cache)</span>' : '') + ' / ' + fmt(tokOut) + '</td>' +
+      '<td class="num" title="time measured by the selected wrapper">' + fmtMs(r.latency_ms) + '</td>' +
       '<td>' + (r.streaming ? '<span class="pill stream">stream</span>' : '<span class="pill info">sync</span>') + '</td>' +
     '</tr>';
   }).join('');

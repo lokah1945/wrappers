@@ -2513,6 +2513,8 @@ class Metrics:
                     self.per_key = data['per_key']
                 if isinstance(data.get('hourly'), dict):
                     self.hourly = data['hourly']
+                if isinstance(data.get('activity'), list):
+                    self.activity.extend(data['activity'][-self.activity.maxlen:])
         except Exception:
             pass
 
@@ -2527,6 +2529,7 @@ class Metrics:
                     'per_model': self.per_model,
                     'per_key': self.per_key,
                     'hourly': self.hourly,
+                    'activity': list(self.activity),
                     'saved_at': time.time(),
                 }, f)
         except Exception:
@@ -2535,8 +2538,10 @@ class Metrics:
     def _touch_model(self, model: str, now: float) -> dict:
         return self.per_model.setdefault(model, {
             'requests': 0, 'errors': 0, 'success_count': 0,
-            'tokens_in': 0, 'tokens_out': 0, 'first_ts': now, 'last_ts': now,
-            'last_status': 200,
+            'tokens_in': 0, 'tokens_out': 0,
+            'latency_total_ms': 0.0, 'latency_count': 0,
+            'last_latency_ms': None, 'max_latency_ms': 0.0,
+            'first_ts': now, 'last_ts': now, 'last_status': 200,
         })
 
     def _touch_key(self, label: str, now: float) -> dict:
@@ -2552,8 +2557,12 @@ class Metrics:
         })
 
     def record(self, prompt=0, completion=0, error=False, model='', key_label='',
-               status=200, path='', streaming=False):
+               status=200, path='', streaming=False, latency_ms=None):
         now = time.time()
+        try:
+            latency_value = max(0.0, float(latency_ms)) if latency_ms is not None else None
+        except (TypeError, ValueError):
+            latency_value = None
         with self._lock:
             self.requests += 1
             self.tokens_in += prompt
@@ -2569,6 +2578,11 @@ class Metrics:
                     m['success_count'] += 1
                 m['tokens_in'] += prompt
                 m['tokens_out'] += completion
+                if latency_value is not None:
+                    m['latency_total_ms'] = m.get('latency_total_ms', 0.0) + latency_value
+                    m['latency_count'] = m.get('latency_count', 0) + 1
+                    m['last_latency_ms'] = latency_value
+                    m['max_latency_ms'] = max(m.get('max_latency_ms', 0.0), latency_value)
                 m['last_ts'] = now
                 m['last_status'] = int(status) if isinstance(status, (int, float)) else 200
             if key_label:
@@ -2593,17 +2607,23 @@ class Metrics:
                 'model': model or 'unknown', 'key_label': key_label or '—',
                 'status_code': int(status) if isinstance(status, (int, float)) else 0,
                 'prompt_tokens': int(prompt), 'completion_tokens': int(completion),
+                'latency_ms': latency_value,
                 'streaming': bool(streaming), 'path': path or '',
             })
             if now - self._last_persist >= self._persist_interval:
                 self._last_persist = now
                 self._persist()
 
-    def record_stream_usage(self, model='', key_label='', prompt_tokens=0, completion_tokens=0):
-        """Add end-of-stream usage without re-counting the request itself."""
-        if prompt_tokens <= 0 and completion_tokens <= 0:
+    def record_stream_usage(self, model='', key_label='', prompt_tokens=0,
+                            completion_tokens=0, latency_ms=None):
+        """Add end-of-stream usage/timing without re-counting the request."""
+        if prompt_tokens <= 0 and completion_tokens <= 0 and latency_ms is None:
             return
         now = time.time()
+        try:
+            latency_value = max(0.0, float(latency_ms)) if latency_ms is not None else None
+        except (TypeError, ValueError):
+            latency_value = None
         with self._lock:
             self.tokens_in += prompt_tokens
             self.tokens_out += completion_tokens
@@ -2611,6 +2631,11 @@ class Metrics:
                 m = self._touch_model(model, now)
                 m['tokens_in'] += prompt_tokens
                 m['tokens_out'] += completion_tokens
+                if latency_value is not None:
+                    m['latency_total_ms'] = m.get('latency_total_ms', 0.0) + latency_value
+                    m['latency_count'] = m.get('latency_count', 0) + 1
+                    m['last_latency_ms'] = latency_value
+                    m['max_latency_ms'] = max(m.get('max_latency_ms', 0.0), latency_value)
                 m['last_ts'] = now
             if key_label:
                 k = self._touch_key(key_label, now)
@@ -2620,11 +2645,19 @@ class Metrics:
             h['tokens'] += prompt_tokens + completion_tokens
             # Update the matching pending activity row so the Activity tab
             # reflects real token counts for streaming requests too.
+            wanted_model = model or 'unknown'
+            wanted_key = key_label or '—'
             for row in reversed(self.activity):
-                if (row.get('streaming') and row.get('model') == (model or 'unknown')
-                        and row.get('prompt_tokens', 0) == 0):
-                    row['prompt_tokens'] = int(prompt_tokens)
-                    row['completion_tokens'] = int(completion_tokens)
+                if (row.get('streaming') and row.get('model') == wanted_model
+                        and row.get('key_label', '—') == wanted_key
+                        and (row.get('prompt_tokens', 0) == 0
+                             or row.get('latency_ms') is None)):
+                    if prompt_tokens > 0:
+                        row['prompt_tokens'] = int(prompt_tokens)
+                    if completion_tokens > 0:
+                        row['completion_tokens'] = int(completion_tokens)
+                    if latency_value is not None:
+                        row['latency_ms'] = latency_value
                     break
             if now - self._last_persist >= self._persist_interval:
                 self._last_persist = now
@@ -2656,6 +2689,10 @@ class Metrics:
                     'prompt_tokens': m.get('tokens_in', 0),
                     'completion_tokens': m.get('tokens_out', 0),
                     'total_tokens': m.get('tokens_in', 0) + m.get('tokens_out', 0),
+                    'avg_latency_ms': (m.get('latency_total_ms', 0.0) / m.get('latency_count', 1)
+                                       if m.get('latency_count', 0) else None),
+                    'max_latency_ms': m.get('max_latency_ms'),
+                    'last_latency_ms': m.get('last_latency_ms'),
                     'first_ts': m.get('first_ts'), 'last_ts': m.get('last_ts'),
                     'last_status': m.get('last_status', 200),
                 })
@@ -2708,6 +2745,10 @@ class Metrics:
 metrics = Metrics()
 
 
+def _metrics_elapsed_ms(started: float) -> float:
+    return round((time.perf_counter() - started) * 1000.0, 1)
+
+
 def _metrics_key_label(key_entry) -> str:
     """Label of the credential that served a request ('' when OAuth)."""
     return (getattr(key_entry, 'label', '') or '') if key_entry is not None else ''
@@ -2735,7 +2776,7 @@ def _result_usage_tokens(result) -> tuple:
         return 0, 0
 
 
-async def _sniff_stream_usage(source, model: str, key_label: str):
+async def _sniff_stream_usage(source, model: str, key_label: str, started_at: float | None = None):
     """Pass frames through UNCHANGED while extracting token usage.
 
     Works for both dialects because it inspects each complete SSE data: line:
@@ -2790,7 +2831,10 @@ async def _sniff_stream_usage(source, model: str, key_label: str):
     finally:
         try:
             metrics.record_stream_usage(model=model, key_label=key_label,
-                                        prompt_tokens=in_tok, completion_tokens=out_tok)
+                                        prompt_tokens=in_tok, completion_tokens=out_tok,
+                                        latency_ms=(
+                                            (time.perf_counter() - started_at) * 1000.0
+                                            if started_at is not None else None))
         except Exception:
             pass
     # NOTE: the finally block above runs when the generator is closed too
@@ -3506,18 +3550,25 @@ async def completions(request: Request):
     if free_only_enabled() and body.get('model') and not model_allowed(body.get('model')):
         return JSONResponse(status_code=400, content=free_only_error(requested or body.get('model')))
     stream = bool(body.get('stream', False))
+    _metrics_t0 = time.perf_counter()
     status, result, key_entry = await post_nous_with_retries(
         body, stream=stream, extra_headers=_build_forward_headers(request.headers),
         client_surface='openai_chat', path='v1/completions',
         recover_context=False)
+    _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
     _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result, '/v1/completions'), 'model-result')
+    _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+    metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                   model=str(body.get('model', '') or ''), key_label=_metrics_key_label(key_entry),
+                   status=status, path='/v1/completions', streaming=stream,
+                   latency_ms=(None if stream else _metrics_latency))
     if status != 200:
         return _native_json_response(result, status)
     if stream:
         cleanup = _stream_resource_cleanup(result, key_entry)
         return StreamingResponse(
             _sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True),
-                                str(body.get('model', '') or ''), _metrics_key_label(key_entry)),
+                                str(body.get('model', '') or ''), _metrics_key_label(key_entry), started_at=_metrics_t0),
             on_close=cleanup, media_type='text/event-stream',
             headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **_native_response_headers(result)})
     return _native_json_response(result, status)
@@ -3574,20 +3625,22 @@ async def chat_completions(request: Request):
     if _is_anthropic_upstream():
         anthro_body = openai_chat_to_anthropic_request(body)
         anthro_body["stream"] = is_stream
+        _metrics_t0 = time.perf_counter()
         status, result, key_entry = await post_nous_with_retries(
             anthro_body, stream=is_stream, extra_headers=extra_h, path="v1/messages")
+        _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
         _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
         _m_id = str(body.get("model", "") or "")
         _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
         metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                        model=_m_id, key_label=_metrics_key_label(key_entry),
-                       status=status, path="/v1/chat/completions", streaming=is_stream)
+                       status=status, path="/v1/chat/completions", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
         if status != 200:
             return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
             source = _translate_anthropic_stream_to_openai_chat(result, body.get("model", ""), HEARTBEAT_MS / 1000.0)
-            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
+            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry), started_at=_metrics_t0)
             async def gen():
                 try:
                     async for frame in _sniff:
@@ -3597,8 +3650,10 @@ async def chat_completions(request: Request):
             return StreamingResponse(gen(), on_close=cleanup, media_type="text/event-stream", headers={**context_response_headers(result), "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
         return JSONResponse(anthropic_to_openai_response(result, body.get("model", "")), headers=context_response_headers(result))
 
+    _metrics_t0 = time.perf_counter()
     status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h,
                                                                recover_context=True)
+    _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
     # F3 round-2 fix: model-state persistence must not delay the response;
     # fire-and-forget with a retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
@@ -3606,14 +3661,18 @@ async def chat_completions(request: Request):
     _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
     metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                    model=_m_id, key_label=_metrics_key_label(key_entry),
-                   status=status, path="/v1/chat/completions", streaming=is_stream)
+                   status=status, path="/v1/chat/completions", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
 
     if status != 200:
         return _native_json_response(result, status)
 
     if is_stream:
         cleanup = _stream_resource_cleanup(result, key_entry)
-        return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
+        return StreamingResponse(_sniff_stream_usage(
+            _stream_passthrough(result, key_entry, on_close=cleanup, preserve=True),
+            _m_id, _metrics_key_label(key_entry), started_at=_metrics_t0),
+            on_close=cleanup, media_type="text/event-stream",
+            headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
     return _native_json_response(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---
@@ -3643,16 +3702,18 @@ async def responses(request: Request):
         if requested:
             body['model'] = resolve_model(requested)
         is_stream = bool(body.get('stream', False))
+        _metrics_t0 = time.perf_counter()
         status, result, key_entry = await post_nous_with_retries(
             body, stream=is_stream, extra_headers=_build_forward_headers(request.headers),
             client_surface='openai_responses', path='v1/responses', recover_context=True)
+        _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
         _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result,
                                              '/v1/responses'), 'model-result')
         _m_id = str(body.get('model', '') or '')
         _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
         metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                        model=_m_id, key_label=_metrics_key_label(key_entry),
-                       status=status, path="/v1/responses", streaming=is_stream)
+                       status=status, path="/v1/responses", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
         if not _responses_chat_fallback_allowed(status, result):
             if status != 200 or not is_stream:
                 return _native_json_response(result, status)
@@ -3682,21 +3743,23 @@ async def responses(request: Request):
     if _is_anthropic_upstream():
         anthro_body = openai_chat_to_anthropic_request(chat_body)
         anthro_body["stream"] = is_stream
+        _metrics_t0 = time.perf_counter()
         status, result, key_entry = await post_nous_with_retries(
             anthro_body, stream=is_stream, extra_headers=extra_h,
             client_surface="openai_responses", path="v1/messages")
+        _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
         _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
         _m_id = str(chat_body.get("model", "") or "")
         _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
         metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                        model=_m_id, key_label=_metrics_key_label(key_entry),
-                       status=status, path="/v1/responses", streaming=is_stream)
+                       status=status, path="/v1/responses", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
         if status != 200:
             return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
             source = _translate_anthropic_stream_to_openai_chat(result, chat_body.get("model", ""), HEARTBEAT_MS / 1000.0)
-            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
+            _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry), started_at=_metrics_t0)
             async def gen():
                 try:
                     async for frame in _sniff:
@@ -3717,7 +3780,9 @@ async def responses(request: Request):
              "tool_calls": _amsg.get("tool_calls") or None}])
         return JSONResponse(resp, headers=context_response_headers(result)) if context_response_headers(result) else resp
 
+    _metrics_t0 = time.perf_counter()
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="openai_responses")
+    _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/responses"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
@@ -3725,7 +3790,7 @@ async def responses(request: Request):
     _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
     metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                    model=_m_id, key_label=_metrics_key_label(key_entry),
-                   status=status, path="/v1/responses", streaming=is_stream)
+                   status=status, path="/v1/responses", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
     if status != 200:
         return JSONResponse(status_code=status, content=result, headers=context_response_headers(result))
 
@@ -3734,7 +3799,7 @@ async def responses(request: Request):
         state = ResponsesStreamState(rid, chat_body["model"])
         cleanup = _stream_resource_cleanup(result, key_entry)
         source = stream_with_heartbeat(result, _responses_sse_serialize, state=state, key_entry=key_entry, on_close=cleanup)
-        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
+        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry), started_at=_metrics_t0)
         async def gen():
             try:
                 # Codex requires output_item.added BEFORE first delta.
@@ -3842,15 +3907,17 @@ async def messages(request: Request):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or body.get("model") or ""))
         is_stream = body.get("stream", False)
         extra_h = _build_forward_headers(request.headers)
+        _metrics_t0 = time.perf_counter()
         status, result, key_entry = await post_nous_with_retries(
             body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages",
             path="v1/messages", recover_context=True)
+        _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
         _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
         _m_id = str(body.get("model", "") or "")
         _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
         metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                        model=_m_id, key_label=_metrics_key_label(key_entry),
-                       status=status, path="/v1/messages", streaming=is_stream)
+                       status=status, path="/v1/messages", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
         if status != 200:
             return _native_json_response(result, status)
         if is_stream:
@@ -3868,7 +3935,9 @@ async def messages(request: Request):
     is_stream = body.get("stream", False)
     extra_h = _build_forward_headers(request.headers)  # transparent: forward all client headers
 
+    _metrics_t0 = time.perf_counter()
     status, result, key_entry = await post_nous_with_retries(chat_body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages")
+    _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
     # F3 round-2 fix: fire-and-forget with retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(chat_body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
     # N-20 fix: record metrics on this surface too (was only chat_completions).
@@ -3876,7 +3945,7 @@ async def messages(request: Request):
     _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
     metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
                    model=_m_id, key_label=_metrics_key_label(key_entry),
-                   status=status, path="/v1/messages", streaming=is_stream)
+                   status=status, path="/v1/messages", streaming=is_stream, latency_ms=(None if is_stream else _metrics_latency))
     if status != 200:
         # FIX: Proper Anthropic error format for Claude Code
         err_data = result if isinstance(result, dict) else {"message": str(result)}
@@ -3888,7 +3957,7 @@ async def messages(request: Request):
         state = AnthropicStreamState(chat_body["model"])
         cleanup = _stream_resource_cleanup(result, key_entry)
         source = stream_with_heartbeat(result, lambda x: f"event: {x.get('type')}\ndata: {json.dumps({**(x.get('data') or {}), **({'type': x.get('type')} if (x.get('data') or {}).get('type') is None else {})})}\n\n", state=state, key_entry=key_entry, on_close=cleanup)
-        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry))
+        _sniff = _sniff_stream_usage(source, _m_id, _metrics_key_label(key_entry), started_at=_metrics_t0)
         async def gen():
             try:
                 async for line in _sniff:
@@ -4031,10 +4100,17 @@ async def embeddings(request: Request):
         body['model'] = resolve_model(requested)
     if free_only_enabled() and body.get('model') and not model_allowed(body.get('model')):
         return JSONResponse(status_code=400, content=free_only_error(requested or body.get('model')))
+    _metrics_t0 = time.perf_counter()
     status, result, key_entry = await post_nous_with_retries(
         body, stream=False, extra_headers=_build_forward_headers(request.headers),
         client_surface='openai_chat', path='v1/embeddings', recover_context=False)
+    _metrics_latency = round((time.perf_counter() - _metrics_t0) * 1000.0, 1)
     _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result, '/v1/embeddings'), 'model-result')
+    _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
+    metrics.record(prompt=_tok[0], completion=_tok[1], error=(status != 200),
+                   model=str(body.get('model', '') or ''), key_label=_metrics_key_label(key_entry),
+                   status=status, path='/v1/embeddings', streaming=False,
+                   latency_ms=_metrics_latency)
     return _native_json_response(result, status)
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])

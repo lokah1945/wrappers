@@ -1020,6 +1020,95 @@ from .capabilities import (
 )
 from .responses_compat import ResponsesHandler
 from .metrics import Metrics
+
+
+
+def _usage_pair(usage: object) -> tuple[int, int]:
+    """Return provider-reported input/output tokens from any supported usage shape."""
+    if not isinstance(usage, dict):
+        return 0, 0
+    def _integer(*names: str) -> int:
+        for name in names:
+            value = usage.get(name)
+            if value is not None:
+                try:
+                    return max(0, int(value))
+                except (TypeError, ValueError):
+                    continue
+        return 0
+    return (
+        _integer('input_tokens', 'prompt_tokens'),
+        _integer('output_tokens', 'completion_tokens'),
+    )
+
+
+def _observe_sse_usage(data: object, state: dict) -> None:
+    """Accumulate terminal/cumulative usage without changing client SSE bytes."""
+    if not isinstance(data, dict):
+        return
+    candidates = [data.get('usage')]
+    message = data.get('message')
+    if isinstance(message, dict):
+        candidates.append(message.get('usage'))
+    response = data.get('response')
+    if isinstance(response, dict):
+        candidates.append(response.get('usage'))
+    for usage in candidates:
+        prompt, completion = _usage_pair(usage)
+        state['prompt_tokens'] = max(state.get('prompt_tokens', 0), prompt)
+        state['completion_tokens'] = max(state.get('completion_tokens', 0), completion)
+
+
+async def _sniff_stream_usage(source, state: dict):
+    """Pass an SSE source through unchanged while collecting usage metadata.
+
+    NVIDIA may emit OpenAI chat usage, Anthropic message usage, or Responses
+    ``response.completed`` usage depending on the selected surface. Chunks can
+    split a line, so parsing is deliberately byte-buffered. The wrapper never
+    waits for or edits a provider frame for telemetry.
+    """
+    buffer = b''
+    try:
+        async for chunk in source:
+            if isinstance(chunk, (bytes, bytearray)):
+                buffer += bytes(chunk)
+            elif isinstance(chunk, str):
+                buffer += chunk.encode('utf-8', 'replace')
+            else:
+                yield chunk
+                continue
+            yield chunk
+            while b'\n' in buffer:
+                line_bytes, buffer = buffer.split(b'\n', 1)
+                line = line_bytes.decode('utf-8', 'replace').strip()
+                if not line.startswith('data:'):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == '[DONE]':
+                    continue
+                try:
+                    _observe_sse_usage(json.loads(payload), state)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    continue
+    finally:
+        # Some NIM gateways terminate the final SSE data line without a
+        # trailing newline. Parse that residual frame before closing so a
+        # terminal usage object cannot be lost merely because of framing.
+        if buffer:
+            try:
+                line = buffer.decode('utf-8', 'replace').strip()
+                if line.startswith('data:'):
+                    payload = line[5:].strip()
+                    if payload and payload != '[DONE]':
+                        _observe_sse_usage(json.loads(payload), state)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
+        close = getattr(source, 'aclose', None)
+        if close is not None:
+            try:
+                await close()
+            except Exception:
+                pass
 from .registry import Registry
 from . import alert_history
 from . import loki_push
@@ -4148,21 +4237,24 @@ class Server:
     async def _prepare_proxy_body(self, body: dict, model_id: str, metric_path: str = '/v1/chat/completions') -> dict:
         """Prepare request body for upstream (P2: extracted from proxy_openai)."""
         body = json.loads(json.dumps(body))  # deep copy
-        if metric_path == '/v1/chat/completions':
-            return body
-        # V6: map max_completion_tokens -> max_tokens only when max_tokens is
-        # absent (NIM needs max_tokens); never delete it when max_tokens exists.
-        if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
-            body['max_tokens'] = body['max_completion_tokens']
-            del body['max_completion_tokens']
-        clamp_max_tokens_for_model(body, model_id)
-        # V7 fix: inject stream_options.include_usage only where the wrapper
-        # itself needs usage (translated /v1/messages and /v1/responses paths),
-        # or when the operator forces it via WRAPPER_FORCE_USAGE=1. Plain
-        # /v1/chat/completions passthrough stays untouched.
-        wrapper_needs_usage = metric_path in ('/v1/messages', '/v1/responses')
-        if body.get('stream') and (wrapper_needs_usage or _env_flag('WRAPPER_FORCE_USAGE', '0')):
-            body['stream_options'] = {**(body.get('stream_options') or {}), 'include_usage': True}
+        if metric_path != '/v1/chat/completions':
+            # V6: map max_completion_tokens -> max_tokens only when max_tokens is
+            # absent (NIM needs max_tokens); never delete it when max_tokens exists.
+            if body.get('max_completion_tokens') is not None and body.get('max_tokens') is None:
+                body['max_tokens'] = body['max_completion_tokens']
+                del body['max_completion_tokens']
+            clamp_max_tokens_for_model(body, model_id)
+        # NVIDIA NIM supports the OpenAI stream_options.include_usage contract.
+        # Request it on every active streaming surface, including plain chat;
+        # the previous early return made /v1/chat/completions Activity rows stay
+        # at zero even though the provider could report usage. Respect an
+        # explicit client value so provider payload semantics remain
+        # client-authoritative.
+        if body.get('stream') and metric_path in (
+                '/v1/chat/completions', '/v1/messages', '/v1/responses'):
+            options = dict(body.get('stream_options') or {})
+            options.setdefault('include_usage', True)
+            body['stream_options'] = options
         return body
 
     async def proxy_openai(self, body: dict, req_headers: dict, model: str, req: Request = None, metric_path: str = '/v1/chat/completions'):
@@ -4351,6 +4443,13 @@ class Server:
                         _sw_t0 = time.time()
                         _sw_ttft_ms = None
                         source = _passthrough_anthropic_sse(resp, hb_interval)
+                        _stream_usage = {'prompt_tokens': 0, 'completion_tokens': 0}
+                        _usage_sniffer = globals().get('_sniff_stream_usage')
+                        if _usage_sniffer is None:
+                            async def _usage_sniffer(source, state):
+                                async for _chunk in source:
+                                    yield _chunk
+                        source = _usage_sniffer(source, _stream_usage)
                         try:
                             async for chunk in source:
                                 if _sw_ttft_ms is None:
@@ -4366,7 +4465,12 @@ class Server:
                                     _fire_and_forget(self.metrics.record_request(
                                         model=model_id, key_label=key.label,
                                         status=resp.status,
-                                        latency_ms=int((time.time() - _sw_t0) * 1000),
+                                        latency_ms=int((time.time() - attempt_start) * 1000),
+                                        prompt_tokens=_stream_usage.get('prompt_tokens', 0),
+                                        completion_tokens=_stream_usage.get('completion_tokens', 0),
+                                        total_tokens=(
+                                            _stream_usage.get('prompt_tokens', 0)
+                                            + _stream_usage.get('completion_tokens', 0)),
                                         streaming=1, ttft_ms=int(_sw_ttft_ms or 0),
                                         retries=attempt, path=metric_path,
                                     ), 'metrics')
@@ -4436,8 +4540,9 @@ class Server:
                         _fire_and_forget(self.metrics.record_request(
                             model=model_id, key_label=key.label,
                             status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                            prompt_tokens=resp_data.get('usage', {}).get('prompt_tokens', 0),
-                            completion_tokens=resp_data.get('usage', {}).get('completion_tokens', 0),
+                            prompt_tokens=_usage_pair(resp_data.get('usage'))[0],
+                            completion_tokens=_usage_pair(resp_data.get('usage'))[1],
+                            total_tokens=sum(_usage_pair(resp_data.get('usage'))),
                             path=metric_path,
                         ), 'metrics')
                     return {'status': resp.status, 'data': resp_data,
@@ -4650,13 +4755,9 @@ class Server:
 
                 if is_streaming and resp.status < 400:
                     await self._record_model_response(model_id, key, resp.status, {}, observation_endpoint)
-                    if self.metrics:
-                        # F2 fix: DB write off the hot path
-                        _fire_and_forget(self.metrics.record_request(
-                            model=model_id, key_label=key.label,
-                            status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                            path=path,
-                        ), 'metrics')
+                    # The stream generator records the completed request
+                    # after it has observed terminal usage; do not create a
+                    # premature zero-token activity row here.
                     transferred = True
                     released = False
 
@@ -4672,7 +4773,7 @@ class Server:
                             self._in_flight = max(0, self._in_flight - 1)
 
                     return StreamingResponse(
-                        self._stream_proxy(resp, key, close_upstream),
+                        self._stream_proxy(resp, key, close_upstream, model_id=model_id, path=path, started_ms=start_ms),
                         status_code=resp.status, media_type='text/event-stream',
                         on_close=close_upstream,
                         headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(resp)},
@@ -4702,15 +4803,18 @@ class Server:
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
                 await self._record_model_response(model_id, key, resp.status, {}, observation_endpoint)
+                response_data = json.loads(resp_data)
+                _usage = _usage_pair(response_data.get('usage')) if isinstance(response_data, dict) else (0, 0)
                 if self.metrics:
                     # F2 fix: DB write off the hot path
                     _fire_and_forget(self.metrics.record_request(
                         model=model_id, key_label=key.label,
                         status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                        path=path,
+                        prompt_tokens=_usage[0], completion_tokens=_usage[1],
+                        total_tokens=sum(_usage), path=path,
                     ), 'metrics')
 
-                return JSONResponse(status_code=resp.status, content=json.loads(resp_data), headers=upstream_response_headers(resp))
+                return JSONResponse(status_code=resp.status, content=response_data, headers=upstream_response_headers(resp))
 
             except asyncio.TimeoutError:
                 release_attempt()
@@ -4730,10 +4834,18 @@ class Server:
 
         return JSONResponse(status_code=429, headers={'Retry-After': '30'}, content={'error': {'message': f'All API keys exhausted or rate-limited for model {model_id}', 'type': 'rate_limit_error'}})
 
-    async def _stream_proxy(self, resp, key, on_close=None):
-        """Forward native event bytes with boundary-safe idle heartbeats."""
+    async def _stream_proxy(self, resp, key, on_close=None, *,
+                            model_id='', path='', started_ms=None):
+        """Forward native event bytes and record terminal usage/latency."""
         hb_interval = float(os.environ.get('HEARTBEAT_INTERVAL_MS', '5000')) / 1000.0
-        source = _passthrough_anthropic_sse(resp, hb_interval)
+        inner = _passthrough_anthropic_sse(resp, hb_interval)
+        usage = {'prompt_tokens': 0, 'completion_tokens': 0}
+        _usage_sniffer = globals().get('_sniff_stream_usage')
+        if _usage_sniffer is None:
+            async def _usage_sniffer(source, state):
+                async for _chunk in source:
+                    yield _chunk
+        source = _usage_sniffer(inner, usage)
         try:
             async for chunk in source:
                 yield chunk
@@ -4741,6 +4853,18 @@ class Server:
             try:
                 await source.aclose()
             finally:
+                if self.metrics:
+                    _fire_and_forget(self.metrics.record_request(
+                        model=model_id, key_label=getattr(key, 'label', ''),
+                        status=resp.status,
+                        latency_ms=(int(time.time() * 1000 - started_ms)
+                                    if started_ms is not None else 0),
+                        prompt_tokens=usage.get('prompt_tokens', 0),
+                        completion_tokens=usage.get('completion_tokens', 0),
+                        total_tokens=(usage.get('prompt_tokens', 0)
+                                      + usage.get('completion_tokens', 0)),
+                        streaming=1, path=path,
+                    ), 'metrics')
                 if on_close is not None:
                     on_close()
                 else:
@@ -4877,13 +5001,9 @@ class Server:
 
                 content_type = resp.headers.get('content-type', '')
                 if ('text/event-stream' in content_type or is_streaming) and resp.status < 400:
-                    if self.metrics:
-                        # F2 fix: DB write off the hot path
-                        _fire_and_forget(self.metrics.record_request(
-                            model=model_id, key_label=key.label,
-                            status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                            path=path,
-                        ), 'metrics')
+                    # The stream generator records the completed request
+                    # after it has observed terminal usage; do not create a
+                    # premature zero-token activity row here.
                     transferred = True
                     released = False
 
@@ -4899,7 +5019,7 @@ class Server:
                             self._in_flight = max(0, self._in_flight - 1)
 
                     return StreamingResponse(
-                        self._stream_proxy(resp, key, close_upstream),
+                        self._stream_proxy(resp, key, close_upstream, model_id=model_id, path=path, started_ms=start_ms),
                         status_code=resp.status, media_type='text/event-stream',
                         on_close=close_upstream,
                         headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **upstream_response_headers(resp)},
@@ -4933,17 +5053,24 @@ class Server:
                         return JSONResponse(status_code=404, content=dead['data'], headers=dead['headers'])
                     return JSONResponse(status_code=resp.status, content=err_data, headers=upstream_response_headers(resp))
 
+                response_data = None
+                try:
+                    response_data = json.loads(resp_data)
+                except (json.JSONDecodeError, ValueError):
+                    pass
+                _usage = _usage_pair(response_data.get('usage')) if isinstance(response_data, dict) else (0, 0)
                 if self.metrics:
                     # F2 fix: DB write off the hot path
                     _fire_and_forget(self.metrics.record_request(
                         model=model_id, key_label=key.label,
                         status=resp.status, latency_ms=int((time.time() * 1000) - start_ms),
-                        path=path,
+                        prompt_tokens=_usage[0], completion_tokens=_usage[1],
+                        total_tokens=sum(_usage), path=path,
                     ), 'metrics')
 
-                try:
-                    return JSONResponse(status_code=resp.status, content=json.loads(resp_data), headers=upstream_response_headers(resp))
-                except (json.JSONDecodeError, ValueError):
+                if response_data is not None:
+                    return JSONResponse(status_code=resp.status, content=response_data, headers=upstream_response_headers(resp))
+                else:
                     return Response(content=resp_data, status_code=resp.status,
                                     headers=upstream_response_headers(resp))
 
