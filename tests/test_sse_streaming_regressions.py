@@ -552,7 +552,9 @@ def test_r03_upstream_error_frame_surfaces_not_swallowed():
     evs = st.translate_chunk({'error': {'message': 'boom', 'type': 'server_error'}})
     types = [json.loads(e.split('data: ')[1])['type'] for e in evs]
     assert 'error' in types, 'upstream error frame was swallowed'
-    assert types[-1] == 'message_stop'
+    assert types[-1] == 'error'
+    assert 'message_stop' not in types
+    assert 'message_delta' not in types
     assert st.upstream_error == 'boom'
     # nothing may be emitted afterwards
     assert st.translate_chunk({'choices': [{'delta': {'content': 'more'}}]}) == []
@@ -1056,6 +1058,7 @@ def test_contract_ports_match_wrappers_json():
         assert cfg[name]['port'] == port, f'{name}: wrappers.json port drifted'
     # The unified dashboard is deliberately separated from inference slots on 9106.
     assert 9106 not in {w['port'] for w in cfg.values()}
+
 
 
 def test_contract_entry_points_match_systemd():

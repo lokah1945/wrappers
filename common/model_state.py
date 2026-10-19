@@ -29,7 +29,7 @@ from .model.errors import classify_provider_error, classify_upstream_error, erro
 from .model.sanitize import sanitize_error_detail
 from .model.validation import validate_catalog_entries, validate_observation
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 logger = logging.getLogger("model-state")
 
 
@@ -117,6 +117,22 @@ class ModelStateStore:
                 version INTEGER PRIMARY KEY,
                 applied_at REAL NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS model_catalog_status (
+                provider              TEXT PRIMARY KEY,
+                source                TEXT NOT NULL DEFAULT '',
+                last_attempt          REAL,
+                last_success          REAL,
+                last_success_count   INTEGER NOT NULL DEFAULT 0,
+                last_error_at         REAL,
+                last_error_code       TEXT NOT NULL DEFAULT '',
+                last_error_detail     TEXT NOT NULL DEFAULT ''
+            );
+            CREATE TABLE IF NOT EXISTS model_catalog_envelopes (
+                provider       TEXT PRIMARY KEY,
+                source         TEXT NOT NULL DEFAULT '',
+                envelope_json  TEXT NOT NULL DEFAULT '{}',
+                fetched_at     REAL NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS model_context_observations (
                 provider TEXT NOT NULL,
                 account_scope TEXT NOT NULL,
@@ -148,6 +164,11 @@ class ModelStateStore:
                 "INSERT OR IGNORE INTO model_state_migrations(version, applied_at) VALUES(3,?)",
                 (time.time(),),
             )
+        if current_version < 4:
+            conn.execute(
+                "INSERT OR IGNORE INTO model_state_migrations(version, applied_at) VALUES(4,?)",
+                (time.time(),),
+            )
         conn.execute(
             "INSERT OR REPLACE INTO model_state_meta(key,value) VALUES('schema_version',?)",
             (str(SCHEMA_VERSION),),
@@ -164,7 +185,16 @@ class ModelStateStore:
         return ""
 
     def upsert_catalog(self, models: Iterable[Any], source: str = "upstream",
-                       ttl_sec: int | None = None) -> list[str]:
+                       ttl_sec: int | None = None, retire_absent: bool = False) -> list[str]:
+        """Persist a catalog snapshot.
+
+        ``retire_absent`` is deliberately opt-in. A provider-specific full
+        snapshot may retire rows missing from a *successful* refresh; callers
+        that merge partial sources (for example NVIDIA's Build/NGC
+        reconciliation) must leave it false. An empty/invalid fetch never
+        reaches this method from CachedModelCatalog, so outages retain the
+        last-good listed snapshot.
+        """
         now = time.time()
         ttl = int(ttl_sec or self.catalog_ttl_sec)
         entries = validate_catalog_entries(models)
@@ -190,9 +220,15 @@ class ModelStateStore:
                      source, now, now + ttl),
                 )
                 ids.append(mid)
-            if ids:
-                # Do not delete absent entries immediately: upstream outages and
-                # transient catalog changes must not erase the last good snapshot.
+            unique_ids = sorted(set(ids))
+            if unique_ids and retire_absent:
+                placeholders = ",".join("?" for _ in unique_ids)
+                conn.execute(
+                    f"UPDATE model_catalog SET is_listed=0 "
+                    f"WHERE provider=? AND is_listed=1 AND model_id NOT IN ({placeholders})",
+                    [self.provider, *unique_ids],
+                )
+            if unique_ids:
                 conn.commit()
         finally:
             conn.close()
@@ -229,6 +265,152 @@ class ModelStateStore:
 
     def get_ids(self, fresh_only: bool = False) -> list[str]:
         return [str(item.get("id")) for item in self.get_catalog(fresh_only) if item.get("id")]
+
+    def record_catalog_attempt(self, source: str = "") -> None:
+        """Record a refresh attempt without exposing credentials or payloads."""
+        now = time.time()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO model_catalog_status(provider,source,last_attempt,
+                       last_success,last_success_count,last_error_at,last_error_code,last_error_detail)
+                       VALUES(?,?,?,NULL,0,NULL,'','')
+                       ON CONFLICT(provider) DO UPDATE SET source=excluded.source,
+                       last_attempt=excluded.last_attempt""",
+                    (self.provider, str(source or "")[:512], now),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def record_catalog_success(self, source: str = "", count: int = 0) -> None:
+        """Commit the successful-refresh watermark after rows are persisted."""
+        now = time.time()
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO model_catalog_status(provider,source,last_attempt,
+                       last_success,last_success_count,last_error_at,last_error_code,last_error_detail)
+                       VALUES(?,?,?,?,?,NULL,'','')
+                       ON CONFLICT(provider) DO UPDATE SET source=excluded.source,
+                       last_success=excluded.last_success,last_success_count=excluded.last_success_count,
+                       last_error_at=NULL,last_error_code='',last_error_detail=''""",
+                    (self.provider, str(source or "")[:512], now, now, int(count or 0)),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def record_catalog_failure(self, source: str = "", error_code: str = "",
+                               error_detail: str = "") -> None:
+        """Persist sanitized refresh failure state while retaining last-good rows."""
+        now = time.time()
+        code = str(error_code or "refresh_failed")[:128]
+        detail = sanitize_error_detail(str(error_detail or ""))[:512]
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO model_catalog_status(provider,source,last_attempt,
+                       last_success,last_success_count,last_error_at,last_error_code,last_error_detail)
+                       VALUES(?,?,?,NULL,0,?,?,?)
+                       ON CONFLICT(provider) DO UPDATE SET source=excluded.source,
+                       last_error_at=excluded.last_error_at,last_error_code=excluded.last_error_code,
+                       last_error_detail=excluded.last_error_detail""",
+                    (self.provider, str(source or "")[:512], now, now, code, detail),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def catalog_status(self) -> dict[str, Any]:
+        """Return freshness/error state without leaking upstream response data."""
+        now = time.time()
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM model_catalog_status WHERE provider=?", (self.provider,)
+            ).fetchone()
+            if row:
+                last_attempt = row["last_attempt"]
+                last_success = row["last_success"]
+                count = int(row["last_success_count"] or 0)
+                last_error_at = row["last_error_at"]
+                error_code = str(row["last_error_code"] or "")
+                error_detail = str(row["last_error_detail"] or "")
+            else:
+                fallback = conn.execute(
+                    "SELECT MAX(catalog_seen_at) AS seen, COUNT(*) AS count "
+                    "FROM model_catalog WHERE provider=? AND is_listed=1",
+                    (self.provider,),
+                ).fetchone()
+                last_attempt = None
+                last_success = fallback["seen"] if fallback and fallback["seen"] is not None else None
+                count = int(fallback["count"] or 0) if fallback else 0
+                last_error_at = None
+                error_code = ""
+                error_detail = ""
+            age = (max(0.0, now - float(last_success))
+                   if isinstance(last_success, (int, float)) else None)
+            stale = (last_success is None or
+                     (age is not None and age >= self.catalog_ttl_sec) or
+                     (last_error_at is not None and
+                      (last_success is None or float(last_error_at) >= float(last_success))))
+            state = "unavailable" if last_success is None and count == 0 else ("stale" if stale else "fresh")
+            error = None
+            if error_code:
+                error = {"code": error_code, "detail": error_detail or None,
+                         "at": last_error_at}
+            return {
+                "provider": self.provider,
+                "state": state,
+                "stale": bool(stale),
+                "age_sec": age,
+                "last_attempt": last_attempt,
+                "last_success": last_success,
+                "last_success_count": count,
+                "last_error": error,
+            }
+        finally:
+            conn.close()
+
+    def save_catalog_envelope(self, envelope: dict[str, Any], source: str = "") -> None:
+        """Retain a sanitized provider catalog envelope for cached list views."""
+        if not isinstance(envelope, dict):
+            raise ValueError("catalog envelope must be an object")
+        encoded = json.dumps(envelope, ensure_ascii=False, default=str)
+        if len(encoded.encode("utf-8")) > 16 * 1024 * 1024:
+            raise ValueError("catalog envelope is too large")
+        with self._write_lock:
+            conn = self._connect()
+            try:
+                conn.execute(
+                    """INSERT INTO model_catalog_envelopes(provider,source,envelope_json,fetched_at)
+                       VALUES(?,?,?,?) ON CONFLICT(provider) DO UPDATE SET source=excluded.source,
+                       envelope_json=excluded.envelope_json,fetched_at=excluded.fetched_at""",
+                    (self.provider, str(source or "")[:512], encoded, time.time()),
+                )
+                conn.commit()
+            finally:
+                conn.close()
+
+    def get_catalog_envelope(self) -> dict[str, Any] | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT envelope_json FROM model_catalog_envelopes WHERE provider=?",
+                (self.provider,),
+            ).fetchone()
+            if not row:
+                return None
+            value = json.loads(row["envelope_json"] or "{}")
+            return value if isinstance(value, dict) else None
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        finally:
+            conn.close()
 
     def record_context_limit(self, model_id: str, credential: str, endpoint: str,
                              limits: dict, ttl_sec: int = 3600) -> None:

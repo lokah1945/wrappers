@@ -12,12 +12,13 @@ E. non-stream surface -> clean content.
 """
 import asyncio
 import json
+import os
 
 import aiohttp
 
 BASE = 'http://localhost:9101'
 KEY = 'wrapper-local-key'
-MODEL = 'nvidia/nemotron-3-ultra-550b-a55b'
+MODEL = os.environ.get('VERIFY_MODEL', 'nvidia/nemotron-3-ultra-550b-a55b')
 
 CLOSE = chr(60) + '/think' + chr(62)      # 8-char closing tag
 NL = chr(10)
@@ -38,8 +39,12 @@ async def collect_events(messages, stream=True, max_tokens=800, tools=None):
             if not stream:
                 data = await resp.json()
                 return 200, data, []
+            buffer = ''
             async for raw in resp.content:
-                for line in raw.decode('utf-8', errors='replace').split(NL):
+                buffer += raw.decode('utf-8', errors='replace')
+                lines = buffer.split(NL)
+                buffer = lines.pop() if lines else ''
+                for line in lines:
                     line = line.strip()
                     if line.startswith('data:'):
                         data = line[5:].strip()
@@ -48,14 +53,25 @@ async def collect_events(messages, stream=True, max_tokens=800, tools=None):
                                 events.append(json.loads(data))
                             except ValueError:
                                 pass
+            if buffer.strip().startswith('data:'):
+                data = buffer.strip()[5:].strip()
+                if data and data != '[DONE]':
+                    try:
+                        events.append(json.loads(data))
+                    except ValueError:
+                        pass
     return 200, None, events
 
 
 def summarize_stream(events):
-    texts, thinks = [], []
+    texts, thinks, errors = [], [], []
     cur = None
     for ev in events:
         t = ev.get('type')
+        if t == 'error':
+            err = ev.get('error') or {}
+            errors.append((err.get('type') or 'api_error', err.get('message') or 'upstream error'))
+            continue
         if t == 'content_block_start':
             cur = (ev.get('content_block') or {}).get('type')
             if cur == 'text':
@@ -68,7 +84,7 @@ def summarize_stream(events):
                 texts[-1] += d.get('text') or ''
             elif cur == 'thinking' and d.get('type') == 'thinking_delta':
                 thinks[-1] += d.get('thinking') or ''
-    return texts, thinks
+    return texts, thinks, errors
 
 
 def artifacts(texts, thinks):
@@ -91,13 +107,15 @@ async def main():
          'What does the XML tag pair ' + chr(60) + 'think' + chr(62) + ' and ' + CLOSE +
          ' do in LLM pipelines? Answer in ONE short paragraph and literally include both tags in your explanation.'}
     ])
-    texts, thinks = summarize_stream(events)
-    print(f'   HTTP {status}, {len(texts)} text blocks, {len(thinks)} thinking blocks')
+    texts, thinks, errors = summarize_stream(events)
+    print(f'   HTTP {status}, {len(texts)} text blocks, {len(thinks)} thinking blocks, errors={len(errors)}')
     for i, t in enumerate(texts):
         print(f'   text[{i}] ({len(t)}ch): {t[:90]!r}')
     for i, t in enumerate(thinks):
         print(f'   think[{i}] ({len(t)}ch): {t[:90]!r}')
     issues = artifacts(texts, thinks)
+    if errors:
+        issues.append(f'upstream error: {errors[0][1][:160]}')
     # reasoning must not leak into text: text must NOT start mid-sentence
     if texts and texts[0].lstrip().startswith('in your explanation'):
         issues.append('REASONING LEAK at text start')
@@ -107,9 +125,11 @@ async def main():
     print('== TEST B: simple turn ==')
     status, err, events = await collect_events(
         [{'role': 'user', 'content': 'Reply with exactly: CLEAN-OK. Nothing else.'}], max_tokens=200)
-    texts, thinks = summarize_stream(events)
-    print(f'   HTTP {status}, text={texts!r}')
+    texts, thinks, errors = summarize_stream(events)
+    print(f'   HTTP {status}, text={texts!r}, errors={len(errors)}')
     issues = artifacts(texts, thinks)
+    if errors:
+        issues.append(f'upstream error: {errors[0][1][:160]}')
     print('   ARTIFACTS:', issues if issues else 'NONE')
     ok_b = not issues and any('CLEAN-OK' in t for t in texts)
 
@@ -123,7 +143,7 @@ async def main():
     status, err, events = await collect_events(
         [{'role': 'user', 'content': 'Run `uname -s` with the bash tool.'}],
         max_tokens=600, tools=tools)
-    texts, thinks = summarize_stream(events)
+    texts, thinks, errors = summarize_stream(events)
     tool_starts = sum(1 for ev in events
                       if ev.get('type') == 'content_block_start'
                       and (ev.get('content_block') or {}).get('type') == 'tool_use')
@@ -131,6 +151,8 @@ async def main():
     for i, t in enumerate(texts):
         print(f'   text[{i}] ({len(t)}ch): {t[-60:]!r}')
     issues = artifacts(texts, thinks)
+    if errors:
+        issues.append(f'upstream error: {errors[0][1][:160]}')
     print('   ARTIFACTS:', issues if issues else 'NONE')
     ok_d = not issues and tool_starts >= 1
 
@@ -139,7 +161,7 @@ async def main():
         [{'role': 'user', 'content': 'What does the tag ' + CLOSE + ' mean? Mention it literally. One sentence.'}],
         stream=False, max_tokens=400)
     ok_e = False
-    if status == 200 and isinstance(data, dict):
+    if status == 200 and isinstance(data, dict) and data.get('type') == 'message':
         blocks = data.get('content') or []
         for b in blocks:
             if b.get('type') == 'text' and CLOSE in (b.get('text') or ''):

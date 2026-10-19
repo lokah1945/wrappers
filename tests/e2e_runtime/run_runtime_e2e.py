@@ -164,7 +164,18 @@ def check_anthropic_stream(evs, mode) -> list[str]:
         return ['no events emitted']
     if types[0] != 'message_start':
         errs.append(f'first event is {types[0]!r}, expected message_start')
-    if 'message_stop' not in types:
+    # A surfaced upstream error is a terminal Anthropic stream event in its
+    # own right. It must not be followed by message_delta/message_stop, which
+    # would turn a failed or truncated turn into a successful completion.
+    has_error = 'error' in types
+    if has_error:
+        if types[-1] != 'error':
+            errs.append(f'last event is {types[-1]!r}, expected terminal error')
+        if types.count('error') != 1:
+            errs.append(f'{types.count("error")} error events (must be exactly 1)')
+        if 'message_stop' in types:
+            errs.append('message_stop emitted after/beside terminal error')
+    elif 'message_stop' not in types:
         errs.append('missing terminal message_stop (client hangs)')
     else:
         if types[-1] != 'message_stop':
@@ -734,6 +745,7 @@ def start_wrapper(name: str, wdir: str, port: int, upstream_var: str, extra: dic
         # Historical adapter tests opt in explicitly; native Responses are
         # covered separately by active_production_acceptance.py.
         'RESPONSES_UPSTREAM_MODE': 'chat',
+        'NATIVE_MESSAGES_MODE': 'translate',  # explicit legacy adapter fixture
         # HARNESS NOTE: this suite fires ~55 requests in well under a minute.
         # nvidia's key pool defaults to SOFT_LIMIT_RPM=30 and deliberately
         # PACES admission above that — correct production behaviour, but it

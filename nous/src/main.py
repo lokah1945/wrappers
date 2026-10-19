@@ -492,6 +492,10 @@ from common.model.metadata import discovery_limits
 MODEL_CATALOG = CachedModelCatalog(MODEL_STORE, MODEL_REGISTRY, MODEL_REGISTRY_CLIENT,
                                   f"{NOUS_BASE}/v1/models", ttl_sec=MODEL_CATALOG_TTL_SEC)
 _MODEL_REFRESH_TASK = None
+NATIVE_MESSAGES_MODE = os.environ.get('NATIVE_MESSAGES_MODE', 'native').strip().lower()
+if NATIVE_MESSAGES_MODE not in ('native', 'translate'):
+    NATIVE_MESSAGES_MODE = 'native'
+NATIVE_PROTOCOL_VALIDATION = os.environ.get('NATIVE_PROTOCOL_VALIDATION', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 AUTH_PATH = os.environ.get("AUTH_PATH", "/root/.hermes/profiles/ilma/auth.json")
 KEY_POOL = KeyPool()
 LISTEN_HOST = os.environ.get("LISTEN_HOST", "127.0.0.1")
@@ -740,72 +744,62 @@ def _load_model_info_template():
     return _MODEL_INFO_TEMPLATE
 
 def get_model_meta(mid, upstream=None):
+    """Return native metadata without overwriting provider facts.
+
+    The old Codex template replaced native ``created``/``description`` and
+    supplied unverified capability defaults. Native rows now remain the base
+    object; compatibility/routing/account observations live under explicit
+    wrapper fields. Synthetic aliases are clearly marked as non-native.
+    """
     rooted = resolve_model(mid) if mid else mid
-    tpl = _load_model_info_template()
-    base = dict(tpl)
-    # Pop template-only fields that upstream does NOT publish per-model.
-    # Empirically verified against the live Nous models endpoint: upstream
-    # returns truncation_policy=None and effective_context_window_percent=None
-    # for every model. The Codex-derived template fabricates
-    # truncation_policy {mode: tokens, limit: 10000} and 95% effective window
-    # — a client honoring those would cap conversations at 10k tokens on
-    # 1M-context models (meituan/longcat-2.5-preview ctx 1048576,
-    # stepfun/step-5-preview ctx 1000000). Only context-family fields were
-    # popped before; truncation_policy and effective_context_window_percent
-    # must be popped too so they only appear when upstream really declares
-    # them.
-    for key in ('context_window', 'context_length', 'max_context_window', 'max_tokens',
-                'max_output_tokens', 'max_input_tokens',
-                'truncation_policy', 'effective_context_window_percent'):
-        base.pop(key, None)
-    if upstream is None:
-        upstream = next((m for m in MODEL_CATALOG.snapshot() if m.get('id') == rooted), {})
-    base.update(upstream or {})
-    # Empirical reinforcement (2026-10-15): account-scoped context
-    # evidence (background probe / rejection parser) fills gaps the
-    # published catalog leaves unknown. Published values always win;
-    # a verified floor never over-labels a small-context model.
-    try:
-        _observed = MODEL_STORE.context_observations(rooted)
-        if _observed:
-            base = merge_observed_context(base, _observed)
-    except Exception:
-        pass
-    base.update(discovery_limits(base))
-    # Provider-declared modalities are authoritative for this model; the
-    # Codex template defaults (input_modalities=[text, image] with
-    # supports_vision=False) must never mask what Nous actually publishes
-    # per model.
-    arch = base.get("architecture") if isinstance(base.get("architecture"), dict) else None
-    if arch is not None:
-        in_mods = arch.get("input_modalities")
-        out_mods = arch.get("output_modalities")
-        if isinstance(in_mods, list) and in_mods:
-            base["input_modalities"] = [str(x) for x in in_mods]
-            base["supports_vision"] = "image" in [str(x) for x in in_mods]
-        if isinstance(out_mods, list) and out_mods:
-            base["output_modalities"] = [str(x) for x in out_mods]
-    base.update({
-        "id": mid, "slug": mid, "object": "model", "created": 0,
-        "owned_by": "alias" if is_alias_name(mid) else "nous",
-        "display_name": mid, "description": f"{mid} via wrapper-nous (Nous Chat)",
-    })
-    concrete = rooted if not is_alias_name(rooted) else get_dynamic_alias_target()
-    if concrete and concrete in MODEL_METADATA:
-        base.update(MODEL_METADATA[concrete])
-    if is_alias_name(mid) and concrete:
-        base["rooted_model"] = concrete
-        base["dynamic_alias"] = True
-    # Nous exposes one exact OpenAI-compatible upstream surface for every
-    # catalog model. Keep this explicit so clients do not need to infer the
-    # endpoint from the provider name or model id.
+    native = dict(upstream) if isinstance(upstream, dict) and (not is_alias_name(mid) or str(upstream.get('id') or '') != str(mid)) else None
+    if native is None and not is_alias_name(mid):
+        native = next((dict(m) for m in MODEL_CATALOG.snapshot()
+                       if isinstance(m, dict) and m.get('id') == rooted), None)
+    if native is not None:
+        base = native
+        base.setdefault('id', mid)
+        if is_alias_name(mid):
+            base['id'] = mid
+        try:
+            observed = MODEL_STORE.context_observations(rooted)
+            if observed:
+                base = merge_observed_context(base, observed)
+        except Exception:
+            pass
+        base.update(discovery_limits(base))
+        wrapper_meta = {
+            'source': 'wrapper-nous',
+            'metadata_source': 'provider_catalog',
+            'provider_model_id': str(native.get('id') or rooted or mid),
+            'requested_model_id': mid,
+            'native_fields_preserved': True,
+            'compatibility_layer': str(globals().get('COMPATIBILITY_LAYER', '1')),
+        }
+    else:
+        concrete = rooted if not is_alias_name(rooted) else get_dynamic_alias_target()
+        base = {'id': mid, 'object': 'model'}
+        wrapper_meta = {
+            'source': 'wrapper-nous',
+            'metadata_source': 'wrapper_alias' if is_alias_name(mid) else 'last_resort_manifest',
+            'provider_model_id': concrete or None,
+            'requested_model_id': mid,
+            'native_fields_preserved': False,
+            'is_alias': bool(is_alias_name(mid)),
+        }
+        if concrete:
+            wrapper_meta['rooted_model'] = concrete
+        if is_alias_name(mid):
+            base['dynamic_alias'] = True
+            if concrete:
+                base['rooted_model'] = concrete
+    base['wrapper_metadata'] = wrapper_meta
     _route_enricher = globals().get("enrich_openai_catalog_entry")
     if _route_enricher is not None:
         base = _route_enricher(
             base, "nous", globals().get("NOUS_BASE", "https://inference-api.nousresearch.com"),
             client_path="/v1/chat/completions", kind="chat", streaming=True)
     return base
-
 
 
 
@@ -843,14 +837,19 @@ def _prepare_nous_request_metadata(payload: dict) -> dict:
 
 
 async def post_nous(payload: dict, token: str, stream: bool = False, extra_headers: dict = None,
-                     path: str = 'v1/chat/completions', context_state=None) -> tuple:
+                     path: str = 'v1/chat/completions', context_state=None,
+                     inject_tags: bool = True, recover_context: bool = True) -> tuple:
     """Forward the selected native endpoint with separate transport metadata.
 
     Error JSON stays unchanged. Retry-After remains in transport headers so
     credential cooldown can use it without changing the upstream error body.
     """
-    from common.context_recovery import context_request, context_response_headers
-    payload = _prepare_nous_request_metadata(payload)
+    from common.context_recovery import context_request, context_response_headers, ContextRecoveryState
+    if context_state is None:
+        context_state = ContextRecoveryState(enabled=recover_context)
+    else:
+        context_state.enabled = bool(recover_context)
+    payload = _prepare_nous_request_metadata(payload) if inject_tags else payload
     url = f"{NOUS_BASE}/{path}"
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json", "Accept-Encoding": "gzip, deflate"}
     if stream:
@@ -933,7 +932,8 @@ def _looks_model_capacity_error(data) -> bool:
 
 
 async def post_nous_with_retries(payload: dict, stream: bool = False, extra_headers: dict = None,
-                                   client_surface: str = "openai_chat", path: str = "v1/chat/completions") -> tuple:
+                                   client_surface: str = "openai_chat", path: str = "v1/chat/completions",
+                                   inject_tags: bool = True, recover_context: bool = True) -> tuple:
     """Post to Nous using every available credential before surfacing failure.
 
     OAuth AUTH_PATH remains supported. If that single token fails with a
@@ -944,7 +944,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     successful streaming response and must be released when the stream ends.
     """
     from common.context_recovery import ContextRecoveryState
-    context_state = ContextRecoveryState()
+    context_state = ContextRecoveryState(enabled=recover_context)
     model_id = str(payload.get("model") or "").strip()
     if model_id:
         try:
@@ -960,10 +960,29 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
     # BUG-M1 fix: preserve OAuth retry-after so it's not lost if static keys also fail
     oauth_retry_after = 0
 
+    # Keep the retry seam compatible with test/management hooks that provide
+    # the older post_nous signature; the production function accepts the new
+    # native-routing controls.
+    import inspect
+    try:
+        _post_params = inspect.signature(post_nous).parameters
+    except (TypeError, ValueError):
+        _post_params = {}
+
+    async def _post_for_key(token):
+        kwargs = {
+            'stream': stream, 'extra_headers': extra_headers, 'path': path,
+            'context_state': context_state,
+        }
+        if 'inject_tags' in _post_params:
+            kwargs['inject_tags'] = inject_tags
+        if 'recover_context' in _post_params:
+            kwargs['recover_context'] = recover_context
+        return await post_nous(payload, token, **kwargs)
+
     oauth_token = _read_token_from_auth_path()
     if oauth_token:
-        status, result = await post_nous(payload, oauth_token, stream=stream, extra_headers=extra_headers, path=path,
-                                       context_state=context_state)
+        status, result = await _post_for_key(oauth_token)
         if status == 200:
             return status, result, None
         if path.rstrip('/').endswith('/responses') and _responses_chat_fallback_allowed(status, result):
@@ -999,8 +1018,7 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             # N-01 fix: the key's in_flight slot is always released via finally
             # (except the successful-stream case where the stream generator owns
             # the release). post_nous itself shapes network errors into a 502.
-            status, result = await post_nous(payload, entry.api_key, stream=stream, extra_headers=extra_headers, path=path,
-                                           context_state=context_state)
+            status, result = await _post_for_key(entry.api_key)
             if status == 200:
                 if stream:
                     released = True  # ownership transferred to the stream generator
@@ -1635,10 +1653,41 @@ def _stream_resource_cleanup(upstream_resp, key_entry):
     return cleanup
 
 
-async def _stream_passthrough(upstream_resp, key_entry=None, *, on_close=None):
-    """Preserve same-dialect SSE bytes and close the response and credential."""
+async def _stream_passthrough(upstream_resp, key_entry=None, *, on_close=None, preserve=False):
+    """Preserve same-dialect SSE bytes and close the response and credential.
+
+    Native routes disable wrapper heartbeats; translated compatibility streams
+    may retain them because their framing is already being adapted.
+    """
     cleanup = on_close or _stream_resource_cleanup(upstream_resp, key_entry)
-    stream = _passthrough_anthropic_sse(upstream_resp, HEARTBEAT_MS / 1000.0)
+    # aiohttp's iter_any() is the raw chunk iterator and is also the ownership
+    # seam used by the transport tests. Native passthrough must not route it
+    # through the heartbeat/event adapter; translated streams still use the
+    # shared Anthropic adapter.
+    stream = None
+    if preserve:
+        # aiohttp exposes the raw iterator on ClientResponse.content, while
+        # transport fixtures and alternate clients may expose iter_any() (or
+        # aiter_raw()) directly on the response. Prefer whichever raw seam is
+        # actually available; never hand the response object itself to an
+        # async-for adapter because ClientResponse is not async-iterable.
+        candidate = getattr(upstream_resp, 'iter_any', None)
+        if callable(candidate):
+            stream = candidate()
+        else:
+            content = getattr(upstream_resp, 'content', None)
+            candidate = getattr(content, 'iter_any', None)
+            if callable(candidate):
+                stream = candidate()
+        if stream is None:
+            candidate = getattr(upstream_resp, 'aiter_raw', None)
+            if callable(candidate):
+                stream = candidate()
+        if stream is None and hasattr(upstream_resp, '__aiter__'):
+            stream = upstream_resp
+    if stream is None:
+        stream = _passthrough_anthropic_sse(upstream_resp, HEARTBEAT_MS / 1000.0,
+                                            add_heartbeats=not preserve)
     try:
         async for chunk in stream:
             yield chunk
@@ -1718,6 +1767,11 @@ async def stream_with_heartbeat(upstream_resp: aiohttp.ClientResponse,
             # immediately instead of waiting for a provider that may keep the
             # socket open after sending its error frame.
             if getattr(state, "upstream_error", None):
+                # Let ResponsesStreamState.done() emit response.failed. The
+                # Anthropic error event is already terminal and its state is
+                # idempotent after the failure.
+                async for ev in emit_state_done():
+                    yield ev
                 terminated = True
                 return
         else:
@@ -1935,8 +1989,9 @@ class AnthropicStreamState:
             events.append({"type": "error", "data": {
                 "type": "error",
                 "error": {"type": etype, "message": str(msg)[:2000]}}})
-            # An error event is terminal; never turn a failed upstream stream
-            # into a fabricated successful end_turn for Claude Code.
+            # The error event is terminal. Do not append message_delta or
+            # message_stop, which can make a failed/truncated turn look
+            # successful to Anthropic clients.
             self.finished = True
             return events
 
@@ -3110,6 +3165,7 @@ async def health():
         # DASH fix: the dashboard Health tab reads catalog age from /health
         # (it previously only lived in /ready, so the card said "not reported").
         "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+        "catalog_state": MODEL_CATALOG.status(),
     }
 
 
@@ -3132,6 +3188,7 @@ async def ready():
                 "status_code": 200,
                 "source": "catalog_cache",
                 "catalog_age_sec": MODEL_STORE.catalog_age_sec(),
+                "catalog_state": MODEL_CATALOG.status(),
                 "last_error": None,
                 "keys": KEY_POOL.total_keys,
                 "available": KEY_POOL.available_keys,
@@ -3310,7 +3367,11 @@ async def models():
             enriched[i]["availability_scope"] = "account"
             enriched[i]["reason_code"] = st.get("reason_code", "")
             enriched[i]["checked_at"] = st.get("checked_at")
-    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(), "free_policy": "free_suffix_or_allowlist", "dynamic_alias_target": get_dynamic_alias_target() or None, "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True))}
+    return {"object": "list", "data": enriched, "models": enriched, "free_only": free_only_enabled(),
+            "free_policy": "free_suffix_or_allowlist",
+            "dynamic_alias_target": get_dynamic_alias_target() or None,
+            "catalog_cached": bool(MODEL_STORE.get_catalog(fresh_only=True)),
+            "catalog_state": MODEL_CATALOG.status()}
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -3376,14 +3437,31 @@ async def capabilities():
     for m in models_list:
         mid = m.get("id") if isinstance(m, dict) else m
         meta = get_model_meta(mid, m if isinstance(m, dict) else {})
+        arch = meta.get("architecture") if isinstance(meta.get("architecture"), dict) else {}
+        in_mods = [str(v) for v in (arch.get("input_modalities") or [])] if isinstance(arch.get("input_modalities"), list) else []
+        out_mods = [str(v) for v in (arch.get("output_modalities") or [])] if isinstance(arch.get("output_modalities"), list) else []
+        params = meta.get("supported_parameters") if isinstance(meta.get("supported_parameters"), list) else []
+        params = {str(v) for v in params}
+        native_caps = []
+        if "embeddings" in out_mods:
+            native_caps.append("embeddings")
+        if "text" in in_mods and "text" in out_mods:
+            native_caps.append("chat")
+        if params.intersection({"tools", "tool_choice", "parallel_tool_calls"}):
+            native_caps.append("tools")
+        if params.intersection({"reasoning", "include_reasoning", "thinking"}):
+            native_caps.append("reasoning")
         enriched.append({
             "id": mid,
-            "capabilities": ["chat", "completion"],
-            "streaming": True,
+            "capabilities": native_caps,
+            "capability_source": "provider_catalog",
+            "capability_state": "known" if native_caps else "unknown",
+            "streaming": meta.get("streaming") if "streaming" in meta else None,
             "endpoints": meta.get("endpoints", []),
+            "wrapper_endpoints": meta.get("wrapper_endpoints", []),
             "routing_metadata": meta.get("routing_metadata", {}),
-            "input_modalities": meta.get("input_modalities", ["text"]),
-            "output_modalities": meta.get("output_modalities", ["text"]),
+            "input_modalities": in_mods,
+            "output_modalities": out_mods,
             **discovery_limits(meta),
         })
     tgt = get_dynamic_alias_target()
@@ -3396,14 +3474,53 @@ async def capabilities():
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(req: Request):
-    # N-18 fix: non-discovery endpoint requires auth.
+    """Use Nous' native token-count contract; never fabricate an estimate."""
     await _auth_check(req)
+    if not check_rate_limit(req.client.host if req.client else "unknown"):
+        return JSONResponse(status_code=429, content={"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
         body = await req.json()
     except Exception as e:
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': f'Invalid JSON: {e}'}})
-    est = len(str(body)) // 4
-    return {"input_tokens": max(1, est)}
+    status, result, key_entry = await post_nous_with_retries(
+        body, stream=False, extra_headers=_build_forward_headers(req.headers),
+        client_surface='anthropic_messages', path='v1/messages/count_tokens',
+        inject_tags=False, recover_context=False)
+    _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result, '/v1/messages/count_tokens'), 'model-result')
+    return _native_json_response(result, status)
+
+
+@app.post("/v1/completions")
+async def completions(request: Request):
+    """Native Nous legacy Completions passthrough."""
+    await _auth_check(request)
+    if not check_rate_limit(request.client.host if request.client else "unknown"):
+        return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}}, status_code=400)
+    requested = body.get('model')
+    if requested:
+        body['model'] = resolve_model(requested)
+    if free_only_enabled() and body.get('model') and not model_allowed(body.get('model')):
+        return JSONResponse(status_code=400, content=free_only_error(requested or body.get('model')))
+    stream = bool(body.get('stream', False))
+    status, result, key_entry = await post_nous_with_retries(
+        body, stream=stream, extra_headers=_build_forward_headers(request.headers),
+        client_surface='openai_chat', path='v1/completions',
+        recover_context=False)
+    _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result, '/v1/completions'), 'model-result')
+    if status != 200:
+        return _native_json_response(result, status)
+    if stream:
+        cleanup = _stream_resource_cleanup(result, key_entry)
+        return StreamingResponse(
+            _sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True),
+                                str(body.get('model', '') or ''), _metrics_key_label(key_entry)),
+            on_close=cleanup, media_type='text/event-stream',
+            headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **_native_response_headers(result)})
+    return _native_json_response(result, status)
 
 # --- OPENAI CHAT ---
 @app.post("/v1/chat/completions")
@@ -3426,7 +3543,7 @@ async def chat_completions(request: Request):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
 
     # BUG-SEC3 fix (via shared helper, N-11): validate + cap max_tokens
-    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens')
+    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens') if (globals().get('NATIVE_PROTOCOL_VALIDATION', False) or _is_anthropic_upstream()) else None
     if mt_err:
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': mt_err}})
 
@@ -3480,7 +3597,8 @@ async def chat_completions(request: Request):
             return StreamingResponse(gen(), on_close=cleanup, media_type="text/event-stream", headers={**context_response_headers(result), "Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
         return JSONResponse(anthropic_to_openai_response(result, body.get("model", "")), headers=context_response_headers(result))
 
-    status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h)
+    status, result, key_entry = await post_nous_with_retries(body, stream=is_stream, extra_headers=extra_h,
+                                                               recover_context=True)
     # F3 round-2 fix: model-state persistence must not delay the response;
     # fire-and-forget with a retained reference (_BG_TASKS pattern).
     _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/chat/completions"), "model-result")
@@ -3495,7 +3613,7 @@ async def chat_completions(request: Request):
 
     if is_stream:
         cleanup = _stream_resource_cleanup(result, key_entry)
-        return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
+        return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
     return _native_json_response(result)
 
 # --- OPENAI RESPONSES (FIXED streaming format for Codex/Claude) ---
@@ -3513,7 +3631,7 @@ async def responses(request: Request):
     if not check_rate_limit(request.client.host if request.client else "unknown"):
         raise HTTPException(429, {"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     # N-11 fix: type-guard + cap max_output_tokens (int("abc") previously → 500).
-    mot_err = validate_max_tokens_field(body.get("max_output_tokens"), "max_output_tokens")
+    mot_err = validate_max_tokens_field(body.get("max_output_tokens"), "max_output_tokens") if (globals().get('NATIVE_PROTOCOL_VALIDATION', False) or not _responses_use_native_upstream()) else None
     if mot_err:
         return JSONResponse(status_code=400, content={'error': {'type': 'invalid_request_error', 'message': mot_err}})
     requested = body.get("model")
@@ -3527,7 +3645,7 @@ async def responses(request: Request):
         is_stream = bool(body.get('stream', False))
         status, result, key_entry = await post_nous_with_retries(
             body, stream=is_stream, extra_headers=_build_forward_headers(request.headers),
-            client_surface='openai_responses', path='v1/responses')
+            client_surface='openai_responses', path='v1/responses', recover_context=True)
         _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result,
                                              '/v1/responses'), 'model-result')
         _m_id = str(body.get('model', '') or '')
@@ -3540,7 +3658,7 @@ async def responses(request: Request):
                 return _native_json_response(result, status)
             cleanup = _stream_resource_cleanup(result, key_entry)
             return StreamingResponse(
-                _sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type='text/event-stream',
+                _sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type='text/event-stream',
                 headers={'cache-control': 'no-cache', 'x-accel-buffering': 'no', **_native_response_headers(result)})
         previous_id = body.get('previous_response_id')
         if previous_id is not None and get_stored_conversation(
@@ -3689,14 +3807,16 @@ async def messages(request: Request):
     # INFO parity fix: request.client can be None — guard with "unknown".
     if not check_rate_limit(request.client.host if request.client else "unknown"):
         raise HTTPException(429, {"type": "error", "error": {"type": "rate_limit_error", "message": "Too many requests"}})
-    # N-11 fix: apply the shared SEC3 cap+validation (upper bound was missing).
-    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens', required=True)
+    # Native Messages validation is provider-authoritative. The wrapper guard
+    # remains available for the explicit translated compatibility route.
+    native_messages = (globals().get('NATIVE_MESSAGES_MODE', 'translate') != 'translate') or _is_anthropic_upstream()
+    mt_err = validate_max_tokens_field(body.get('max_tokens'), 'max_tokens', required=True) if (globals().get('NATIVE_PROTOCOL_VALIDATION', False) or not native_messages) else None
     if mt_err:
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': mt_err}})
     sys_field = body.get('system')
     if sys_field is not None and not isinstance(sys_field, (str, list)):
         return JSONResponse(status_code=400, content={'type': 'error', 'error': {'type': 'invalid_request_error', 'message': '"system" must be a string or array of content blocks'}})
-    cross_dialect = not _is_anthropic_upstream()
+    cross_dialect = (not native_messages) and not _is_anthropic_upstream()
     if cross_dialect:
         try:
             _validate_anthropic_chat_request(body)
@@ -3715,15 +3835,16 @@ async def messages(request: Request):
         resolved = resolve_model(requested)
         if not model_allowed(requested) and not model_allowed(resolved):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested))
-    # COMPATIBILITY_LAYER=2: Anthropic upstream — the /v1/messages surface
-    # passes through verbatim (model alias already applied above).
-    if _is_anthropic_upstream():
+    # Native Messages is the default. Translation is explicit and only used
+    # when NATIVE_MESSAGES_MODE=translate is configured.
+    if native_messages:
         if free_only_enabled() and body.get("model") and not model_allowed(body.get("model", "")):
             return JSONResponse(status_code=400, content=free_only_anthropic_error(requested or body.get("model") or ""))
         is_stream = body.get("stream", False)
         extra_h = _build_forward_headers(request.headers)
         status, result, key_entry = await post_nous_with_retries(
-            body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages", path="v1/messages")
+            body, stream=is_stream, extra_headers=extra_h, client_surface="anthropic_messages",
+            path="v1/messages", recover_context=True)
         _fire_and_forget(record_model_result(body.get("model", ""), key_entry, status, result, "/v1/messages"), "model-result")
         _m_id = str(body.get("model", "") or "")
         _tok = _result_usage_tokens(result) if status == 200 else (0, 0)
@@ -3734,7 +3855,7 @@ async def messages(request: Request):
             return _native_json_response(result, status)
         if is_stream:
             cleanup = _stream_resource_cleanup(result, key_entry)
-            return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
+            return StreamingResponse(_sniff_stream_usage(_stream_passthrough(result, key_entry, on_close=cleanup, preserve=True), _m_id, _metrics_key_label(key_entry)), on_close=cleanup, media_type="text/event-stream", headers={"cache-control": "no-cache", "x-accel-buffering": "no", **_native_response_headers(result)})
         return _native_json_response(result)
 
     try:
@@ -3897,32 +4018,24 @@ except ImportError as _cie:
 
 @app.post("/v1/embeddings")
 async def embeddings(request: Request):
-    """Embeddings endpoint — not supported by this upstream provider.
-
-    Returns a clear 501 so SDK clients get a structured error instead of
-    a 404 catch-all. Operators who need embeddings should use nvidia-python
-    or openrouter wrappers which DO support embeddings.
-    """
-    # B-31 fix: this endpoint previously parsed an arbitrary JSON body with NO
-    # auth and NO rate limit — unauthenticated CPU/memory work reachable by
-    # anyone who can hit the port. Gate it like every other POST surface.
+    """Native Nous embeddings passthrough; model support is provider-defined."""
     await _auth_check(request)
     if not check_rate_limit(request.client.host if request.client else "unknown"):
         return JSONResponse(status_code=429, content={"error": {"type": "rate_limit_error", "message": "Too many requests"}})
     try:
-        # B-19: validate the body is well-formed JSON (so clients get 400 not
-        # 501 for malformed input) without binding an unused variable.
-        await request.json()
+        body = await request.json()
     except Exception:
-        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
-                            status_code=400)
-    return JSONResponse({
-        "error": {
-            "message": "Embeddings not supported by this provider. Use nvidia-python (port 9101) or openrouter (port 9103) for embeddings.",
-            "type": "not_implemented_error",
-            "code": 501,
-        }
-    }, status_code=501)
+        return JSONResponse({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}}, status_code=400)
+    requested = body.get('model')
+    if requested:
+        body['model'] = resolve_model(requested)
+    if free_only_enabled() and body.get('model') and not model_allowed(body.get('model')):
+        return JSONResponse(status_code=400, content=free_only_error(requested or body.get('model')))
+    status, result, key_entry = await post_nous_with_retries(
+        body, stream=False, extra_headers=_build_forward_headers(request.headers),
+        client_surface='openai_chat', path='v1/embeddings', recover_context=False)
+    _fire_and_forget(record_model_result(body.get('model', ''), key_entry, status, result, '/v1/embeddings'), 'model-result')
+    return _native_json_response(result, status)
 
 @app.api_route("/{path:path}", methods=["GET", "POST"])
 async def catch_all(path: str, request: Request):

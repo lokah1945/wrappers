@@ -154,7 +154,8 @@ def plan_context_recovery(payload, status, error, *, attempted=False):
 
 
 class ContextRecoveryState:
-    def __init__(self):
+    def __init__(self, *, enabled: bool = True):
+        self.enabled = bool(enabled)
         self.attempted = False
         self.headers = {}
         self.output_field = None
@@ -185,6 +186,10 @@ class context_request:
 
     async def _run(self):
         payload = self.payload
+        if not self.state.enabled:
+            response = await self.send(payload)
+            response._context_recovery_headers = dict(self.state.headers)
+            return response
         # A repaired request may then hit a quota/auth failure and rotate keys.
         # Keep its reduced ceiling across those attempts, with the same global
         # one-repair bound, without replaying or replacing any input fields.

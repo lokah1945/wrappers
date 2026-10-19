@@ -27,6 +27,23 @@ except ImportError:  # pragma: no cover - standalone use outside the package
     from think_tags import extract_inline_thinking, strip_trailing_think_tags, thinking_signature
 
 
+_SPECIAL_TOKENS = frozenset({
+    '<|end_of_turn|>', '<|tool_call_begin|>', '<|tool_call_end|>',
+    '<|tool_calls_section_begin|>', '<|tool_calls_section_end|>',
+    '<|tool_call|>', '<|tool_calls|>',
+    '❓', '回答', '<thinking>', '</thinking>',
+})
+
+
+def _filter_special_tokens(text: str) -> str:
+    """Remove provider control tokens from translated reasoning deltas."""
+    if not isinstance(text, str):
+        return text
+    for token in _SPECIAL_TOKENS:
+        text = text.replace(token, '')
+    return text
+
+
 def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
     """Split MiniMax DSML tool markup leaked into content into (clean_text, tool_use blocks).
 

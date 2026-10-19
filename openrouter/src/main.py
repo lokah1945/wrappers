@@ -52,9 +52,12 @@ except ImportError:
     from common.model import (
         LocalModelRegistry,
         ModelRegistryClient,
+        same_provider_model_id,
+        classify_upstream_error,
     )
     from common.model_state import (
         ModelStateStore,
+        credential_fingerprint,
     )
     from common.model.routing import enrich_openai_catalog_entry
 
@@ -235,6 +238,14 @@ from common.model.metadata import discovery_limits
 MODEL_CATALOG = CachedModelCatalog(MODEL_STORE, MODEL_REGISTRY, MODEL_REGISTRY_CLIENT,
                                   f"{OPENROUTER_BASE}/models", ttl_sec=MODEL_CATALOG_TTL_SEC)
 _MODEL_REFRESH_TASK = None
+# The provider envelope is retained separately from the row cache so native
+# links/total_count survive cached discovery. It is only updated after a
+# successful, non-empty provider response.
+_CATALOG_ENVELOPE = MODEL_STORE.get_catalog_envelope() or {}
+NATIVE_MESSAGES_MODE = os.environ.get('NATIVE_MESSAGES_MODE', 'native').strip().lower()
+if NATIVE_MESSAGES_MODE not in ('native', 'translate'):
+    NATIVE_MESSAGES_MODE = 'native'
+NATIVE_PROTOCOL_VALIDATION = os.environ.get('NATIVE_PROTOCOL_VALIDATION', 'false').strip().lower() in ('1', 'true', 'yes', 'on')
 
 # FREE_ONLY truth: OpenRouter free model ids carry the explicit ``:free``
 # (or legacy ``-free``) suffix. Pricing is intentionally not used here:
@@ -599,12 +610,23 @@ async def _refresh_models_loop():
 
 
 async def _fetch_model_catalog():
+    global _CATALOG_ENVELOPE
     agent = await get_agent()
     async with agent.get(f"{OPENROUTER_BASE}/models", headers={"Accept": "application/json"}) as resp:
         if resp.status != 200:
             raise ValueError('OpenRouter model catalog unavailable')
         data = await resp.json()
-        return data.get('data', [])
+        if not isinstance(data, dict) or not isinstance(data.get('data'), list) or not data.get('data'):
+            raise ValueError('OpenRouter model catalog contains no models')
+        _CATALOG_ENVELOPE = {key: value for key, value in data.items()
+                            if key in ('data', 'links', 'total_count')}
+        store = globals().get('MODEL_STORE')
+        if store is not None and hasattr(store, 'save_catalog_envelope'):
+            try:
+                store.save_catalog_envelope(_CATALOG_ENVELOPE, source=f"{OPENROUTER_BASE}/models")
+            except Exception:
+                logger.warning('[openrouter] catalog envelope persistence failed')
+        return data['data']
 
 
 async def _refresh_models(force: bool = False) -> list:
@@ -1019,7 +1041,9 @@ async def _sniff_stream_usage(source, model: str, key_label: str):
 async def _proxy_request(method: str, path: str, body: dict | None = None,
                          headers: dict | None = None, stream: bool = False,
                          request: Request | None = None,
-                         terminal_done: bool = False) -> Response:
+                         terminal_done: bool = False,
+                         native_stream: bool = False,
+                         recover_context: bool = True) -> Response:
     """Generic proxy handler for OpenRouter API with multi-key retry loop.
 
     Iterates over all available keys on retriable failures (429, 5xx, network errors).
@@ -1030,7 +1054,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
     """
     from common.context_recovery import context_request, ContextRecoveryState
     from common.http_headers import upstream_response_headers
-    context_state = ContextRecoveryState()
+    context_state = ContextRecoveryState(enabled=recover_context)
     model_id = (body or {}).get("model", "") if body else ""
     endpoint = path.strip('/').rsplit('/', 1)[-1]
 
@@ -1094,11 +1118,15 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                 sock_read=int(os.environ.get('STREAM_SOCK_READ_TIMEOUT_SEC', '300')),
             )
 
+            def _send(payload):
+                if method.upper() == 'GET':
+                    return agent.get(url, headers=fwd, timeout=timeout)
+                return agent.request(method, url, json=payload, headers=fwd, timeout=timeout)
+
             if stream:
                 # Streaming: do NOT async-with so caller owns release; release in finally.
                 resp = await context_request(
-                    lambda payload: agent.request(method, url, json=payload, headers=fwd, timeout=timeout),
-                    body, state=context_state, store=globals().get('MODEL_STORE'),
+                    _send, body, state=context_state, store=globals().get('MODEL_STORE'),
                     credential=key_obj.api_key, endpoint=url)
                 if resp.status >= 400:
                     last_headers = upstream_response_headers(resp)
@@ -1198,6 +1226,13 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     finally:
                         release_stream()
 
+                if native_stream:
+                    return StreamingResponse(
+                        _sniff_stream_usage(stream_gen(), model_id, getattr(key_obj, 'label', '')),
+                        on_close=release_stream, status_code=resp.status,
+                        media_type="text/event-stream",
+                        headers={**upstream_response_headers(resp)})
+
                 async def stream_with_heartbeat():
                     # B-08 fix: use the shared sentinel-task iterator instead of
                     # asyncio.wait_for. wait_for CANCELS the pending read on
@@ -1256,8 +1291,7 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
 
             # Non-streaming
             async with context_request(
-                lambda payload: agent.request(method, url, json=payload, headers=fwd, timeout=timeout),
-                body, state=context_state, store=globals().get('MODEL_STORE'),
+                _send, body, state=context_state, store=globals().get('MODEL_STORE'),
                 credential=key_obj.api_key, endpoint=url) as resp:
                 response_headers = upstream_response_headers(resp)
                 await metrics.record_request(model=model_id, status_code=resp.status,
@@ -1354,6 +1388,22 @@ def _check_free_only(model: str) -> JSONResponse | None:
     return None
 
 
+@app.post("/v1/completions")
+async def completions(request: Request):
+    """Native OpenRouter legacy Completions passthrough."""
+    try:
+        body = await request.json()
+    except Exception:
+        return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
+                            status_code=400)
+    blocked = _check_free_only(body.get("model", ""))
+    if blocked:
+        return blocked
+    stream = bool(body.get("stream", False))
+    return await _proxy_request("POST", "completions", body, stream=stream, request=request,
+                                native_stream=stream, recover_context=True)
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     from common.context_recovery import context_response_headers
@@ -1364,14 +1414,17 @@ async def chat_completions(request: Request):
                             status_code=400)
     model = body.get("model", "")
 
-    # WRAPPER_CONTRACT §4: max_tokens MUST be a positive integer capped at 1M.
+    # Native OpenRouter validation is authoritative. The historical local cap
+    # remains available only with NATIVE_PROTOCOL_VALIDATION=true or on the
+    # explicit cross-dialect adapter.
     mt = body.get("max_tokens")
-    if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
-        return _error_response({"error": {"message": "max_tokens must be a positive integer",
-                                          "type": "invalid_request_error"}}, status_code=400)
-    if isinstance(mt, int) and mt > 1_000_000:
-        return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
-                                          "type": "invalid_request_error"}}, status_code=400)
+    if globals().get('NATIVE_PROTOCOL_VALIDATION', False) or _is_anthropic_upstream():
+        if mt is not None and (not isinstance(mt, int) or isinstance(mt, bool) or mt <= 0):
+            return _error_response({"error": {"message": "max_tokens must be a positive integer",
+                                              "type": "invalid_request_error"}}, status_code=400)
+        if isinstance(mt, int) and mt > 1_000_000:
+            return _error_response({"error": {"message": "max_tokens exceeds maximum allowed value of 1000000",
+                                              "type": "invalid_request_error"}}, status_code=400)
     # WRAPPER_CONTRACT §4: unknown roles and orphan tool messages are rejected.
     cross_dialect = _is_anthropic_upstream()
     for _m in body.get("messages") or []:
@@ -1420,7 +1473,8 @@ async def chat_completions(request: Request):
                 return JSONResponse(oai_resp, status_code=res.status_code)
         return res
 
-    return await _proxy_request("POST", "chat/completions", body, stream=stream, request=request)
+    return await _proxy_request("POST", "chat/completions", body, stream=stream, request=request,
+                                 native_stream=bool(stream), recover_context=True)
 
 
 @app.post("/v1/responses")
@@ -1434,16 +1488,17 @@ async def responses(request: Request):
                             status_code=400)
     model = body.get("model", "")
 
-    # WRAPPER_CONTRACT §4: max_output_tokens / max_tokens capped at 1M and
-    # positive on the Responses surface too.
-    for _mt_key in ("max_output_tokens", "max_tokens"):
-        _mtv = body.get(_mt_key)
-        if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
-            return _error_response({"error": {"message": f"{_mt_key} must be a positive integer",
-                                              "type": "invalid_request_error"}}, status_code=400)
-        if isinstance(_mtv, int) and _mtv > 1_000_000:
-            return _error_response({"error": {"message": f"{_mt_key} exceeds maximum allowed value of 1000000",
-                                              "type": "invalid_request_error"}}, status_code=400)
+    # Native OpenRouter Responses validation is authoritative; the local guard
+    # is opt-in or applies only to the Chat compatibility adapter.
+    if globals().get('NATIVE_PROTOCOL_VALIDATION', False) or not _responses_use_native_upstream():
+        for _mt_key in ("max_output_tokens", "max_tokens"):
+            _mtv = body.get(_mt_key)
+            if _mtv is not None and (not isinstance(_mtv, int) or isinstance(_mtv, bool) or _mtv <= 0):
+                return _error_response({"error": {"message": f"{_mt_key} must be a positive integer",
+                                                  "type": "invalid_request_error"}}, status_code=400)
+            if isinstance(_mtv, int) and _mtv > 1_000_000:
+                return _error_response({"error": {"message": f"{_mt_key} exceeds maximum allowed value of 1000000",
+                                                  "type": "invalid_request_error"}}, status_code=400)
 
     blocked = _check_free_only(model)
     if blocked:
@@ -1451,7 +1506,9 @@ async def responses(request: Request):
 
     if _responses_use_native_upstream():
         native_response = await _proxy_request('POST', 'responses', body,
-                                               stream=bool(body.get('stream', False)), request=request)
+                                               stream=bool(body.get('stream', False)), request=request,
+                                               native_stream=bool(body.get('stream', False)),
+                                               recover_context=True)
         if not isinstance(native_response, JSONResponse):
             return native_response
         try:
@@ -2027,7 +2084,10 @@ async def embeddings(request: Request):
     except Exception:
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
-    return await _proxy_request("POST", "embeddings", body, request=request)
+    blocked = _check_free_only(body.get("model", ""))
+    if blocked:
+        return blocked
+    return await _proxy_request("POST", "embeddings", body, request=request, recover_context=False)
 
 
 @app.post("/v1/images/generations")
@@ -2037,21 +2097,62 @@ async def images_generations(request: Request):
     except Exception:
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
-    return await _proxy_request("POST", "images/generations", body, request=request)
+    blocked = _check_free_only(body.get("model", ""))
+    if blocked:
+        return blocked
+    return await _proxy_request("POST", "images/generations", body, request=request, recover_context=False)
 
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """Serve persistent provider metadata; stale catalogs refresh once in background."""
+    """Return a provider snapshot while retaining OpenRouter list semantics.
+
+    Rows are cached/polled, not a live inference stream. The native envelope
+    (including ``links`` and ``total_count``) is retained when available;
+    FREE_ONLY and wrapper/account fields are explicitly namespaced.
+    """
     entries = await MODEL_CATALOG.get(_fetch_model_catalog)
-    if free_only_enabled():
-        # OpenRouter's explicit free suffix is authoritative. Do not infer
-        # free access from text pricing because some modalities bill separately.
-        entries = [m for m in entries if _model_entry_is_free(m)]
+    store = globals().get("MODEL_STORE")
+    envelope = globals().get("_CATALOG_ENVELOPE") or {}
+    if not envelope and store is not None and hasattr(store, 'get_catalog_envelope'):
+        try:
+            envelope = store.get_catalog_envelope() or {}
+        except Exception:
+            envelope = {}
+
+    # Preserve provider order from the last successful envelope. The row cache
+    # adds provenance/observations but never invents missing provider rows.
+    by_id = {str(m.get('id')): m for m in entries if isinstance(m, dict) and m.get('id')}
+    ordered = []
+    for raw in (envelope.get('data') if isinstance(envelope.get('data'), list) else []):
+        if isinstance(raw, dict) and str(raw.get('id')) in by_id:
+            ordered.append(by_id.pop(str(raw.get('id'))))
+    ordered.extend(by_id.values())
+
+    free_only = free_only_enabled()
+    provider_total = envelope.get('total_count')
+    if not isinstance(provider_total, int) or provider_total < 0:
+        provider_total = len(ordered)
+    filtered = [m for m in ordered if not free_only or _model_entry_is_free(m)]
+    free_total = len(filtered)
+
+    query = getattr(request, 'query_params', {})
+    try:
+        raw_limit = query.get('limit')
+        raw_offset = query.get('offset', '0')
+        limit = int(raw_limit) if raw_limit not in (None, '') else None
+        offset = int(raw_offset or 0)
+        if offset < 0 or (limit is not None and (limit <= 0 or limit > 10000)):
+            raise ValueError
+    except (TypeError, ValueError):
+        return _error_response({'error': {'type': 'invalid_request_error',
+                             'message': 'limit must be 1..10000 and offset must be non-negative'}}, status_code=400)
+    if limit is None:
+        page = filtered[offset:]
+    else:
+        page = filtered[offset:offset + limit]
+
     def _with_observations(m):
-        # Empirical reinforcement (2026-10-15): account-scoped context
-        # evidence fills gaps; published values always win; a verified
-        # floor never over-labels a small-context model.
         try:
             if isinstance(m, dict):
                 obs = MODEL_STORE.context_observations(str(m.get('id') or ''))
@@ -2060,31 +2161,66 @@ async def list_models(request: Request):
         except Exception:
             pass
         return m
-    _model_store = globals().get("MODEL_STORE")
-    status_map = _model_store.effective_status_map() if _model_store is not None else {}
+
+    status_map = store.effective_status_map() if store is not None else {}
     enriched = []
-    for raw in entries:
+    for raw in page:
         observed = _with_observations(raw)
-        status = status_map.get(str(observed.get("id") or ""), {}) if isinstance(observed, dict) else {}
-        # OpenRouter's catalog describes model capabilities, while this
-        # wrapper owns the exact public route. Make model → endpoint matching
-        # explicit and keep the provider metadata untouched.
-        _route_enricher = globals().get("enrich_openai_catalog_entry")
-        if _route_enricher is not None:
-            observed = _route_enricher(
-                observed, "openrouter", globals().get("OPENROUTER_BASE", "https://openrouter.ai/api/v1"),
-                client_path="/v1/chat/completions", kind="chat", streaming=True)
+        status = status_map.get(str(observed.get('id') or ''), {}) if isinstance(observed, dict) else {}
+        route_enricher = globals().get('enrich_openai_catalog_entry')
+        if route_enricher is not None:
+            observed = route_enricher(
+                observed, 'openrouter', globals().get('OPENROUTER_BASE', 'https://openrouter.ai/api/v1'),
+                client_path='/v1/chat/completions', kind='chat', streaming=True)
         observed.update(discovery_limits(observed))
         if isinstance(observed, dict):
             observed.update({
-                "catalog_listed": True,
-                "availability_state": status.get("state", "unknown"),
-                "availability_scope": "account",
-                "reason_code": status.get("reason_code", ""),
-                "checked_at": status.get("checked_at"),
+                'catalog_listed': True,
+                'availability_state': status.get('state', 'unknown'),
+                'availability_scope': 'account',
+                'reason_code': status.get('reason_code', ''),
+                'checked_at': status.get('checked_at'),
             })
         enriched.append(observed)
-    return JSONResponse({'object': 'list', 'data': enriched, 'free_only': free_only_enabled(), 'free_policy': 'provider_free_suffix_only'})
+
+    payload = {
+        'object': 'list', 'data': enriched,
+        'free_only': free_only,
+        'free_policy': 'provider_free_suffix_only',
+        'catalog_state': MODEL_CATALOG.status(),
+        'catalog_snapshot_source': 'openrouter_provider_poll_cache',
+    }
+    if free_only:
+        payload['provider_total_count'] = provider_total
+        payload['provider_links'] = envelope.get('links')
+        payload['free_total_count'] = free_total
+    else:
+        payload['total_count'] = provider_total
+        if isinstance(envelope.get('links'), dict):
+            payload['links'] = envelope['links']
+
+    # For an explicitly paginated cached view, expose a deterministic wrapper
+    # pagination envelope rather than returning a stale provider link for a
+    # different offset. Native full-list links remain untouched above.
+    if limit is not None or offset:
+        total = free_total if free_only else provider_total
+        base = f"{OPENROUTER_BASE}/models"
+        links = {}
+        if offset > 0:
+            prev_offset = max(0, offset - (limit or len(filtered) or 1))
+            links['prev'] = f"{base}?offset={prev_offset}" + (f"&limit={limit}" if limit else '')
+        if limit is not None and offset + limit < total:
+            next_offset = offset + limit
+            links['next'] = f"{base}?offset={next_offset}&limit={limit}"
+        payload['pagination'] = {'offset': offset, 'limit': limit, 'total_count': total, 'links': links}
+    return JSONResponse(payload)
+
+
+@app.get("/v1/models/{model_id:path}/endpoints")
+async def get_model_endpoints(model_id: str, request: Request):
+    """Forward OpenRouter's native model endpoint-detail contract."""
+    return await _proxy_request('GET', f'models/{model_id}/endpoints',
+                                request=request, recover_context=False)
 
 
 @app.get("/v1/models/{model_id:path}")
@@ -2178,24 +2314,42 @@ async def capabilities(request: Request):
     except Exception as e:
         logger.warning(f'[capabilities] model list unavailable: {e}')
         models_list = []
+    capability_models = []
+    for m in models_list:
+        item = m if isinstance(m, dict) else {}
+        arch = item.get('architecture') if isinstance(item.get('architecture'), dict) else {}
+        in_mods = [str(v) for v in (arch.get('input_modalities') or [])] if isinstance(arch.get('input_modalities'), list) else []
+        out_mods = [str(v) for v in (arch.get('output_modalities') or [])] if isinstance(arch.get('output_modalities'), list) else []
+        params = item.get('supported_parameters') if isinstance(item.get('supported_parameters'), list) else []
+        params = {str(v) for v in params}
+        native_caps = []
+        if 'embeddings' in out_mods:
+            native_caps.append('embeddings')
+        if 'text' in in_mods and 'text' in out_mods:
+            native_caps.append('chat')
+        if params.intersection({'tools', 'tool_choice', 'parallel_tool_calls'}):
+            native_caps.append('tools')
+        if params.intersection({'reasoning', 'include_reasoning', 'thinking'}):
+            native_caps.append('reasoning')
+        capability_models.append({
+            'id': item.get('id') if item else m,
+            'capabilities': native_caps,
+            'capability_source': 'provider_catalog',
+            'capability_state': 'known' if native_caps else 'unknown',
+            'streaming': item.get('streaming') if 'streaming' in item else None,
+            'endpoints': item.get('endpoints', []) if item else [],
+            'wrapper_endpoints': item.get('wrapper_endpoints', []) if item else [],
+            'routing_metadata': item.get('routing_metadata', {}) if item else {},
+            'input_modalities': in_mods,
+            'output_modalities': out_mods,
+            **discovery_limits(item),
+        })
     return {
-        "object": "list",
-        "models": [
-            {
-                "id": m.get("id") if isinstance(m, dict) else m,
-                "capabilities": ["chat", "completion"],
-                "streaming": True,
-                "endpoints": (m.get("endpoints") or m.get("wrapper_endpoints") or []) if isinstance(m, dict) else [],
-                "routing_metadata": m.get("routing_metadata", {}) if isinstance(m, dict) else {},
-                "input_modalities": (m.get("architecture") or {}).get("input_modalities", []) if isinstance(m, dict) and isinstance(m.get("architecture"), dict) else [],
-                "output_modalities": (m.get("architecture") or {}).get("output_modalities", []) if isinstance(m, dict) and isinstance(m.get("architecture"), dict) else [],
-                **discovery_limits(m if isinstance(m, dict) else {}),
-            }
-            for m in models_list
-        ],
-        "summary": {"total": len(models_list),
-                    "by_type": {"chat": len(models_list)}},
-        "dynamic_alias_target": None,
+        'object': 'list',
+        'models': capability_models,
+        'summary': {'total': len(capability_models)},
+        'catalog_state': MODEL_CATALOG.status(),
+        'dynamic_alias_target': None,
     }
 
 
@@ -2213,7 +2367,8 @@ async def messages(request: Request):
     model = body.get("model", "")
 
     # WRAPPER_CONTRACT §4: unknown roles / orphan tool messages are rejected.
-    cross_dialect = not _is_anthropic_upstream()
+    native_messages = (globals().get('NATIVE_MESSAGES_MODE', 'translate') != 'translate') or _is_anthropic_upstream()
+    cross_dialect = (not native_messages) and not _is_anthropic_upstream()
     for _m in body.get("messages") or []:
         if cross_dialect and isinstance(_m, dict) and _m.get("role") not in (None, "user", "assistant", "tool", "system", "developer"):
             return _error_response({"error": {"message": f"Invalid role: {_m.get('role')!r}",
@@ -2226,12 +2381,14 @@ async def messages(request: Request):
     if blocked:
         return blocked
 
-    # COMPATIBILITY_LAYER=2: upstream speaks Anthropic — the /v1/messages
-    # surface passes through verbatim (model alias only); no translation.
-    if _is_anthropic_upstream():
+    # Native provider Messages is the default for both Nous and OpenRouter.
+    # Translation is an explicit compatibility choice, never an accidental
+    # consequence of the global upstream dialect flag.
+    if native_messages:
+        _stream = bool(body.get("stream", False))
         return await _proxy_request("POST", "messages", body,
-                                    stream=bool(body.get("stream", False)),
-                                    request=request, terminal_done=False)
+                                    stream=_stream, request=request,
+                                    native_stream=_stream, recover_context=True)
 
     # Translate Anthropic → OpenAI
     openai_body = _anthropic_to_openai(body)
@@ -2290,27 +2447,18 @@ async def messages(request: Request):
 
 @app.post("/v1/messages/count_tokens")
 async def count_tokens(request: Request):
-    """Token counting via OpenRouter.
-    Returns an estimate; OpenRouter does not have a dedicated count_tokens endpoint."""
+    """Forward Nous/OpenRouter native count-token semantics.
+
+    OpenRouter currently returns its native 404 for this route; that result is
+    intentionally preserved instead of fabricating an estimate.
+    """
     try:
         body = await request.json()
     except Exception:
         return _error_response({"error": {"message": "Invalid JSON body", "type": "invalid_request_error"}},
                             status_code=400)
-    # Best-effort: count characters / 4 as a rough token estimate without burning quota.
-    msgs = body.get("messages", [])
-    total_chars = 0
-    for m in msgs:
-        c = m.get("content", "")
-        if isinstance(c, str):
-            total_chars += len(c)
-        elif isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict):
-                    total_chars += len(b.get("text", ""))
-                    total_chars += len(json.dumps(b.get("input", {})))
-    est_tokens = max(1, total_chars // 4)
-    return JSONResponse({"input_tokens": est_tokens})
+    return await _proxy_request("POST", "messages/count_tokens", body,
+                                stream=False, request=request, recover_context=False)
 
 
 # ── Responses API (Codex/Claude Code) ↔ Chat Completions translation ──────
@@ -3111,8 +3259,9 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'type': 'error',
                 'error': {'type': 'api_error', 'message': str(upstream_error)[:2000]},
             })
-            # An error event is terminal. Do not fabricate message_delta /
-            # message_stop with end_turn after a failed upstream turn.
+            # The error event is terminal. Do not append message_delta or
+            # message_stop, which can make a failed/truncated turn look
+            # successful to Anthropic clients.
             return
 
         # B-06 parity: map strictly from finish_reason; never infer tool_use
@@ -3155,7 +3304,8 @@ async def _translate_openai_stream_to_anthropic(openai_gen, request_body: dict):
                 'error': {'type': 'api_error',
                           'message': f'upstream stream error: {str(e)[:2000]}'},
             })
-            # The error event is terminal; never fabricate end_turn after it.
+            # The error event is terminal; never fabricate end_turn or
+            # message_stop after a translated upstream failure.
             return
         except Exception:
             pass
@@ -3444,6 +3594,7 @@ async def health():
         "keys": pool.available_keys,
         "uptime_seconds": int(time.time() - metrics.start),
         "catalog": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
+        "catalog_state": MODEL_CATALOG.status(),
         "free_only": free_only_enabled(),
         "free_policy": "provider_free_suffix_only",
         "management": _HAS_MANAGEMENT,
@@ -3457,6 +3608,7 @@ async def ready():
         "ready": pool.total_keys > 0,
         "keys_loaded": pool.total_keys,
         "catalog_ready": _HAS_CATALOG and os.path.exists(CATALOG_DB_PATH),
+        "catalog_state": MODEL_CATALOG.status(),
         "free_only": free_only_enabled(),
         "free_policy": "provider_free_suffix_only",
     }

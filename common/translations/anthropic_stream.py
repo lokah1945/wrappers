@@ -202,7 +202,10 @@ class AnthropicStreamState:
                 "type": "error",
                 "error": {"type": etype, "message": str(msg)[:2000]},
             }))
-            events.extend(self._terminal_events("end_turn"))
+            # An error event is terminal. Do not append message_delta or
+            # message_stop: either event would let clients persist a failed or
+            # truncated turn as a successful completion. The error event itself
+            # is the terminal lifecycle signal for the compatibility stream.
             self.finished = True
             return events
 

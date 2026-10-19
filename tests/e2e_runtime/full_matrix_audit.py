@@ -92,6 +92,10 @@ def start_wrapper(name, port, pfx, base_style, layer):
         'PYTHONUNBUFFERED': '1',
         'FREE_ONLY': 'no',
         'RESPONSES_UPSTREAM_MODE': 'chat',  # explicit historical adapter fixture
+        'NATIVE_MESSAGES_MODE': 'translate' if layer == 1 else 'native',
+        # This fixture explicitly exercises wrapper-side validation against a
+        # permissive mock provider; production defaults remain provider-authoritative.
+        'NATIVE_PROTOCOL_VALIDATION': 'true' if layer == 1 else 'false',
         'SOFT_LIMIT_RPM': '100000',
         'HARD_LIMIT_RPM': '100000',
         f'{pfx}_API_KEY_1': 'mock-key-0000000001',

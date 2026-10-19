@@ -20,9 +20,9 @@ import aiohttp
 
 ROOT = Path('/root/wrapper')
 WRAPPERS = {
-    'nvidia-python': (9101, 'nvidia/nemotron-3-super-120b-a12b'),
-    'nous': (9102, 'poolside/laguna-s-2.1:free'),
-    'openrouter': (9103, 'nvidia/nemotron-3.5-lightning:free'),
+    'nvidia-python': (9101, os.environ.get('LIVE_SMOKE_NVIDIA_MODEL', 'nvidia/nemotron-3-super-120b-a12b')),
+    'nous': (9102, os.environ.get('LIVE_SMOKE_NOUS_MODEL', 'poolside/laguna-s-2.1:free')),
+    'openrouter': (9103, os.environ.get('LIVE_SMOKE_OPENROUTER_MODEL', 'nvidia/nemotron-3.5-lightning:free')),
 }
 RESULTS = []
 
@@ -83,9 +83,12 @@ async def smoke(name, port, model):
         detail = f'HTTP {st} {ms:.1f}s'
         if ok:
             d = json.loads(raw)
+            # Native Messages routes must preserve provider-generated IDs;
+            # Nous/OpenRouter legitimately return ``gen-*``/provider IDs rather
+            # than the compatibility ``msg_*`` shape used by a translator.
             ok = (d.get('type') == 'message' and d.get('role') == 'assistant'
                   and isinstance(d.get('content'), list) and d.get('stop_reason')
-                  and str(d.get('id', '')).startswith('msg_')
+                  and bool(d.get('id'))
                   and d.get('usage', {}).get('input_tokens', 0) >= 0)
             detail += f' stop={d.get("stop_reason")} id={d.get("id","")[:20]} blocks={len(d.get("content",[]))}'
         report(f'{name} messages nonstream', ok, detail)
@@ -99,10 +102,16 @@ async def smoke(name, port, model):
         if ok:
             evs = parse_sse(raw)
             types = [d.get('type') if isinstance(d, dict) else None for _e, d in evs]
+            # OpenRouter's native Messages endpoint preserves its upstream
+            # ``event: data`` / ``data: [DONE]`` terminator; direct-upstream
+            # comparison verifies that framing. NVIDIA and Nous native
+            # Messages streams terminate at message_stop without [DONE].
+            done_payloads = [d for _e, d in evs]
+            native_done_allowed = name == 'openrouter'
             ok = (types.count('message_start') == 1 and types.count('message_stop') == 1
                   and 'content_block_start' in types and 'content_block_delta' in types
                   and 'message_delta' in types and 'ping' not in types
-                  and '[DONE]' not in [d for _e, d in evs])
+                  and (native_done_allowed or '[DONE]' not in done_payloads))
             detail += f' events={len(evs)} lifecycle={"ok" if ok else "broken"}'
         report(f'{name} messages stream', ok, detail)
 

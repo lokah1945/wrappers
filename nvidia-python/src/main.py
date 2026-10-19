@@ -912,6 +912,20 @@ class AnthropicStreamState:
 
     def translate_chunk(self, chunk: dict):
         events = self.start_events()
+        if isinstance(chunk, dict) and chunk.get('error') is not None and 'choices' not in chunk:
+            err = chunk.get('error')
+            msg = err.get('message') if isinstance(err, dict) else str(err)
+            etype = (err.get('type') if isinstance(err, dict) else None) or 'api_error'
+            events.extend(self._close_block())
+            events.append(self._sse('error', {
+                'type': 'error',
+                'error': {'type': etype, 'message': str(msg)[:2000]},
+            }))
+            # Error is terminal, but message_stop closes the compatibility
+            # lifecycle without claiming a successful end_turn.
+            events.append(self._sse('message_stop', {'type': 'message_stop'}))
+            self.finished = True
+            return events
         if not isinstance(chunk, dict) or 'choices' not in chunk:
             return events
         ch = (chunk.get('choices') or [{}])[0]
@@ -3062,16 +3076,16 @@ class Server:
             visibility = (visibility_getter(request)
                           if callable(visibility_getter)
                           else 'catalog')
-            # Public catalog union: every Build/website row plus only
-            # backend/provider-only rows with a positive runtime observation.
-            # A provider listing alone must not inflate the public "available"
-            # surface, while a website row is retained even when deployment is
-            # required or its account observation is still unknown.
+            # Public catalog union: every Build/website row plus every model
+            # in the current hosted provider snapshot. Provider membership is
+            # a catalog fact, not a health assertion: provider-only rows remain
+            # visible with unknown/diagnostic availability and never receive a
+            # fabricated ``available`` boolean. Build membership remains the
+            # authoritative source for website badges and downloadable access.
             catalog_entries = [entry for entry in enriched
                                if isinstance(entry, dict)
                                and (entry.get('build_catalog_listed')
-                                    or (entry.get('availability_state') == 'available'
-                                        and entry.get('available') is not False))]
+                                    or entry.get('provider_catalog_listed'))]
             available_entries = [entry for entry in catalog_entries
                                  if entry.get('availability_state') == 'available'
                                  and entry.get('available') is not False]

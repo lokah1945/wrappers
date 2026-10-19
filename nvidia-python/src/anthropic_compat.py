@@ -698,6 +698,11 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     real_thinking_emitted = False
     synthetic_thinking_emitted = False
     errored = False
+    # Explicit provider error frames are already terminal Anthropic events and
+    # must not be followed by message_stop. A transport exception has no
+    # provider terminal frame, so retain the compatibility close marker for
+    # clients that require deterministic lifecycle closure on abrupt EOF.
+    explicit_error_frame = False
     error_message = ''
     client_gone = False  # V-15 fix: set on GeneratorExit/CancelledError
     _think_filter = ThinkTagStreamFilter()  # anti-trace: tag-aware content filter
@@ -1041,6 +1046,7 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 if isinstance(chunk, dict) and chunk.get('error') is not None and 'choices' not in chunk:
                     _e = chunk['error']
                     errored = True
+                    explicit_error_frame = True
                     error_message = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
                     break
                 # R-08: guard against an empty choices array.
@@ -1110,6 +1116,11 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 if ch.get('finish_reason'):
                     final_stop = _FINISH_TO_STOP.get(ch['finish_reason']) or 'end_turn'
 
+            # A surfaced upstream error terminates the translated stream;
+            # never continue consuming frames after it.
+            if errored:
+                break
+
         if buffer:
             trimmed = buffer.strip()
             if trimmed.startswith('data:'):
@@ -1117,7 +1128,12 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
                 if data and data != '[DONE]':
                     try:
                         chunk = json.loads(data)
-                        if chunk.get('choices'):
+                        if chunk.get('error') is not None and 'choices' not in chunk:
+                            _e = chunk['error']
+                            errored = True
+                            explicit_error_frame = True
+                            error_message = (_e.get('message') if isinstance(_e, dict) else str(_e)) or 'upstream error'
+                        elif chunk.get('choices'):
                             # R-08: empty choices array is legal.
                             ch = (chunk.get('choices') or [{}])[0] or {}
                             delta = ch.get('delta', {})
@@ -1220,32 +1236,19 @@ async def stream_openai_to_anthropic(stream, model: str, capture: dict = None,
     if errored:
         capture['errored'] = True
         capture['errorMessage'] = error_message or 'upstream connection error'
-        # Still close the Anthropic SSE cleanly so Claude Code / SDKs do not hang mid-turn
-        # B-13 fix: do NOT fabricate model text from a transport error. Emitting
-        # "[upstream stream error: ...]" as a text_delta made the client persist
-        # an infrastructure failure as the assistant's answer, with no way to
-        # detect it or retry. Emit a real Anthropic `error` event instead.
+        # Do not fabricate a successful model turn after a transport/upstream
+        # error. Surface the error as the terminal compatibility event; neither
+        # message_delta nor message_stop may follow because either can make a
+        # client persist the failed/truncated turn as successful.
         yield _sse('error', {
             'type': 'error',
             'error': {'type': 'api_error',
                       'message': f'upstream stream error: {str(error_message)[:2000]}'},
         })
-        if not sent_text_or_tool_block:
-            # Still open+close an empty text block so SDKs that require at least
-            # one content block do not choke on the envelope.
-            empty_idx = next_index
-            yield _sse('content_block_start', {
-                'type': 'content_block_start', 'index': empty_idx,
-                'content_block': {'type': 'text', 'text': ''},
-            })
-            yield _sse('content_block_stop', {'type': 'content_block_stop', 'index': empty_idx})
-        yield _sse('message_delta', {
-            'type': 'message_delta',
-            'delta': {'stop_reason': 'end_turn', 'stop_sequence': None},
-            'usage': {'input_tokens': input_tokens or 0, 'output_tokens': 0,
-                      'cache_creation_input_tokens': 0, 'cache_read_input_tokens': 0},
-        })
-        yield _sse('message_stop', {'type': 'message_stop'})
+        if not explicit_error_frame:
+            # Abrupt transport failure: no provider error event existed to
+            # terminate the lifecycle, so close it deterministically.
+            yield _sse('message_stop', {'type': 'message_stop'})
         return
 
     if not sent_text_or_tool_block and not errored:
