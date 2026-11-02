@@ -250,8 +250,8 @@ class ContextProbeService:
 
         When the catalog advertises a context window, probing starts at the
         highest ladder rung at-or-below it: one accepted request verifies the
-        advertised capacity (floor), one rejection may reveal the exact
-        window. Unknown-context models climb the full ladder.
+        advertised capacity (floor), then continues climbing to discover the
+        true ceiling. Unknown-context models climb the full ladder.
 
         - Accepted rungs raise the VERIFIED FLOOR (never a ceiling).
         - A context rejection parsed by parse_context_error may reveal the
@@ -263,12 +263,15 @@ class ContextProbeService:
         accepted_tokens: Optional[int] = None
         rungs = list(self.ladder)
         verify_mode = False
+        start_idx = 0
         if positive_int(advertised):
             eligible = [r for r in rungs if r <= advertised]
             if eligible:
-                rungs = [eligible[-1]]
+                start_idx = rungs.index(eligible[-1])
                 verify_mode = True
-        for target in rungs:
+        # Iterate from start_idx through remaining rungs
+        for i in range(start_idx, len(rungs)):
+            target = rungs[i]
             messages = build_probe_messages(target, chars_per_token=ratio)
             payload = {'model': model_id, 'messages': messages, 'max_tokens': 16,
                        'stream': False}
@@ -287,11 +290,8 @@ class ContextProbeService:
                     ratio = len(messages[0]['content']) / accepted_tokens
                     self._chars_per_token = ratio
                     result.rungs_accepted.append(accepted_tokens)
-                if verify_mode:
-                    # Advertised capacity verified: one accepted request at
-                    # (or near) the published window satisfies the contract.
-                    result.outcome = 'advertised_verified'
-                    break
+                # In verify_mode, after accepting the advertised rung, continue
+                # climbing to discover true ceiling. In normal mode, always climb.
                 continue
             if outcome.status == 'rejected':
                 evidence = outcome.evidence or {}
@@ -307,7 +307,12 @@ class ContextProbeService:
             break
         result.verified_floor = accepted_tokens
         if result.outcome in ('not_probed',):
-            result.outcome = 'accepted_floor' if accepted_tokens else 'inconclusive'
+            if verify_mode and accepted_tokens:
+                result.outcome = 'advertised_verified'
+            elif accepted_tokens:
+                result.outcome = 'accepted_floor'
+            else:
+                result.outcome = 'inconclusive'
         self._last_outcome = result.outcome
         return result if (result.verified_floor or result.context_window) else None
 

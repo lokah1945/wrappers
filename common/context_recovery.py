@@ -96,6 +96,21 @@ def parse_context_error(status, error):
                           r'is limited to|cannot exceed|must not exceed)\s*' + _NUMBER)
     if output is None:
         output = _number(text, r'maximum (?:output|completion) (?:tokens|length)(?:\s+(?:is|of))?\s*[:=]?\s*' + _NUMBER)
+    # NVIDIA-specific: check details.type == 'context_length' for exact limit
+    # Format: {"details":{"type":"context_length","limit":1048576,"actual":1129054}}
+    # Also check nested: {"error":{"details":{"type":"context_length",...}}}
+    details = None
+    if isinstance(error, dict):
+        details = error.get('details')
+        if details is None:
+            nested_error = error.get('error')
+            if isinstance(nested_error, dict):
+                details = nested_error.get('details')
+    if isinstance(details, dict) and details.get('type') == 'context_length':
+        context = context or positive_int(details.get('limit'))
+        input_tokens = input_tokens or positive_int(details.get('actual'))
+        # This IS a definite context error — mark as such
+        definite = True
     # Structured provider error facts, only after a definite context code/text.
     definite = (context is not None or output is not None or code in
                 ('context_length_exceeded', 'max_tokens_exceeded', 'prompt_too_long') or

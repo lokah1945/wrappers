@@ -52,6 +52,10 @@ def test_reduces_only_explicit_output_to_exact_room(field):
                  'input': 100000}]}, (None, None, 8192)),
     ({'error': {'code': 'context_length_exceeded', 'max_context_length': 10000, 'input_tokens': 8000}}, (10000, 8000, None)),
     ({'error': {'metadata': {'raw': json.dumps(ERROR)}}}, (10000, 8000, None)),
+    # NVIDIA error format: details.type=context_length with limit and actual
+    ({'details': {'type': 'context_length', 'limit': 1048576, 'actual': 1129054}}, (1048576, 1129054, None)),
+    # NVIDIA nested error format: error.details.type=context_length
+    ({'error': {'details': {'type': 'context_length', 'limit': 2048, 'actual': 3000}}}, (2048, 3000, None)),
 ])
 def test_definite_provider_error_shapes(error, expected):
     evidence = parse_context_error(400, error)

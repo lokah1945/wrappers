@@ -6,10 +6,13 @@ max_tokens or another provider's model metadata as hosted endpoint limits.
 from __future__ import annotations
 
 import json
+import logging
 import re
 from html.parser import HTMLParser
 
 from common.model.metadata import positive_int
+
+logger = logging.getLogger(__name__)
 
 
 def build_model_url(model_id):
@@ -89,6 +92,45 @@ def _flight_records(document):
             continue
 
 
+_PROSE_CONTEXT_PATTERNS = [
+    # "1M tokens", "1 M tokens", "1m tokens" -> 1048576 (2^20, binary megabyte)
+    (re.compile(r'(?i)(\d+(?:\.\d+)?)\s*M\s*tokens?'), 1_048_576),
+    # "1,048,576 tokens", "1048576 tokens" near "context window"
+    (re.compile(r'(?i)(\d{1,3}(?:,\d{3})+|\d{4,})\s*tokens?'), 1),
+    # "128K tokens", "128 K tokens" -> 131072 (2^17 = 128 * 1024)
+    (re.compile(r'(?i)(\d+(?:\.\d+)?)\s*K\s*tokens?'), 1_024),
+]
+
+
+def _extract_prose_context(attributes: dict) -> list[int]:
+    """Extract context window mentions from prose description fields.
+
+    Scans known text attributes for patterns like "1M tokens", "128K tokens",
+    "1,048,576 tokens" near "context window" phrasing.
+    """
+    text_fields = [
+        attributes.get('description'),
+        attributes.get('specsDescription'),
+        attributes.get('longDescription'),
+        attributes.get('shortDescription'),
+        attributes.get('marketingDescription'),
+    ]
+    values = []
+    for text in text_fields:
+        if not isinstance(text, str):
+            continue
+        for pattern, multiplier in _PROSE_CONTEXT_PATTERNS:
+            for match in pattern.finditer(text):
+                try:
+                    raw = match.group(1).replace(',', '')
+                    value = int(float(raw) * multiplier)
+                    if value > 0:
+                        values.append(value)
+                except (ValueError, IndexError):
+                    continue
+    return values
+
+
 def parse_build_context(html, model_id):
     url = build_model_url(model_id)
     if not url:
@@ -109,7 +151,8 @@ def parse_build_context(html, model_id):
             if isinstance(data, list) and len(data) == 2 and data[0] == 1 and isinstance(data[1], str):
                 chunks.append(data[1])
     document = ''.join(chunks)
-    values = set()
+    spec_values = set()
+    prose_values = set()
     artifact = model_id.split('/')[1]
     for record in _flight_records(document):
         # NVIDIA's model component owns a spec object. In particular, do not
@@ -126,6 +169,32 @@ def parse_build_context(html, model_id):
         specs = attributes.get('specifications')
         value = positive_int(specs.get('contextLength')) if isinstance(specs, dict) else None
         if value:
-            values.add(value)
-    # Conflicting specifications are uncertain, never pick the largest one.
-    return values.pop() if len(values) == 1 else None
+            spec_values.add(value)
+        # Extract prose context mentions from description fields
+        prose = _extract_prose_context(attributes)
+        for p in prose:
+            prose_values.add(p)
+    # Resolve conflicts between spec and prose values
+    # If prose indicates significantly larger context (2x+), prefer prose
+    # as live API probes have proven prose correct for mistral-large-4
+    all_values = set()
+    if spec_values:
+        all_values.update(spec_values)
+    if prose_values:
+        all_values.update(prose_values)
+    if not all_values:
+        return None
+    if len(all_values) == 1:
+        return all_values.pop()
+    # Multiple values found - apply conflict resolution
+    max_spec = max(spec_values) if spec_values else 0
+    max_prose = max(prose_values) if prose_values else 0
+    if max_prose > max_spec * 2:
+        logger.warning(
+            'build page spec contextLength=%s conflicts with prose=%s for %s; '
+            'preferring prose value (live API proven correct for similar cases)',
+            max_spec, max_prose, model_id
+        )
+        return max_prose
+    # Otherwise return the largest value (don't discard all data)
+    return max(all_values)

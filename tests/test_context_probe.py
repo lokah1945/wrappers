@@ -126,12 +126,77 @@ def test_advertised_verify_single_rung():
     outcomes = [(10**9, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=524288))]
     svc, calls = make_service(store, outcomes)
     result = run(svc._probe_model('m/big', advertised=1048576))
-    # verify mode: exactly ONE request at the highest rung <= advertised
+    # verify mode: starts at highest rung <= advertised (1048576 is max ladder rung)
+    # no higher rung to climb, so exactly ONE request
     assert len(calls) == 1
     assert result.outcome == 'advertised_verified'
     assert result.verified_floor == 524288
     svc._record('m/big', result)
     assert store.recorded['m/big'] == {'input_tokens': 524288}
+
+
+def test_verify_mode_climbs_above_advertised():
+    """When advertised < max ladder rung, verify_mode should climb higher."""
+    store = FakeStore()
+    # Simulate: accepts 262144 (advertised), accepts 524288, rejects 1048576 with exact window
+    # Message chars ≈ tokens * 4 (initial ratio). After first accept, ratio recalibrates.
+    outcomes = [
+        (2_000_000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=262144)),  # 262144 rung (~1M chars)
+        (3_000_000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=524288)),  # 524288 rung (~2M chars)
+        (5_000_000, ProbeOutcome(status='rejected', http_status=400,
+                                    evidence={'context_window': 1048576, 'input_tokens': 1100000})),  # 1048576 rung (~4M chars)
+    ]
+    svc, calls = make_service(store, outcomes)
+    # advertised=262144, ladder=[4096, 32768, 131072, 262144, 524288, 1048576]
+    # start_idx = index of 262144 = 3, should test 262144, 524288, 1048576
+    result = run(svc._probe_model('m/under-reported', advertised=262144))
+    assert len(calls) == 3
+    assert result.verified_floor == 524288
+    assert result.context_window == 1048576
+    assert result.outcome == 'rejected_exact'
+    svc._record('m/under-reported', result)
+    assert store.recorded['m/under-reported']['context_window'] == 1048576
+    # When exact window found, floor is not stored as input_tokens (only context_window)
+    assert 'input_tokens' not in store.recorded['m/under-reported']
+
+
+def test_verify_mode_stops_at_non_context_error():
+    """Verify mode should stop on non-context error (e.g., 500), record floor only."""
+    store = FakeStore()
+    # accepts 262144, then 500 error on next rung
+    outcomes = [
+        (2_000_000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=262144)),
+        (5_000_000, ProbeOutcome(status='error', http_status=500, detail='internal error')),
+    ]
+    svc, calls = make_service(store, outcomes)
+    result = run(svc._probe_model('m/flaky', advertised=262144))
+    assert len(calls) == 2
+    assert result.verified_floor == 262144
+    assert result.context_window is None
+    assert result.outcome == 'error'
+    svc._record('m/flaky', result)
+    assert store.recorded['m/flaky'] == {'input_tokens': 262144}
+
+
+def test_verify_mode_full_ladder_unknown_advertised():
+    """When advertised is None, should climb full ladder."""
+    store = FakeStore()
+    # accepts all rungs up to 524288, rejects 1048576
+    outcomes = [
+        (50000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=4096)),
+        (40000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=32768)),
+        (150000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=131072)),
+        (300000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=262144)),
+        (600000, ProbeOutcome(status='accepted', http_status=200, prompt_tokens=524288)),
+        (1200000, ProbeOutcome(status='rejected', http_status=400,
+                                evidence={'context_window': 1048576, 'input_tokens': 1100000})),
+    ]
+    svc, calls = make_service(store, outcomes)
+    result = run(svc._probe_model('m/unknown'))
+    assert len(calls) == 6  # all 6 rungs
+    assert result.verified_floor == 524288
+    assert result.context_window == 1048576
+    assert result.outcome == 'rejected_exact'
 
 
 def test_merge_observed_context_floor_no_alias():
