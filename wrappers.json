@@ -244,6 +244,24 @@
       "service_kind": "internal",
       "dashboard_policy": "unified_only",
       "local_dashboard_routes": "410"
+    },
+    "coarena": {
+      "port": 9107,
+      "module": "src.main",
+      "entry_point": "main:app",
+      "upstream": "Coarena",
+      "status": "production",
+      "structure": "standardized",
+      "run_command": "uvicorn main:app --host 127.0.0.1 --port 9107",
+      "env_prefix": "COARENA_",
+      "supports": [
+        "openai_chat",
+        "openai_responses",
+        "anthropic_messages"
+      ],
+      "dashboard_stream": "polling",
+      "dashboard_policy": "unified_only",
+      "local_dashboard_routes": "410"
     }
   },
   "metadata": {
@@ -260,6 +278,7 @@
       "nvidia-python",
       "nous",
       "openrouter",
+      "coarena",
       "model-registry"
     ],
     "pending_wrappers": [
@@ -273,7 +292,7 @@
     ],
     "qualification_policy": "Lifecycle production selects eligible maintenance scope; it is not proof of every model/client feature. Check per-wrapper client_qualification and current real upstream evidence before rollout.",
     "dashboard_url": "http://127.0.0.1:9106",
-    "port_allocation": "9100 model-fetcher MCP HTTP server, 9101 NVIDIA, 9102 Nous, 9103 OpenRouter, 9104-9105 frozen reserved providers, 9106 unified dashboard; model-registry internal9200",
+    "port_allocation": "9100 model-fetcher MCP HTTP server, 9101 NVIDIA, 9102 Nous, 9103 OpenRouter, 9104-9105 frozen reserved providers, 9106 unified dashboard, 9107 Coarena; model-registry internal 9200",
     "port_9100_owner": "model-fetcher MCP HTTP server (model_fetcher/mcp_server.py), bound to 127.0.0.1:9100; unchanged",
     "model_service_ownership": {
       "catalog_api": {
