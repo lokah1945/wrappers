@@ -154,7 +154,8 @@ async def test_actual_native_transports_forward_extensions_and_replace_local_aut
             result.release()
         sent = records[0]['headers']
         provider_key = 'synthetic-provider-key'
-    elif wrapper == 'openrouter':
+    elif wrapper in ('openrouter', 'coarena'):
+        from test_active_native_passthrough import _coarena_proxy_namespace
         records = []
 
         def send(*args, **kwargs):
@@ -162,7 +163,9 @@ async def test_actual_native_transports_forward_extensions_and_replace_local_aut
             return peer
 
         pool = _pool(wrapper)
-        namespace = _openrouter_proxy_namespace(pool, SimpleNamespace(request=send))
+        namespace = (_openrouter_proxy_namespace(pool, SimpleNamespace(request=send))
+                     if wrapper == 'openrouter'
+                     else _coarena_proxy_namespace(pool, SimpleNamespace(request=send)))
         namespace['_build_forward_headers'] = build_forward_headers
         result = await namespace['_proxy_request']('POST', surface, body, request=request, stream=stream)
         assert result.status_code == 200

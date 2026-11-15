@@ -9,7 +9,8 @@ import pytest
 from common.context_recovery import (ContextRecoveryState, context_request, context_response_headers,
                                      parse_context_error, plan_context_recovery)
 from common.wrapper_scope import select_wrappers
-from test_active_native_passthrough import (_Upstream, _collect, _load, _openrouter_proxy_namespace,
+from test_active_native_passthrough import (_Upstream, _collect, _coarena_proxy_namespace, _load,
+                                            _openrouter_proxy_namespace,
                                             _pool, _registry, ROOT)
 from test_nvidia_messages_request_controls import _server, _request, Peer
 
@@ -233,6 +234,11 @@ async def test_active_transports_recover_once_preserve_native_data_and_release(w
         body['previous_response_id'] = 'native-history-id'
     body['stream'] = stream
     expected = {**copy.deepcopy(body), field: 2000}
+    if wrapper == 'nvidia-python' and stream and surface == 'chat':
+        # NVIDIA NIM's streaming chat transport opts into the documented
+        # stream_options.include_usage contract; the reduced retry keeps it.
+        # The compat2 responses/messages transports do not add it.
+        expected['stream_options'] = {'include_usage': True}
     wire = b'event: future_native_event\ndata: {"opaque":true}\n\n'
     success = {'id': 'native_ok', 'future_result': {'opaque': True}}
     peers = [Peer(status=400, reply=ERROR), Peer([wire], reply=None) if stream else Peer(reply=success)]
@@ -248,7 +254,9 @@ async def test_active_transports_recover_once_preserve_native_data_and_release(w
                 assert result['data'] == success
         elif surface == 'responses':
             # _handle_catch_all uses _stream_proxy from the normal class.
-            async def stream_proxy(resp, key, on_close):
+            # The stub mirrors the current production signature (which passes
+            # model_id and other stream metadata as keyword arguments).
+            async def stream_proxy(resp, key, on_close, **kwargs):
                 try:
                     async for chunk in resp: yield chunk
                 finally: on_close()
@@ -272,9 +280,11 @@ async def test_active_transports_recover_once_preserve_native_data_and_release(w
         def send(*args, json, headers, **kwargs):
             records.append((copy.deepcopy(json), headers['Authorization']))
             return peers[len(records)-1]
-        if wrapper == 'openrouter':
+        if wrapper in ('openrouter', 'coarena'):
             pool = _pool(wrapper)
-            namespace = _openrouter_proxy_namespace(pool, SimpleNamespace(request=send))
+            namespace = (_openrouter_proxy_namespace(pool, SimpleNamespace(request=send))
+                         if wrapper == 'openrouter'
+                         else _coarena_proxy_namespace(pool, SimpleNamespace(request=send)))
             result = await namespace['_proxy_request']('POST', {'chat': 'chat/completions', 'responses': 'responses', 'messages': 'messages'}[surface], body, stream=stream)
             assert result.status_code == 200
             assert await _collect(result) == wire if stream else json.loads(result.body) == success

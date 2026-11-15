@@ -38,6 +38,7 @@ WRAPPERS = {
     'opencode':      ('opencode',      19103, 'OPENCODE_BASE_URL', {}),
     'blackbox':      ('blackbox',      19104, 'BLACKBOX_BASE_URL', {}),
     'openrouter':    ('openrouter',    19106, 'OPENROUTER_BASE_URL', {}),
+    'coarena':       ('coarena',       19107, 'COARENA_BASE_URL', {}),
 }
 WRAPPERS = {name: config for name, config in WRAPPERS.items()
             if name in production_wrappers(ROOT, include_registry=False)}
@@ -50,6 +51,7 @@ BASE_FOR = {
     'opencode':      f'http://127.0.0.1:{MOCK_PORT}/v1',
     'blackbox':      f'http://127.0.0.1:{MOCK_PORT}/v1',
     'openrouter':    f'http://127.0.0.1:{MOCK_PORT}/v1',
+    'coarena':       f'http://127.0.0.1:{MOCK_PORT}/v1',
 }
 
 STREAM_MODES = [
@@ -759,9 +761,10 @@ def start_wrapper(name: str, wdir: str, port: int, upstream_var: str, extra: dic
         'OPENCODE_HARD_LIMIT_RPM': '100000',
         'BLACKBOX_HARD_LIMIT_RPM': '100000',
         'OPENROUTER_HARD_LIMIT_RPM': '100000',
+        'COARENA_HARD_LIMIT_RPM': '100000',
     })
     # per-wrapper key pool env
-    for pfx in ('NVIDIA', 'NOUS', 'OPENCODE', 'BLACKBOX', 'OPENROUTER'):
+    for pfx in ('NVIDIA', 'NOUS', 'OPENCODE', 'BLACKBOX', 'OPENROUTER', 'COARENA'):
         env[f'{pfx}_API_KEY_1'] = 'mock-key-0000000001'
         env[f'{pfx}_API_KEY_2'] = 'mock-key-0000000002'
         env[f'{pfx}_BASE_URL'] = BASE_FOR[name]

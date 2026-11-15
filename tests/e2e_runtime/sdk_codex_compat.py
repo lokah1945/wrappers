@@ -33,8 +33,9 @@ BASE_FOR = {
     'opencode':   f'http://127.0.0.1:{MOCK_PORT}/v1',
     'blackbox':   f'http://127.0.0.1:{MOCK_PORT}/v1',
     'openrouter': f'http://127.0.0.1:{MOCK_PORT}/v1',
+    'coarena':    f'http://127.0.0.1:{MOCK_PORT}/v1',
 }
-PORT = {'nvidia-python': 19101, 'nous': 19102, 'opencode': 19103, 'blackbox': 19104, 'openrouter': 19106}
+PORT = {'nvidia-python': 19101, 'nous': 19102, 'opencode': 19103, 'blackbox': 19104, 'openrouter': 19106, 'coarena': 19107}
 PORT = {name: port for name, port in PORT.items()
         if name in production_wrappers(ROOT, include_registry=False)}
 FAILURES = []
@@ -72,7 +73,7 @@ def start_wrapper(name: str, wdir: str, port: int, upstream_var: str):
         'HARD_LIMIT_RPM': '100000',
         f'{name.upper()}_HARD_LIMIT_RPM'.replace('NOUS', 'NOUS').replace('OPENCODE', 'OPENCODE'): '100000',
     })
-    for pfx in ('NVIDIA', 'NOUS', 'OPENCODE', 'BLACKBOX', 'OPENROUTER'):
+    for pfx in ('NVIDIA', 'NOUS', 'OPENCODE', 'BLACKBOX', 'OPENROUTER', 'COARENA'):
         env[f'{pfx}_API_KEY_1'] = 'mock-key-0000000001'
         env[f'{pfx}_BASE_URL'] = BASE_FOR[name]
     logf = open(f'/tmp/sdk-{name}.log', 'w')

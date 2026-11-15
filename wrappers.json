@@ -248,17 +248,18 @@
     "coarena": {
       "port": 9107,
       "module": "src.main",
-      "entry_point": "main:app",
+      "entry_point": "src.main:app",
       "upstream": "Coarena",
       "status": "production",
       "structure": "standardized",
-      "run_command": "uvicorn main:app --host 127.0.0.1 --port 9107",
+      "run_command": "uvicorn src.main:app --host 127.0.0.1 --port 9107",
       "env_prefix": "COARENA_",
       "supports": [
         "openai_chat",
         "openai_responses",
         "anthropic_messages"
       ],
+      "upstream_notes": "One Coarena key serves both dialects natively (https://coarena.ai/api/v1); documented upstream limits 30 rpm / 2 concurrent per key, free funded tier.",
       "dashboard_stream": "polling",
       "dashboard_policy": "unified_only",
       "local_dashboard_routes": "410"

@@ -1218,8 +1218,16 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                     # error out at the very end of an otherwise good turn.
                     saw_done = False
                     ends_newline = True
+                    # §3.5: close the wrapped upstream iterator
+                    # deterministically instead of leaving it to the asyncgen
+                    # GC finalizer (client disconnect must release the
+                    # upstream read immediately, not "eventually").
+                    content_iter = resp_ref.content
                     try:
-                        async for line in resp_ref.content:
+                        _aiter = getattr(content_iter, '__aiter__', None)
+                        if _aiter is not None:
+                            content_iter = _aiter()
+                        async for line in content_iter:
                             if line:
                                 if b'[DONE]' in line:
                                     saw_done = True
@@ -1242,6 +1250,12 @@ async def _proxy_request(method: str, path: str, body: dict | None = None,
                         raise
                     finally:
                         release_stream()
+                        close_iter = getattr(content_iter, 'aclose', None)
+                        if callable(close_iter) and content_iter is not resp_ref.content:
+                            try:
+                                await close_iter()
+                            except Exception:
+                                pass
 
                 if native_stream:
                     return StreamingResponse(

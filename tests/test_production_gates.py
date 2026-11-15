@@ -120,7 +120,7 @@ def test_preflight_checks_production_services_with_their_own_commit(monkeypatch,
     assert "systemd wrapper-nvidia-python.service" in report
     assert "systemd wrapper-openrouter.service" in report
     assert "readiness openrouter" in report
-    assert len([url for url, _ in requests if url.endswith("/ready")]) == 3
+    assert len([url for url, _ in requests if url.endswith("/ready")]) == 4
     metadata = json.loads((tmp_path / "wrappers.json").read_text())["wrappers"]
     for name, config in metadata.items():
         if config["status"] == "pending":

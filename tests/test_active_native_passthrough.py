@@ -349,6 +349,34 @@ def _openrouter_proxy_namespace(pool, agent):
                     JSONResponse(content, status_code=status_code))
 
 
+def _coarena_proxy_namespace(pool, agent):
+    """Isolated coarena transport namespace — mirrors _openrouter_proxy_namespace."""
+    async def get_agent():
+        return agent
+
+    async def record(*args, **kwargs):
+        pass
+
+    def discard_background(coro, *args):
+        coro.close()
+
+    return _load(ROOT / 'coarena/src/main.py',
+                 {'_proxy_request', '_usage_tokens', '_sniff_stream_usage'},
+                 MODEL_REGISTRY=_registry(), same_provider_model_id=lambda *args: True,
+                 pool=pool, COARENA_BASE='http://mock.invalid/v1', get_agent=get_agent,
+                 _build_forward_headers=lambda headers: dict(headers),
+                 _parse_retry_after=parse_retry_after, _is_retriable_status=is_retriable_status,
+                 _should_cooldown_key=should_cooldown_key,
+                 classify_upstream_error=classify_upstream_error,
+                 _responses_chat_fallback_allowed=responses_chat_fallback_allowed,
+                 _spawn_background=discard_background, _record_model_result=record,
+                 metrics=SimpleNamespace(record_request=record, record_tokens=record),
+                 sanitize_header_value=lambda value: value,
+                 _iter_chunks_with_idle=iter_chunks_with_idle, _IDLE=IDLE, HEARTBEAT_MS=100000,
+                 _error_response=lambda content, status_code=500, **kwargs:
+                    JSONResponse(content, status_code=status_code))
+
+
 @pytest.mark.parametrize('wire', [b'data: [DONE]', b'event: future\ndata: {"x":1}\n\n'])
 async def test_openrouter_proxy_native_stream_has_no_synthetic_terminal(wire):
     pool = _pool('openrouter')

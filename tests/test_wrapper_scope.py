@@ -15,7 +15,7 @@ from common import wrapper_scope
 
 pytestmark = pytest.mark.scope_policy
 ROOT = Path(__file__).resolve().parents[1]
-ACTIVE = ("nvidia-python", "nous", "openrouter", "model-registry")
+ACTIVE = ("nvidia-python", "nous", "openrouter", "model-registry", "coarena")
 
 
 def metadata_only_repo(tmp_path):
@@ -47,7 +47,7 @@ def test_metadata_status_change_alone_controls_selection(tmp_path):
     metadata = json.loads((repo / "wrappers.json").read_text())
     metadata["wrappers"]["nous"]["status"] = "pending"
     (repo / "wrappers.json").write_text(json.dumps(metadata))
-    assert wrapper_scope.production_wrappers(repo) == ("nvidia-python", "openrouter", "model-registry")
+    assert wrapper_scope.production_wrappers(repo) == ("nvidia-python", "openrouter", "model-registry", "coarena")
     with pytest.raises(wrapper_scope.WrapperScopeError, match="nous.*frozen"):
         wrapper_scope.require_production("nous", repo)
 
@@ -144,7 +144,7 @@ def test_supervisor_lists_active_metadata_with_registry_dependency_first():
     assert result.returncode == 0
     services = [line.split(":", 1)[0] for line in result.stdout.splitlines()
                 if ":pending" not in line and line.rsplit(":", 1)[-1].isdigit()]
-    assert services == ["model-registry", "nvidia-python", "nous", "openrouter", "dashboard"]
+    assert services == ["model-registry", "nvidia-python", "nous", "openrouter", "coarena", "dashboard"]
     assert "PID" not in result.stdout
 
 
@@ -152,7 +152,7 @@ def test_dashboard_deployment_is_separate_from_inference_scope(tmp_path):
     repo = metadata_only_repo(tmp_path)
     assert tuple(wrapper_scope.select_services(repo=repo)) == (*ACTIVE, 'dashboard')
     assert tuple(wrapper_scope.select_services(['dashboard'], repo)) == ('dashboard',)
-    assert wrapper_scope.production_wrappers(repo, include_registry=False) == ('nvidia-python', 'nous', 'openrouter')
+    assert wrapper_scope.production_wrappers(repo, include_registry=False) == ('nvidia-python', 'nous', 'openrouter', 'coarena')
     for name in wrapper_scope.frozen_wrappers(repo):
         with pytest.raises(wrapper_scope.WrapperScopeError, match='frozen'):
             wrapper_scope.select_services(['dashboard', name], repo)

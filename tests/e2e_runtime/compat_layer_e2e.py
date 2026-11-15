@@ -39,6 +39,7 @@ WRAPPERS = {
     'opencode':      (19103, 'OPENCODE', 'v1'),
     'blackbox':      (19104, 'BLACKBOX', 'v1'),
     'openrouter':    (19106, 'OPENROUTER', 'v1'),
+    'coarena':       (19107, 'COARENA', 'v1'),
 }
 WRAPPERS = {name: config for name, config in WRAPPERS.items()
             if name in production_wrappers(ROOT, include_registry=False)}

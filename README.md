@@ -59,6 +59,7 @@ and its linked reports; pending providers remain frozen.
 | **opencode** | Pending — frozen | 9104 | OpenCode Zen | `src.main:app` |
 | **blackbox** | Pending — frozen | 9105 | BLACKBOX AI | `src.main:app` |
 | **openrouter** | Production verified: LFM model, three CLI versions and SDK/read-tool loops on 2026-10-11 | 9103 | OpenRouter | `src.main:app` |
+| **coarena** | Production scope; contract gates green on mock upstreams (2026-11-15), live client qualification pending | 9107 | Coarena | `src.main:app` |
 | **model-registry** | Active dependency; no inference client surface | 9200 | internal | `service:app` |
 
 The explicit qualified models are `nvidia/nemotron-3-super-120b-a12b` on
@@ -98,6 +99,7 @@ not current release approval or authorization to rerun pending-provider tests.
 - [nvidia-python/README.md](nvidia-python/README.md)
 - [nous/README.md](nous/README.md)
 - [openrouter/README.md](openrouter/README.md)
+- [coarena/README.md](coarena/README.md)
 
 ---
 
@@ -388,7 +390,8 @@ Active wrappers retain their local **monitoring dashboard** at `/dashboard`:
 
 The port plan is the existing model-fetcher MCP HTTP service **9100**,
 NVIDIA **9101**, Nous **9102**, OpenRouter **9103**, reserved pending
-providers **9104–9105**, and the unified dashboard **9106**. Port 9100 is
+providers **9104–9105**, the unified dashboard **9106**, and Coarena
+**9107**. Port 9100 is
 not reused because the unrelated model-fetcher MCP service already owns it; that service
 is preserved. The internal model-registry remains on **9200**. Reserved
 ports remain untouched while their providers are frozen. Client configurations
