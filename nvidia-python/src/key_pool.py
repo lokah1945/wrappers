@@ -679,16 +679,30 @@ class KeyPool:
         return self.keys[0] if self.keys else None
 
     async def sync_keys(self, keys_list: List[str]) -> bool:
-        if not keys_list:
-            return False
+        """State-preserving credential reconciliation (final audit 2026-11-15).
+
+        ``keys_list`` is the authoritative snapshot from the watched .env file.
+        An empty list is a *valid zero-key generation* — the operator removed
+        every credential — and must apply instead of silently keeping the old
+        pool. Retained credentials keep their identity/state (matched by
+        api_key, not label): cooldowns, RPM windows, in-flight reservations
+        and counters survive add/remove/reorder/duplicate churn. Credentials
+        absent from the new snapshot are retired from acquisition; requests
+        already holding them finish on their own object.
+        """
+        keys_list = list(keys_list or [])
         await self._lock.acquire()
         try:
             old_set = {k.api_key for k in self.keys}
-            new_set = set(keys_list)
+            new_list, seen = [], set()
+            for k in keys_list:
+                if k and k not in seen:
+                    seen.add(k)
+                    new_list.append(k)
 
-            same = old_set == new_set and len(self.keys) == len(keys_list)
+            same = old_set == seen and len(self.keys) == len(new_list)
             if same:
-                for i, k in enumerate(keys_list):
+                for i, k in enumerate(new_list):
                     if i < len(self.keys) and self.keys[i].api_key != k:
                         same = False
                         break
@@ -698,7 +712,7 @@ class KeyPool:
 
             by_api = {k.api_key: k for k in self.keys}
             new_keys = []
-            for i, k in enumerate(keys_list):
+            for i, k in enumerate(new_list):
                 ex = by_api.get(k)
                 if ex:
                     ex.label = f'key{i+1}'
@@ -706,8 +720,8 @@ class KeyPool:
                 else:
                     new_keys.append(KeyEntry(f'key{i+1}', k))
 
-            added = [k for k in keys_list if k not in old_set]
-            removed = [k for k in old_set if k not in new_set]
+            added = [k for k in new_list if k not in old_set]
+            removed = [k for k in old_set if k not in seen]
             self.keys = new_keys
             logger.info(f'[wrapper-nvidia] Key pool synced: +{len(added)} / -{len(removed)} -> {len(self.keys)} total key(s)')
             return True
