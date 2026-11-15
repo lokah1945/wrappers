@@ -119,11 +119,68 @@ try:
 except ImportError as _imp_err:  # pragma: no cover
     raise RuntimeError("common.translations import failed; wrapper requires shared translations") from _imp_err
 
+# Final audit 2026-11-15: coarena previously had NO runtime reload path at all
+# (dotenv was read at import, the pool only at lifespan startup). The shared
+# .env hot-reload service in common/env_reload.py now provides add/remove/
+# replace/zero-key hot swap without a restart.
+_ENV_RELOAD_SERVICE = None
+
+
+def start_env_watcher():
+    """Start the shared .env hot-reload service (common/env_reload.py).
+
+    WRAPPER_SKIP_DOTENV keeps test isolation; the check must stay first.
+    """
+    if os.environ.get('WRAPPER_SKIP_DOTENV', '').lower() in ('1', 'true', 'yes', 'on'):
+        return
+    global _ENV_RELOAD_SERVICE
+    try:
+        from common.env_reload import EnvReloadService, resolve_env_path, scan_pool_keys
+        stop_env_watcher()
+
+        async def _apply_env_snapshot(snapshot):
+            # Runs on the service loop: schedule the state-preserving pool sync
+            # there; never rebuild the pool from a watcher thread.
+            try:
+                new_keys = scan_pool_keys(snapshot, r'^COARENA_API_KEY(_\d+)?$')
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(pool.sync_keys(new_keys), loop)
+                logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
+            except Exception as e:
+                logger.warning(f'[env] key pool reload failed: {e}')
+
+        service = EnvReloadService(
+            env_path=resolve_env_path(ROOT / '.env'),
+            apply=_apply_env_snapshot)
+        if not service.initialize():
+            logger.warning('[env] boot snapshot unavailable; ownership baseline starts empty')
+        service.start()
+        _ENV_RELOAD_SERVICE = service
+    except Exception as e:
+        logger.warning(f'[env] watcher failed: {e}')
+
+
+def stop_env_watcher():
+    """Idempotently stop the shared .env reload service."""
+    global _ENV_RELOAD_SERVICE
+    service, _ENV_RELOAD_SERVICE = _ENV_RELOAD_SERVICE, None
+    if service is not None:
+        try:
+            service.stop()
+        except Exception as e:
+            logger.warning(f'[env] watcher stop failed: {e}')
+
 # ── Bootstrap ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[1]
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
-    load_dotenv(ROOT / '.env')
-    load_dotenv()
+    # Final audit 2026-11-15: WRAPPER_ENV_FILE pins the boot .env to a
+    # deterministic path (hot-swap acceptance harness uses it).
+    _env_override = os.environ.get("WRAPPER_ENV_FILE", "").strip()
+    if _env_override:
+        load_dotenv(_env_override)
+    else:
+        load_dotenv(ROOT / '.env')
+        load_dotenv()
 
 # ── Logging ──────────────────────────────────────────────────────────────
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/coarena/coarena.log')
@@ -402,11 +459,18 @@ async def lifespan(app: FastAPI):
     await initialize_upstream_compatibility(COARENA_BASE)
     logger.info("[coarena] Starting wrapper-coarena")
     pool.load_from_env()
+    # Final audit 2026-11-15: start the shared .env hot-reload service after
+    # the boot pool load so add/remove/replace/zero-key changes apply without
+    # a restart (previously coarena had no runtime reload path at all).
+    start_env_watcher()
     logger.info(f"[coarena] Ready on {BIND_HOST}:{LISTEN_PORT}")
 
     yield
 
     logger.info("[coarena] Starting graceful shutdown...")
+    # Final audit 2026-11-15: stop the .env reload watcher before draining so
+    # no reload can race pool/session teardown.
+    stop_env_watcher()
     shutdown_start = time.time()
     max_wait = int(os.environ.get('SHUTDOWN_DRAIN_SEC', '30'))
     while shutdown_start + max_wait > time.time():
@@ -1381,10 +1445,28 @@ async def _cached_models_envelope() -> dict:
 
 @app.get("/v1/models")
 async def list_models(request: Request):
-    """Native Coarena model list (provider envelope preserved verbatim)."""
+    """Native Coarena model list (native envelope rows + local context metadata).
+
+    Final audit 2026-11-15: every active wrapper enriches catalog rows with
+    the shared ``discovery_limits`` normalization (context_window,
+    max_output_tokens, context_metadata status) while preserving native
+    fields verbatim; coarena previously returned the raw envelope and made
+    fleet clients blind to context limits. Native rows are kept unchanged
+    apart from the additive local metadata.
+    """
+    from common.model.metadata import discovery_limits
     try:
         envelope = await _cached_models_envelope()
         if envelope:
+            rows = envelope.get('data')
+            if isinstance(rows, list):
+                enriched = []
+                for row in rows:
+                    if isinstance(row, dict):
+                        enriched.append({**row, **discovery_limits(row)})
+                    else:
+                        enriched.append(row)
+                return JSONResponse({**envelope, 'data': enriched})
             return JSONResponse(envelope)
     except asyncio.CancelledError:
         raise

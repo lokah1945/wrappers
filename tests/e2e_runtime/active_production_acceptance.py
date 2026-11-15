@@ -33,6 +33,7 @@ WRAPPERS = {
     "nvidia-python": (19401, "NVIDIA", False),
     "nous": (19402, "NOUS", False),
     "openrouter": (19406, "OPENROUTER", True),
+    "coarena": (19407, "COARENA", True),
 }
 TOKEN = "acceptance-client-token"
 WRAPPERS = {name: config for name, config in WRAPPERS.items()

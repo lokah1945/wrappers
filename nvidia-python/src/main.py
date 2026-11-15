@@ -119,9 +119,11 @@ from common.nvidia_build_catalog import (
 )
 from common.nvidia_build_web_catalog import NvidiaBuildWebCatalogRegistry
 
+# Final audit 2026-11-15: the env watcher moved to common/env_reload.py,
+# which handles a missing watchdog with a polling fallback and exposes the
+# active mode in its status. The old direct imports are gone.
 try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
+    import watchdog  # noqa: F401  (availability probe; env_reload imports lazily)
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
@@ -663,9 +665,17 @@ def validate_config():
     import sys
     
     missing = []
-    for var in ['NVIDIA_API_KEY_1', 'BEARER_TOKEN']:
-        if not os.environ.get(var):
-            missing.append(var)
+    # Final audit 2026-11-15: the key pool loads NVIDIA_API_KEY and
+    # NVIDIA_API_KEY_<n>; the validator previously accepted only
+    # NVIDIA_API_KEY_1 and rejected valid single-key .env files.
+    import re as _re
+    has_key = bool(os.environ.get('NVIDIA_API_KEY')) or any(
+        value for name, value in os.environ.items()
+        if _re.match(r'^NVIDIA_API_KEY_\d+$', name) and value)
+    if not has_key:
+        missing.append('NVIDIA_API_KEY(_N)?')
+    if not os.environ.get('BEARER_TOKEN'):
+        missing.append('BEARER_TOKEN')
     
     if missing:
         print(f"❌ ERROR: Missing required environment variables: {', '.join(missing)}")
@@ -686,42 +696,54 @@ def validate_config():
 
 # Callbacks invoked after .env hot-reload. The wrapper server registers
 # a pool-sync callback here during startup so new API keys take effect
-# without a process restart.
+# without a process restart. Final audit 2026-11-15: the watcher itself is
+# the shared service in common/env_reload.py (modified/created/moved/deleted
+# events, debounce, polling fallback, thread-safe scheduling on the service
+# loop, ownership-based env reconciliation, last-known-good on parse errors).
 _ENV_RELOAD_CALLBACKS = []
+_ENV_RELOAD_SERVICE = None
 
 
 def start_env_watcher():
-    """Start .env hot-reload watcher (exact parity with Node reloadDotenv + fs.watch).
+    """Start the shared .env hot-reload service (common/env_reload.py).
 
-    On .env modification, reloads env vars AND triggers the registered
-    _ENV_RELOAD_CALLBACKS so the key pool can pick up new keys without
-    a process restart.
+    WRAPPER_SKIP_DOTENV keeps test isolation: the check must stay first so
+    the function never touches watcher machinery when isolation is requested.
     """
     if os.environ.get('WRAPPER_SKIP_DOTENV', '').lower() in ('1', 'true', 'yes', 'on'):
         return
-    if not HAS_WATCHDOG:
-        logger.warning('[env] watchdog not available; hot reload disabled')
-        return
+    global _ENV_RELOAD_SERVICE
     try:
-        class EnvWatcher(FileSystemEventHandler):
-            def on_modified(self, event):
-                if event.src_path.endswith('.env') or event.src_path.endswith('/.env'):
-                    load_dotenv(override=True)
-                    # Invoke registered reload callbacks (e.g. pool.sync_from_env).
-                    for cb in _ENV_RELOAD_CALLBACKS:
-                        try:
-                            cb()
-                        except Exception as e:
-                            logger.warning(f'[env] reload callback failed: {e}')
-                    logger.info('[env] .env reloaded (hot)')
-
-        observer = Observer()
-        watch_path = str(Path(__file__).parent.parent)
-        observer.schedule(EnvWatcher(), path=watch_path, recursive=False)
-        observer.start()
-        logger.info('[env] Watching .env for hot reload')
+        from common.env_reload import EnvReloadService, resolve_env_path
+        stop_env_watcher()
+        async def _apply_env_snapshot(snapshot):
+            for cb in _ENV_RELOAD_CALLBACKS:
+                try:
+                    cb(snapshot)
+                except Exception as e:
+                    logger.warning(f'[env] reload callback failed: {e}')
+        service = EnvReloadService(
+            env_path=resolve_env_path(Path(__file__).parent.parent / '.env'),
+            apply=_apply_env_snapshot)
+        # Record the boot snapshot before any event can fire; boot OS-env
+        # semantics stay authoritative until the first real file change.
+        if not service.initialize():
+            logger.warning('[env] boot snapshot unavailable; ownership baseline starts empty')
+        service.start()
+        _ENV_RELOAD_SERVICE = service
     except Exception as e:
         logger.warning(f'[env] Failed to start watcher: {e}')
+
+
+def stop_env_watcher():
+    """Idempotently stop the shared .env reload service."""
+    global _ENV_RELOAD_SERVICE
+    service, _ENV_RELOAD_SERVICE = _ENV_RELOAD_SERVICE, None
+    if service is not None:
+        try:
+            service.stop()
+        except Exception as e:
+            logger.warning(f'[env] watcher stop failed: {e}')
 
 from .key_pool import KeyPool, NVIDIA_BASE_URL, NVIDIA_GENAI_URL, NVIDIA_NVCF_URL
 
@@ -1114,7 +1136,11 @@ from . import alert_history
 from . import loki_push
 
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
-    load_dotenv()
+    # Final audit 2026-11-15: WRAPPER_ENV_FILE pins the boot .env to a
+    # deterministic path (hot-swap acceptance and deployments that keep the
+    # file outside the working directory).
+    _env_override = os.environ.get("WRAPPER_ENV_FILE", "").strip()
+    load_dotenv(dotenv_path=_env_override) if _env_override else load_dotenv()
 
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/nvidia-python/nvidia_py.log')
 try:
@@ -2570,26 +2596,22 @@ class Server:
         self._bg_tasks.append(asyncio.create_task(_metrics_prune_loop()))
         self._bg_tasks.append(asyncio.create_task(_heal_in_flight_loop()))
 
-        # Register a hot-reload callback so new NVIDIA_API_KEY_* entries
-        # in .env are picked up without a process restart. sync_keys is
-        # async, so we schedule it on the running event loop.
-        def _sync_pool_from_env():
-            import re as _re
-            new_keys = []
-            seen = set()
-            for key_name, value in sorted(os.environ.items()):
-                if _re.match(r'^NVIDIA_API_KEY(_\d+)?$', key_name):
-                    v = (value or '').strip()
-                    if v and len(v) >= 10 and v not in seen:
-                        seen.add(v)
-                        new_keys.append(v)
-            if new_keys:
-                try:
-                    loop = asyncio.get_event_loop()
-                    asyncio.run_coroutine_threadsafe(self.pool.sync_keys(new_keys), loop)
-                    logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
-                except Exception as e:
-                    logger.warning(f'[env] pool sync schedule failed: {e}')
+        # Register a hot-reload callback so NVIDIA_API_KEY(_\d+)? changes in
+        # the watched .env are picked up without a process restart. Final
+        # audit 2026-11-15: the callback receives the *parsed file snapshot*
+        # (not os.environ, which cannot reflect deleted lines) and schedules
+        # the state-preserving pool.sync_keys on the running service loop —
+        # the previous implementation called asyncio.get_event_loop() inside
+        # the watchdog thread, which raises on Python 3.10+ and never synced.
+        def _sync_pool_from_env(snapshot):
+            try:
+                from common.env_reload import scan_pool_keys
+                new_keys = scan_pool_keys(snapshot, r'^NVIDIA_API_KEY(_\d+)?$')
+                loop = asyncio.get_running_loop()  # service loop via _apply hook
+                asyncio.run_coroutine_threadsafe(self.pool.sync_keys(new_keys), loop)
+                logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
+            except Exception as e:
+                logger.warning(f'[env] pool sync schedule failed: {e}')
 
         _ENV_RELOAD_CALLBACKS.append(_sync_pool_from_env)
         start_env_watcher()
@@ -4244,14 +4266,17 @@ class Server:
                 body['max_tokens'] = body['max_completion_tokens']
                 del body['max_completion_tokens']
             clamp_max_tokens_for_model(body, model_id)
-        # NVIDIA NIM supports the OpenAI stream_options.include_usage contract.
-        # Request it on every active streaming surface, including plain chat;
-        # the previous early return made /v1/chat/completions Activity rows stay
-        # at zero even though the provider could report usage. Respect an
-        # explicit client value so provider payload semantics remain
-        # client-authoritative.
-        if body.get('stream') and metric_path in (
-                '/v1/chat/completions', '/v1/messages', '/v1/responses'):
+        # Native-request purity (final audit 2026-11-15): the client payload is
+        # authoritative on streaming surfaces. NVIDIA NIM supports the OpenAI
+        # stream_options.include_usage contract, but injecting it by default
+        # rewrote the native request beyond provider routing metadata and broke
+        # the native acceptance oracle. Operators who want the Activity-usage
+        # telemetry injection can opt in explicitly with
+        # NVIDIA_STREAM_USAGE_TELEMETRY=1; an explicit client value is always
+        # preserved either way.
+        if (os.environ.get('NVIDIA_STREAM_USAGE_TELEMETRY', '').lower() in ('1', 'true', 'yes', 'on')
+                and body.get('stream') and metric_path in (
+                    '/v1/chat/completions', '/v1/messages', '/v1/responses')):
             options = dict(body.get('stream_options') or {})
             options.setdefault('include_usage', True)
             body['stream_options'] = options
@@ -5349,6 +5374,9 @@ def create_app() -> FastAPI:
             yield
         finally:
             logger.info('[lifecycle] wrapper-nvidia shutting down gracefully...')
+            # Final audit 2026-11-15: stop the .env reload watcher first so no
+            # reload can race pool/session teardown.
+            stop_env_watcher()
             # B-34 fix: drain in-flight requests before closing the session, so
             # a deploy/restart does not sever active streams mid-response
             # (nous/opencode/blackbox parity).

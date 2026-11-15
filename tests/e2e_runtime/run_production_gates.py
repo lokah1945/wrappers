@@ -41,6 +41,7 @@ def main() -> int:
         ("matrix", ["tests/e2e_runtime/full_matrix_audit.py", "--output", str(output.resolve() / "matrix.json")]),
         ("compat", ["tests/e2e_runtime/compat_layer_e2e.py"]),
         ("acceptance", ["tests/e2e_runtime/active_production_acceptance.py", "--output", str(output.resolve() / "acceptance.json")]),
+        ("hot-swap", ["tests/e2e_runtime/hot_swap_acceptance.py", "--output", str(output.resolve() / "hot_swap.json")]),
         ("soak", ["tests/e2e_runtime/soak.py", "--seconds", str(args.soak_seconds), "--concurrency", str(args.concurrency)]),
         ("transparency", ["tests/run_transparency_check.py"]),
         ("unit", ["-m", "pytest", "tests/", "nvidia-python/tests/", "-q", "-rs", "-p", "no:cacheprovider", "--tb=short"]),

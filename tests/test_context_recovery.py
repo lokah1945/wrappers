@@ -234,11 +234,9 @@ async def test_active_transports_recover_once_preserve_native_data_and_release(w
         body['previous_response_id'] = 'native-history-id'
     body['stream'] = stream
     expected = {**copy.deepcopy(body), field: 2000}
-    if wrapper == 'nvidia-python' and stream and surface == 'chat':
-        # NVIDIA NIM's streaming chat transport opts into the documented
-        # stream_options.include_usage contract; the reduced retry keeps it.
-        # The compat2 responses/messages transports do not add it.
-        expected['stream_options'] = {'include_usage': True}
+    # Native default (final audit 2026-11-15): no wrapper injects
+    # stream_options.include_usage; the reduced retry keeps the client payload
+    # byte-identical apart from the reduced token field.
     wire = b'event: future_native_event\ndata: {"opaque":true}\n\n'
     success = {'id': 'native_ok', 'future_result': {'opaque': True}}
     peers = [Peer(status=400, reply=ERROR), Peer([wire], reply=None) if stream else Peer(reply=success)]

@@ -186,21 +186,42 @@ async def test_messages_controls_reach_actual_transport(stream, controls, effort
     assert server._in_flight == 0 and all(key.in_flight == 0 for key in server.pool.keys)
 
 
-async def test_plain_chat_stream_requests_nim_usage_for_activity():
+async def test_plain_chat_stream_usage_telemetry_is_opt_in():
     server, _ = _server([], [])
+    # Native default (final audit 2026-11-15): the streaming client payload is
+    # authoritative; the wrapper must not inject stream_options.include_usage.
     prepared = await server._prepare_proxy_body(
         {'model': MODEL, 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]},
         MODEL,
         metric_path='/v1/chat/completions',
     )
-    assert prepared['stream_options']['include_usage'] is True
+    assert 'stream_options' not in prepared
 
+    # Explicit client values are always preserved, injected or not.
     explicit = await server._prepare_proxy_body(
         {'model': MODEL, 'stream': True, 'stream_options': {'include_usage': False}},
         MODEL,
         metric_path='/v1/chat/completions',
     )
     assert explicit['stream_options']['include_usage'] is False
+
+    # Operators can opt in to the Activity-usage telemetry injection.
+    os.environ['NVIDIA_STREAM_USAGE_TELEMETRY'] = '1'
+    try:
+        telemetry = await server._prepare_proxy_body(
+            {'model': MODEL, 'stream': True, 'messages': [{'role': 'user', 'content': 'x'}]},
+            MODEL,
+            metric_path='/v1/chat/completions',
+        )
+        assert telemetry['stream_options']['include_usage'] is True
+        preserved = await server._prepare_proxy_body(
+            {'model': MODEL, 'stream': True, 'stream_options': {'include_usage': False}},
+            MODEL,
+            metric_path='/v1/chat/completions',
+        )
+        assert preserved['stream_options']['include_usage'] is False
+    finally:
+        os.environ.pop('NVIDIA_STREAM_USAGE_TELEMETRY', None)
 
 
 async def test_mapped_controls_win_conflicts_and_preserve_explicit_extensions():

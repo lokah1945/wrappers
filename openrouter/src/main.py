@@ -136,12 +136,60 @@ from common.auth import extract_client_tokens, tokens_match
 
 from dotenv import load_dotenv
 
+# Final audit 2026-11-15: the dead watchdog import (nothing was ever watched)
+# is replaced by the shared .env hot-reload service in common/env_reload.py.
 try:
-    from watchdog.events import FileSystemEventHandler
-    from watchdog.observers import Observer
+    import watchdog  # noqa: F401  (availability probe; env_reload imports lazily)
     HAS_WATCHDOG = True
 except ImportError:
     HAS_WATCHDOG = False
+
+_ENV_RELOAD_SERVICE = None
+
+
+def start_env_watcher():
+    """Start the shared .env hot-reload service (common/env_reload.py).
+
+    WRAPPER_SKIP_DOTENV keeps test isolation; the check must stay first.
+    """
+    if os.environ.get('WRAPPER_SKIP_DOTENV', '').lower() in ('1', 'true', 'yes', 'on'):
+        return
+    global _ENV_RELOAD_SERVICE
+    try:
+        from common.env_reload import EnvReloadService, resolve_env_path, scan_pool_keys
+        stop_env_watcher()
+
+        async def _apply_env_snapshot(snapshot):
+            # Runs on the service loop: schedule the state-preserving pool sync
+            # there; never rebuild the pool from a watcher thread.
+            try:
+                new_keys = scan_pool_keys(snapshot, r'^OPENROUTER_API_KEY(_\d+)?$')
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(pool.sync_keys(new_keys), loop)
+                logger.info(f'[env] scheduled pool.sync_keys({len(new_keys)} keys)')
+            except Exception as e:
+                logger.warning(f'[env] key pool reload failed: {e}')
+
+        service = EnvReloadService(
+            env_path=resolve_env_path(ROOT / '.env'),
+            apply=_apply_env_snapshot)
+        if not service.initialize():
+            logger.warning('[env] boot snapshot unavailable; ownership baseline starts empty')
+        service.start()
+        _ENV_RELOAD_SERVICE = service
+    except Exception as e:
+        logger.warning(f'[env] watcher failed: {e}')
+
+
+def stop_env_watcher():
+    """Idempotently stop the shared .env reload service."""
+    global _ENV_RELOAD_SERVICE
+    service, _ENV_RELOAD_SERVICE = _ENV_RELOAD_SERVICE, None
+    if service is not None:
+        try:
+            service.stop()
+        except Exception as e:
+            logger.warning(f'[env] watcher stop failed: {e}')
 
 from .key_pool import KeyPool
 
@@ -201,8 +249,14 @@ from mcp.server.sse import SseServerTransport
 # ── Bootstrap ────────────────────────────────────────────────────────────
 ROOT = Path(__file__).resolve().parents[1]
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
-    load_dotenv(ROOT / '.env')
-    load_dotenv()
+    # Final audit 2026-11-15: WRAPPER_ENV_FILE pins the boot .env to a
+    # deterministic path (hot-swap acceptance harness uses it).
+    _env_override = os.environ.get("WRAPPER_ENV_FILE", "").strip()
+    if _env_override:
+        load_dotenv(_env_override)
+    else:
+        load_dotenv(ROOT / '.env')
+        load_dotenv()
 
 # ── Logging ──────────────────────────────────────────────────────────────
 LOG_FILE = os.environ.get('LOG_FILE', '/root/wrapper/openrouter/openrouter.log')
@@ -707,6 +761,11 @@ async def lifespan(app: FastAPI):
     await initialize_upstream_compatibility(OPENROUTER_BASE)
     logger.info("[openrouter] Starting wrapper-openrouter")
     pool.load_from_env()
+    # Final audit 2026-11-15: openrouter previously had NO runtime reload path
+    # (dotenv was read at import, the pool only at startup, and the watchdog
+    # import was dead code). The shared .env service now provides add/remove/
+    # replace/zero-key hot swap without a restart.
+    start_env_watcher()
 
     if _HAS_CATALOG:
         logger.info("[openrouter] Catalog integration enabled")
@@ -726,6 +785,9 @@ async def lifespan(app: FastAPI):
     # every active stream mid-response on each deploy/restart (all three
     # siblings already implement this drain).
     logger.info("[openrouter] Starting graceful shutdown...")
+    # Final audit 2026-11-15: stop the .env reload watcher before draining so
+    # no reload can race pool/session teardown.
+    stop_env_watcher()
     shutdown_start = time.time()
     max_wait = int(os.environ.get('SHUTDOWN_DRAIN_SEC', '30'))
     while shutdown_start + max_wait > time.time():

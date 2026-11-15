@@ -222,11 +222,17 @@ class KeyPool:
             return {'key': key}
 
     def release(self, key: KeyEntry = None):
-        """Release in-flight slot for a key."""
+        """Release in-flight slot for a key.
+
+        Final audit 2026-11-15: a reservation on a credential retired by a
+        hot-reload generation releases its own object only; it must not
+        decrement the pool-level counter that no longer counts it.
+        """
         if key is None:
             return
         key.decrement_in_flight()
-        self._in_flight_total = max(0, self._in_flight_total - 1)
+        if any(k is key for k in self.keys):
+            self._in_flight_total = max(0, self._in_flight_total - 1)
 
     def mark_failure(self, key: KeyEntry, status_code: int = 0, retry_after: int | None = None,
                      reason: str = '', available_keys: int | None = None, model: str = ''):
@@ -265,6 +271,50 @@ class KeyPool:
 
     def all_stats(self) -> list:
         return [k.stats(self.soft_limit, self.hard_limit) for k in self.keys]
+
+    async def sync_keys(self, keys_list: list[str]) -> bool:
+        r"""State-preserving credential reconciliation (final audit 2026-11-15).
+
+        ``keys_list`` is the authoritative snapshot of OPENROUTER_API_KEY(_\d+)?
+        values from the watched .env file. Unlike the destructive
+        ``load_from_env`` boot rebuild, this keeps the SAME KeyEntry object —
+        cooldowns, model blocks, RPM windows, in-flight reservations and
+        counters — for every credential that survives the reload, matched by
+        api_key identity. An empty list is a valid zero-key generation.
+        Credentials absent from the snapshot are retired from acquisition;
+        in-flight requests holding them finish on their own object and their
+        eventual release() decrements that object safely.
+        """
+        keys_list = [k for k in (keys_list or []) if k]
+        async with self._lock:
+            old_set = {k.api_key for k in self.keys}
+            new_list, seen = [], set()
+            for k in keys_list:
+                if k not in seen:
+                    seen.add(k)
+                    new_list.append(k)
+
+            if old_set == seen and len(self.keys) == len(new_list) and \
+                    all(self.keys[i].api_key == k for i, k in enumerate(new_list)):
+                return False
+
+            by_api = {k.api_key: k for k in self.keys}
+            new_keys = []
+            for i, k in enumerate(new_list):
+                existing = by_api.get(k)
+                if existing:
+                    existing.label = f'key{i+1}'
+                    new_keys.append(existing)
+                else:
+                    new_keys.append(KeyEntry(f'key{i+1}', k))
+            self.keys = new_keys
+            # Retired credentials keep their own object for in-flight holders;
+            # the pool-level counter tracks retained reservations only.
+            self._in_flight_total = sum(k.in_flight for k in self.keys)
+            self._rr = 0
+            logger.info(f'[openrouter] key pool synced: {len(new_keys)} key(s) '
+                        f'(+{len(seen - old_set)}/-{len(old_set - seen)})')
+            return True
 
     def prom_metrics(self) -> str:
         lines = [

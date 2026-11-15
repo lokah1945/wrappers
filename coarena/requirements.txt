@@ -1,7 +1,5 @@
-fastapi==0.142.2
-uvicorn[standard]==0.27.0
-aiohttp==3.14.4
-pydantic==2.5.0
-python-dotenv==1.0.0
-anyio==4.15.1
-starlette==1.7.0
+# Coarena shares the constrained runtime set with every active wrapper.
+# Direct pins previously conflicted with tests/constraints-verified.txt
+# (uvicorn 0.27.0 vs 0.54.0, pydantic 2.5.0 vs 2.13.5,
+#  python-dotenv 1.0.0 vs 1.2.4) and made a clean release install impossible.
+-r ../requirements-runtime.txt

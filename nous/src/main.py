@@ -279,11 +279,56 @@ class KeyPool:
         logger.info(f"[key_pool] Loaded {len(self.keys)} Nous API key(s) hard={self.hard_limit}rpm")
         return self
 
+    async def sync_keys(self, keys_list: List[str]) -> bool:
+        r"""State-preserving credential reconciliation (final audit 2026-11-15).
+
+        ``keys_list`` is the authoritative snapshot of NOUS_API_KEY(_\d+)?
+        values from the watched .env file. Unlike ``load_from_env`` (a
+        destructive boot-time rebuild), this keeps the SAME KeyEntry object —
+        cooldowns, RPM windows, in-flight reservations and counters — for every
+        credential that survives the reload, matched by api_key identity.
+        An empty list is a valid zero-key generation. Credentials absent from
+        the snapshot are retired from acquisition; in-flight requests holding
+        them finish on their own object and release exactly once.
+        """
+        keys_list = [k for k in (keys_list or []) if k]
+        async with self._lock:
+            old_set = {k.api_key for k in self.keys}
+            new_list, seen = [], set()
+            for k in keys_list:
+                if k not in seen:
+                    seen.add(k)
+                    new_list.append(k)
+
+            if old_set == seen and len(self.keys) == len(new_list) and \
+                    all(self.keys[i].api_key == k for i, k in enumerate(new_list)):
+                return False
+
+            by_api = {k.api_key: k for k in self.keys}
+            new_keys = []
+            for i, k in enumerate(new_list):
+                existing = by_api.get(k)
+                if existing:
+                    existing.label = f"key{i+1}"
+                    new_keys.append(existing)
+                else:
+                    new_keys.append(KeyEntry(f"key{i+1}", k))
+            removed = [k for k in old_set if k not in seen]
+            self.keys = new_keys
+            self._rr = 0
+            logger.info(f"[key_pool] Nous key pool synced: {len(new_keys)} key(s) "
+                        f"(+{len(seen - old_set)}/-{len(removed)})")
+            return True
+
     async def acquire(self, model_id: str = None, exclude: Optional[Set[str]] = None) -> Optional[KeyEntry]:
         """Least-loaded selection.
 
-        N-10 fix: `exclude` lets retry loops skip labels already tried for the
-        same client request. N-12 fix: keys cooled down for `model_id` only are
+        N-10 fix: `exclude` lets retry loops skip credentials already tried for
+        the same client request. Final audit 2026-11-15: exclusion is by
+        **api_key identity**, not positional label — a mid-request hot-reload
+        reorder relabels entries, and label-based exclusion could then re-select
+        a credential that already failed (openrouter/coarena semantics).
+        N-12 fix: keys cooled down for `model_id` only are
         skipped for that model but stay usable for other models.
         """
         async with self._lock:
@@ -294,7 +339,7 @@ class KeyPool:
             candidates = [
                 k for k in self.keys
                 if not k.is_blocked() and k.current_rpm() < self.hard_limit
-                and (not exclude or k.label not in exclude)
+                and (not exclude or k.api_key not in exclude)
                 and not (model_id and k.is_model_blocked(model_id))
             ]
             if not candidates:
@@ -418,7 +463,9 @@ def load_dotenv(override: bool = False):
     N-13 fix: `override=True` replaces existing os.environ values (hot reload
     must pick up rotated keys); default keeps setdefault semantics for boot.
     """
-    for p in [".env", os.path.expanduser("~/.env")]:
+    for p in ([os.environ["WRAPPER_ENV_FILE"]]
+              if os.environ.get("WRAPPER_ENV_FILE", "").strip()
+              else [".env", os.path.expanduser("~/.env")]):
         if os.path.exists(p):
             with open(p) as f:
                 for line in f:
@@ -448,37 +495,54 @@ def load_dotenv(override: bool = False):
 if os.environ.get("WRAPPER_SKIP_DOTENV", "").lower() != "true":
     load_dotenv()
 
-# .env hot reload watcher (parity with opencode/nvidia-python)
-try:
-    from watchdog.observers import Observer
-    from watchdog.events import FileSystemEventHandler
-    HAS_WATCHDOG = True
-except ImportError:
-    HAS_WATCHDOG = False
+# .env hot reload watcher — final audit 2026-11-15: replaced the private
+# on_modified-only watcher (loose '.env' substring match, destructive
+# KEY_POOL.load_from_env() from the observer thread, no lock, no moved/created
+# events) with the shared service in common/env_reload.py. The skip check
+# stays first so test isolation never touches watcher machinery.
+_ENV_RELOAD_SERVICE = None
+
 
 def start_env_watcher():
+    """Start the shared .env hot-reload service (common/env_reload.py)."""
     if os.environ.get('WRAPPER_SKIP_DOTENV', '').lower() in ('1', 'true', 'yes', 'on'):
         return
-    if not HAS_WATCHDOG:
-        return
+    global _ENV_RELOAD_SERVICE
     try:
-        class EnvWatcher(FileSystemEventHandler):
-            def on_modified(self, event):
-                if '.env' in event.src_path:
-                    # N-13 fix: reload with override so changed values (e.g.
-                    # rotated keys) actually take effect, then rebuild the pool.
-                    load_dotenv(override=True)
-                    try:
-                        KEY_POOL.load_from_env()
-                    except Exception as e:
-                        logger.warning(f'[env] key pool reload failed: {e}')
-                    logger.info('[env] .env reloaded (hot, override)')
-        obs = Observer()
-        obs.schedule(EnvWatcher(), path=str(Path(__file__).parent.parent), recursive=False)
-        obs.start()
-        logger.info('[env] Watching .env for hot reload')
+        from common.env_reload import EnvReloadService, resolve_env_path, scan_pool_keys
+        stop_env_watcher()
+
+        async def _apply_env_snapshot(snapshot):
+            # Runs on the service loop: schedule the state-preserving pool sync
+            # there; never rebuild the pool from a watcher thread.
+            try:
+                new_keys = scan_pool_keys(snapshot, r'^NOUS_API_KEY(_\d+)?$')
+                loop = asyncio.get_running_loop()
+                asyncio.run_coroutine_threadsafe(KEY_POOL.sync_keys(new_keys), loop)
+                logger.info(f'[env] scheduled KEY_POOL.sync_keys({len(new_keys)} keys)')
+            except Exception as e:
+                logger.warning(f'[env] key pool reload failed: {e}')
+
+        service = EnvReloadService(
+            env_path=resolve_env_path(Path(__file__).parent.parent / '.env'),
+            apply=_apply_env_snapshot)
+        if not service.initialize():
+            logger.warning('[env] boot snapshot unavailable; ownership baseline starts empty')
+        service.start()
+        _ENV_RELOAD_SERVICE = service
     except Exception as e:
         logger.warning(f'[env] watcher failed: {e}')
+
+
+def stop_env_watcher():
+    """Idempotently stop the shared .env reload service."""
+    global _ENV_RELOAD_SERVICE
+    service, _ENV_RELOAD_SERVICE = _ENV_RELOAD_SERVICE, None
+    if service is not None:
+        try:
+            service.stop()
+        except Exception as e:
+            logger.warning(f'[env] watcher stop failed: {e}')
 
 NOUS_BASE = os.environ.get("NOUS_BASE_URL", "https://inference-api.nousresearch.com").rstrip("/")
 MODEL_STATE_DB = os.environ.get("MODEL_STATE_DB", str(Path(__file__).resolve().parent.parent / "model-state.db"))
@@ -999,16 +1063,19 @@ async def post_nous_with_retries(payload: dict, stream: bool = False, extra_head
             return status, result, None
 
     attempts = max(1, KEY_POOL.total_keys)
-    # N-10 fix: skip labels already tried for this request so acquire() cannot
-    # re-select the same key every iteration, and back off with jitter between
-    # attempts instead of hammering upstream back-to-back.
-    tried_labels: Set[str] = set()
+    # N-10 fix: skip credentials already tried for this request so acquire()
+    # cannot re-select the same key every iteration, and back off with jitter
+    # between attempts instead of hammering upstream back-to-back. Final audit
+    # 2026-11-15: exclusion is by api_key identity so a concurrent hot-reload
+    # reorder (which relabels entries) cannot make a retry re-use a failed
+    # credential.
+    tried_keys: Set[str] = set()
     retry_backoff_base = float(os.environ.get("RETRY_BACKOFF_BASE_SEC", "0.25"))
     for attempt_i in range(attempts):
-        entry = await KEY_POOL.acquire(model_id=model_id, exclude=tried_labels)
+        entry = await KEY_POOL.acquire(model_id=model_id, exclude=tried_keys)
         if not entry:
             break
-        tried_labels.add(entry.label)
+        tried_keys.add(entry.api_key)
         released = False
         try:
             if attempt_i > 0:
@@ -3046,9 +3113,12 @@ async def lifespan(app: FastAPI):
         set_dynamic_alias_target(seed, force=True)
         MODEL_REGISTRY.bind_explicit_aliases(seed, _ALIAS_NAME_SET, scope_type="wrapper", scope_id="nous")
     logger.info(f"wrapper-nous v{VERSION} starting on {LISTEN_HOST}:{LISTEN_PORT}")
-    start_env_watcher()
-    # Load API keys from environment before the daily catalog task starts.
+    # Load API keys from environment before the watcher can fire syncs.
     KEY_POOL.load_from_env()
+    # Final audit 2026-11-15: shared .env hot-reload service (started after the
+    # boot pool load so watcher-driven syncs never race the destructive boot
+    # rebuild).
+    start_env_watcher()
     # N-17 fix: populate _known_models at startup from the persisted catalog so
     # dynamic alias binding works before the first /v1/models discovery call.
     try:
@@ -3070,6 +3140,9 @@ async def lifespan(app: FastAPI):
 
     # Graceful shutdown: wait for in-flight requests
     logger.info(f"[wrapper-nous] Starting graceful shutdown...")
+    # Final audit 2026-11-15: stop the .env reload watcher before draining so
+    # no reload can race pool teardown.
+    stop_env_watcher()
     shutdown_start = time.time()
     max_wait = 30
     while shutdown_start + max_wait > time.time():

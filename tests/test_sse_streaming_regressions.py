@@ -991,7 +991,10 @@ def test_b37_model_block_predicates_are_side_effect_free():
 def test_b38_nous_key_pool_uses_asyncio_lock():
     src = (ROOT / 'nous' / 'src' / 'main.py').read_text()
     i = src.index('class KeyPool:')
-    block = src[i:i + 4200]
+    # Final audit 2026-11-15: window widened — the state-preserving sync_keys
+    # reconciliation (hot swap) added between load_from_env and acquire pushed
+    # release beyond the old 4200-char slice without changing the B-38 shape.
+    block = src[i:i + 6500]
     assert 'self._lock = asyncio.Lock()' in block
     assert 'self._lock = threading.Lock()' not in block
     assert 'async def acquire' in block

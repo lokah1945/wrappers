@@ -319,6 +319,41 @@ Port 9100 belongs to the model-fetcher MCP service and remains untouched. Port 9
 | `COMPATIBILITY_PROBE_TTL_SEC` | `300` | Cache TTL for auto-discovery probes (layer 3). |
 | `LOAD_SHEDDING_ENABLED` | `false` | Shed load above `INFLIGHT_SOFT_CAP`. |
 | `OPENROUTER_MANAGEMENT_TOKEN` | falls back to `BEARER_TOKEN` | Provisioning-API credential (openrouter). |
+| `WRAPPER_ENV_FILE` | *(unset → `<provider>/.env`)* | Deterministic .env path for boot **and** the runtime hot-reload watcher (see §9.3). |
+| `WRAPPER_SKIP_DOTENV` | *(unset)* | Truthy disables dotenv load and the reload watcher — **test isolation only**; the live hot-swap gate must use `WRAPPER_ENV_FILE` instead. |
+| `NVIDIA_STREAM_USAGE_TELEMETRY` | *(unset)* | `1` opts NVIDIA streaming surfaces into injecting `stream_options.include_usage` for Activity usage telemetry. Default off: the client payload stays authoritative (native purity, final audit 2026-11-15). |
+
+### 9.3 API-key hot swap (normative — final audit 2026-11-15)
+
+Every active wrapper MUST add, remove, replace, reorder and zero its upstream
+credentials **without a process restart**, via the shared service
+`common/env_reload.py`:
+
+- The watched `.env` (or `WRAPPER_ENV_FILE`) is the authoritative runtime
+  source for the variables it defines; OS environment wins at boot;
+  variables never defined by the file are never touched (ownership model).
+- A valid file with zero keys — or a deleted file — is a legitimate
+  zero-credential generation: the pool goes empty, requests fail honestly,
+  the service stays alive, and re-adding a key recovers without restart.
+- Reloads are state-preserving: retained credentials keep cooldowns, RPM
+  windows, in-flight reservations and counters on the same pool entry,
+  matched by **api_key identity** (labels are display-only). Removed
+  credentials are retired from new acquisitions; in-flight requests finish
+  and release exactly once on their own object.
+- Corrupt/unreadable files keep the last-known-good snapshot with a visible
+  failed status; nothing partial is applied.
+- The watcher must handle in-place writes, creates, atomic renames onto the
+  watched path (destination checked) and deletion, with debounce; a missing
+  `watchdog` dependency falls back to bounded polling rather than silently
+  disabling hot swap. Reloads run on the service event loop captured at
+  startup — never scheduled from a watcher thread with an ad-hoc loop
+  lookup.
+- Measured reload bound on the supported local filesystem: ≤ 5 s.
+
+Full specification, operator scenarios and limits:
+[`docs/HOT_SWAP_RUNBOOK.md`](docs/HOT_SWAP_RUNBOOK.md). Live gate:
+`tests/e2e_runtime/hot_swap_acceptance.py` (10 scenarios × active wrappers,
+PID pinned).
 
 ---
 
@@ -334,32 +369,40 @@ Port 9100 belongs to the model-fetcher MCP service and remains untouched. Port 9
 
 ## 11. Testing and verification
 
-A wrapper is **not** contract-compliant until it passes all six gates.
+A wrapper is **not** contract-compliant until it passes all seven gates.
 
 ```bash
 python -m pip install -r tests/requirements.txt
 
 # 1. Unit + parity + regression suite (incl. AI Gateway translation matrix)
-python -m pytest tests -q                        # 241 tests
+python -m pytest tests -q
 
 # 2. Live agent-traffic E2E — boots each wrapper as a real server against a
 #    mock upstream and drives it as Claude Code / Codex / OpenAI SDK would.
-python tests/e2e_runtime/run_runtime_e2e.py      # 445 checks, exits non-zero on failure
+python tests/e2e_runtime/run_runtime_e2e.py      # exits non-zero on failure
 
 # 3. SDK compatibility — every wrapper's /v1/responses output (streaming +
 #    non-streaming) must parse with the official openai SDK (Codex's parser).
-python tests/e2e_runtime/sdk_codex_compat.py     # 5 wrappers × 4 modes
+python tests/e2e_runtime/sdk_codex_compat.py
 
-# 4. COMPATIBILITY_LAYER E2E — layer=2 (Anthropic upstream) across all 5
+# 4. COMPATIBILITY_LAYER E2E — layer=2 (Anthropic upstream) across the active
 #    wrappers × 3 surfaces + layer=3 auto-discovery against both mocks.
 python tests/e2e_runtime/compat_layer_e2e.py
 
 # 5. Full matrix audit — every wrapper × upstream dialect × surface ×
 #    parameter, driven with the real anthropic + openai SDKs.
-python tests/e2e_runtime/full_matrix_audit.py    # 240 checks
+python tests/e2e_runtime/full_matrix_audit.py
 
 # 6. Sustained load — leak, pool-starvation and degradation detection
 python tests/e2e_runtime/soak.py --seconds 12 --concurrency 6
+
+# 7. Native acceptance + hot-swap (final audit 2026-11-15) — native defaults
+#    on every client API with opaque-field/SSE oracles, then the LIVE key
+#    hot-swap table (add/remove/replace/zero/state/atomic/corrupt/stream/
+#    restart; PID pinned; ≤5s reload bound; WRAPPER_SKIP_DOTENV must NOT be
+#    set — isolation comes from WRAPPER_ENV_FILE).
+python tests/e2e_runtime/active_production_acceptance.py
+python tests/e2e_runtime/hot_swap_acceptance.py
 ```
 
 The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrappers: `normal`, `nospace`, `keepalive`, `crlf`, `tools`, `reasoning`, `reasoning_only`, `nofinish`, `noterminator`, `midstream_error`, `usage_after`, `empty`, `unicode`, `slow`, `bigchunk`, `bytesplit`, `comments`, `dupfinish`, `nullcontent`, `emptychoices`, `toolnoid`, `longtool`. The mock upstream additionally provides non-stream modes (`echo`, `error`, `http429once`, `abrupt`, `http500`, `http429`) for parameter/error/retry probes.
@@ -369,6 +412,12 @@ The streaming E2E drives **22 streaming modes** against 3 surfaces on all 5 wrap
 ---
 
 ## 12. Changelog
+
+### v3.2 → v3.3 (2026-11-15, final audit)
+
+- **§9.2:** added `WRAPPER_ENV_FILE` (deterministic boot + watcher path), `WRAPPER_SKIP_DOTENV` (test-isolation semantics) and `NVIDIA_STREAM_USAGE_TELEMETRY` (opt-in usage telemetry injection; default preserves native request purity).
+- **§9.3 (new, normative):** API-key hot swap without restart on every active wrapper via `common/env_reload.py` — ownership-based reconciliation, state-preserving pool sync by api_key identity, valid zero-key generations, corrupt-file last-known-good, watcher event coverage with polling fallback, ≤5 s measured reload bound.
+- **§11:** gate 7 added — `active_production_acceptance.py` (native defaults across all client APIs, now including coarena) and `hot_swap_acceptance.py` (live hot-swap table, PID pinned).
 
 ### v3.0 → v3.1 (2026-08-01)
 
