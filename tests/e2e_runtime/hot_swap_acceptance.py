@@ -249,6 +249,7 @@ async def run_provider(name: str, upstream: Upstream, client: aiohttp.ClientSess
             second = Harness(client, upstream)
             await second.wait_health(port, process2)
             await second.check(f"{name}/restart-clean-boot", lambda: _boot(second, name))
+            harness.checks.extend(second.checks)
         finally:
             await asyncio.to_thread(stop_process, process2)
             log2.close()

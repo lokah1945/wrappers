@@ -34,7 +34,7 @@ def test_readiness_requires_a_positive_contract(status, body, expected):
 
 
 def test_isolated_tests_cannot_recover_production_credentials(monkeypatch, tmp_path):
-    for name in ("OPENROUTER_API_KEY_1", "NOUS_API_KEY", "AUTH_PATH", "BEARER_TOKEN", "MODEL_STATE_DB"):
+    for name in ("OPENROUTER_API_KEY_1", "NOUS_API_KEY", "AUTH_PATH", "BEARER_TOKEN", "MODEL_STATE_DB", "FREE_ONLY"):
         monkeypatch.setenv(name, "production-value")
     env = AUDIT.isolated_test_environment(tmp_path)
     assert "OPENROUTER_API_KEY_1" not in env
@@ -45,10 +45,43 @@ def test_isolated_tests_cannot_recover_production_credentials(monkeypatch, tmp_p
     assert env["AUTH_PATH"] == str(tmp_path / "missing-auth.json")
     runtime_env = ISOLATION.isolated_environment()
     assert "production-value" not in runtime_env.values()
+    assert runtime_env["FREE_ONLY"] == "no"
     assert runtime_env["MODEL_REGISTRY_URL"] == ""
     assert not Path(runtime_env["AUTH_PATH"]).exists()
     assert ROOT not in Path(runtime_env["MODEL_STATE_DB"]).parents
     assert ROOT not in Path(runtime_env["METRICS_SNAPSHOT_FILE"]).parents
+
+
+async def test_hot_swap_restart_failure_counts_toward_release_result(monkeypatch, tmp_path):
+    monkeypatch.syspath_prepend(str(ROOT / "tests/e2e_runtime"))
+    harness = load_module("hot_swap_release_regression", ROOT / "tests/e2e_runtime/hot_swap_acceptance.py")
+
+    async def ready(self, port, process):
+        self.pid = 1
+
+    async def noop(*args):
+        pass
+
+    boots = 0
+
+    async def boot(*args):
+        nonlocal boots
+        boots += 1
+        if boots == 2:
+            raise AssertionError("restarted wrapper did not serve requests")
+
+    monkeypatch.setattr(harness.Harness, "wait_health", ready)
+    monkeypatch.setattr(harness, "start_wrapper", lambda *args: (object(), SimpleNamespace(close=lambda: None)))
+    monkeypatch.setattr(harness, "stop_process", lambda process: None)
+    monkeypatch.setattr(harness, "_boot", boot)
+    for name in ("_add_keys", "_remove_one", "_reorder", "_state_retained", "_zero_and_recover",
+                 "_retired_not_reselected", "_atomic_replace", "_corrupt_then_repair", "_stream_during_removal"):
+        monkeypatch.setattr(harness, name, noop)
+
+    checks, failures = await harness.run_provider("nous", object(), None, tmp_path)
+    assert len(checks) == 11
+    assert failures == [{"check": "nous/restart-clean-boot", "passed": False,
+                         "error": "AssertionError: restarted wrapper did not serve requests"}]
 
 
 def test_port_conflict_does_not_touch_existing_listener():

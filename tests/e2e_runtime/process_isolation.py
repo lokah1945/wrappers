@@ -21,6 +21,7 @@ def isolated_environment() -> dict[str, str]:
     env.update({
         "WRAPPER_SKIP_DOTENV": "true", "PYTHONDONTWRITEBYTECODE": "1",
         "PYTHONUNBUFFERED": "1", "VERIFY_ON_BOOT": "false",
+        "FREE_ONLY": "no",
         "VERIFY_PERIODIC_ENABLED": "false",
         "AUTH_PATH": str(state / "missing-auth.json"),
         "MODEL_REGISTRY_URL": "", "MODEL_REGISTRY_ADMIN_TOKEN": "",
