@@ -47,3 +47,7 @@ Timeout `all-keys-402/stream0` NVIDIA dari run persiapan TIDAK terulang pada 3 r
 ## Versi tercatat
 
 Python 3.12.16; fastapi 0.142.2; uvicorn 0.54.0; aiohttp 3.14.4; pydantic 2.13.5; python-dotenv 1.2.4; watchdog 6.0.0; starlette 1.7.0; mcp 1.30.0; openai 2.54.0; anthropic 0.125.0; pytest 8.4.2; pytest-asyncio 0.26.0 (semua dari `tests/constraints-verified.txt`).
+
+## Catatan metode eksekusi gate
+
+Setiap gate pada tabel dijalankan individual pada HEAD `496c280` dengan perintah yang sama dengan yang didaftarkan `tests/e2e_runtime/run_production_gates.py` (kini termasuk gate `hot-swap`; CI `production-gates.yml` menjalankan pipeline penuh terintegrasi pada setiap push/PR). Run terintegrasi satu-proses penuh tidak dapat diselesaikan dalam satu sesi mesin audit (batas durasi eksekusi perintah); bukti per-gate tersimpan di `docs/artifacts/` dan dapat direproduksi dengan runner yang sama.
