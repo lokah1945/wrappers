@@ -1,0 +1,1146 @@
+{
+  "source_head": "66ec1c188face2ace6cb3ee6e2f2d1ae3d44ebd4",
+  "timestamp_utc": "2026-11-15T15:11:27.724645+00:00",
+  "python": "3.12.14",
+  "environment_note": "Isolated venv with selected pinned SDK/test dependencies and inherited runtime packages; this is not the clean release-constraint installation, which has direct-pin conflicts.",
+  "package_versions": {
+    "pytest": "8.4.2",
+    "pytest-asyncio": "0.26.0",
+    "watchdog": "6.0.0",
+    "openai": "2.54.0",
+    "anthropic": "0.125.0",
+    "aiohttp": "3.14.4",
+    "fastapi": "0.141.1",
+    "starlette": "1.6.0",
+    "python-dotenv": "1.2.2",
+    "pydantic": "2.13.4"
+  },
+  "pytest": {
+    "command": "python -m pytest selected 16 files -q -rs --tb=short -p no:cacheprovider",
+    "exit_code": 0,
+    "tests": 459,
+    "failures": 0,
+    "errors": 0,
+    "skipped": 38,
+    "passed": 421,
+    "scope": "selected contract/native/compatibility/context/retry/cleanup/registry/scope/installer tests; frozen-related exclusions retained"
+  },
+  "compatibility_e2e": {
+    "command": "python tests/e2e_runtime/compat_layer_e2e.py",
+    "exit_code": 0,
+    "providers": [
+      "nvidia-python",
+      "nous",
+      "openrouter",
+      "coarena"
+    ],
+    "note": "Layer 2 and auto layer 3; historical Responses adapter fixture; not complete native default qualification"
+  },
+  "sdk_matrix": {
+    "command": "python tests/e2e_runtime/full_matrix_audit.py --output PATH",
+    "exit_code": 0,
+    "total": 192,
+    "passed": 192,
+    "failed": 0,
+    "blocked": 0,
+    "providers": [
+      "nvidia-python",
+      "nous",
+      "openrouter",
+      "coarena"
+    ],
+    "note": "OpenAI and Anthropic SDKs to local mocks; explicit legacy adapter settings"
+  },
+  "native_default_acceptance": {
+    "command": "python tests/e2e_runtime/active_production_acceptance.py --output PATH",
+    "exit_code": 1,
+    "scope": [
+      "nvidia-python",
+      "nous",
+      "openrouter"
+    ],
+    "upstream": "isolated-local-mock",
+    "checks": [
+      {
+        "check": "nvidia-python/layer1/auth",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-recovery/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/context-input-overflow/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/context-rotation/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/native/stream1",
+        "passed": false,
+        "error": "AssertionError: Native request was rewritten beyond provider metadata: {'model': 'mock/nvidia-python-native-layer1-stream1', 'messages': [{'role': 'user', 'content': 'Check', 'opaque_future_message': {'nested': [None, False, {'future': '界 👋'}], 'revision': 500}}], 'stream': True, 'opaque_future_request': {'nested': [None, False, {'future': '界 👋'}], 'revision': 500}, 'reasoning_effort': 'high', 'max_completion_tokens': 128, 'stream_options': {'include_usage': True}}"
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-402/stream0",
+        "passed": false,
+        "error": "TimeoutError: "
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/auth",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/opaque/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/sdk-tools-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/opaque/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/sdk-tools-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/unsupported-no-downgrade",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/native-first",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-404/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-404/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-405/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-405/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-501/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-501/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unknown-history",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/auth",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer1/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/auth",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/layer2/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/opaque/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/sdk-tools-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/opaque/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/sdk-tools-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/native-responses-strict/unsupported-no-downgrade",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/native-first",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-404/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-404/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-405/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-405/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-501/stream0",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unsupported-501/stream1",
+        "passed": true
+      },
+      {
+        "check": "nous/responses-auto-default/unknown-history",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/auth",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/disconnect",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer1/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/auth",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/disconnect",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/layer2/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/opaque/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/sdk-tools-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/opaque/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/sdk-tools-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/native-responses-strict/unsupported-no-downgrade",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/native-first",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-404/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-404/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-405/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-405/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-501/stream0",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unsupported-501/stream1",
+        "passed": true
+      },
+      {
+        "check": "openrouter/responses-auto-default/unknown-history",
+        "passed": true
+      }
+    ],
+    "passed": 190,
+    "failed": 5
+  },
+  "native_nvidia_rerun": {
+    "command": "python tests/e2e_runtime/active_production_acceptance.py --wrapper nvidia-python --output PATH",
+    "exit_code": 1,
+    "scope": [
+      "nvidia-python"
+    ],
+    "upstream": "isolated-local-mock",
+    "checks": [
+      {
+        "check": "nvidia-python/layer1/auth",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/context-recovery/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/context-input-overflow/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/context-rotation/stream1",
+        "passed": false,
+        "error": "AssertionError: "
+      },
+      {
+        "check": "nvidia-python/layer1/native/stream1",
+        "passed": false,
+        "error": "AssertionError: Native request was rewritten beyond provider metadata: {'model': 'mock/nvidia-python-native-layer1-stream1', 'messages': [{'role': 'user', 'content': 'Check', 'opaque_future_message': {'nested': [None, False, {'future': '界 👋'}], 'revision': 500}}], 'stream': True, 'opaque_future_request': {'nested': [None, False, {'future': '界 👋'}], 'revision': 500}, 'reasoning_effort': 'high', 'max_completion_tokens': 128, 'stream_options': {'include_usage': True}}"
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer1/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/auth",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-catalog-cache",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-input-overflow/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/native/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-chat-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-messages-tools/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-responses-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-input-overflow/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/native/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-chat-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-messages-tools/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/sdk-responses-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/disconnect",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-429/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-429/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-401/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-401/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-402/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/all-keys-402/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/layer2/key-exhaustion",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-recovery/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-rotation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/opaque/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/sdk-tools-continuation/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-recovery/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/context-rotation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/opaque/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/sdk-tools-continuation/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/native-responses-strict/unsupported-no-downgrade",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/native-first",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-404/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-404/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-405/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-405/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-501/stream0",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unsupported-501/stream1",
+        "passed": true
+      },
+      {
+        "check": "nvidia-python/responses-auto-default/unknown-history",
+        "passed": true
+      }
+    ],
+    "passed": 61,
+    "failed": 4
+  },
+  "limits": {
+    "live_upstream_inference": "NOT_RUN",
+    "live_client_cli": "NOT_RUN",
+    "production_deployment": "NOT_RUN",
+    "full_release_gates": "NOT_RUN",
+    "full_resource_profile_and_soak": "NOT_RUN",
+    "runtime_implementation_changes": "NONE"
+  },
+  "raw_evidence_sha256": {
+    "fleet-targeted-pytest.xml": "6e63ec28ae7ba643d4f301048748c7f1376b1e98408ee9a6e63aabf9734c8b9e",
+    "fleet-targeted-pytest.log": "6e98e8da8449466d2024c3dc7a8c957da69019abc730735b6e94eced22b55387",
+    "fleet-compat.log": "5cf1c3a29e3385ecb092e45b6773b5283a3501d1981e4fd2f847b2068b5d3903",
+    "fleet-matrix.json": "afbaefb4f764d04b2c02aecdb2cda59250a771061ef6a77c7361da247c69d810",
+    "fleet-matrix.log": "effddf09b15d807e41e558da19daca19ee7c5d433395684959b6b1509ae362ae",
+    "fleet-native-acceptance.json": "0314aef4b8b366007f49ea7f204df019a32969a51bc4deb11f8513f37da7336c",
+    "fleet-native-nvidia-rerun.json": "0f2c22f5304bf944c6fa5a7292b3d8be4290521bd180c8173926c6ced05f04ca"
+  }
+}

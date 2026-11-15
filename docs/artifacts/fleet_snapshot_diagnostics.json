@@ -1,0 +1,665 @@
+{
+  "source_head": "66ec1c188face2ace6cb3ee6e2f2d1ae3d44ebd4",
+  "timestamp_utc": "2026-11-15T15:04:11.155326+00:00",
+  "scope": "snapshot AST-executed pool/parser/handler diagnostics with fake credentials; no vendor inference or production runtime",
+  "active_inference_providers": [
+    "nvidia-python",
+    "nous",
+    "openrouter",
+    "coarena"
+  ],
+  "diagnostics": [
+    {
+      "id": "H1",
+      "provider": "nvidia-python",
+      "check": "explicit_pool_refresh_retains_state",
+      "note": "Calls pool refresh directly; this does not prove a runtime file watcher exists",
+      "new_key_loaded": true,
+      "same_entry_object": true,
+      "in_flight": 2,
+      "cooldown_retained": true,
+      "request_counter": 7
+    },
+    {
+      "id": "H2",
+      "provider": "nvidia-python",
+      "check": "remove_last_key_via_sync",
+      "changed": false,
+      "remaining_keys": 2
+    },
+    {
+      "id": "H3",
+      "provider": "nvidia-python",
+      "check": "deleted_env_assignment_after_overwrite_reload",
+      "deleted_key_remains_in_process_env": true,
+      "deleted_key_remains_selectable_in_pool": true,
+      "note": "Exercises the actual dotenv parser and actual pool; explicit refresh for providers without watcher"
+    },
+    {
+      "id": "H1",
+      "provider": "nous",
+      "check": "explicit_pool_refresh_retains_state",
+      "note": "Calls pool refresh directly; this does not prove a runtime file watcher exists",
+      "new_key_loaded": true,
+      "same_entry_object": false,
+      "in_flight": 0,
+      "cooldown_retained": false,
+      "request_counter": 0
+    },
+    {
+      "id": "H3",
+      "provider": "nous",
+      "check": "deleted_env_assignment_after_overwrite_reload",
+      "deleted_key_remains_in_process_env": true,
+      "deleted_key_remains_selectable_in_pool": true,
+      "note": "Exercises the actual dotenv parser and actual pool; explicit refresh for providers without watcher"
+    },
+    {
+      "id": "H1",
+      "provider": "openrouter",
+      "check": "explicit_pool_refresh_retains_state",
+      "note": "Calls pool refresh directly; this does not prove a runtime file watcher exists",
+      "new_key_loaded": true,
+      "same_entry_object": false,
+      "in_flight": 0,
+      "cooldown_retained": false,
+      "request_counter": 0
+    },
+    {
+      "id": "H3",
+      "provider": "openrouter",
+      "check": "deleted_env_assignment_after_overwrite_reload",
+      "deleted_key_remains_in_process_env": true,
+      "deleted_key_remains_selectable_in_pool": true,
+      "note": "Exercises the actual dotenv parser and actual pool; explicit refresh for providers without watcher"
+    },
+    {
+      "id": "H1",
+      "provider": "coarena",
+      "check": "explicit_pool_refresh_retains_state",
+      "note": "Calls pool refresh directly; this does not prove a runtime file watcher exists",
+      "new_key_loaded": true,
+      "same_entry_object": false,
+      "in_flight": 0,
+      "cooldown_retained": false,
+      "request_counter": 0
+    },
+    {
+      "id": "H3",
+      "provider": "coarena",
+      "check": "deleted_env_assignment_after_overwrite_reload",
+      "deleted_key_remains_in_process_env": true,
+      "deleted_key_remains_selectable_in_pool": true,
+      "note": "Exercises the actual dotenv parser and actual pool; explicit refresh for providers without watcher"
+    },
+    {
+      "id": "H4",
+      "provider": "nvidia-python",
+      "check": "atomic_replace_event_dispatch",
+      "modified_event_calls": [
+        "parse",
+        "sync"
+      ],
+      "moved_event_calls": [],
+      "note": "Actual handler dispatched with watchdog events; observer registration is stubbed"
+    },
+    {
+      "id": "H4",
+      "provider": "nous",
+      "check": "atomic_replace_event_dispatch",
+      "modified_event_calls": [
+        "parse",
+        "sync"
+      ],
+      "moved_event_calls": [],
+      "note": "Actual handler dispatched with watchdog events; observer registration is stubbed"
+    },
+    {
+      "id": "H5",
+      "provider": "nvidia-python",
+      "check": "watcher_callback_in_background_thread",
+      "sync_executed": false,
+      "note": "Actual callback in thread without an asyncio loop, matching a normal observer callback thread"
+    },
+    {
+      "id": "H6",
+      "provider": "openrouter",
+      "check": "source_runtime_refresh_calls",
+      "calls": [
+        {
+          "line": 709,
+          "call": "pool.load_from_env"
+        }
+      ],
+      "note": "Source inspection; no runtime hot-swap claim follows from having a load_from_env method"
+    },
+    {
+      "id": "H6",
+      "provider": "coarena",
+      "check": "source_runtime_refresh_calls",
+      "calls": [
+        {
+          "line": 404,
+          "call": "pool.load_from_env"
+        }
+      ],
+      "note": "Source inspection; no runtime hot-swap claim follows from having a load_from_env method"
+    }
+  ],
+  "duplication_inventory": {
+    "method": "Function AST equality after replacing only Coarena/OpenRouter strings; minimum 10 source lines; evidence of candidates, not proof of interchangeable semantics or RAM savings",
+    "files": [
+      {
+        "provider": "nvidia-python",
+        "file": "main.py",
+        "lines": 5403,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "nvidia-python",
+        "file": "key_pool.py",
+        "lines": 991,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "nvidia-python",
+        "file": "metrics.py",
+        "lines": 634,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "nous",
+        "file": "main.py",
+        "lines": 4138,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "openrouter",
+        "file": "main.py",
+        "lines": 3745,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "openrouter",
+        "file": "key_pool.py",
+        "lines": 295,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "openrouter",
+        "file": "metrics.py",
+        "lines": 339,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "coarena",
+        "file": "main.py",
+        "lines": 2226,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "coarena",
+        "file": "key_pool.py",
+        "lines": 311,
+        "top_level_basewrapper_subclasses": []
+      },
+      {
+        "provider": "coarena",
+        "file": "metrics.py",
+        "lines": 328,
+        "top_level_basewrapper_subclasses": []
+      }
+    ],
+    "matched_groups": 28,
+    "matched_functions": [
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_resolve_git_root",
+          "line": 291,
+          "lines": 14
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_resolve_git_root",
+          "line": 196,
+          "lines": 14
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_resolve_git_dirty",
+          "line": 315,
+          "lines": 21
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_resolve_git_dirty",
+          "line": 221,
+          "lines": 10
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "check_rate_limit",
+          "line": 391,
+          "lines": 19
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "check_rate_limit",
+          "line": 282,
+          "lines": 18
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "get_agent",
+          "line": 508,
+          "lines": 14
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "get_agent",
+          "line": 322,
+          "lines": 14
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_spawn_background",
+          "line": 646,
+          "lines": 15
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_spawn_background",
+          "line": 342,
+          "lines": 15
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_drain_background_tasks",
+          "line": 687,
+          "lines": 10
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_drain_background_tasks",
+          "line": 385,
+          "lines": 10
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_usage_tokens",
+          "line": 956,
+          "lines": 17
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_usage_tokens",
+          "line": 548,
+          "lines": 17
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_remember_completed_response",
+          "line": 1660,
+          "lines": 24
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_remember_completed_response",
+          "line": 1696,
+          "lines": 24
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_remember_response_stream",
+          "line": 1686,
+          "lines": 22
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_remember_response_stream",
+          "line": 1722,
+          "lines": 22
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "responses_to_chat",
+          "line": 2580,
+          "lines": 91
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "responses_to_chat",
+          "line": 1576,
+          "lines": 86
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "chat_to_responses",
+          "line": 2673,
+          "lines": 34
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "chat_to_responses",
+          "line": 1664,
+          "lines": 30
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "_anthropic_to_openai",
+          "line": 2709,
+          "lines": 204
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "_anthropic_to_openai",
+          "line": 1748,
+          "lines": 189
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "metrics_activity",
+          "line": 3676,
+          "lines": 11
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "metrics_activity",
+          "line": 2159,
+          "lines": 11
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "stream_gen",
+          "line": 1210,
+          "lines": 49
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "stream_gen",
+          "line": 790,
+          "lines": 39
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "main.py",
+          "function": "stream_with_heartbeat",
+          "line": 1267,
+          "lines": 44
+        },
+        {
+          "provider": "coarena",
+          "file": "main.py",
+          "function": "stream_with_heartbeat",
+          "line": 837,
+          "lines": 36
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "key_pool.py",
+          "function": "block_model",
+          "line": 80,
+          "lines": 10
+        },
+        {
+          "provider": "coarena",
+          "file": "key_pool.py",
+          "function": "block_model",
+          "line": 88,
+          "lines": 10
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "key_pool.py",
+          "function": "stats",
+          "line": 117,
+          "lines": 21
+        },
+        {
+          "provider": "coarena",
+          "file": "key_pool.py",
+          "function": "stats",
+          "line": 125,
+          "lines": 21
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "key_pool.py",
+          "function": "acquire",
+          "line": 190,
+          "lines": 33
+        },
+        {
+          "provider": "coarena",
+          "file": "key_pool.py",
+          "function": "acquire",
+          "line": 198,
+          "lines": 33
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "key_pool.py",
+          "function": "mark_failure",
+          "line": 231,
+          "lines": 34
+        },
+        {
+          "provider": "coarena",
+          "file": "key_pool.py",
+          "function": "mark_failure",
+          "line": 239,
+          "lines": 34
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "key_pool.py",
+          "function": "prom_metrics",
+          "line": 269,
+          "lines": 18
+        },
+        {
+          "provider": "coarena",
+          "file": "key_pool.py",
+          "function": "prom_metrics",
+          "line": 285,
+          "lines": 18
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "_load_persisted",
+          "line": 56,
+          "lines": 21
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "_load_persisted",
+          "line": 49,
+          "lines": 21
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "_persist",
+          "line": 78,
+          "lines": 18
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "_persist",
+          "line": 71,
+          "lines": 18
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "record_request",
+          "line": 100,
+          "lines": 75
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "record_request",
+          "line": 93,
+          "lines": 75
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "summary",
+          "line": 245,
+          "lines": 11
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "summary",
+          "line": 234,
+          "lines": 11
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "per_model_summary",
+          "line": 257,
+          "lines": 22
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "per_model_summary",
+          "line": 246,
+          "lines": 22
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "per_key_summary",
+          "line": 288,
+          "lines": 17
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "per_key_summary",
+          "line": 277,
+          "lines": 17
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "hourly_chart",
+          "line": 306,
+          "lines": 17
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "hourly_chart",
+          "line": 295,
+          "lines": 17
+        }
+      ],
+      [
+        {
+          "provider": "openrouter",
+          "file": "metrics.py",
+          "function": "prom_metrics",
+          "line": 327,
+          "lines": 12
+        },
+        {
+          "provider": "coarena",
+          "file": "metrics.py",
+          "function": "prom_metrics",
+          "line": 316,
+          "lines": 12
+        }
+      ]
+    ]
+  }
+}

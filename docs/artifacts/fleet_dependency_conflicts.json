@@ -1,0 +1,17 @@
+[
+  {
+    "provider": "coarena",
+    "requirement": "uvicorn[standard]==0.27.0",
+    "release_constraint": "0.54.0"
+  },
+  {
+    "provider": "coarena",
+    "requirement": "pydantic==2.5.0",
+    "release_constraint": "2.13.5"
+  },
+  {
+    "provider": "coarena",
+    "requirement": "python-dotenv==1.0.0",
+    "release_constraint": "1.2.4"
+  }
+]
