@@ -1,0 +1,148 @@
+{
+  "source_head": "5a02a0cb1773327fb719a8ab4c0412a187d5e60a",
+  "timestamp_utc": "2026-11-15T13:26:17.421322+00:00",
+  "scope": "snapshot diagnostic, fake keys, loopback upstream, ASGI transport; no real inference or deployment",
+  "results": [
+    {
+      "id": "P01",
+      "check": "native_paths_ignore_model_brand",
+      "note": "Fake upstream does not validate the payload dialect",
+      "cases": [
+        {
+          "client_path": "/v1/chat/completions",
+          "model": "claude-test-only",
+          "upstream_path": "/api/v1/chat/completions",
+          "body_bytes_preserved": true,
+          "status": 200
+        },
+        {
+          "client_path": "/v1/chat/completions",
+          "model": "gpt-test-only",
+          "upstream_path": "/api/v1/chat/completions",
+          "body_bytes_preserved": true,
+          "status": 200
+        },
+        {
+          "client_path": "/v1/responses",
+          "model": "claude-test-only",
+          "upstream_path": "/api/v1/responses",
+          "body_bytes_preserved": true,
+          "status": 200
+        },
+        {
+          "client_path": "/v1/responses",
+          "model": "gpt-test-only",
+          "upstream_path": "/api/v1/responses",
+          "body_bytes_preserved": true,
+          "status": 200
+        },
+        {
+          "client_path": "/v1/messages",
+          "model": "claude-test-only",
+          "upstream_path": "/api/v1/messages",
+          "body_bytes_preserved": true,
+          "status": 200
+        },
+        {
+          "client_path": "/v1/messages",
+          "model": "gpt-test-only",
+          "upstream_path": "/api/v1/messages",
+          "body_bytes_preserved": true,
+          "status": 200
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "D01",
+      "check": "local_auth_missing",
+      "expected": "401 without invoking upstream",
+      "observed_status": 200,
+      "upstream_calls": 1,
+      "finding_reproduced": true
+    },
+    {
+      "id": "D02",
+      "check": "retry_available_second_key",
+      "expected": "second fake key succeeds in same request",
+      "observed_status": 429,
+      "upstream_calls": 1,
+      "finding_reproduced": true
+    },
+    {
+      "id": "D03",
+      "check": "stream_resource_lifetime",
+      "error_types": [
+        "ClientConnectionError"
+      ],
+      "finding_reproduced": true
+    },
+    {
+      "id": "D04",
+      "check": "response_header_framing",
+      "upstream_content_length_reused": 33,
+      "actual_body_length": 23,
+      "connection_header_forwarded": true,
+      "cookie_forwarded": true,
+      "finding_reproduced": true
+    },
+    {
+      "id": "D05",
+      "check": "catchall_version_prefix_query",
+      "expected_path": "/api/v1/responses/resp_fake",
+      "expected_query": "include=output",
+      "observed": [
+        {
+          "method": "GET",
+          "path": "/api/v1/v1/responses/resp_fake",
+          "query": ""
+        }
+      ],
+      "finding_reproduced": true
+    },
+    {
+      "id": "D06",
+      "check": "inference_catchall_can_reach_management",
+      "expected": "route rejected locally without upstream credential use",
+      "observed_status": 200,
+      "observed": [
+        {
+          "method": "DELETE",
+          "path": "/api/v1/key",
+          "query": ""
+        }
+      ],
+      "finding_reproduced": true
+    },
+    {
+      "id": "D07",
+      "check": "readiness_not_local",
+      "observed": [
+        {
+          "method": "GET",
+          "path": "/api/v1/ready",
+          "query": ""
+        }
+      ],
+      "local_ready_field": null,
+      "finding_reproduced": true
+    },
+    {
+      "id": "D08",
+      "check": "idle_sentinel_serialization",
+      "note": "IDLE yielded immediately by controlled helper stub",
+      "error_types": [
+        "AttributeError"
+      ],
+      "finding_reproduced": true
+    },
+    {
+      "id": "D09",
+      "check": "installer_and_entrypoint",
+      "expected_unit_present": false,
+      "main_at_configured_workdir_present": false,
+      "src_main_present": true,
+      "finding_reproduced": true
+    }
+  ]
+}
