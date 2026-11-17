@@ -21,10 +21,15 @@ except Exception:  # pragma: no cover - fallback for standalone use
         return False
 
 
+# Handle both package and standalone imports for think_tags functions.
 try:
-    from .think_tags import extract_inline_thinking, strip_trailing_think_tags, thinking_signature
+    from . import think_tags as _think_tags_mod  # type: ignore[attr-defined,no-redef]
 except ImportError:  # pragma: no cover - standalone use outside the package
-    from think_tags import extract_inline_thinking, strip_trailing_think_tags, thinking_signature
+    import think_tags as _think_tags_mod  # type: ignore[attr-defined,no-redef]
+
+extract_inline_thinking = _think_tags_mod.extract_inline_thinking
+strip_trailing_think_tags = _think_tags_mod.strip_trailing_think_tags
+thinking_signature = _think_tags_mod.thinking_signature
 
 
 _SPECIAL_TOKENS = frozenset({
@@ -102,9 +107,9 @@ def parse_dsml_from_text(text: str) -> tuple[str, list[dict]]:
 
 def responses_output_to_assistant_message(response: dict) -> dict:
     """Reconstruct one assistant turn, retaining structured calls for replay."""
-    text_parts = []
-    reasoning_parts = []
-    tool_calls = []
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict] = []
     for item in response.get('output') or []:
         if not isinstance(item, dict):
             continue
@@ -119,7 +124,7 @@ def responses_output_to_assistant_message(response: dict) -> dict:
             tool_calls.append({'id': item.get('call_id') or item.get('id'), 'type': 'function',
                                'function': {'name': item.get('name', ''),
                                             'arguments': item.get('arguments', '')}})
-    message = {'role': 'assistant', 'content': ''.join(text_parts) or (None if tool_calls else '')}
+    message: dict[str, Any] = {'role': 'assistant', 'content': ''.join(text_parts) or (None if tool_calls else '')}
     if tool_calls:
         message['tool_calls'] = tool_calls
     if reasoning_parts:
@@ -565,9 +570,9 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
     role = a_resp.get("role", "assistant")
     content_blocks = a_resp.get("content", [])
 
-    text_parts = []
-    reasoning_parts = []
-    tool_calls = []
+    text_parts: list[str] = []
+    reasoning_parts: list[str] = []
+    tool_calls: list[dict] = []
 
     if isinstance(content_blocks, str):
         text_parts.append(content_blocks)
@@ -604,14 +609,14 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
     final_reasoning = "".join(reasoning_parts)
 
     anthro_stop = a_resp.get("stop_reason")
-    finish_map = {
+    finish_map: dict[str, str] = {
         "end_turn": "stop",
         "stop_sequence": "stop",
         "max_tokens": "length",
         "tool_use": "tool_calls",
         "refusal": "content_filter",
     }
-    finish_reason = finish_map.get(anthro_stop) or ("tool_calls" if tool_calls else "stop")
+    finish_reason = finish_map.get(anthro_stop if isinstance(anthro_stop, str) else "") or ("tool_calls" if tool_calls else "stop")
 
     msg_obj = {
         "role": role,
@@ -644,7 +649,7 @@ def anthropic_to_openai_response(a_resp: dict, request_model: str = "") -> dict:
     }
 
 
-def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str = None) -> dict:
+def openai_to_anthropic_response(o_resp: dict, model: str = "", request_id: str | None = None) -> dict:
     """Convert OpenAI ChatCompletion response object -> Anthropic Message response object.
 
     If input `o_resp` is already an Anthropic response (type == 'message'), returns it as-is.
@@ -966,8 +971,8 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
 
         if role == 'assistant':
             converted = _openai_content_to_anthropic(content)
-            am: dict = {'role': 'assistant'}
-            blocks = []
+            am: dict[str, Any] = {'role': 'assistant'}
+            blocks: list[dict] = []
             if isinstance(converted, str):
                 if converted:
                     blocks.append({'type': 'text', 'text': converted})
@@ -1055,20 +1060,23 @@ def openai_chat_to_anthropic_request(chat_body: dict) -> dict:
     elif isinstance(stop, list):
         out['stop_sequences'] = [str(s) for s in stop if s]
     # tools
-    tools = []
-    for t in chat_body.get('tools') or []:
-        if not isinstance(t, dict):
-            continue
-        fn = t.get('function') if isinstance(t.get('function'), dict) else t
-        name = fn.get('name') if isinstance(fn, dict) else None
-        if not name:
-            continue
-        tools.append({
-            'name': name,
-            'description': fn.get('description', '') or '',
-            'input_schema': fn.get('parameters') or {'type': 'object', 'properties': {}},
-            **({'strict': fn['strict']} if 'strict' in fn else {}),
-        })
+    tools: list[dict] = []
+    raw_tools = chat_body.get('tools')
+    if isinstance(raw_tools, list):
+        for t in raw_tools:
+            if not isinstance(t, dict):
+                continue
+            func_val = t.get('function')
+            func_dict: dict = func_val if isinstance(func_val, dict) else t
+            name = func_dict.get('name')
+            if not isinstance(name, str) or not name:
+                continue
+            tools.append({
+                'name': name,
+                'description': func_dict.get('description', '') or '',
+                'input_schema': func_dict.get('parameters') or {'type': 'object', 'properties': {}},
+                **({'strict': func_dict['strict']} if 'strict' in func_dict else {}),
+            })
     if tools:
         out['tools'] = tools
     # tool_choice

@@ -264,8 +264,9 @@ class ContextProbeService:
         rungs = list(self.ladder)
         verify_mode = False
         start_idx = 0
-        if positive_int(advertised):
-            eligible = [r for r in rungs if r <= advertised]
+        adv = positive_int(advertised)
+        if adv is not None:
+            eligible = [r for r in rungs if r <= adv]
             if eligible:
                 start_idx = rungs.index(eligible[-1])
                 verify_mode = True

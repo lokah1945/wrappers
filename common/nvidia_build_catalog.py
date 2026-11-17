@@ -109,9 +109,11 @@ def apply_build_website_catalog(rows: Iterable[Mapping[str, Any]] | None) -> dic
         merged[model_id] = row
         website_order.append(model_id)
         try:
-            retrieved = float(website.get("retrieved_at"))
-            if retrieved > 0:
-                retrieved_values.append(retrieved)
+            retrieved_at = website.get("retrieved_at")
+            if isinstance(retrieved_at, (int, float, str)):
+                retrieved = float(retrieved_at)
+                if retrieved > 0:
+                    retrieved_values.append(retrieved)
         except (TypeError, ValueError):
             pass
 

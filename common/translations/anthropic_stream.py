@@ -21,9 +21,11 @@ import time
 from typing import List, Optional
 
 try:
-    from .think_tags import thinking_signature
+    from . import think_tags as _think_tags  # type: ignore[attr-defined,no-redef]
 except ImportError:  # pragma: no cover - standalone use outside the package
-    from think_tags import thinking_signature
+    import think_tags as _think_tags  # type: ignore[attr-defined,no-redef]
+
+thinking_signature = _think_tags.thinking_signature
 
 _log = logging.getLogger("wrapper-anthropic-stream")
 

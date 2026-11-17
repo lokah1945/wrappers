@@ -26,17 +26,15 @@ import logging
 import os
 import sys
 from pathlib import Path
+from typing import Any
 
 logger = logging.getLogger('catalog-integration')
 
-try:
-    # FastAPI resolves route annotations against module globals, so the
-    # Request type used by mcp_sse/mcp_messages MUST be importable at module
-    # level. A function-local import leaves the annotation unresolvable and
-    # FastAPI degrades the parameter to a (required) query param -> 422.
-    from fastapi import Request as _FastAPIRequest
-except ImportError:  # pragma: no cover - FastAPI is a hard runtime dep
-    _FastAPIRequest = None
+# FastAPI resolves route annotations against module globals, so the
+# Request type used by mcp_sse/mcp_messages MUST be importable at module
+# level. A function-local import leaves the annotation unresolvable and
+# FastAPI degrades the parameter to a (required) query param -> 422.
+from fastapi import Request as _FastAPIRequest  # type: ignore[attr-defined]
 
 # ── Resolve model_fetcher path ──────────────────────────────────────────
 # Try multiple common locations
@@ -181,7 +179,7 @@ def ngc_modality_map() -> dict:
 
 # ── FastMCP Server Setup ───────────────────────────────────────────────
 
-def setup_mcp_server(app, wrapper_name: str = "wrapper") -> None:
+def setup_mcp_server(app, wrapper_name: str = "wrapper") -> Any:
     """Mount FastMCP SSE transport on /mcp/sse and /mcp.
 
     Args:

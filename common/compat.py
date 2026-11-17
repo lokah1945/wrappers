@@ -356,7 +356,7 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
     acc_reason = ''
     rsn_index = 1
     rsn_id = f"rsn_{int(time.time()*1000)}"
-    tool_accs: list = []
+    tool_accs: list[dict | None] = []
     next_output_index = 1
     msg_open = False
     upstream_error = None
@@ -388,7 +388,8 @@ async def translate_openai_chat_sse_to_responses(chat_sse_gen, model: str):
 
     def _get_tool_acc(tc: dict) -> dict:
         nonlocal next_output_index
-        idx = tc.get('index') if isinstance(tc.get('index'), int) else len(tool_accs)
+        index_val = tc.get('index')
+        idx: int = index_val if isinstance(index_val, int) else len(tool_accs)
         acc = tool_accs[idx] if idx < len(tool_accs) else None
         if acc is None:
             acc = {'call_id': tc.get('id') or f'call_{idx}_{int(time.time()*1000)}',

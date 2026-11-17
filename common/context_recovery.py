@@ -172,9 +172,9 @@ class ContextRecoveryState:
     def __init__(self, *, enabled: bool = True):
         self.enabled = bool(enabled)
         self.attempted = False
-        self.headers = {}
-        self.output_field = None
-        self.output_tokens = None
+        self.headers: dict[str, str] = {}
+        self.output_field: str | None = None
+        self.output_tokens: int | None = None
 
 
 def context_response_headers(response):

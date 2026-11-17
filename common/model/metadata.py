@@ -83,10 +83,12 @@ def context_metadata(entry: dict | None) -> dict:
 def discovery_limits(entry: dict | None) -> dict:
     """Consistent discovery aliases used by different clients, with provenance."""
     metadata = context_metadata(entry)
-    result = {'context_metadata': metadata}
+    result: dict[str, Any] = {'context_metadata': metadata}
     window = positive_int(metadata.get('context_window'))
     if window is not None:
-        result.update(context_window=window, context_length=window, max_context_window=window)
+        result['context_window'] = window
+        result['context_length'] = window
+        result['max_context_window'] = window
     for key in ('max_input_tokens', 'max_output_tokens'):
         value = positive_int(metadata.get(key))
         if value is not None:
@@ -127,8 +129,8 @@ def merge_observed_context(entry: dict | None, observations: list | None) -> dic
     metadata = context_metadata(result)
     published = positive_int(metadata.get('context_window'))
     now = time.time()
-    best_exact = None
-    best_floor = None
+    best_exact: dict[str, Any] | None = None
+    best_floor: dict[str, Any] | None = None
     for obs in observations:
         if not isinstance(obs, dict):
             continue
@@ -136,7 +138,8 @@ def merge_observed_context(entry: dict | None, observations: list | None) -> dic
         if not isinstance(expiry, (int, float)) or expiry <= now:
             continue
         limits = obs.get('limits') or {}
-        checked = obs.get('checked_at') if isinstance(obs.get('checked_at'), (int, float)) else 0
+        checked_at = obs.get('checked_at')
+        checked: int | float = checked_at if isinstance(checked_at, (int, float)) else 0
         exact = positive_int(limits.get('context_window'))
         floor = positive_int(limits.get('input_tokens'))
         if exact and (best_exact is None or checked > (best_exact.get('checked_at') or 0)):
@@ -175,6 +178,9 @@ def merge_observed_context(entry: dict | None, observations: list | None) -> dic
             merged['max_output_tokens'] = best_exact['max_output_tokens']
         merged['status'] = 'probe_verified'
     else:
+        # best_floor must be non-None here because chosen = best_exact or best_floor
+        # and chosen is not None (early return at line 152-153)
+        assert best_floor is not None
         merged['verified_context_window'] = best_floor['input_tokens']
         merged['status'] = 'observed_floor'
     merged['source'] = 'empirical_probe'

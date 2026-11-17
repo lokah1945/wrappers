@@ -101,3 +101,9 @@ nvidia-python/nim-metadata-cache.json
 
 # Live NVIDIA Build website catalog snapshot (runtime artifact)
 nvidia-python/build-web-catalog-cache.json
+
+# Local latency test scripts (not part of test suite)
+latency_test*.py
+
+# Local backup files with keys
+*.backup_all_keys

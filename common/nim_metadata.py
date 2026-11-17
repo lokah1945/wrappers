@@ -589,7 +589,7 @@ class NimMetadataRegistry:
                 resource_id, metadata_tag or tag_candidates[0], metadata_body,
                 repository=repository, metadata_url=_metadata_url(
                     self.base_url, resource_id, metadata_tag or tag_candidates[0]),
-                repository_url=repository_url, checked_at=checked,
+                repository_url=repository_url or "", checked_at=checked,
                 request_id=metadata_request_id or repo_request_id,
             )
             normalized["model_id"] = model_id

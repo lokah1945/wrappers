@@ -216,7 +216,7 @@ class ThinkTagStreamFilter:
         return self._emit_safe_text()
 
     def _flush_boundary(self, *, strip_tags: bool):
-        out = []
+        out: list[tuple[str, str]] = []
         if self._mode == 'detect':
             # nothing meaningful seen; drop pure-whitespace holdback
             self._buf = ''

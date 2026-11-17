@@ -99,7 +99,8 @@ class ContentTranslator:
         return out
 
     def _drain_text(self, final: bool) -> list[dict]:
-        out, literal = [], []
+        out: list[dict] = []
+        literal: list[str] = []
         def flush():
             if literal:
                 out.extend(self._emit('text', ''.join(literal)))

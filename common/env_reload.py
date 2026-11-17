@@ -51,7 +51,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Awaitable, Callable, Dict, List, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("wrapper.env_reload")
 
@@ -112,7 +112,7 @@ def parse_env_file(path: Path) -> Tuple[Optional[Dict[str, str]], Optional[str]]
     return snapshot, None
 
 
-def reconcile_snapshot(snapshot: Dict[str, str], previous: Dict[str, str]) -> Dict[str, object]:
+def reconcile_snapshot(snapshot: Dict[str, str], previous: Dict[str, str]) -> Dict[str, Dict[str, str] | List[str]]:
     """Apply file-owned variables to ``os.environ`` and report the changes.
 
     ``snapshot`` is the new file content, ``previous`` the last applied file
@@ -170,7 +170,7 @@ class EnvReloadService:
         self._debounce = float(debounce)
         self._poll_interval = float(poll_interval)
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._observer = None
+        self._observer: Any = None
         self._poll_thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
         self._pending = threading.Event()
@@ -279,7 +279,7 @@ class EnvReloadService:
         class Handler(FileSystemEventHandler):
             def _relevant(self, path: Optional[str]) -> bool:
                 try:
-                    return bool(path) and Path(path).resolve() == service.env_path.resolve()
+                    return path is not None and Path(path).resolve() == service.env_path.resolve()
                 except OSError:
                     return False
 

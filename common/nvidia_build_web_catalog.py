@@ -170,9 +170,10 @@ def _website_row(resource: dict[str, Any]) -> dict[str, Any]:
     if deprecation:
         website_badges.insert(0, f"Deprecation in {deprecation}")
 
-    website_available = attributes.get("AVAILABLE")
-    if website_available is not None:
-        website_available = website_available.lower() == "true"
+    website_available_raw = attributes.get("AVAILABLE")
+    website_available: bool | None = None
+    if website_available_raw is not None:
+        website_available = website_available_raw.lower() == "true"
 
     return {
         "id": model_id,

@@ -667,11 +667,11 @@ class BaseWrapper:
                     key_released = True
 
         # All keys exhausted → 429 (not 503) so SDKs auto-retry.
-        retry_after = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))
+        exhausted_retry_after: str = str(int(os.environ.get('KEY_EXHAUSTED_RETRY_AFTER', '30')))
         return JSONResponse(
             last_data if isinstance(last_data, dict) else {'error': {'message': str(last_data)[:2000], 'type': 'rate_limit_error'}},
             status_code=last_status if last_status in (429, 401, 402, 403, 408, 409) else 429,
-            headers={'Retry-After': retry_after},
+            headers={'Retry-After': exhausted_retry_after},
         )
 
     # ─── Entrypoint ───────────────────────────────────────────────────────
